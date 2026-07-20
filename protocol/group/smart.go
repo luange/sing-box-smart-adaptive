@@ -234,6 +234,8 @@ type Smart struct {
 	loadedHistory     map[string]smartStoreSnapshot
 }
 
+var _ adapter.RuntimeEpochLifecycle = (*Smart)(nil)
+
 type smartHistoryEntry struct {
 	fileAccess sync.Mutex
 	stores     map[string]smartHistoryStore
@@ -416,10 +418,20 @@ func (s *Smart) Start() error {
 func (s *Smart) PostStart() error {
 	s.lifecycleAccess.Lock()
 	s.postStarted = true
-	s.publishHistoryLocked()
 	s.startWorkerLocked()
 	s.lifecycleAccess.Unlock()
 	return nil
+}
+
+func (s *Smart) OnRuntimeEpochPublish() {
+	s.lifecycleAccess.Lock()
+	s.publishHistoryLocked()
+	s.startWorkerLocked()
+	s.lifecycleAccess.Unlock()
+}
+
+func (s *Smart) OnRuntimeEpochRetire() {
+	s.stopWorker()
 }
 
 func (s *Smart) publishHistoryLocked() {
@@ -490,7 +502,7 @@ func (s *Smart) Close() error {
 	if !s.closing.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.stopWorker()
+	s.OnRuntimeEpochRetire()
 	s.unregisterProviderCallbacks()
 	s.worker.Wait()
 	s.lifecycleAccess.Lock()

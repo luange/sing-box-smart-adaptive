@@ -232,7 +232,7 @@ func TestSmartHistorySnapshotHonorsRetentionAndLimit(t *testing.T) {
 	}
 }
 
-func TestSmartWorkerStartsAfterPostStart(t *testing.T) {
+func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
 	smart := &Smart{
 		ctx:               context.Background(),
 		store:             newSmartStore(time.Hour, 3, time.Minute),
@@ -251,8 +251,15 @@ func TestSmartWorkerStartsAfterPostStart(t *testing.T) {
 	smart.lifecycleAccess.Lock()
 	startedAfterPostStart := smart.workerStarted
 	smart.lifecycleAccess.Unlock()
-	if !startedAfterPostStart {
-		t.Fatal("Smart worker did not start after post-start")
+	if startedAfterPostStart {
+		t.Fatal("unpublished Smart worker started during PREPARE")
+	}
+	smart.OnRuntimeEpochPublish()
+	smart.lifecycleAccess.Lock()
+	startedAfterPublish := smart.workerStarted
+	smart.lifecycleAccess.Unlock()
+	if !startedAfterPublish {
+		t.Fatal("Smart worker did not start after runtime epoch publish")
 	}
 	if err := smart.Close(); err != nil {
 		t.Fatal(err)
@@ -266,10 +273,12 @@ func TestSmartHistoryStoreSharedAcrossPublishedGenerations(t *testing.T) {
 	if err := first.PostStart(); err != nil {
 		t.Fatal(err)
 	}
+	first.OnRuntimeEpochPublish()
 	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
 	if err := second.PostStart(); err != nil {
 		t.Fatal(err)
 	}
+	second.OnRuntimeEpochPublish()
 	if first.store != second.store {
 		t.Fatal("published generations do not share the same history store")
 	}
@@ -304,9 +313,11 @@ func TestSmartHistoryConcurrentFlushUsesAtomicFiles(t *testing.T) {
 	if err := first.PostStart(); err != nil {
 		t.Fatal(err)
 	}
+	first.OnRuntimeEpochPublish()
 	if err := second.PostStart(); err != nil {
 		t.Fatal(err)
 	}
+	second.OnRuntimeEpochPublish()
 	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
 	var waitGroup sync.WaitGroup
 	for range 20 {
