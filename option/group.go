@@ -40,3 +40,41 @@ type LoadBalanceOutboundOptions struct {
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 	Strategy                  string             `json:"strategy,omitempty"`
 }
+
+type SmartOutboundOptions struct {
+	GroupCommonOption
+	URL                  string                  `json:"url,omitempty"`
+	ProbeInterval        badoption.Duration      `json:"probe_interval,omitempty"`
+	ProbeTimeout         badoption.Duration      `json:"probe_timeout,omitempty"`
+	MaxAttempts          int                     `json:"max_attempts,omitempty"`
+	AttemptTimeout       badoption.Duration      `json:"attempt_timeout,omitempty"`
+	SiteStickiness       badoption.Duration      `json:"site_stickiness,omitempty"`
+	SwitchMargin         *float64                `json:"switch_margin,omitempty"`
+	Exploration          *float64                `json:"exploration,omitempty"`
+	MinSamples           int                     `json:"min_samples,omitempty"`
+	BreakerFailures      int                     `json:"breaker_failures,omitempty"`
+	BreakerCooldown      badoption.Duration      `json:"breaker_cooldown,omitempty"`
+	HalfLife             badoption.Duration      `json:"half_life,omitempty"`
+	HistoryPath          string                  `json:"history_path,omitempty"`
+	HistoryRetention     badoption.Duration      `json:"history_retention,omitempty"`
+	MaxHistoryEntries    int                     `json:"max_history_entries,omitempty"`
+	InterruptConnections bool                    `json:"interrupt_exist_connections,omitempty"`
+	ReachTests           []SmartReachTestOptions `json:"reach_tests,omitempty"`
+}
+
+type SmartReachTestOptions struct {
+	Tag              string              `json:"tag"`
+	Preset           string              `json:"preset,omitempty"`
+	Domains          []string            `json:"domains,omitempty"`
+	URL              string              `json:"url,omitempty"`
+	Interval         badoption.Duration  `json:"interval,omitempty"`
+	Timeout          badoption.Duration  `json:"timeout,omitempty"`
+	AcceptedStatus   []uint16            `json:"accepted_status,omitempty"`
+	BlockedStatus    []uint16            `json:"blocked_status,omitempty"`
+	RequestHeaders   map[string]string   `json:"request_headers,omitempty"`
+	ReachableBody    []string            `json:"reachable_body,omitempty"`
+	BlockedBody      []string            `json:"blocked_body,omitempty"`
+	BlockedHeaders   map[string][]string `json:"blocked_headers,omitempty"`
+	UnmeasuredPolicy string              `json:"unmeasured_policy,omitempty"`
+	MaxBodyBytes     int64               `json:"max_body_bytes,omitempty"`
+}
