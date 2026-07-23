@@ -44,6 +44,12 @@ func TestSmartReachPresetAndDomainScopedSelection(t *testing.T) {
 	if len(tests) != 1 || tests[0].tag != "gemini" || !reachTestMatchesHost(tests[0], "gemini.google.com") {
 		t.Fatalf("unexpected Gemini preset: %+v", tests)
 	}
+	if tests[0].url != "https://www.google.com/generate_204" {
+		t.Fatalf("Gemini must follow the Google connectivity probe, got: %s", tests[0].url)
+	}
+	if !containsReachStatus(tests[0].acceptedStatus, http.StatusNoContent) {
+		t.Fatalf("Gemini Google connectivity probe must accept HTTP 204: %+v", tests[0].acceptedStatus)
+	}
 
 	blocked := newSmartFakeOutbound("blocked-for-gemini", nil)
 	reachable := newSmartFakeOutbound("reachable-for-gemini", nil)

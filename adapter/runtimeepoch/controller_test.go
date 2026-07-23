@@ -1,6 +1,7 @@
 package runtimeepoch
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,6 +9,38 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 )
+
+func TestPublishFailureKeepsPreviousRuntimeCurrent(t *testing.T) {
+	controller := New()
+	var firstPublished, firstRetired, firstClosed atomic.Int32
+	if _, err := controller.PrepareInitial(testRuntime(&firstPublished, &firstRetired, &firstClosed)); err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := controller.ActivateInitial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedClosed atomic.Int32
+	failed := testRuntime(new(atomic.Int32), new(atomic.Int32), &failedClosed)
+	failed.Publish = func() error { return errors.New("publish rejected") }
+	if _, err = controller.Publish(failed); err == nil {
+		t.Fatal("failed runtime publish succeeded")
+	}
+	if controller.CurrentID() != firstID || firstRetired.Load() != 0 {
+		t.Fatalf("failed publish replaced/retired previous runtime: current=%d retired=%d", controller.CurrentID(), firstRetired.Load())
+	}
+	if failedClosed.Load() != 1 {
+		t.Fatalf("failed runtime was not closed: %d", failedClosed.Load())
+	}
+	if _, lease, err := controller.Acquire(); err != nil {
+		t.Fatal("previous runtime unavailable after failed publish: ", err)
+	} else {
+		lease.Release()
+	}
+	if err = controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 type testRouter struct{ adapter.Router }
 type testDNSRouter struct{ adapter.DNSRouter }
@@ -24,7 +57,7 @@ func testRuntime(published, retired, closed *atomic.Int32) Runtime {
 		Outbound:     &testOutboundManager{},
 		Provider:     &testProviderManager{},
 		Endpoint:     &testEndpointManager{},
-		Publish:      func() { published.Add(1) },
+		Publish:      func() error { published.Add(1); return nil },
 		Retire:       func() { retired.Add(1) },
 		Close:        func() error { closed.Add(1); return nil },
 	}

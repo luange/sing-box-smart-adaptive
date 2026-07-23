@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "read_only": true,
+  "instances": {
+    "vm107": {"version": "1.14.0-alpha.50-reF1nd-luan-adaptive.rc5", "role": "production-smart-shadow"},
+    "vm115": {"version": "1.14.0-alpha.50-reF1nd-luan-adaptive.rc5", "role": "legacy-smart-test"},
+    "vm116": {"version": "1.14.0-alpha.50-reF1nd-luan-adaptive.rc5", "role": "legacy-smart-test"},
+    "vm117": {"version": "1.14.0-alpha.50-reF1nd-luan-adaptive.rc5", "role": "seven-day-soak"},
+    "qnap-main": {"version": "1.14.0-alpha.50-reF1nd-luan-adaptive.rc6", "role": "production-smart-shadow"}
+  }
+}

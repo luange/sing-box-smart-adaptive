@@ -1,0 +1,248 @@
+package adaptive
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	N "github.com/sagernet/sing/common/network"
+)
+
+type fakeClock struct {
+	access sync.Mutex
+	now    time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(duration time.Duration) {
+	c.access.Lock()
+	c.now = c.now.Add(duration)
+	c.access.Unlock()
+}
+
+func newBreakerTestStore() (*HealthStore, *fakeClock) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	return NewHealthStoreWithClock(time.Hour, 64, clock, BreakerConfig{FailureThreshold: 3, BaseCooldown: 10 * time.Second, MaxCooldown: 40 * time.Second}), clock
+}
+
+func TestHealthStoreIsBoundedAndDeferredIsIgnored(t *testing.T) {
+	store := NewHealthStore(time.Hour, 3)
+	now := time.Now()
+	store.Observe(Observation{NodeID: NodeID{1}, Scope: ScopeEndpoint, Outcome: OutcomeDeferred, At: now})
+	if entries, _ := store.Stats(); entries != 0 {
+		t.Fatalf("deferred observation created state: %d", entries)
+	}
+	for index := 1; index <= 5; index++ {
+		store.Observe(Observation{NodeID: NodeID{byte(index)}, Scope: ScopeEndpoint, Outcome: OutcomeSuccess, At: now.Add(time.Duration(index) * time.Second)})
+	}
+	entries, evictions := store.Stats()
+	if entries != 3 {
+		t.Fatalf("health store exceeded bound: %d", entries)
+	}
+	if evictions != 2 {
+		t.Fatalf("unexpected eviction count: %d", evictions)
+	}
+}
+
+func TestHealthScopesDoNotContaminateEndpoint(t *testing.T) {
+	store := NewHealthStore(time.Hour, 16)
+	nodeID := NodeID{1}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: ScopeService, Service: "youtube", Outcome: OutcomeBlocked})
+	}
+	if status := store.Endpoint(nodeID); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("service failure contaminated endpoint health: %+v", status)
+	}
+	store.Observe(Observation{NodeID: nodeID, Scope: ScopeEndpoint, Outcome: OutcomeSuccess})
+	if status := store.Endpoint(nodeID); status.Health != HealthHealthy || status.Breaker != BreakerClosed {
+		t.Fatalf("endpoint success was not recorded: %+v", status)
+	}
+}
+
+func TestBreakerFailureDomainsAreIsolated(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{1}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainService, Service: "youtube", Outcome: OutcomeBlocked, At: clock.Now()})
+	}
+	if status := store.Status(nodeID, DomainService, "", "youtube"); status.Breaker != BreakerOpen || status.Health != HealthUnreachable || status.Failures != 3 {
+		t.Fatalf("service breaker did not enter cooldown: %+v", status)
+	}
+	if status := store.Endpoint(nodeID); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("service 403/451 contaminated endpoint breaker: %+v", status)
+	}
+	if status := store.Status(nodeID, DomainTransport, N.NetworkTCP, ""); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("service failure contaminated transport breaker: %+v", status)
+	}
+	if status := store.Status(nodeID, DomainService, "", "google"); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("service failure contaminated another service: %+v", status)
+	}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainTransport, Transport: N.NetworkTCP, Outcome: OutcomeFailure, At: clock.Now(), Reason: "timeout"})
+	}
+	if status := store.Status(nodeID, DomainTransport, N.NetworkTCP, ""); status.Breaker != BreakerOpen || status.Health != HealthUnreachable {
+		t.Fatalf("transport timeout did not open transport breaker: %+v", status)
+	}
+	if status := store.Endpoint(nodeID); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("transport timeout contaminated endpoint breaker: %+v", status)
+	}
+}
+
+func TestBreakerHalfOpenHasSingleTokenAndClosesOnSuccess(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{2}
+	service := ServiceContext{ID: "youtube", Transport: N.NetworkTCP}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainService, Service: service.ID, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	clock.Advance(10 * time.Second)
+	first, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+	if !allowed {
+		t.Fatal("first recovery attempt was not admitted")
+	}
+	if _, allowed = store.TryAcquireAttemptPermit(nodeID, service, clock.Now()); allowed {
+		t.Fatal("second concurrent recovery attempt bypassed half-open token")
+	}
+	first.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainService: OutcomeSuccess}, clock.Now(), 25*time.Millisecond, "")
+	status := store.Status(nodeID, DomainService, "", service.ID)
+	if status.Breaker != BreakerClosed || status.Health != HealthHealthy || status.Successes != 1 || status.Failures != 3 || status.ConsecutiveFailures != 0 {
+		t.Fatalf("half-open success was not settled exactly once: %+v", status)
+	}
+	if _, allowed = store.TryAcquireAttemptPermit(nodeID, service, clock.Now()); !allowed {
+		t.Fatal("closed breaker did not admit the next request")
+	}
+}
+
+func TestBreakerStatusIsPureObservation(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{4}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	store.access.RLock()
+	record := store.entries[healthKey{nodeID: nodeID, domain: DomainEndpoint}]
+	before := *record
+	beforeStatus := record.status
+	store.access.RUnlock()
+	for range 10 {
+		_ = store.Endpoint(nodeID)
+	}
+	store.access.RLock()
+	after := *record
+	afterStatus := record.status
+	store.access.RUnlock()
+	if beforeStatus != afterStatus || before.halfOpenToken != after.halfOpenToken || before.consecutiveFailure != after.consecutiveFailure || before.reopenCount != after.reopenCount {
+		t.Fatalf("Status mutated breaker state: before=%+v after=%+v", beforeStatus, afterStatus)
+	}
+}
+
+func TestBreakerLateSuccessCannotCloseNewVersion(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{5}
+	service := ServiceContext{ID: "service", Transport: N.NetworkTCP}
+	old, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+	if !allowed {
+		t.Fatal("old attempt was not admitted")
+	}
+	failures := make([]*AttemptPermit, 3)
+	for index := range failures {
+		failures[index], allowed = store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+		if !allowed {
+			t.Fatal("failure attempt was not admitted")
+		}
+	}
+	for _, permit := range failures {
+		permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeFailure}, clock.Now(), 0, "dial failed")
+	}
+	old.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeSuccess}, clock.Now(), 0, "late success")
+	status := store.Endpoint(nodeID)
+	if status.Breaker != BreakerOpen || status.Health != HealthUnreachable || status.Successes != 0 || status.Failures != 3 {
+		t.Fatalf("late v0 success closed v1 breaker: %+v", status)
+	}
+}
+
+func TestBreakerHalfOpenFailureUsesBoundedBackoff(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{3}
+	service := ServiceContext{ID: "service", Transport: N.NetworkTCP}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	for _, expected := range []time.Duration{20 * time.Second, 40 * time.Second, 40 * time.Second} {
+		status := store.Endpoint(nodeID)
+		clock.Advance(status.Backoff)
+		permit, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+		if !allowed {
+			t.Fatalf("half-open attempt was not admitted after %s", status.Backoff)
+		}
+		permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeFailure}, clock.Now(), 0, "dial failed")
+		status = store.Endpoint(nodeID)
+		if status.Backoff != expected || status.Failures == 0 {
+			t.Fatalf("unexpected bounded backoff: got=%s want=%s status=%+v", status.Backoff, expected, status)
+		}
+	}
+}
+
+func TestHealthStoreBoundsTenThousandObservations(t *testing.T) {
+	store := NewHealthStore(time.Hour, 4096)
+	for index := 0; index < 10000; index++ {
+		store.Observe(Observation{
+			NodeID:  NodeID{byte(index), byte(index >> 8)},
+			Scope:   ScopeService,
+			Service: "service",
+			Outcome: OutcomeSuccess,
+		})
+	}
+	entries, evictions := store.Stats()
+	if entries != 4096 {
+		t.Fatalf("10k observations exceeded state bound: %d", entries)
+	}
+	if evictions != 10000-4096 {
+		t.Fatalf("unexpected 10k eviction count: %d", evictions)
+	}
+}
+
+func TestHealthStoreNodeVersionDoesNotInheritRetiredBreaker(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(400, 0)}
+	store := NewHealthStoreWithClock(time.Hour, 32, clock, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Second, MaxCooldown: time.Minute})
+	nodeID := NodeID{77}
+	store.Observe(Observation{NodeID: nodeID, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+	if status := store.EndpointVersion(nodeID, 1); status.Breaker != BreakerOpen {
+		t.Fatalf("v1 breaker did not open: %+v", status)
+	}
+	if status := store.EndpointVersion(nodeID, 2); status.Health != HealthUnknown || status.Breaker != BreakerClosed {
+		t.Fatalf("v2 inherited v1 health: %+v", status)
+	}
+	store.Observe(Observation{NodeID: nodeID, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, At: clock.Now().Add(time.Second)})
+	if status := store.EndpointVersion(nodeID, 2); status.Health != HealthUnknown || status.Successes != 0 {
+		t.Fatalf("retiring v1 evidence changed v2: %+v", status)
+	}
+	store.RetireNodeVersion(nodeID, 1)
+	if status := store.EndpointVersion(nodeID, 1); status.Health != HealthUnknown {
+		t.Fatalf("retired v1 health remains active: %+v", status)
+	}
+}
+
+func TestHealthStoreThroughputUsesQualityEWMAWithoutBreakerMutation(t *testing.T) {
+	store := NewHealthStore(time.Hour, 16)
+	handle := NodeHandle{NodeID: NodeID{78}, Slot: 3, Version: 2}
+	for _, throughput := range []float64{1 << 20, 4 << 20} {
+		store.ObserveEvidence(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainService, Service: "bulk", Outcome: OutcomeSuccess, ThroughputBPS: throughput}, false, 0.6)
+	}
+	status := store.StatusHandle(handle, DomainService, "", "bulk")
+	if status.ThroughputSamples != 2 || status.ThroughputBPS <= 1<<20 || status.ThroughputBPS >= 4<<20 {
+		t.Fatalf("throughput EWMA is invalid: %+v", status)
+	}
+	if status.Breaker != BreakerClosed || status.Successes != 0 || status.Failures != 0 || status.NonBreakerSuccesses != 2 {
+		t.Fatalf("throughput quality mutated breaker counters: %+v", status)
+	}
+	summary := store.ThroughputByHandle()[handle]
+	if summary.Samples != 2 || summary.BPS != status.ThroughputBPS {
+		t.Fatalf("throughput monitoring aggregate diverged: summary=%+v status=%+v", summary, status)
+	}
+}

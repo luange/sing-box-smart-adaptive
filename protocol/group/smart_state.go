@@ -63,6 +63,8 @@ type smartStore struct {
 	halfLife        time.Duration
 	breakerFailures int
 	breakerCooldown time.Duration
+	retention       time.Duration
+	maxEntries      int
 }
 
 func newSmartStore(halfLife time.Duration, breakerFailures int, breakerCooldown time.Duration) *smartStore {
@@ -100,9 +102,24 @@ func (s *smartStore) setPolicy(halfLife time.Duration, breakerFailures int, brea
 	s.access.Unlock()
 }
 
-func (s *smartStore) metric(key smartMetricKey) *smartMetric {
+func (s *smartStore) setBounds(retention time.Duration, maxEntries int) {
+	s.access.Lock()
+	s.retention = retention
+	s.maxEntries = maxEntries
+	s.pruneLocked(time.Now(), retention, maxEntries)
+	s.access.Unlock()
+}
+
+func (s *smartStore) metric(key smartMetricKey, now time.Time) *smartMetric {
 	metric := s.metrics[key]
 	if metric == nil {
+		if s.maxEntries > 0 && len(s.metrics) >= s.maxEntries {
+			target := max(1, s.maxEntries-s.maxEntries/10)
+			s.pruneLocked(now, s.retention, target)
+			if len(s.metrics) >= s.maxEntries {
+				s.removeOldestLocked()
+			}
+		}
 		metric = &smartMetric{
 			Network:   key.Network,
 			Site:      key.Site,
@@ -112,6 +129,24 @@ func (s *smartStore) metric(key smartMetricKey) *smartMetric {
 		s.metrics[key] = metric
 	}
 	return metric
+}
+
+func (s *smartStore) removeOldestLocked() {
+	var (
+		oldestKey smartMetricKey
+		oldest    time.Time
+		loaded    bool
+	)
+	for key, metric := range s.metrics {
+		if !loaded || metric.LastUpdated.Before(oldest) {
+			oldestKey = key
+			oldest = metric.LastUpdated
+			loaded = true
+		}
+	}
+	if loaded {
+		delete(s.metrics, oldestKey)
+	}
 }
 
 func (s *smartStore) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
@@ -128,7 +163,7 @@ func (s *smartStore) observeDial(now time.Time, network, site, candidate, transp
 }
 
 func (s *smartStore) observeDialLocked(now time.Time, key smartMetricKey, success bool, elapsed time.Duration, weight float64, updateBreaker bool) {
-	metric := s.metric(key)
+	metric := s.metric(key, now)
 	metric.decay(now, s.halfLife)
 	if success {
 		metric.Successes += weight
@@ -163,7 +198,7 @@ func (s *smartStore) observeFirstByte(now time.Time, network, site, candidate, t
 }
 
 func (s *smartStore) observeFirstByteLocked(now time.Time, key smartMetricKey, elapsed time.Duration) {
-	metric := s.metric(key)
+	metric := s.metric(key, now)
 	metric.decay(now, s.halfLife)
 	metric.updateFirstByte(float64(elapsed.Microseconds()) / 1000)
 	metric.LastUpdated = now
@@ -186,7 +221,7 @@ func (s *smartStore) observeThroughput(now time.Time, network, site, candidate, 
 }
 
 func (s *smartStore) observeThroughputLocked(now time.Time, key smartMetricKey, bps float64) {
-	metric := s.metric(key)
+	metric := s.metric(key, now)
 	metric.decay(now, s.halfLife)
 	value := math.Log1p(bps)
 	metric.ThroughputLog = updateEWMA(metric.ThroughputLog, value, metric.ThroughputSamples)
@@ -213,17 +248,15 @@ func (s *smartStore) metricCopy(key smartMetricKey, now time.Time) *smartMetric 
 }
 
 func (s *smartStore) snapshot(now time.Time, retention time.Duration, maxEntries int) smartStoreSnapshot {
-	s.access.RLock()
+	s.access.Lock()
+	s.pruneLocked(now, retention, maxEntries)
 	metrics := make([]smartMetric, 0, len(s.metrics))
 	for _, metric := range s.metrics {
 		copyMetric := *metric
 		copyMetric.decay(now, s.halfLife)
-		if retention > 0 && !copyMetric.LastUpdated.IsZero() && now.Sub(copyMetric.LastUpdated) > retention {
-			continue
-		}
 		metrics = append(metrics, copyMetric)
 	}
-	s.access.RUnlock()
+	s.access.Unlock()
 	sort.Slice(metrics, func(i, j int) bool {
 		return metrics[i].LastUpdated.After(metrics[j].LastUpdated)
 	})
@@ -231,6 +264,33 @@ func (s *smartStore) snapshot(now time.Time, retention time.Duration, maxEntries
 		metrics = metrics[:maxEntries]
 	}
 	return smartStoreSnapshot{Version: smartStateVersion, Metrics: metrics}
+}
+
+func (s *smartStore) pruneLocked(now time.Time, retention time.Duration, maxEntries int) {
+	if retention > 0 {
+		for key, metric := range s.metrics {
+			if !metric.LastUpdated.IsZero() && now.Sub(metric.LastUpdated) > retention {
+				delete(s.metrics, key)
+			}
+		}
+	}
+	if maxEntries <= 0 || len(s.metrics) <= maxEntries {
+		return
+	}
+	type metricAge struct {
+		key       smartMetricKey
+		updatedAt time.Time
+	}
+	ages := make([]metricAge, 0, len(s.metrics))
+	for key, metric := range s.metrics {
+		ages = append(ages, metricAge{key: key, updatedAt: metric.LastUpdated})
+	}
+	sort.Slice(ages, func(i, j int) bool {
+		return ages[i].updatedAt.After(ages[j].updatedAt)
+	})
+	for _, entry := range ages[maxEntries:] {
+		delete(s.metrics, entry.key)
+	}
 }
 
 func (s *smartStore) restore(snapshot smartStoreSnapshot) {
@@ -250,6 +310,7 @@ func (s *smartStore) restore(snapshot smartStoreSnapshot) {
 		copyMetric := metric
 		s.metrics[key] = &copyMetric
 	}
+	s.pruneLocked(time.Now(), s.retention, s.maxEntries)
 }
 
 func (m *smartMetric) decay(now time.Time, halfLife time.Duration) {

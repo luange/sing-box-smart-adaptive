@@ -17,7 +17,7 @@ type Runtime struct {
 	Outbound     adapter.OutboundManager
 	Provider     adapter.ProviderManager
 	Endpoint     adapter.EndpointManager
-	Publish      func()
+	Publish      func() error
 	Retire       func()
 	Close        func() error
 }
@@ -92,7 +92,9 @@ func (c *Controller) ActivateInitial() (uint64, error) {
 	}
 	if !c.current.published {
 		if c.current.runtime.Publish != nil {
-			c.current.runtime.Publish()
+			if err := c.current.runtime.Publish(); err != nil {
+				return 0, err
+			}
 		}
 		c.current.published = true
 	}
@@ -110,7 +112,11 @@ func (c *Controller) Publish(runtime Runtime) (uint64, error) {
 	}
 	runtime.ID = c.assignID(runtime.ID)
 	if runtime.Publish != nil {
-		runtime.Publish()
+		if err := runtime.Publish(); err != nil {
+			c.access.Unlock()
+			closeErr := runtime.Close()
+			return 0, errors.Join(err, closeErr)
+		}
 	}
 	next := &epoch{runtime: runtime, published: true, done: make(chan struct{})}
 	previous := c.current

@@ -369,7 +369,7 @@ func TestSmartProbeCancellationDoesNotDeadlockDispatcher(t *testing.T) {
 	}
 }
 
-func TestSmartBrokenPinIsCleared(t *testing.T) {
+func TestSmartBrokenPermanentPinIsRetained(t *testing.T) {
 	first := newSmartFakeOutbound("first", errors.New("dial failed"))
 	second := newSmartFakeOutbound("second", nil)
 	smart := newTestSmart(first, second)
@@ -385,8 +385,31 @@ func TestSmartBrokenPinIsCleared(t *testing.T) {
 	peer := <-second.peers
 	peer.Close()
 	status := smart.SmartStatus()
-	if status.Pinned != "" {
-		t.Fatalf("expected broken pin cleared, got %q", status.Pinned)
+	if status.Pinned != "first" {
+		t.Fatalf("expected permanent pin retained, got %q", status.Pinned)
+	}
+}
+
+func TestSmartUnstartedHalfOpenAttemptReleasesReservation(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	ranks := []smartRank{
+		{outbound: first, eligible: true, status: adapter.SmartCandidateStatus{State: "healthy"}},
+		{outbound: second, eligible: true, status: adapter.SmartCandidateStatus{State: "half_open"}},
+	}
+	attempts := smart.collectDialAttempts(ranks, "network", "site", N.NetworkTCP)
+	conn, _, _, ok := smart.dialContextAdaptive(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"), attempts, "network", "site", N.NetworkTCP)
+	if !ok {
+		t.Fatal("expected first attempt to succeed")
+	}
+	conn.Close()
+	peer := <-first.peers
+	peer.Close()
+	smart.access.Lock()
+	defer smart.access.Unlock()
+	if len(smart.halfOpen) != 0 {
+		t.Fatalf("unstarted half-open reservation leaked: %d", len(smart.halfOpen))
 	}
 }
 

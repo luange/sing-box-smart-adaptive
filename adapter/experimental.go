@@ -171,6 +171,12 @@ type PreMatchOutboundGroup interface {
 	SelectPreMatchOutbound(metadata *InboundContext, selectOutbound func(Outbound) (Outbound, PreMatchAction)) (Outbound, PreMatchAction)
 }
 
+// PreMatchDisabledOutbound keeps transparent flows on the L4 outbound path.
+// Groups use it when resolving to a leaf would bypass retry or observation.
+type PreMatchDisabledOutbound interface {
+	DisablePreMatch()
+}
+
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)

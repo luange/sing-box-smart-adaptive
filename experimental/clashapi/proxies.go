@@ -93,6 +93,25 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		}
 		info.Put("smart", status)
 	}
+	if adaptiveGroup, isAdaptive := detour.(adapter.AdaptivePoolGroup); isAdaptive {
+		status := adaptiveGroup.AdaptiveStatus()
+		info.Put("type", "Selector")
+		info.Put("all", append([]string{"♻️ 智能选择"}, adaptiveGroup.All()...))
+		if status.Shadow {
+			info.Put("now", "shadow")
+		} else if status.Pinned != "" {
+			info.Put("now", status.Pinned)
+		} else {
+			info.Put("now", "♻️ 智能选择")
+		}
+		info.Put("adaptive_pool", status)
+		info.Put("adaptive_generation", status.Generation)
+		info.Put("adaptive_control_revision", status.ControlRevision)
+		info.Put("adaptive_mode", status.Mode)
+		info.Put("adaptive_active_leases", status.ActiveLeases)
+		info.Put("adaptive_probe_queue", status.ProbeQueueDepth)
+		info.Put("adaptive_candidates", status.Candidates)
+	}
 	return &info
 }
 
@@ -169,11 +188,12 @@ func getProxy(server *Server) func(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateProxyRequest struct {
-	Name       string `json:"name"`
-	Temporary  *bool  `json:"temporary,omitempty"`
-	TTL        int64  `json:"ttl,omitempty"`
-	Persistent bool   `json:"persistent,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Name       string  `json:"name"`
+	Temporary  *bool   `json:"temporary,omitempty"`
+	TTL        int64   `json:"ttl,omitempty"`
+	Persistent bool    `json:"persistent,omitempty"`
+	Reason     string  `json:"reason,omitempty"`
+	Revision   *uint64 `json:"revision,omitempty"`
 }
 
 func updateProxy(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +215,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		if req.Name == "" || req.Name == "♻️ 智能选择" {
 			smartGroup.ClearTemporarySelection()
 			smartGroup.ClearSelection()
-		} else if req.Persistent || (req.Temporary != nil && !*req.Temporary) {
+		} else if !useTemporarySmartOverride(req) {
 			smartGroup.ClearTemporarySelection()
 			if !smartGroup.SelectOutbound(req.Name) {
 				render.Status(r, http.StatusBadRequest)
@@ -215,13 +235,45 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	} else if adaptiveGroup, isAdaptive := proxy.(adapter.AdaptivePoolGroup); isAdaptive {
+		revisioned, hasRevision := adaptiveGroup.(adapter.AdaptivePoolRevisioned)
+		if req.Revision != nil && (!hasRevision || revisioned.AdaptiveSelectionRevision() != *req.Revision) {
+			render.Status(r, http.StatusConflict)
+			render.JSON(w, r, newError("adaptive selection revision conflict"))
+			return
+		}
+		if req.Name == "" || req.Name == "♻️ 智能选择" {
+			if hasRevision && req.Revision != nil {
+				if !revisioned.ClearAdaptiveSelectionAt(*req.Revision) {
+					render.Status(r, http.StatusConflict)
+					render.JSON(w, r, newError("adaptive selection revision conflict"))
+					return
+				}
+			} else {
+				adaptiveGroup.ClearAdaptiveSelection()
+			}
+		} else if hasRevision && req.Revision != nil {
+			if !revisioned.SelectAdaptiveOutboundAt(req.Name, *req.Revision) {
+				render.Status(r, http.StatusConflict)
+				render.JSON(w, r, newError("Adaptive pin error: candidate not found"))
+				return
+			}
+		} else if !adaptiveGroup.SelectAdaptiveOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("Adaptive pin error: candidate not found"))
+			return
+		}
 	} else {
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a Selector or Smart group"))
+		render.JSON(w, r, newError("Must be a Selector, Smart, or AdaptivePool group"))
 		return
 	}
 
 	render.NoContent(w, r)
+}
+
+func useTemporarySmartOverride(request UpdateProxyRequest) bool {
+	return request.Temporary != nil && *request.Temporary && !request.Persistent
 }
 
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {

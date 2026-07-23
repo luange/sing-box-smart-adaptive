@@ -548,6 +548,9 @@ func (r *Router) selectPreMatchOutbound(metadata *adapter.InboundContext, outbou
 	if outbound == nil || depth > 8 {
 		return nil, adapter.PreMatchContinue
 	}
+	if _, disabled := outbound.(adapter.PreMatchDisabledOutbound); disabled {
+		return nil, adapter.PreMatchContinue
+	}
 	if preMatchGroup, isPreMatchGroup := outbound.(adapter.PreMatchOutboundGroup); isPreMatchGroup {
 		return preMatchGroup.SelectPreMatchOutbound(metadata, func(selectedOutbound adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction) {
 			return r.selectPreMatchOutbound(metadata, selectedOutbound, depth+1)

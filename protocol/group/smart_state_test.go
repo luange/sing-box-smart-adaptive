@@ -230,6 +230,12 @@ func TestSmartHistorySnapshotHonorsRetentionAndLimit(t *testing.T) {
 	if snapshot.Metrics[0].Candidate != "new-b" {
 		t.Fatalf("snapshot did not keep the newest metric: %s", snapshot.Metrics[0].Candidate)
 	}
+	store.access.RLock()
+	liveEntries := len(store.metrics)
+	store.access.RUnlock()
+	if liveEntries != 1 {
+		t.Fatalf("live state was not pruned with snapshot: %d", liveEntries)
+	}
 }
 
 func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
@@ -254,7 +260,7 @@ func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
 	if startedAfterPostStart {
 		t.Fatal("unpublished Smart worker started during PREPARE")
 	}
-	smart.OnRuntimeEpochPublish()
+	publishSmartForTest(t, smart)
 	smart.lifecycleAccess.Lock()
 	startedAfterPublish := smart.workerStarted
 	smart.lifecycleAccess.Unlock()
@@ -273,12 +279,12 @@ func TestSmartHistoryStoreSharedAcrossPublishedGenerations(t *testing.T) {
 	if err := first.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	first.OnRuntimeEpochPublish()
+	publishSmartForTest(t, first)
 	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
 	if err := second.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	second.OnRuntimeEpochPublish()
+	publishSmartForTest(t, second)
 	if first.store != second.store {
 		t.Fatal("published generations do not share the same history store")
 	}
@@ -313,11 +319,11 @@ func TestSmartHistoryConcurrentFlushUsesAtomicFiles(t *testing.T) {
 	if err := first.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	first.OnRuntimeEpochPublish()
+	publishSmartForTest(t, first)
 	if err := second.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	second.OnRuntimeEpochPublish()
+	publishSmartForTest(t, second)
 	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
 	var waitGroup sync.WaitGroup
 	for range 20 {
@@ -379,4 +385,12 @@ func newSmartHistoryTestInstance(path string) *Smart {
 		historyRetention:  time.Hour,
 		maxHistoryEntries: 100,
 	}
+}
+
+func publishSmartForTest(t *testing.T, smart *Smart) {
+	t.Helper()
+	if err := smart.OnRuntimeEpochPublish(); err != nil {
+		t.Fatal(err)
+	}
+	smart.OnRuntimeEpochPublishCommit()
 }

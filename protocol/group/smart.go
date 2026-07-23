@@ -40,6 +40,7 @@ import (
 
 const (
 	defaultSmartProbeInterval     = 10 * time.Minute
+	defaultSmartProbeCycleTimeout = 30 * time.Second
 	defaultSmartProbeTimeout      = 5 * time.Second
 	defaultSmartAttemptTimeout    = 4 * time.Second
 	defaultSmartSiteStickiness    = 10 * time.Minute
@@ -205,6 +206,7 @@ type Smart struct {
 	store             *smartStore
 	probeURL          string
 	probeInterval     time.Duration
+	probeCycleTimeout time.Duration
 	probeTimeout      time.Duration
 	maxAttempts       int
 	attemptTimeout    time.Duration
@@ -221,6 +223,7 @@ type Smart struct {
 	interruptGroup    *interrupt.Group
 	interruptExternal bool
 	probing           atomic.Bool
+	probeCursor       atomic.Uint64
 	closing           atomic.Bool
 	cancel            context.CancelFunc
 	worker            sync.WaitGroup
@@ -273,9 +276,16 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if probeInterval <= 0 {
 		probeInterval = defaultSmartProbeInterval
 	}
+	probeCycleTimeout := time.Duration(options.ProbeCycleTimeout)
+	if probeCycleTimeout <= 0 {
+		probeCycleTimeout = defaultSmartProbeCycleTimeout
+	}
 	probeTimeout := time.Duration(options.ProbeTimeout)
 	if probeTimeout <= 0 {
 		probeTimeout = defaultSmartProbeTimeout
+	}
+	if probeCycleTimeout < probeTimeout {
+		probeCycleTimeout = probeTimeout
 	}
 	maxAttempts := options.MaxAttempts
 	if maxAttempts <= 0 {
@@ -325,7 +335,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if historyPath == "" {
 		historyPath = "smart-history-" + safeSmartFileName(tag) + ".json"
 	}
-	return &Smart{
+	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
+	store.setBounds(historyRetention, maxHistoryEntries)
+	smart := &Smart{
 		Adapter:    outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:        ctx,
 		outbound:   service.FromContext[adapter.OutboundManager](ctx),
@@ -348,10 +360,11 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		lastSelected:   make(map[string]string),
 		affinity:       make(map[string]smartAffinity),
 		halfOpen:       make(map[string]struct{}),
-		store:          newSmartStore(halfLife, breakerFailures, breakerCooldown),
+		store:          store,
 
 		probeURL:          options.URL,
 		probeInterval:     probeInterval,
+		probeCycleTimeout: probeCycleTimeout,
 		probeTimeout:      probeTimeout,
 		maxAttempts:       maxAttempts,
 		attemptTimeout:    attemptTimeout,
@@ -370,7 +383,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		reachTests:        reachTests,
 		reachResults:      make(map[string]map[string]adapter.SmartReachCandidateStatus),
 		reachLastRun:      make(map[string]time.Time),
-	}, nil
+	}
+	return smart, nil
 }
 
 func (s *Smart) Start() error {
@@ -423,12 +437,18 @@ func (s *Smart) PostStart() error {
 	return nil
 }
 
-func (s *Smart) OnRuntimeEpochPublish() {
+func (s *Smart) OnRuntimeEpochPublish() error {
+	return nil
+}
+
+func (s *Smart) OnRuntimeEpochPublishCommit() {
 	s.lifecycleAccess.Lock()
 	s.publishHistoryLocked()
 	s.startWorkerLocked()
 	s.lifecycleAccess.Unlock()
 }
+
+func (s *Smart) OnRuntimeEpochPublishRollback() { s.OnRuntimeEpochRetire() }
 
 func (s *Smart) OnRuntimeEpochRetire() {
 	s.stopWorker()
@@ -473,6 +493,7 @@ func (s *Smart) publishHistoryLocked() {
 	s.control = control
 	entry.references[s.Tag()]++
 	s.store.setPolicy(s.halfLife, s.breakerFailures, s.breakerCooldown)
+	s.store.setBounds(s.historyRetention, s.maxHistoryEntries)
 	s.historyEntry = entry
 	s.published = true
 	smartHistoryPool.Unlock()
@@ -534,7 +555,7 @@ func (s *Smart) run(ctx context.Context) {
 	defer probeTicker.Stop()
 	defer flushTicker.Stop()
 	defer reachTicker.Stop()
-	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 	_, _ = s.probe(probeCtx)
 	cancel()
 	s.runDueReachTests(ctx, true)
@@ -543,7 +564,7 @@ func (s *Smart) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-probeTicker.C:
-			probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			_, _ = s.probe(probeCtx)
 			cancel()
 		case <-flushTicker.C:
@@ -685,17 +706,13 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 	s.control.access.Unlock()
 
 	s.access.RLock()
-	_, pinnedExists := s.candidateByTag[pinned]
 	_, temporaryExists := s.candidateByTag[temporary]
 	s.access.RUnlock()
-	if (pinned == "" || pinnedExists) && (temporary == "" || temporaryExists) {
+	if temporary == "" || temporaryExists {
 		return pinned, temporary, expiresAt, reason
 	}
 
 	s.control.access.Lock()
-	if pinned != "" && !pinnedExists && s.control.pinned == pinned {
-		s.control.pinned = ""
-	}
 	if temporary != "" && !temporaryExists && s.control.temporary == temporary {
 		s.clearTemporaryLocked()
 	}
@@ -775,6 +792,14 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 	parentCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
 	results := make(chan smartDialResult, len(attempts))
+	started := 0
+	defer func() {
+		for index := started; index < len(attempts); index++ {
+			if attempts[index].reserved {
+				s.releaseHalfOpen(attempts[index].candidate.Tag(), networkKey, siteKey, transport)
+			}
+		}
+	}()
 	startAttempt := func(attempt smartDialAttempt) {
 		go func() {
 			startedAt := time.Now()
@@ -799,7 +824,6 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 		}()
 	}
 
-	started := 0
 	active := 0
 	startAttempt(attempts[started])
 	started++
@@ -981,10 +1005,15 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	s.access.RLock()
 	candidates := append([]adapter.Outbound(nil), s.candidates...)
 	s.access.RUnlock()
+	if len(candidates) > 1 {
+		start := int(s.probeCursor.Add(1)-1) % len(candidates)
+		candidates = append(candidates[start:], candidates[:start]...)
+	}
 	type probeResult struct {
 		candidate adapter.Outbound
 		delay     uint16
 		err       error
+		penalize  bool
 	}
 	results := make(chan probeResult, len(candidates))
 	jobs := make(chan adapter.Outbound)
@@ -997,8 +1026,9 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 			for candidate := range jobs {
 				testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
 				delay, err := urltest.URLTest(testCtx, s.probeURL, candidate)
+				penalize := err != nil && ctx.Err() == nil
 				cancel()
-				results <- probeResult{candidate: candidate, delay: delay, err: err}
+				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
 			}
 		}()
 	}
@@ -1032,7 +1062,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	for _, probe := range collected {
 		if probe.err == nil {
 			s.store.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
-		} else if !commonFailure {
+		} else if probe.penalize && !commonFailure {
 			s.store.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
 		}
 	}
@@ -1111,6 +1141,13 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		return ranking.ranks[i].status.Score < ranking.ranks[j].status.Score
 	})
 	ranks := ranking.ranks
+	manualPinUnavailable := false
+	statusReason := func(reason string) string {
+		if manualPinUnavailable {
+			return "manual pin unavailable; automatic fallback: " + reason
+		}
+		return reason
+	}
 	if len(ranks) == 0 {
 		return ranking, networkKey, siteKey, siteDisplay
 	}
@@ -1136,9 +1173,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
 			return ranking, networkKey, siteKey, siteDisplay
 		}
+		manualPinUnavailable = true
 	}
 	if !hasEligibleSmartRank(ranks) {
-		s.updateStatus(networkKey, siteDisplay, transport, ranks, "no service-reachable candidates")
+		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	bestScore := ranks[0].status.Score
@@ -1146,7 +1184,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if index := smartRankIndex(ranks, affinity.Candidate); index >= 0 && ranks[index].status.State != "open" && ranks[index].status.Score <= bestScore+s.switchMargin {
 			ranks[index].status.Reason = "site affinity within switch margin"
 			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "site affinity")
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("site affinity"))
 			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
@@ -1154,12 +1192,12 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if index := smartRankIndex(ranks, lastSelected); index >= 0 && ranks[index].status.State != "open" && ranks[index].status.Score <= bestScore+s.switchMargin {
 			ranks[index].status.Reason = "current candidate within switch margin"
 			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "switch margin retained current candidate")
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("switch margin retained current candidate"))
 			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
 	ranks[0].status.Reason = "lowest confidence-adjusted score"
-	s.updateStatus(networkKey, siteDisplay, transport, ranks, "lowest confidence-adjusted score")
+	s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("lowest confidence-adjusted score"))
 	return ranking, networkKey, siteKey, siteDisplay
 }
 
@@ -1297,6 +1335,9 @@ func (s *Smart) pruneAffinityLocked(now time.Time) {
 }
 
 func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string) {
+	_ = networkKey
+	_ = siteKey
+	_ = transport
 	temporaryCleared := false
 	s.control.access.Lock()
 	if s.control.temporary == candidate {
@@ -1307,27 +1348,12 @@ func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string)
 	if temporaryCleared && s.logger != nil {
 		s.logger.Warn("smart temporary override cleared after connection failure: ", candidate)
 	}
-	estimate := s.store.estimate(time.Now(), networkKey, siteKey, candidate, transport, s.minSamples)
-	if estimate.State != "open" {
-		return
-	}
-	cleared := false
-	s.control.access.Lock()
-	if s.control.pinned == candidate {
-		s.control.pinned = ""
-		cleared = true
-	}
-	s.control.access.Unlock()
-	if cleared {
-		if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-			if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil {
-				if s.logger != nil {
-					s.logger.Error("clear failed smart pin: ", err)
-				}
-			}
-		}
-		if s.logger != nil {
-			s.logger.Warn("smart pin cleared after circuit opened: ", candidate)
+	if s.logger != nil {
+		s.control.access.Lock()
+		pinned := s.control.pinned == candidate
+		s.control.access.Unlock()
+		if pinned {
+			s.logger.Warn("smart permanent pin unavailable after connection failure; keeping manual pin: ", candidate)
 		}
 	}
 }
@@ -1413,9 +1439,6 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.control.access.Lock()
 	if s.control.temporary != "" && candidateByTag[s.control.temporary] == nil {
 		s.clearTemporaryLocked()
-	}
-	if s.control.pinned != "" && candidateByTag[s.control.pinned] == nil {
-		s.control.pinned = ""
 	}
 	s.control.access.Unlock()
 	s.setCandidatesReadyStatus(candidates)

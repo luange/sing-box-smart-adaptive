@@ -1,0 +1,62 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "test-in",
+      "listen": "0.0.0.0",
+      "listen_port": 19080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct-a"
+    },
+    {
+      "type": "direct",
+      "tag": "direct-b"
+    },
+    {
+      "type": "adaptive_pool",
+      "tag": "ADAPTIVE-TEST",
+      "outbounds": [
+        "direct-a",
+        "direct-b"
+      ],
+      "probe": {
+        "url": "http://10.254.40.118:18080/health",
+        "coverage_interval": "2s",
+        "timeout": "1s",
+        "concurrency": 2,
+        "queue_size": 16
+      },
+      "policy": {
+        "default": "adaptive",
+        "adaptive_lease_ttl": "30s",
+        "max_leases": 128,
+        "max_attempts": 2,
+        "attempt_timeout": "2s",
+        "hedge_delay": "200ms",
+        "manual_failure": "fallback"
+      },
+      "state": {
+        "path": "/root/adaptive-test/state",
+        "retention": "5m",
+        "max_entries": 128
+      }
+    }
+  ],
+  "route": {
+    "final": "ADAPTIVE-TEST"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "0.0.0.0:19091",
+      "secret": "adaptive-test-only"
+    }
+  }
+}

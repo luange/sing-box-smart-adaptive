@@ -560,7 +560,7 @@ func (s *Box) Start() error {
 		return err
 	}
 	s.logger.Info("sing-box started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
-	return nil
+	return adapter.PublishRuntimeEpochOutbounds(s.outbound.Outbounds())
 }
 
 func (s *Box) preStart() error {

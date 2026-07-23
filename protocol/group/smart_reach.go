@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group/probe"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -65,7 +66,11 @@ func normalizeSmartReachTest(raw option.SmartReachTestOptions) (smartReachTest, 
 	switch preset {
 	case "":
 	case "gemini":
-		setReachDefaults(&raw, "https://gemini.google.com/", []string{"gemini.google.com", "aistudio.google.com"}, []uint16{200, 302}, []uint16{403, 429, 451}, []string{"unusual traffic", "unsupported_country", "not available in your country"}, map[string][]string{"location": {"app-unavailable-in-region"}})
+		// Gemini follows the Google connectivity signal. Probing the Gemini web
+		// application directly is unstable (redirects, bot challenges and
+		// application-layer policy can all produce false negatives) and must not
+		// become a hard node-selection gate.
+		setReachDefaults(&raw, probe.GoogleConnectivityURL, []string{"gemini.google.com", "aistudio.google.com"}, []uint16{204}, []uint16{403, 429, 451}, []string{"unusual traffic"}, nil)
 	case "chatgpt":
 		setReachDefaults(&raw, "https://api.openai.com/v1/models", []string{"chatgpt.com", "openai.com"}, []uint16{401}, []uint16{403, 429, 451}, []string{"unsupported_country", "unsupported country", "not available in your country"}, nil)
 	case "claude":
