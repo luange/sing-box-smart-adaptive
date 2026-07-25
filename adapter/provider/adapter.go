@@ -137,6 +137,7 @@ func (a *Adapter) OutboundOption(tag string) (option.Outbound, bool) {
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 	tags := make([]string, len(newOpts))
 	seen := make(map[string]bool)
+	duplicateCount := 0
 	for i, opt := range newOpts {
 		var baseTag string
 		if opt.Tag != "" {
@@ -149,10 +150,16 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 			tag = F.ToString(baseTag, " (", n, ")")
 		}
 		if tag != baseTag {
-			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
+			duplicateCount++
+			if a.logger != nil {
+				a.logger.Debug("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
+			}
 		}
 		seen[tag] = true
 		tags[i] = tag
+	}
+	if duplicateCount > 0 && a.logger != nil {
+		a.logger.Warn("provider ", a.providerTag, ": renamed ", duplicateCount, " duplicate outbound tags")
 	}
 	return tags
 }

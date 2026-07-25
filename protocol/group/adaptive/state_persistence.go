@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const adaptiveStateSchemaVersion = 2
+const adaptiveStateSchemaVersion = 3
 const adaptiveStateFlushInterval = 250 * time.Millisecond
 
 type persistedHealthRecord struct {
@@ -188,13 +188,17 @@ func (p *AdaptivePool) persistStateDurable() error {
 func (p *AdaptivePool) persistentStatePath() string { return p.statePath + ".json" }
 
 func (p *AdaptivePool) persistenceSnapshot(now time.Time) persistedAdaptiveState {
-	state := persistedAdaptiveState{Health: p.health.PersistenceSnapshot(), Leases: p.leases.PersistenceSnapshot(now)}
+	// Health, breaker and lease state is deliberately process-local. A new
+	// process must prove every candidate again instead of trusting observations
+	// made by an earlier process. Only stable identity and explicit control state
+	// are durable.
+	state := persistedAdaptiveState{}
 	if p.runtimeManager != nil && p.groupID != "" {
 		state.Identity = p.runtimeManager.PersistenceSnapshot(p.groupID)
 	}
 	if p.control != nil {
 		p.control.access.RLock()
-		state.Pinned, state.PinnedTag, state.LatestTag = p.control.pinned, safePersistentTag(p.control.pinnedTag), safePersistentTag(p.control.latestTag)
+		state.Pinned, state.PinnedTag = p.control.pinned, safePersistentTag(p.control.pinnedTag)
 		p.control.access.RUnlock()
 		state.BulkSequence = p.control.bulkSequence.Load()
 		state.ControlRevision = p.control.revision.Load()
@@ -237,18 +241,16 @@ func (p *AdaptivePool) loadPersistentState() {
 		p.statePersistenceFailures.Add(1)
 		return
 	}
-	now := time.Now()
 	if state.Identity != nil && p.runtimeManager != nil && p.groupID != "" {
 		if err = p.runtimeManager.RestorePersistence(p.groupID, p.health, p.leases, p.control, state.Identity); err != nil {
 			p.statePersistenceFailures.Add(1)
 			return
 		}
 	}
-	p.health.RestorePersistence(state.Health, now)
-	p.leases.RestorePersistence(state.Leases, now)
 	if p.control != nil {
 		p.control.access.Lock()
-		p.control.pinned, p.control.pinnedTag, p.control.latestTag = state.Pinned, state.PinnedTag, state.LatestTag
+		p.control.pinned, p.control.pinnedTag = state.Pinned, state.PinnedTag
+		p.control.latestTag = ""
 		p.control.access.Unlock()
 		p.control.bulkSequence.Store(state.BulkSequence)
 		p.control.revision.Store(state.ControlRevision)
@@ -306,7 +308,7 @@ func readAdaptiveState(path string) (persistedAdaptiveState, error) {
 		return persistedAdaptiveState{}, err
 	}
 	var envelope adaptiveStateEnvelope
-	if err = json.Unmarshal(content, &envelope); err != nil || (envelope.Version != 1 && envelope.Version != adaptiveStateSchemaVersion) || len(envelope.Payload) == 0 {
+	if err = json.Unmarshal(content, &envelope); err != nil || (envelope.Version != 1 && envelope.Version != 2 && envelope.Version != adaptiveStateSchemaVersion) || len(envelope.Payload) == 0 {
 		return persistedAdaptiveState{}, errors.New("adaptive persisted state envelope is invalid")
 	}
 	digest := sha256.Sum256(envelope.Payload)

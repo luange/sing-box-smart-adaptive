@@ -385,6 +385,32 @@ func (s *HealthStore) TryAcquireConnectionPermitHandle(handle NodeHandle, transp
 	return s.tryAcquirePermit(keys, at)
 }
 
+// TryAcquireConnectionFallbackPermitHandle permits one bounded last-resort
+// attempt when policy has no normally eligible candidate. It preserves the
+// captured record versions so a successful attempt can close an open breaker,
+// but never competes with an existing half-open owner.
+func (s *HealthStore) TryAcquireConnectionFallbackPermitHandle(handle NodeHandle, transport string, at time.Time) (*AttemptPermit, bool) {
+	if at.IsZero() {
+		at = s.clock.Now()
+	}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: transport}}
+	s.access.Lock()
+	defer s.access.Unlock()
+	entries := make([]permitEntry, 0, len(keys))
+	for _, key := range keys {
+		record := s.entries[key]
+		if record == nil {
+			entries = append(entries, permitEntry{key: key})
+			continue
+		}
+		if record.status.Breaker == BreakerHalfOpen {
+			return nil, false
+		}
+		entries = append(entries, permitEntry{key: key, version: record.version})
+	}
+	return &AttemptPermit{store: s, entries: entries}, true
+}
+
 func (s *HealthStore) tryAcquirePermit(keys []healthKey, at time.Time) (*AttemptPermit, bool) {
 	s.access.Lock()
 	defer s.access.Unlock()

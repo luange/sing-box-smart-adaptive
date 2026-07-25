@@ -369,6 +369,24 @@ func TestSmartProbeCancellationDoesNotDeadlockDispatcher(t *testing.T) {
 	}
 }
 
+func TestSmartProbeCoversEveryCandidateRegardlessOfGroupSize(t *testing.T) {
+	candidates := make([]adapter.Outbound, 128)
+	fakes := make([]*smartFakeOutbound, len(candidates))
+	for index := range candidates {
+		fakes[index] = newSmartFakeOutbound("probe-all-"+strconv.Itoa(index), errors.New("offline"))
+		candidates[index] = fakes[index]
+	}
+	smart := newTestSmart(candidates...)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = smart.probe(ctx)
+	for index, candidate := range fakes {
+		if candidate.dials.Load() != 1 {
+			t.Fatalf("candidate %d was probed %d times", index, candidate.dials.Load())
+		}
+	}
+}
+
 func TestSmartBrokenPermanentPinIsRetained(t *testing.T) {
 	first := newSmartFakeOutbound("first", errors.New("dial failed"))
 	second := newSmartFakeOutbound("second", nil)

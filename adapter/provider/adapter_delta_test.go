@@ -1,6 +1,10 @@
 package provider
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sagernet/sing-box/option"
+)
 
 func TestProviderOutboundDeltaCombinesAndExpiresCursor(t *testing.T) {
 	provider := new(Adapter)
@@ -15,5 +19,16 @@ func TestProviderOutboundDeltaCombinesAndExpiresCursor(t *testing.T) {
 	}
 	if _, ok = provider.OutboundDelta(0); ok {
 		t.Fatal("expired provider delta cursor was accepted")
+	}
+}
+
+func TestResolveOutboundTagsRenamesDuplicatesWithoutPerNodeWarnings(t *testing.T) {
+	provider := &Adapter{providerTag: "airport"}
+	tags := provider.resolveOutboundTags([]option.Outbound{{Tag: "node"}, {Tag: "node"}, {Tag: "node"}, {Tag: "other"}})
+	want := []string{"airport/node", "airport/node (2)", "airport/node (3)", "airport/other"}
+	for index := range want {
+		if tags[index] != want[index] {
+			t.Fatalf("unexpected resolved tag %d: got=%q want=%q", index, tags[index], want[index])
+		}
 	}
 }

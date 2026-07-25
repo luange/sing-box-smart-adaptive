@@ -53,6 +53,14 @@ func TestPeriodicProbeFailureUsesFastRecoveryThenReturnsToCoverage(t *testing.T)
 	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != time.Minute {
 		t.Fatalf("failure did not select recovery interval: %s", got)
 	}
+	task.FailureStreak = 1
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 5*time.Minute {
+		t.Fatalf("second failure did not back off to five minutes: %s", got)
+	}
+	task.FailureStreak = 2
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 10*time.Minute {
+		t.Fatalf("persistent failure did not return to coverage interval: %s", got)
+	}
 	for _, outcome := range []ObservationOutcome{OutcomeSuccess, OutcomeDeferred, OutcomeBlocked} {
 		if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: outcome}); got != 10*time.Minute {
 			t.Fatalf("%s unexpectedly changed normal coverage: %s", outcome, got)

@@ -69,9 +69,6 @@ func (o *businessObservation) observePayload(source ObservationSource, delay tim
 		reducer := &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
-		if disposition == IngestAccepted && publishErr == nil {
-			o.pool.persistState()
-		}
 	})
 }
 
@@ -95,9 +92,6 @@ func (o *businessObservation) observeThroughput(bytes int64, elapsed time.Durati
 		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
-		if disposition == IngestAccepted && publishErr == nil {
-			o.pool.persistState()
-		}
 	})
 }
 
@@ -278,7 +272,6 @@ func (p *AdaptivePool) recordObservationResult(disposition IngestDisposition, er
 		p.observationDuplicate.Add(1)
 	case IngestStale:
 		p.observationStale.Add(1)
-		p.missedObservations.Add(1)
 	case IngestBackpressure:
 		p.observationBackpressure.Add(1)
 		p.missedObservations.Add(1)

@@ -615,7 +615,7 @@ func TestObservationReasonCountersSeparateDeferredAndMissedEvidence(t *testing.T
 	pool.recordObservationIdentityFailure()
 	pool.recordObservationPanic()
 	pool.observationPermitBusy.Add(1)
-	if pool.missedObservations.Load() != 5 || pool.observationDuplicate.Load() != 1 || pool.observationStale.Load() != 1 || pool.observationBackpressure.Load() != 1 || pool.observationReducerFailure.Load() != 1 || pool.observationIdentityFailure.Load() != 1 || pool.observationPanic.Load() != 1 || pool.observationPermitBusy.Load() != 1 {
+	if pool.missedObservations.Load() != 4 || pool.observationDuplicate.Load() != 1 || pool.observationStale.Load() != 1 || pool.observationBackpressure.Load() != 1 || pool.observationReducerFailure.Load() != 1 || pool.observationIdentityFailure.Load() != 1 || pool.observationPanic.Load() != 1 || pool.observationPermitBusy.Load() != 1 {
 		t.Fatalf("observation reasons were not classified: missed=%d duplicate=%d stale=%d backpressure=%d reducer=%d identity=%d panic=%d permit=%d", pool.missedObservations.Load(), pool.observationDuplicate.Load(), pool.observationStale.Load(), pool.observationBackpressure.Load(), pool.observationReducerFailure.Load(), pool.observationIdentityFailure.Load(), pool.observationPanic.Load(), pool.observationPermitBusy.Load())
 	}
 }

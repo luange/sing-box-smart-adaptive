@@ -18,13 +18,14 @@ var (
 type DecisionReason string
 
 const (
-	ReasonManualPin      DecisionReason = "manual_pin"
-	ReasonLease          DecisionReason = "session_lease"
-	ReasonRanked         DecisionReason = "ranked_health"
-	ReasonFallback       DecisionReason = "manual_pin_fallback"
-	ReasonStrictNew      DecisionReason = "strict_affinity_new"
-	ReasonBulkSpread     DecisionReason = "bulk_spread"
-	ReasonBulkThroughput DecisionReason = "bulk_throughput"
+	ReasonManualPin       DecisionReason = "manual_pin"
+	ReasonLease           DecisionReason = "session_lease"
+	ReasonRanked          DecisionReason = "ranked_health"
+	ReasonFallback        DecisionReason = "manual_pin_fallback"
+	ReasonStrictNew       DecisionReason = "strict_affinity_new"
+	ReasonBulkSpread      DecisionReason = "bulk_spread"
+	ReasonBulkThroughput  DecisionReason = "bulk_throughput"
+	ReasonWarmingFallback DecisionReason = "warming_fallback"
 )
 
 type DecisionPlan struct {
@@ -36,6 +37,7 @@ type DecisionPlan struct {
 	Candidates      []Candidate
 	health          *HealthStore
 	service         ServiceContext
+	allowBlocked    bool
 }
 
 func (p DecisionPlan) TryAcquireAttemptPermit(nodeID NodeID, at time.Time) (*AttemptPermit, bool) {
@@ -48,6 +50,9 @@ func (p DecisionPlan) TryAcquireAttemptPermit(nodeID NodeID, at time.Time) (*Att
 			handle = candidate.Handle
 			break
 		}
+	}
+	if p.allowBlocked {
+		return p.health.TryAcquireConnectionFallbackPermitHandle(handle, p.service.Transport, at)
 	}
 	return p.health.TryAcquireConnectionPermitHandle(handle, p.service.Transport, at)
 }
@@ -81,10 +86,12 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		return DecisionPlan{}, ErrNoCandidates
 	}
 	eligible := make([]Candidate, 0, len(snapshot.Candidates))
+	supported := make([]Candidate, 0, len(snapshot.Candidates))
 	for _, candidate := range snapshot.Candidates {
 		if !candidateSupports(candidate, service.Transport) {
 			continue
 		}
+		supported = append(supported, candidate)
 		if e.candidateBlocked(candidate, service) {
 			continue
 		}
@@ -106,15 +113,12 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	if mode == "" {
 		mode = ModeAdaptive
 	}
-	if mode == ModeStrictAffinity && lease != nil {
-		for _, candidate := range eligible {
-			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
-				return e.plan(snapshot, mode, ReasonLease, service, []Candidate{candidate}), nil
-			}
-		}
-		return DecisionPlan{}, ErrStrictAffinityUnavailable
-	}
 	if len(eligible) == 0 {
+		if len(supported) > 0 && (mode == ModeAdaptive || mode == ModeBulk) {
+			plan := e.plan(snapshot, mode, ReasonWarmingFallback, service, limitCandidates(supported, e.maxAttempts))
+			plan.allowBlocked = true
+			return plan, nil
+		}
 		return DecisionPlan{}, ErrNoEligibleCandidates
 	}
 	if mode == ModeAdaptive && lease != nil {
@@ -126,10 +130,10 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
-		left := e.health.EndpointHandle(eligible[i].Handle)
-		right := e.health.EndpointHandle(eligible[j].Handle)
-		if healthPriority(left.Health) != healthPriority(right.Health) {
-			return healthPriority(left.Health) < healthPriority(right.Health)
+		leftPriority, leftDelay := e.candidatePriority(eligible[i], service)
+		rightPriority, rightDelay := e.candidatePriority(eligible[j], service)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
 		}
 		if mode == ModeBulk {
 			leftService := e.health.StatusHandle(eligible[i].Handle, DomainService, "", service.ID)
@@ -142,8 +146,6 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 				return leftService.ThroughputBPS > rightService.ThroughputBPS
 			}
 		}
-		leftDelay := left.LastDelay
-		rightDelay := right.LastDelay
 		if leftDelay == 0 {
 			leftDelay = 10 * time.Second
 		}
@@ -155,13 +157,24 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 		return bytes.Compare(eligible[i].ID[:], eligible[j].ID[:]) < 0
 	})
+	if mode == ModeStrictAffinity && lease != nil {
+		for index, candidate := range eligible {
+			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
+				moveCandidateFirst(eligible, index)
+				return e.plan(snapshot, mode, ReasonLease, service, limitCandidates(eligible, e.maxAttempts)), nil
+			}
+		}
+		// The leased handle is no longer eligible. Start a bounded sequential
+		// failover plan; DialContext replaces the lease only after a candidate
+		// actually connects.
+	}
 	reason := ReasonRanked
 	if pinned != nil {
 		reason = ReasonFallback
 	}
 	switch mode {
 	case ModeStrictAffinity:
-		return e.plan(snapshot, mode, ReasonStrictNew, service, eligible[:1]), nil
+		return e.plan(snapshot, mode, ReasonStrictNew, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeBulk:
 		sequence := e.bulkSequence.Add(1)
 		if hasTrustedBulkThroughput(e.health, eligible, service.ID) {
@@ -178,6 +191,28 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	default:
 		return DecisionPlan{}, errors.New("adaptive policy mode is invalid")
 	}
+}
+
+// candidatePriority combines generic endpoint health with transport- and
+// service-specific evidence. A node that passes a generic URL test but fails a
+// real TCP/UDP connection is therefore ranked below a proven working node.
+func (e *PolicyEngine) candidatePriority(candidate Candidate, service ServiceContext) (int, time.Duration) {
+	statuses := []HealthStatus{
+		e.health.EndpointHandle(candidate.Handle),
+		e.health.StatusHandle(candidate.Handle, DomainTransport, service.Transport, ""),
+		e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID),
+	}
+	priority := healthPriority(HealthHealthy)
+	var delay time.Duration
+	for _, status := range statuses {
+		if current := healthPriority(status.Health); current > priority {
+			priority = current
+		}
+		if status.LastDelay > 0 && (delay == 0 || status.LastDelay > delay) {
+			delay = status.LastDelay
+		}
+	}
+	return priority, delay
 }
 
 func hasTrustedBulkThroughput(health *HealthStore, candidates []Candidate, serviceID string) bool {

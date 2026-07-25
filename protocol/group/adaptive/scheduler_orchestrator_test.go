@@ -382,6 +382,29 @@ func TestURLTestTriggerAndPeriodicShareOneScheduler(t *testing.T) {
 	}
 }
 
+func TestRealFailureProbeUsesExistingScheduler(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, candidate := newProbeTestPool(t, context.Background(), health)
+	pool.probeURL = "test://failure-feedback"
+	pool.scheduler = NewProbeScheduler(context.Background(), 1, 16)
+	defer pool.scheduler.Close()
+	runs := make(chan struct{}, 1)
+	pool.probeRunner = func(context.Context, string, N.Dialer) (uint16, error) {
+		runs <- struct{}{}
+		return 4, nil
+	}
+	pool.scheduleFailureProbe(candidate.Handle)
+	select {
+	case <-runs:
+	case <-time.After(time.Second):
+		t.Fatal("real failure did not submit an immediate probe")
+	}
+	accepted, _, _, rejected := pool.scheduler.SubmissionStats()
+	if accepted != 1 || rejected != 0 {
+		t.Fatalf("failure feedback bypassed scheduler accounting: accepted=%d rejected=%d", accepted, rejected)
+	}
+}
+
 func TestProviderRevisionReplacesPendingProbeWithCurrentExecutionView(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	pool, oldSnapshot := newWiredObservationPool(t, health, wired(NodeID{63}, "old", newTestOutbound("old")))

@@ -510,7 +510,6 @@ func (p *AdaptivePool) Close() error {
 		_ = p.source.Close()
 	}
 	if p.stateWriter != nil {
-		p.persistState()
 		p.stateWriter.Close()
 	}
 	p.runtimeManager.UnregisterGroup(p.groupID)
@@ -743,9 +742,31 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, att
 	}
 	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
 	p.recordObservationResult(disposition, publishErr)
-	if disposition == IngestAccepted && publishErr == nil {
-		p.persistState()
+	if publishErr == nil && disposition == IngestAccepted && evidence.Outcome == OutcomeFailure && evidence.Stage == StageDestinationTransport {
+		p.scheduleFailureProbe(evidence.Handle)
 	}
+}
+
+// scheduleFailureProbe feeds real connection failures back into the existing
+// scheduler. Submit coalesces an on-demand probe with an active or pending
+// periodic probe, so an outage cannot create a second scheduler or an
+// unbounded probe fan-out.
+func (p *AdaptivePool) scheduleFailureProbe(handle NodeHandle) {
+	p.lifecycleAccess.Lock()
+	scheduler := p.scheduler
+	p.lifecycleAccess.Unlock()
+	if scheduler == nil {
+		return
+	}
+	snapshot := p.catalog.load()
+	if snapshot == nil {
+		return
+	}
+	candidate, loaded := snapshot.Candidate(handle.NodeID)
+	if !loaded || candidate.Handle.Slot != handle.Slot || candidate.Handle.Version != handle.Version {
+		return
+	}
+	_ = scheduler.Submit(p.probeTask(snapshot, candidate, time.Now(), 0))
 }
 
 type observationAttempt struct {
@@ -1289,7 +1310,7 @@ func (p *AdaptivePool) startCapabilityControllerLocked(snapshot *ExecutionSnapsh
 			closeCapabilityControllers(controllers)
 			return
 		}
-		controller.WithServiceID(serviceID).onComplete = p.persistState
+		controller.WithServiceID(serviceID)
 		if err = controller.Start(parent); err != nil {
 			controller.Close()
 			p.capabilityInitFailures.Add(1)
@@ -1466,9 +1487,6 @@ func (p *AdaptivePool) completeGenericProbe(attempt *observationAttempt, probeEr
 	}
 	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
 	p.recordObservationResult(disposition, publishErr)
-	if disposition == IngestAccepted && publishErr == nil {
-		p.persistState()
-	}
 }
 
 func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidate, dueAt time.Time, interval time.Duration) ProbeTask {
@@ -1525,9 +1543,6 @@ func (p *AdaptivePool) applyCommittedTransitions(identity RuntimeIdentity) {
 			scheduler.RemoveHandle(handle)
 		}
 	}
-	if len(identity.RetiredHandles) > 0 {
-		p.persistState()
-	}
 }
 
 func (p *AdaptivePool) runProbe(ctx context.Context, candidate N.Dialer) (uint16, error) {
@@ -1557,7 +1572,6 @@ func (p *AdaptivePool) setLatest(tag string) {
 	p.control.access.Lock()
 	p.control.latestTag = tag
 	p.control.access.Unlock()
-	p.persistState()
 }
 
 func (p *AdaptivePool) leaseTTL(mode PolicyMode) time.Duration {

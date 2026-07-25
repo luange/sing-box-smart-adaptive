@@ -196,6 +196,47 @@ func TestAdaptivePoolReusesNodeAcrossYouTubeDomains(t *testing.T) {
 	}
 }
 
+func TestStrictAffinityFailureSwitchesAndReplacesLease(t *testing.T) {
+	hasher := testIdentityHasher(t)
+	failedOutbound := newDialTestOutbound("failed", 0, errors.New("failed"))
+	workingOutbound := newDialTestOutbound("working", 0, nil)
+	failed := retryCandidate(11, "failed")
+	working := retryCandidate(12, "working")
+	health := NewHealthStore(time.Hour, 32)
+	resolver := NewServiceResolver(hasher, ModeAdaptive)
+	leases := NewSessionLeaseManager(32)
+	pool := &AdaptivePool{
+		resolver: resolver, leases: leases, health: health,
+		policy:         NewPolicyEngine(health, 2, "fallback"),
+		strictLeaseTTL: time.Minute, adaptiveLeaseTTL: time.Minute,
+	}
+	pool.catalog = NewCatalogPort()
+	installTestCatalog(pool.catalog, []Candidate{failed, working}, failedOutbound, workingOutbound)
+	pool.runner = NewAttemptRunner(time.Second, time.Second, pool.catalog)
+	metadata := &adapter.InboundContext{Inbound: "mixed-in", Source: M.ParseSocksaddr("192.168.0.20:2000")}
+	destination := M.ParseSocksaddr("youtube.com:443")
+	service := resolver.Resolve(metadata, destination, N.NetworkTCP)
+	_, reservation, err := leases.Reserve(context.Background(), service.Session, time.Now())
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve strict lease: reservation=%v err=%v", reservation, err)
+	}
+	reservation.CommitHandle(failed.Handle, service.ID, service.Mode, time.Minute, time.Now())
+	ctx := adapter.WithContext(context.Background(), metadata)
+	conn, err := pool.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	(<-workingOutbound.peers).Close()
+	lease, loaded := leases.Peek(service.Session, time.Now())
+	if !loaded || lease.NodeID != working.ID || lease.NodeSlot != working.Handle.Slot || lease.NodeVersion != working.Handle.Version {
+		t.Fatalf("successful fallback did not replace strict lease: loaded=%v lease=%+v", loaded, lease)
+	}
+	if failedOutbound.dials.Load() != 1 || workingOutbound.dials.Load() != 1 {
+		t.Fatalf("strict failover attempts are wrong: failed=%d working=%d", failedOutbound.dials.Load(), workingOutbound.dials.Load())
+	}
+}
+
 func (*dialTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("not implemented")
 }

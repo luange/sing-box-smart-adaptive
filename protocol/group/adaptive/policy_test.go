@@ -43,12 +43,12 @@ func TestPolicyKeepsHealthySessionLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Reason != ReasonLease || plan.Candidates[0].ID != first.ID || len(plan.Candidates) != 1 {
+	if plan.Reason != ReasonLease || plan.Candidates[0].ID != first.ID || len(plan.Candidates) != 2 {
 		t.Fatalf("healthy lease was not retained: %+v", plan)
 	}
 }
 
-func TestStrictAffinityLeaseFailsClosedInsteadOfChangingNode(t *testing.T) {
+func TestStrictAffinityLeaseFailsOverOnlyAfterLeasedNodeIsUnavailable(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	leased := Candidate{ID: NodeID{11}, Handle: NodeHandle{NodeID: NodeID{11}, Slot: 1, Version: 1}, PrimaryTag: "leased"}
 	alternative := Candidate{ID: NodeID{12}, Handle: NodeHandle{NodeID: NodeID{12}, Slot: 2, Version: 1}, PrimaryTag: "alternative"}
@@ -57,9 +57,30 @@ func TestStrictAffinityLeaseFailsClosedInsteadOfChangingNode(t *testing.T) {
 	}
 	service := ServiceContext{ID: "youtube", Mode: ModeStrictAffinity, Transport: N.NetworkTCP}
 	lease := &SessionLease{NodeID: leased.ID, NodeSlot: leased.Handle.Slot, NodeVersion: leased.Handle.Version, ServiceID: service.ID, Mode: service.Mode}
-	_, err := NewPolicyEngine(health, 3, "fallback").Plan(testExecutionSnapshot(leased, alternative), service, lease, nil)
-	if err != ErrStrictAffinityUnavailable {
-		t.Fatalf("strict affinity silently changed node: %v", err)
+	plan, err := NewPolicyEngine(health, 3, "fallback").Plan(testExecutionSnapshot(leased, alternative), service, lease, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Reason != ReasonStrictNew || len(plan.Candidates) != 1 || plan.Candidates[0].ID != alternative.ID {
+		t.Fatalf("strict affinity did not build a bounded replacement plan: %+v", plan)
+	}
+}
+
+func TestRealTransportFailureDownranksGenericProbeWinner(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	fastButBroken := Candidate{ID: NodeID{31}, Handle: NodeHandle{NodeID: NodeID{31}, Slot: 1, Version: 1}, PrimaryTag: "fast-but-broken"}
+	working := Candidate{ID: NodeID{32}, Handle: NodeHandle{NodeID: NodeID{32}, Slot: 2, Version: 1}, PrimaryTag: "working"}
+	health.Observe(Observation{NodeID: fastButBroken.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 5 * time.Millisecond})
+	health.Observe(Observation{NodeID: working.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 50 * time.Millisecond})
+	health.Observe(Observation{NodeID: fastButBroken.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: N.NetworkTCP, Outcome: OutcomeFailure, Delay: 4 * time.Second})
+	health.Observe(Observation{NodeID: working.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: N.NetworkTCP, Outcome: OutcomeSuccess, Delay: 60 * time.Millisecond})
+	service := ServiceContext{ID: "telegram", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	plan, err := NewPolicyEngine(health, 2, "fallback").Plan(testExecutionSnapshot(fastButBroken, working), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidates[0].ID != working.ID || plan.Candidates[1].ID != fastButBroken.ID {
+		t.Fatalf("real transport failure did not override generic probe latency: %+v", plan.Candidates)
 	}
 }
 
@@ -110,6 +131,35 @@ func TestPolicyManualPinFallbackIsExplicit(t *testing.T) {
 	}
 	if plan.Reason != ReasonFallback || plan.Candidates[0].ID != fallback.ID {
 		t.Fatalf("manual fallback was not explicit: %+v", plan)
+	}
+}
+
+func TestPolicyUsesBoundedWarmingFallbackWhenEveryBreakerIsOpen(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	candidates := []Candidate{
+		{ID: NodeID{71}, Handle: NodeHandle{NodeID: NodeID{71}, Slot: 1, Version: 1}, PrimaryTag: "first"},
+		{ID: NodeID{72}, Handle: NodeHandle{NodeID: NodeID{72}, Slot: 2, Version: 1}, PrimaryTag: "second"},
+	}
+	for _, candidate := range candidates {
+		for range 3 {
+			health.Observe(Observation{NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeFailure})
+		}
+	}
+	service := ServiceContext{ID: "site:startup.example", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	plan, err := NewPolicyEngine(health, 2, "fallback").Plan(testExecutionSnapshot(candidates...), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Reason != ReasonWarmingFallback || len(plan.Candidates) != 2 || !plan.allowBlocked {
+		t.Fatalf("all-open startup did not receive bounded fallback: %+v", plan)
+	}
+	permit, allowed := plan.TryAcquireAttemptPermit(candidates[0].ID, time.Now())
+	if !allowed || permit == nil {
+		t.Fatal("last-resort candidate was not permitted")
+	}
+	permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeSuccess, DomainTransport: OutcomeSuccess}, time.Now(), time.Millisecond, "recovered")
+	if status := health.EndpointHandle(candidates[0].Handle); status.Health != HealthHealthy || status.Breaker != BreakerClosed {
+		t.Fatalf("successful last-resort attempt did not recover breaker: %+v", status)
 	}
 }
 

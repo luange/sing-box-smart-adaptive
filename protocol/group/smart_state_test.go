@@ -272,7 +272,7 @@ func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
 	}
 }
 
-func TestSmartHistoryStoreSharedAcrossPublishedGenerations(t *testing.T) {
+func TestSmartHistoryStoreSharedAcrossPublishedGenerationsWithoutDiskPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "history.json")
 	first := newSmartHistoryTestInstance(path)
 	second := newSmartHistoryTestInstance(path)
@@ -298,17 +298,8 @@ func TestSmartHistoryStoreSharedAcrossPublishedGenerations(t *testing.T) {
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var historyFile smartHistoryFile
-	if err = json.Unmarshal(content, &historyFile); err != nil {
-		t.Fatal(err)
-	}
-	snapshot := historyFile.Groups[""]
-	if len(snapshot.Metrics) == 0 {
-		t.Fatal("shared history was not persisted")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("process-local Smart health was persisted: %v", err)
 	}
 }
 

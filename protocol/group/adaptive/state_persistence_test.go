@@ -60,11 +60,11 @@ func TestAdaptiveStateSurvivesSIGKILLAndRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("durable state was unreadable after SIGKILL: %v", err)
 	}
-	if state.Identity == nil || len(state.Identity.Lineage) != 1 || len(state.Health) != 1 {
+	if state.Identity == nil || len(state.Identity.Lineage) != 1 || len(state.Health) != 0 || len(state.Leases) != 0 {
 		t.Fatalf("SIGKILL restored a partial snapshot: identity=%+v health=%d", state.Identity, len(state.Health))
 	}
-	if state.LatestTag != "durable" && state.LatestTag != "pending" {
-		t.Fatalf("SIGKILL restored neither complete old nor complete new snapshot: latest=%q", state.LatestTag)
+	if state.LatestTag != "" {
+		t.Fatalf("runtime selection survived SIGKILL: latest=%q", state.LatestTag)
 	}
 
 	manager := NewRuntimeManager()
@@ -126,7 +126,7 @@ func runAdaptiveSIGKILLHelper(t *testing.T, path string) {
 	}
 }
 
-func TestAdaptiveStateRestoresSafeHealthLeaseAndPinState(t *testing.T) {
+func TestAdaptiveStateRestoresControlButNotHealthOrLeases(t *testing.T) {
 	now := time.Now()
 	path := filepath.Join(t.TempDir(), "adaptive-state")
 	openHandle := NodeHandle{NodeID: NodeID{91}, Slot: 1, Version: 2}
@@ -155,14 +155,14 @@ func TestAdaptiveStateRestoresSafeHealthLeaseAndPinState(t *testing.T) {
 	if pool.statePersistenceFailures.Load() != 0 {
 		t.Fatal("valid state was reported as a persistence failure")
 	}
-	if status := health.EndpointHandle(openHandle); status.Breaker != BreakerOpen || status.Failures != 3 || status.HalfOpen || status.ThroughputBPS != 4<<20 || status.ThroughputSamples != 3 {
-		t.Fatalf("open breaker was not restored safely: %+v", status)
+	if status := health.EndpointHandle(openHandle); status.Health != HealthUnknown || status.Failures != 0 || status.Breaker != BreakerClosed {
+		t.Fatalf("health observation survived process restart: %+v", status)
 	}
-	if status := health.StatusHandle(halfOpenHandle, DomainService, "", youtubeProbeServiceID); status.Breaker != BreakerClosed || status.HalfOpen {
-		t.Fatalf("half-open token survived restart: %+v", status)
+	if status := health.StatusHandle(halfOpenHandle, DomainService, "", youtubeProbeServiceID); status.Health != HealthUnknown || status.Failures != 0 || status.Breaker != BreakerClosed {
+		t.Fatalf("service observation survived process restart: %+v", status)
 	}
-	if lease, loaded := leases.Peek(validKey, now); !loaded || lease.NodeID != openHandle.NodeID || lease.NodeSlot != openHandle.Slot || lease.NodeVersion != openHandle.Version {
-		t.Fatalf("valid lease was not restored: %+v loaded=%v", lease, loaded)
+	if lease, loaded := leases.Peek(validKey, now); loaded {
+		t.Fatalf("lease survived process restart: %+v", lease)
 	}
 	if _, loaded := leases.Peek(expiredKey, now); loaded {
 		t.Fatal("expired lease survived restart")
@@ -170,7 +170,7 @@ func TestAdaptiveStateRestoresSafeHealthLeaseAndPinState(t *testing.T) {
 	control.access.RLock()
 	pinned, pinnedTag, latestTag := control.pinned, control.pinnedTag, control.latestTag
 	control.access.RUnlock()
-	if pinned != openHandle.NodeID || pinnedTag != "node-a" || latestTag != "node-b" {
+	if pinned != openHandle.NodeID || pinnedTag != "node-a" || latestTag != "" {
 		t.Fatalf("control state was not restored: pinned=%v pinnedTag=%q latest=%q", pinned, pinnedTag, latestTag)
 	}
 	if control.bulkSequence.Load() != 13 {
@@ -223,8 +223,11 @@ func TestAdaptiveStateSnapshotExcludesPrivateTextAndWritesAtomically(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Pinned != (NodeID{94}) || state.PinnedTag != "" || state.LatestTag != "node-safe" {
+	if state.Pinned != (NodeID{94}) || state.PinnedTag != "" || state.LatestTag != "" {
 		t.Fatalf("safe control snapshot changed: %+v", state)
+	}
+	if len(state.Health) != 0 || len(state.Leases) != 0 {
+		t.Fatalf("process-local health or leases entered durable state: health=%d leases=%d", len(state.Health), len(state.Leases))
 	}
 	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".adaptive-state-*.tmp"))
 	if err != nil || len(matches) != 0 {
@@ -238,7 +241,7 @@ func TestAdaptiveStateWriterCoalescesAndCloseFlushesLatestState(t *testing.T) {
 	pool.stateWriter = newAdaptiveStateWriter(pool)
 	for index := 0; index < 100; index++ {
 		pool.control.access.Lock()
-		pool.control.latestTag = "node-latest"
+		pool.control.pinnedTag = "node-pinned"
 		pool.control.access.Unlock()
 		pool.persistState()
 	}
@@ -247,7 +250,7 @@ func TestAdaptiveStateWriterCoalescesAndCloseFlushesLatestState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.LatestTag != "node-latest" || pool.statePersistenceFailures.Load() != 0 {
+	if state.PinnedTag != "node-pinned" || state.LatestTag != "" || pool.statePersistenceFailures.Load() != 0 {
 		t.Fatalf("coalesced writer did not flush latest state: state=%+v failures=%d", state, pool.statePersistenceFailures.Load())
 	}
 }

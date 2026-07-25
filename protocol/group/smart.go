@@ -419,7 +419,6 @@ func (s *Smart) Start() error {
 			s.logger.Info("smart group waiting for provider candidates")
 		}
 	}
-	s.loadHistory()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
 		pinned := cacheFile.LoadSelected(s.Tag())
 		if pinned != "" {
@@ -530,7 +529,6 @@ func (s *Smart) Close() error {
 	published := s.published
 	s.lifecycleAccess.Unlock()
 	if published {
-		s.flushHistory()
 		s.releaseHistory()
 	}
 	return nil
@@ -550,10 +548,8 @@ func (s *Smart) unregisterProviderCallbacks() {
 func (s *Smart) run(ctx context.Context) {
 	defer s.worker.Done()
 	probeTicker := time.NewTicker(s.probeInterval)
-	flushTicker := time.NewTicker(30 * time.Second)
 	reachTicker := time.NewTicker(30 * time.Second)
 	defer probeTicker.Stop()
-	defer flushTicker.Stop()
 	defer reachTicker.Stop()
 	probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 	_, _ = s.probe(probeCtx)
@@ -567,8 +563,6 @@ func (s *Smart) run(ctx context.Context) {
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			_, _ = s.probe(probeCtx)
 			cancel()
-		case <-flushTicker.C:
-			s.flushHistory()
 		case <-reachTicker.C:
 			s.runDueReachTests(ctx, s.reachForce.Swap(false))
 		}
