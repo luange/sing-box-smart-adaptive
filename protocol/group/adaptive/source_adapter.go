@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"regexp"
 	"time"
+
+	"github.com/sagernet/sing-box/common/nodefilter"
 )
 
 // CanonicalNode is the only node shape consumed by the future catalog. It has
@@ -74,6 +76,7 @@ type SourceRuntimeConfig struct {
 	ProviderPollInterval time.Duration
 	Include              *regexp.Regexp
 	Exclude              *regexp.Regexp
+	ManualExclude        *nodefilter.Matcher
 }
 
 type SourceDeltaAdapter interface {

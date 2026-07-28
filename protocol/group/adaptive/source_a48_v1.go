@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/nodefilter"
 	"github.com/sagernet/sing-box/option"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
@@ -241,7 +242,7 @@ func (r *A48SourceRuntimeV1) Snapshot(ctx context.Context, generation uint64) (S
 	}
 	config, manager, hasher := r.config, r.manager, r.hasher
 	r.access.Unlock()
-	publication, err := SnapshotA48RuntimeV1(ctx, generation, hasher, manager, config.StaticTags, providers, providerTags, config.Include, config.Exclude)
+	publication, err := SnapshotA48RuntimeV1(ctx, generation, hasher, manager, config.StaticTags, providers, providerTags, config.Include, config.Exclude, config.ManualExclude)
 	if err != nil {
 		return SourcePublication{}, err
 	}
@@ -319,7 +320,7 @@ func (r *A48SourceRuntimeV1) Delta(ctx context.Context, generation uint64) (Sour
 			}
 		}
 		for _, tag := range providerDelta.Upserts {
-			if config.Exclude != nil && config.Exclude.MatchString(tag) || config.Include != nil && !config.Include.MatchString(tag) {
+			if config.Exclude != nil && config.Exclude.MatchString(tag) || config.Include != nil && !config.Include.MatchString(tag) || config.ManualExclude.Match(tag) {
 				continue
 			}
 			candidate, loaded := provider.Outbound(tag)
@@ -379,7 +380,11 @@ func cloneSourcePublication(source SourcePublication) SourcePublication {
 	return cloned
 }
 
-func SnapshotA48RuntimeV1(ctx context.Context, generation uint64, hasher *IdentityHasher, manager adapter.OutboundManager, staticTags []string, providers map[string]adapter.Provider, providerTags []string, include, exclude *regexp.Regexp) (SourcePublication, error) {
+func SnapshotA48RuntimeV1(ctx context.Context, generation uint64, hasher *IdentityHasher, manager adapter.OutboundManager, staticTags []string, providers map[string]adapter.Provider, providerTags []string, include, exclude *regexp.Regexp, manualExclude ...*nodefilter.Matcher) (SourcePublication, error) {
+	var manual *nodefilter.Matcher
+	if len(manualExclude) > 0 {
+		manual = manualExclude[0]
+	}
 	var roots []A48SourceRoot
 	for _, tag := range staticTags {
 		candidate, loaded := manager.Outbound(tag)
@@ -401,6 +406,9 @@ func SnapshotA48RuntimeV1(ctx context.Context, generation uint64, hasher *Identi
 			if exclude != nil && exclude.MatchString(candidate.Tag()) {
 				continue
 			}
+			if manual.Match(candidate.Tag()) {
+				continue
+			}
 			if include != nil && !include.MatchString(candidate.Tag()) {
 				continue
 			}
@@ -413,7 +421,34 @@ func SnapshotA48RuntimeV1(ctx context.Context, generation uint64, hasher *Identi
 		}
 	}
 	adapterV1 := NewA48SourceAdapterV1(generation, hasher, roots, manager.Outbound)
-	return adapterV1.Snapshot(ctx)
+	publication, err := adapterV1.Snapshot(ctx)
+	if err != nil || manual == nil {
+		return publication, err
+	}
+	return filterManualSourcePublication(publication, manual), nil
+}
+
+func filterManualSourcePublication(publication SourcePublication, manual *nodefilter.Matcher) SourcePublication {
+	if manual == nil {
+		return publication
+	}
+	filtered := publication.Nodes[:0]
+	excluded := 0
+	for _, node := range publication.Nodes {
+		match := manual.Match(node.SourceKey)
+		for _, alias := range node.Aliases {
+			match = match || manual.Match(alias)
+		}
+		if match {
+			delete(publication.Bindings, node.NodeID)
+			excluded++
+			continue
+		}
+		filtered = append(filtered, node)
+	}
+	publication.Nodes = filtered
+	publication.InputLeafCount = max(0, publication.InputLeafCount-excluded)
+	return publication
 }
 
 // This is the only A48 adapter allowed to know official provider/group/option

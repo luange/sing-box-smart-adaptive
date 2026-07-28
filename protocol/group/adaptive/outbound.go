@@ -18,6 +18,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/nodefilter"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -302,12 +303,17 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	}
 	health := NewHealthStore(stateRetention, stateMaxEntries)
 	resolver := NewServiceResolver(hasher, defaultMode)
+	manualExclude, err := nodefilter.New([]string(options.ExcludeNodes))
+	if err != nil {
+		return nil, err
+	}
 	sourceRuntime, err := NewA48SourceRuntimeV1(ctx, hasher, SourceRuntimeConfig{
-		StaticTags:   options.Outbounds,
-		ProviderTags: options.Providers,
-		UseAll:       options.UseAllProviders,
-		Include:      (*regexp.Regexp)(options.Include),
-		Exclude:      (*regexp.Regexp)(options.Exclude),
+		StaticTags:    options.Outbounds,
+		ProviderTags:  options.Providers,
+		UseAll:        options.UseAllProviders,
+		Include:       (*regexp.Regexp)(options.Include),
+		Exclude:       (*regexp.Regexp)(options.Exclude),
+		ManualExclude: manualExclude,
 	})
 	if err != nil {
 		return nil, err

@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/nodefilter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
@@ -644,6 +645,31 @@ func TestSmartNestedGroupsExpandToUniqueLeaves(t *testing.T) {
 	}
 	if leaves[0].Tag() != "leaf-a" || leaves[1].Tag() != "leaf-b" {
 		t.Fatalf("unexpected leaf order: %s, %s", leaves[0].Tag(), leaves[1].Tag())
+	}
+}
+
+func TestSmartManualNodeExclusionFiltersNestedLeaves(t *testing.T) {
+	keep := newSmartFakeOutbound("airport/美国-普通节点", nil)
+	excludedKeyword := newSmartFakeOutbound("airport/美国-Gcore-01", nil)
+	excludedExact := newSmartFakeOutbound("airport/完整节点名", nil)
+	group := &smartFakeGroup{
+		smartFakeOutbound: newSmartFakeOutbound("provider/group", nil),
+		children:          []string{keep.Tag(), excludedKeyword.Tag(), excludedExact.Tag()},
+	}
+	manager := &smartFakeOutboundManager{byTag: map[string]adapter.Outbound{
+		keep.Tag(): keep, excludedKeyword.Tag(): excludedKeyword, excludedExact.Tag(): excludedExact, group.Tag(): group,
+	}}
+	matcher, err := nodefilter.New([]string{"Gcore", "=" + excludedExact.Tag()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	smart := newTestSmart()
+	smart.outbound = manager
+	smart.manualExclude = matcher
+	var leaves []adapter.Outbound
+	smart.flattenCandidate(group, make(map[string]bool), make(map[string]bool), &leaves)
+	if len(leaves) != 1 || leaves[0].Tag() != keep.Tag() {
+		t.Fatalf("manual exclusion did not filter nested leaves: %+v", leaves)
 	}
 }
 

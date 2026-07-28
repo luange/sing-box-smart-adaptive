@@ -7,6 +7,7 @@ import (
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/nodefilter"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
@@ -142,6 +143,28 @@ func TestA48StaticRuntimeDescriptorIsStableAcrossSnapshots(t *testing.T) {
 	}
 	if len(first.Nodes) != 1 || !first.Nodes[0].IdentityStable || first.Nodes[0].NodeID != second.Nodes[0].NodeID {
 		t.Fatalf("static runtime descriptor was not stable: first=%+v second=%+v", first.Nodes, second.Nodes)
+	}
+}
+
+func TestA48ManualNodeExclusionFiltersCanonicalNodesAndBindings(t *testing.T) {
+	matcher, err := nodefilter.New([]string{"Gcore", "=airport/完整节点名"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepID := NodeID{1}
+	keywordID := NodeID{2}
+	exactID := NodeID{3}
+	publication := SourcePublication{
+		SourceSnapshot: SourceSnapshot{Generation: 1, InputLeafCount: 3, Nodes: []CanonicalNode{
+			{NodeID: keepID, SourceKey: "airport/普通节点", Aliases: []string{"airport/普通节点"}},
+			{NodeID: keywordID, SourceKey: "provider/source", Aliases: []string{"airport/US-Gcore-01"}},
+			{NodeID: exactID, SourceKey: "airport/完整节点名", Aliases: []string{"airport/完整节点名"}},
+		}},
+		Bindings: map[NodeID]ExecutionPort{keepID: newTestOutbound("keep"), keywordID: newTestOutbound("keyword"), exactID: newTestOutbound("exact")},
+	}
+	filtered := filterManualSourcePublication(publication, matcher)
+	if len(filtered.Nodes) != 1 || filtered.Nodes[0].NodeID != keepID || len(filtered.Bindings) != 1 || filtered.Bindings[keepID] == nil || filtered.InputLeafCount != 1 {
+		t.Fatalf("manual canonical filter failed: %+v bindings=%d", filtered.SourceSnapshot, len(filtered.Bindings))
 	}
 }
 

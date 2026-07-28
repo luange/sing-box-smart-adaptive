@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/nodefilter"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -182,6 +183,7 @@ type Smart struct {
 	providerTags    []string
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
+	manualExclude   *nodefilter.Matcher
 	useAllProviders bool
 
 	access          sync.RWMutex
@@ -272,6 +274,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if err != nil {
 		return nil, err
 	}
+	manualExclude, err := nodefilter.New([]string(options.ExcludeNodes))
+	if err != nil {
+		return nil, err
+	}
 	probeInterval := time.Duration(options.ProbeInterval)
 	if probeInterval <= 0 {
 		probeInterval = defaultSmartProbeInterval
@@ -353,6 +359,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		providerTags:    options.Providers,
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
+		manualExclude:   manualExclude,
 		useAllProviders: options.UseAllProviders,
 
 		candidateByTag: make(map[string]adapter.Outbound),
@@ -1403,6 +1410,9 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 			if s.exclude != nil && s.exclude.MatchString(candidate.Tag()) {
 				continue
 			}
+			if s.manualExclude.Match(candidate.Tag()) {
+				continue
+			}
 			if s.include != nil && !s.include.MatchString(candidate.Tag()) {
 				continue
 			}
@@ -1479,6 +1489,9 @@ func (s *Smart) flattenCandidate(candidate adapter.Outbound, stack, seen map[str
 		return
 	}
 	if seen[tag] {
+		return
+	}
+	if s.manualExclude.Match(tag) {
 		return
 	}
 	seen[tag] = true
