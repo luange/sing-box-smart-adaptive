@@ -61,9 +61,26 @@ func tokenizeExitIdentity(value []byte) ([16]byte, bool) {
 	return token, true
 }
 
-func (s *ExitIdentityStore) Observe(handle NodeHandle, token [16]byte) (changed bool, accepted bool) {
+func (s *ExitIdentityStore) Compare(handle NodeHandle, token [16]byte) (changed bool, accepted bool) {
 	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token == ([16]byte{}) {
 		return false, false
+	}
+	processExitIdentities.access.Lock()
+	defer processExitIdentities.access.Unlock()
+	group := processExitIdentities.groups[s.groupID]
+	if group == nil {
+		return false, true
+	}
+	previous, loaded := group.identities[handle.NodeID]
+	if !loaded {
+		return false, true
+	}
+	return !hmac.Equal(previous[:], token[:]), true
+}
+
+func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
+	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token == ([16]byte{}) {
+		return false
 	}
 	processExitIdentities.access.Lock()
 	defer processExitIdentities.access.Unlock()
@@ -79,17 +96,17 @@ func (s *ExitIdentityStore) Observe(handle NodeHandle, token [16]byte) (changed 
 			entries += len(state.identities)
 		}
 		if entries >= maxProcessExitIdentityEntries {
-			return false, false
+			return false
 		}
 		group.identities[handle.NodeID] = token
-		return false, true
+		return true
 	}
 	if hmac.Equal(previous[:], token[:]) {
-		return false, true
+		return true
 	}
 	group.identities[handle.NodeID] = token
 	group.changes++
-	return true, true
+	return true
 }
 
 func (s *ExitIdentityStore) Stats() (baselines, changes uint64) {

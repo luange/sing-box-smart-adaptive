@@ -203,6 +203,9 @@ func (s *CapabilityProbeSuite) Run(ctx context.Context, request CapabilitySuiteR
 	type taskCompletion struct {
 		done   <-chan error
 		future *ProbeFuture
+		handle NodeHandle
+		target ProbeTarget
+		holder *capabilitySampleHolder
 	}
 	completions := make([]taskCompletion, 0, len(request.Nodes)*len(targets))
 	for _, node := range request.Nodes {
@@ -218,7 +221,7 @@ func (s *CapabilityProbeSuite) Run(ctx context.Context, request CapabilitySuiteR
 				s.aggregator.Abort(request.RunID)
 				return ProbeRunResult{}, fmt.Errorf("adaptive capability probe submission %s: %w", submission.Status, submission.Err)
 			}
-			completions = append(completions, taskCompletion{done: done, future: submission.Future})
+			completions = append(completions, taskCompletion{done: done, future: submission.Future, handle: node.Handle, target: target, holder: holder})
 		}
 	}
 	for _, completion := range completions {
@@ -246,6 +249,18 @@ func (s *CapabilityProbeSuite) Run(ctx context.Context, request CapabilitySuiteR
 	}
 	if err = s.publishResult(ctx, result, attempts, session); err != nil {
 		return ProbeRunResult{}, err
+	}
+	for _, completion := range completions {
+		if completion.target.Capability != ProbeCapabilityExitIdentity || s.exitIdentities == nil {
+			continue
+		}
+		completion.holder.access.Lock()
+		raw := completion.holder.raw
+		set := completion.holder.set
+		completion.holder.access.Unlock()
+		if set && raw.hasIdentityToken {
+			s.exitIdentities.Commit(completion.handle, raw.identityToken)
+		}
 	}
 	return result, nil
 }
@@ -448,7 +463,7 @@ func (s *CapabilityProbeSuite) probeTask(spec ProbeRunSpec, node CapabilitySuite
 			classification := ProbeSampleClassification{Class: ProbeSampleDeferred, Failure: FailureCanceled}
 			if set && scheduled.Outcome != OutcomeDeferred {
 				if target.Capability == ProbeCapabilityExitIdentity && raw.hasIdentityToken && s.exitIdentities != nil {
-					changed, accepted := s.exitIdentities.Observe(node.Handle, raw.identityToken)
+					changed, accepted := s.exitIdentities.Compare(node.Handle, raw.identityToken)
 					raw.identityChanged = changed
 					if !accepted {
 						raw.hasIdentityToken = false
