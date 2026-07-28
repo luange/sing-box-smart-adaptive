@@ -1093,6 +1093,26 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	if snapshot == nil {
 		return status
 	}
+	leaseSnapshot := p.leases.PersistenceSnapshot(time.Now())
+	slices.SortFunc(leaseSnapshot, func(left, right SessionLease) int {
+		if left.ServiceID != right.ServiceID {
+			return bytes.Compare([]byte(left.ServiceID), []byte(right.ServiceID))
+		}
+		return bytes.Compare(left.NodeID[:], right.NodeID[:])
+	})
+	for _, lease := range leaseSnapshot {
+		if len(status.ServiceLeases) >= statusCandidateLimit {
+			break
+		}
+		tag := ""
+		if candidate, loaded := snapshot.Candidate(lease.NodeID); loaded && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
+			tag = safePersistentTag(candidate.PrimaryTag)
+		}
+		status.ServiceLeases = append(status.ServiceLeases, adapter.AdaptiveServiceLease{
+			ServiceID: lease.ServiceID, Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
+			ExpiresAt: lease.ExpiresAt, UpdatedAt: lease.UpdatedAt,
+		})
+	}
 	status.Generation = snapshot.Generation
 	status.CandidateCount = len(snapshot.Candidates)
 	status.DuplicatesSuppressed = snapshot.DuplicatesSuppressed

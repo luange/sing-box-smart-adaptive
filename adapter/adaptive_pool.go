@@ -45,6 +45,15 @@ type AdaptiveSwitchAudit struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
+type AdaptiveServiceLease struct {
+	ServiceID string    `json:"service_id"`
+	Mode      string    `json:"mode"`
+	NodeID    string    `json:"node_id"`
+	Tag       string    `json:"tag,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type AdaptivePoolStatus struct {
 	Shadow                          bool                      `json:"shadow"`
 	Generation                      uint64                    `json:"generation"`
@@ -100,6 +109,7 @@ type AdaptivePoolStatus struct {
 	UpdatedAt                       time.Time                 `json:"updated_at,omitempty"`
 	Candidates                      []AdaptiveCandidateStatus `json:"candidates"`
 	RecentSwitches                  []AdaptiveSwitchAudit     `json:"recent_switches,omitempty"`
+	ServiceLeases                   []AdaptiveServiceLease    `json:"service_leases,omitempty"`
 }
 
 type AdaptivePoolGroup interface {
