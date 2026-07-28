@@ -120,6 +120,30 @@ func TestTCPEarlyTLSFailurePenalizesServiceAndInvalidatesLease(t *testing.T) {
 	_ = wrapped.Close()
 }
 
+func TestDestinationTransportFailureInvalidatesStickyLease(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{85}, "dial-timeout", newTestOutbound("dial-timeout")))
+	service := testBusinessService(N.NetworkTCP)
+	handle := snapshot.Candidates[0].Handle
+	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+	permit, allowed := health.TryAcquireConnectionPermitHandle(handle, service.Transport, time.Now())
+	if !allowed {
+		t.Fatal("transport attempt was not admitted")
+	}
+	attempt, err := pool.beginObservationAttempt(snapshot, snapshot.Candidates[0], permit, service.Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.completeTransportAttempt(attempt, service, context.DeadlineExceeded, time.Second, false, false)
+	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
+		t.Fatal("failed destination transport lease was retained")
+	}
+	status := health.StatusHandle(handle, DomainTransport, service.Transport, "")
+	if status.Failures != 1 || status.Reason != context.DeadlineExceeded.Error() {
+		t.Fatalf("transport failure was not reduced: %+v", status)
+	}
+}
+
 func TestTCPOrdinaryEarlyEOFDoesNotPenalizeService(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{84}, "plain-eof", newTestOutbound("plain-eof")))

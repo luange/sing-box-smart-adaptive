@@ -686,7 +686,7 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		return nil, err
 	}
 	startedAt := time.Now()
-	conn, candidate, err := p.runner.Dial(ctx, network, destination, plan, p.beginDialAttempt(snapshot, N.NetworkName(network)))
+	conn, candidate, err := p.runner.Dial(ctx, network, destination, plan, p.beginDialAttempt(snapshot, serviceContext))
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()
@@ -705,22 +705,22 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
 }
 
-func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, transport string) AttemptBegin {
+func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, service ServiceContext) AttemptBegin {
 	if snapshot == nil || snapshot.RuntimeEpochID == 0 || snapshot.CatalogRevision == 0 || p.runtimeManager == nil {
 		return nil
 	}
 	return func(candidate Candidate, permit *AttemptPermit) (AttemptComplete, error) {
-		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, transport)
+		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, service.Transport)
 		if err != nil {
 			return nil, err
 		}
 		return func(result DialAttemptResult) {
-			p.completeTransportAttempt(attempt, result.Err, result.Delay, result.Deferred, result.Panic)
+			p.completeTransportAttempt(attempt, service, result.Err, result.Delay, result.Deferred, result.Panic)
 		}, nil
 	}
 }
 
-func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, attemptErr error, delay time.Duration, deferred, implementationFailure bool) {
+func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, service ServiceContext, attemptErr error, delay time.Duration, deferred, implementationFailure bool) {
 	defer attempt.lease.Release()
 	evidence := attempt.evidence
 	evidence.Source = SourceDial
@@ -743,6 +743,10 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, att
 	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
 	p.recordObservationResult(disposition, publishErr)
 	if publishErr == nil && disposition == IngestAccepted && evidence.Outcome == OutcomeFailure && evidence.Stage == StageDestinationTransport {
+		if service.Mode != ModeBulk {
+			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
+			p.persistState()
+		}
 		p.scheduleFailureProbe(evidence.Handle)
 	}
 }
@@ -845,7 +849,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 				permit.ReleaseDeferred()
 				return
 			}
-			p.completeTransportAttempt(observation, attemptErr, time.Since(startedAt), deferred, false)
+			p.completeTransportAttempt(observation, serviceContext, attemptErr, time.Since(startedAt), deferred, false)
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, p.runner.attemptTimeout)
 		var packetConn net.PacketConn
