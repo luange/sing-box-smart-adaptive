@@ -88,6 +88,55 @@ func TestTCPNoPayloadDoesNotCreateServiceFailure(t *testing.T) {
 	}
 }
 
+func TestTCPEarlyTLSFailurePenalizesServiceAndInvalidatesLease(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{83}, "tls-eof", newTestOutbound("tls-eof")))
+	service := testBusinessService(N.NetworkTCP)
+	handle := snapshot.Candidates[0].Handle
+	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+
+	local, peer := net.Pipe()
+	wrapped := pool.wrapBusinessConn(local, snapshot, snapshot.Candidates[0], service, time.Now())
+	clientHello := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
+	writeDone := make(chan error, 1)
+	go func() { _, writeErr := wrapped.Write(clientHello); writeDone <- writeErr }()
+	read := make([]byte, len(clientHello))
+	if _, err := io.ReadFull(peer, read); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.Close()
+	if count, err := wrapped.Read(make([]byte, 1)); count != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("early TLS EOF changed: count=%d err=%v", count, err)
+	}
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 1 || status.Successes != 0 || status.Reason != io.EOF.Error() {
+		t.Fatalf("early TLS failure was not reduced: %+v", status)
+	}
+	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
+		t.Fatal("failed TLS lease was retained")
+	}
+	_ = wrapped.Close()
+}
+
+func TestTCPOrdinaryEarlyEOFDoesNotPenalizeService(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{84}, "plain-eof", newTestOutbound("plain-eof")))
+	service := testBusinessService(N.NetworkTCP)
+	handle := snapshot.Candidates[0].Handle
+	local, peer := net.Pipe()
+	wrapped := pool.wrapBusinessConn(local, snapshot, snapshot.Candidates[0], service, time.Now())
+	go func() { _, _ = wrapped.Write([]byte("not tls")) }()
+	_, _ = io.ReadFull(peer, make([]byte, len("not tls")))
+	_ = peer.Close()
+	_, _ = wrapped.Read(make([]byte, 1))
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 0 {
+		t.Fatalf("ordinary EOF polluted service health: %+v", status)
+	}
+	_ = wrapped.Close()
+}
+
 type zeroReadConn struct{ net.Conn }
 
 func (*zeroReadConn) Read([]byte) (int, error) { return 0, nil }

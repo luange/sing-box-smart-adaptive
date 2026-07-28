@@ -24,8 +24,39 @@ type businessObservation struct {
 	evidence       ObservationEvidence
 	service        ServiceContext
 	payloadOnce    sync.Once
+	failureOnce    sync.Once
 	throughputOnce sync.Once
 	releaseOnce    sync.Once
+}
+
+func (o *businessObservation) observeTLSFailure(delay time.Duration, reason string) {
+	if o == nil {
+		return
+	}
+	o.failureOnce.Do(func() {
+		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, time.Now())
+		if !allowed {
+			o.pool.observationPermitBusy.Add(1)
+			return
+		}
+		evidence := o.evidence
+		evidence.Source = SourceTLS
+		evidence.Stage = StageServiceApplication
+		evidence.Confidence = ConfidenceHigh
+		evidence.Outcome = OutcomeFailure
+		evidence.Failure = FailureTLS
+		evidence.Delay = delay
+		evidence.At = time.Now()
+		evidence.Reason = reason
+		reducer := &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
+		o.pool.recordObservationResult(disposition, publishErr)
+		if publishErr == nil && disposition == IngestAccepted {
+			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+			o.pool.scheduleFailureProbe(o.evidence.Handle)
+			o.pool.persistState()
+		}
+	})
 }
 
 func (p *AdaptivePool) beginBusinessObservation(snapshot *ExecutionSnapshot, candidate Candidate, service ServiceContext) (*businessObservation, error) {
@@ -123,6 +154,7 @@ type observedConn struct {
 	closeErr    error
 	readBytes   atomic.Int64
 	writeBytes  atomic.Int64
+	tlsStarted  atomic.Bool
 }
 
 func (c *observedConn) observeRead(count int) {
@@ -135,6 +167,9 @@ func (c *observedConn) observeRead(count int) {
 func (c *observedConn) Read(payload []byte) (int, error) {
 	count, err := c.Conn.Read(payload)
 	c.observeRead(count)
+	if count == 0 && err != nil && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
+	}
 	if errors.Is(err, io.EOF) {
 		c.observeThroughput()
 		c.observation.release()
@@ -156,11 +191,18 @@ func (c *observedConn) observeThroughput() {
 }
 
 func (c *observedConn) Write(payload []byte) (int, error) {
+	if isTLSClientHello(payload) {
+		c.tlsStarted.Store(true)
+	}
 	count, err := c.Conn.Write(payload)
 	if count > 0 {
 		c.writeBytes.Add(int64(count))
 	}
 	return count, err
+}
+
+func isTLSClientHello(payload []byte) bool {
+	return len(payload) >= 6 && payload[0] == 0x16 && payload[1] == 0x03 && payload[5] == 0x01
 }
 
 func (c *observedConn) ReadFrom(reader io.Reader) (int64, error) {
@@ -221,6 +263,9 @@ func (c *observedExtendedConn) ReadBuffer(buffer *buf.Buffer) error {
 	before := buffer.Len()
 	err := c.extended.ReadBuffer(buffer)
 	c.observeRead(buffer.Len() - before)
+	if buffer.Len() == before && err != nil && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
+	}
 	if errors.Is(err, io.EOF) {
 		c.observation.release()
 	}
@@ -229,6 +274,9 @@ func (c *observedExtendedConn) ReadBuffer(buffer *buf.Buffer) error {
 
 func (c *observedExtendedConn) WriteBuffer(buffer *buf.Buffer) error {
 	count := buffer.Len()
+	if isTLSClientHello(buffer.Bytes()) {
+		c.tlsStarted.Store(true)
+	}
 	err := c.extended.WriteBuffer(buffer)
 	if err == nil && count > 0 {
 		c.writeBytes.Add(int64(count))
