@@ -114,7 +114,7 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		mode = ModeAdaptive
 	}
 	if len(eligible) == 0 {
-		if len(supported) > 0 && (mode == ModeAdaptive || mode == ModeBulk) {
+		if len(supported) > 0 && (mode == ModeAdaptive || mode == ModeLatency || mode == ModeBulk) {
 			plan := e.plan(snapshot, mode, ReasonWarmingFallback, service, limitCandidates(supported, e.maxAttempts))
 			plan.allowBlocked = true
 			return plan, nil
@@ -188,9 +188,15 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		return e.plan(snapshot, mode, ReasonBulkSpread, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeAdaptive:
 		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
+	case ModeLatency:
+		return e.plan(snapshot, mode, ReasonRanked, service, limitCandidates(eligible, e.maxAttempts)), nil
 	default:
 		return DecisionPlan{}, errors.New("adaptive policy mode is invalid")
 	}
+}
+
+func modeUsesLease(mode PolicyMode) bool {
+	return mode != ModeBulk && mode != ModeLatency
 }
 
 // candidatePriority combines generic endpoint health with transport- and

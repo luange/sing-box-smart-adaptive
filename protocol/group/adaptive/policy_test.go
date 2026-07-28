@@ -163,6 +163,19 @@ func TestPolicyUsesBoundedWarmingFallbackWhenEveryBreakerIsOpen(t *testing.T) {
 	}
 }
 
+func TestLatencyModeRanksWithoutCreatingLease(t *testing.T) {
+	health := NewHealthStore(time.Hour, 16)
+	fast := Candidate{ID: NodeID{1}, Handle: NodeHandle{NodeID: NodeID{1}, Slot: 1, Version: 1}, PrimaryTag: "fast"}
+	slow := Candidate{ID: NodeID{2}, Handle: NodeHandle{NodeID: NodeID{2}, Slot: 2, Version: 1}, PrimaryTag: "slow"}
+	health.Observe(Observation{NodeID: fast.ID, NodeSlot: fast.Handle.Slot, NodeVersion: fast.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 10 * time.Millisecond})
+	health.Observe(Observation{NodeID: slow.ID, NodeSlot: slow.Handle.Slot, NodeVersion: slow.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	service := ServiceContext{ID: "site:example.com", Mode: ModeLatency, Transport: N.NetworkTCP}
+	plan, err := NewPolicyEngine(health, 2, "fallback").Plan(testExecutionSnapshot(fast, slow), service, nil, nil)
+	if err != nil || len(plan.Candidates) != 2 || plan.Candidates[0].ID != fast.ID || modeUsesLease(plan.Mode) {
+		t.Fatalf("latency policy mismatch: plan=%+v err=%v", plan, err)
+	}
+}
+
 func TestAdaptivePoolDisablesPreMatchLeafSelection(t *testing.T) {
 	pool := new(AdaptivePool)
 	if _, loaded := any(pool).(adapter.PreMatchOutboundGroup); loaded {

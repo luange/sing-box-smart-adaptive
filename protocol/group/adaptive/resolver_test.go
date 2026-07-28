@@ -18,14 +18,46 @@ func TestServiceResolverBindsYouTubeCrossDomainSession(t *testing.T) {
 	control := resolver.Resolve(metadata, M.ParseSocksaddr("www.youtube.com:443"), N.NetworkTCP)
 	media := resolver.Resolve(metadata, M.ParseSocksaddr("r1---sn.example.googlevideo.com:443"), N.NetworkUDP)
 	image := resolver.Resolve(metadata, M.ParseSocksaddr("i.ytimg.com:443"), N.NetworkTCP)
-	if control.ID != "youtube" || media.ID != "youtube" || image.ID != "youtube" {
-		t.Fatalf("YouTube domains split across services: %q %q %q", control.ID, media.ID, image.ID)
+	avatar := resolver.Resolve(metadata, M.ParseSocksaddr("yt3.ggpht.com:443"), N.NetworkTCP)
+	if control.ID != "youtube" || media.ID != "youtube" || image.ID != "youtube" || avatar.ID != "youtube" {
+		t.Fatalf("YouTube domains split across services: %q %q %q %q", control.ID, media.ID, image.ID, avatar.ID)
 	}
-	if control.Session != media.Session || control.Session != image.Session {
+	if control.Session != media.Session || control.Session != image.Session || control.Session != avatar.Session {
 		t.Fatal("YouTube TCP/UDP domains did not share one session lease")
 	}
 	if control.Mode != ModeStrictAffinity {
 		t.Fatalf("YouTube did not use strict affinity: %s", control.Mode)
+	}
+}
+
+func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000")}
+	tests := map[string]string{
+		"accounts.google.com": "google_account", "payments.google.com": "google_account",
+		"challenges.cloudflare.com": "cloudflare_challenge", "web.whatsapp.com": "whatsapp", "mmg.whatsapp.net": "whatsapp",
+	}
+	for host, expected := range tests {
+		if got := resolver.Resolve(client, M.ParseSocksaddr(host+":443"), N.NetworkTCP); got.ID != expected || got.Mode != ModeStrictAffinity {
+			t.Fatalf("service family mismatch host=%s got=%+v", host, got)
+		}
+	}
+}
+
+func TestServiceResolverFakeIPAndQUICMetadataPriority(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	metadata := &adapter.InboundContext{
+		Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000"), FakeIP: true,
+		Domain: "r1.googlevideo.com", SniffHost: "unrelated.example", Destination: M.ParseSocksaddr("198.18.0.1:443"),
+	}
+	if got := resolver.Resolve(metadata, metadata.Destination, N.NetworkUDP); got.ID != "youtube" {
+		t.Fatalf("FakeIP reverse domain did not win: %+v", got)
+	}
+	metadata.Domain = ""
+	metadata.SniffHost = "api.openai.com"
+	metadata.Protocol = "quic"
+	if got := resolver.Resolve(metadata, metadata.Destination, N.NetworkUDP); got.ID != "openai_api" || got.Transport != N.NetworkUDP {
+		t.Fatalf("QUIC sniff host did not determine service: %+v", got)
 	}
 }
 

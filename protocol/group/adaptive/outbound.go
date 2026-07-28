@@ -105,6 +105,8 @@ type AdaptivePool struct {
 	observationIdentityFailure atomic.Uint64
 	observationPanic           atomic.Uint64
 	observationPermitBusy      atomic.Uint64
+	businessTLSFailures        atomic.Uint64
+	transportFailures          atomic.Uint64
 	observationReducerHook     func(ObservationEvidence, []DomainEvidence) error
 	observationAccess          sync.Mutex
 	observationIngestor        *ObservationIngestor
@@ -112,6 +114,7 @@ type AdaptivePool struct {
 	statePersistenceFailures   atomic.Uint64
 	stateWriter                *adaptiveStateWriter
 	control                    *ControlState
+	switchAudit                *SwitchAuditStore
 	catalogAccess              sync.Mutex
 	preparedIdentity           *PreparedIdentity
 	preparedExecution          *PreparedExecution
@@ -247,7 +250,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	if defaultMode == "" {
 		defaultMode = ModeAdaptive
 	}
-	if defaultMode != ModeAdaptive && defaultMode != ModeStrictAffinity && defaultMode != ModeBulk {
+	if defaultMode != ModeAdaptive && defaultMode != ModeStrictAffinity && defaultMode != ModeLatency && defaultMode != ModeBulk {
 		return nil, E.New("unknown adaptive default policy: ", defaultMode)
 	}
 	strictLeaseTTL := time.Duration(options.Policy.StrictLeaseTTL)
@@ -351,6 +354,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		strictLeaseTTL:          strictLeaseTTL,
 		adaptiveLeaseTTL:        adaptiveLeaseTTL,
 		control:                 new(ControlState),
+		switchAudit:             NewSwitchAuditStore(),
 		observationIngestor:     NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
@@ -670,14 +674,14 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	var lease SessionLease
 	var reservation *LeaseReservation
 	var err error
-	if serviceContext.Mode != ModeBulk {
+	if modeUsesLease(serviceContext.Mode) {
 		lease, reservation, err = p.leases.Reserve(ctx, serviceContext.Session, time.Now())
 		if err != nil {
 			return nil, err
 		}
 	}
 	var leasePointer *SessionLease
-	if serviceContext.Mode != ModeBulk && reservation == nil {
+	if modeUsesLease(serviceContext.Mode) && reservation == nil {
 		leasePointer = &lease
 	}
 	pinned := p.pinnedNodeID()
@@ -696,13 +700,15 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		}
 		return nil, err
 	}
-	if serviceContext.Mode != ModeBulk {
+	if modeUsesLease(serviceContext.Mode) {
+		previous := NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}
 		ttl := p.leaseTTL(serviceContext.Mode)
 		if reservation != nil {
 			reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 		} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
 			p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 		}
+		p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 	}
 	p.setLatest(candidate.PrimaryTag)
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
@@ -786,7 +792,13 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
 	p.recordObservationResult(disposition, publishErr)
 	if publishErr == nil && disposition == IngestAccepted && evidence.Outcome == OutcomeFailure && evidence.Stage == StageDestinationTransport {
-		if service.Mode != ModeBulk {
+		p.transportFailures.Add(1)
+		if snapshot := p.catalog.load(); snapshot != nil {
+			if candidate, loaded := snapshot.Candidate(evidence.Handle.NodeID); loaded {
+				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, evidence.At)
+			}
+		}
+		if modeUsesLease(service.Mode) {
 			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
 			p.persistState()
 		}
@@ -856,14 +868,14 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	var lease SessionLease
 	var reservation *LeaseReservation
 	var err error
-	if serviceContext.Mode != ModeBulk {
+	if modeUsesLease(serviceContext.Mode) {
 		lease, reservation, err = p.leases.Reserve(ctx, serviceContext.Session, time.Now())
 		if err != nil {
 			return nil, err
 		}
 	}
 	var leasePointer *SessionLease
-	if serviceContext.Mode != ModeBulk && reservation == nil {
+	if modeUsesLease(serviceContext.Mode) && reservation == nil {
 		leasePointer = &lease
 	}
 	plan, err := p.policy.Plan(snapshot, serviceContext, leasePointer, p.pinnedNodeID())
@@ -929,13 +941,15 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 		// PacketConn creation proves destination transport setup only. Actual UDP
 		// response evidence and its epoch lease belong to B2b.
 		settle(nil, false)
-		if serviceContext.Mode != ModeBulk {
+		if modeUsesLease(serviceContext.Mode) {
+			previous := NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}
 			ttl := p.leaseTTL(serviceContext.Mode)
 			if reservation != nil {
 				reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 			} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
 				p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 			}
+			p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 		}
 		p.setLatest(candidate.PrimaryTag)
 		return p.wrapBusinessPacketConn(packetConn, snapshot, candidate, serviceContext, startedAt), nil
@@ -1047,6 +1061,9 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	status.ObservationIdentityFailureTotal = p.observationIdentityFailure.Load()
 	status.ObservationPanicTotal = p.observationPanic.Load()
 	status.ObservationPermitBusyTotal = p.observationPermitBusy.Load()
+	status.BusinessTLSFailuresTotal = p.businessTLSFailures.Load()
+	status.TransportFailuresTotal = p.transportFailures.Load()
+	status.RecentSwitches, status.SelectionSwitchesTotal = p.switchAudit.Snapshot()
 	status.DeltaAppliedTotal = p.deltaAppliedTotal.Load()
 	status.DeltaFallbackTotal = p.deltaFallbackTotal.Load()
 	if p.control == nil {

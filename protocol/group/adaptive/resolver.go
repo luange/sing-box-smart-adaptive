@@ -19,6 +19,7 @@ type PolicyMode string
 const (
 	ModeStrictAffinity PolicyMode = "strict-affinity"
 	ModeAdaptive       PolicyMode = "adaptive"
+	ModeLatency        PolicyMode = "latency"
 	ModeBulk           PolicyMode = "bulk"
 	ModeManual         PolicyMode = "manual"
 )
@@ -84,7 +85,7 @@ func (r *ServiceResolver) SetOverride(serviceID string, mode PolicyMode, ttl tim
 	if serviceID == "" || len(serviceID) > 128 || strings.ContainsAny(serviceID, "?\n\r") || ttl < time.Minute || ttl > 24*time.Hour {
 		return errors.New("adaptive service override is invalid")
 	}
-	if mode != ModeStrictAffinity && mode != ModeAdaptive && mode != ModeBulk {
+	if mode != ModeStrictAffinity && mode != ModeAdaptive && mode != ModeLatency && mode != ModeBulk {
 		return errors.New("adaptive service override mode is invalid")
 	}
 	r.access.Lock()
@@ -133,7 +134,7 @@ func (r *ServiceResolver) override(serviceID string, now time.Time) (ServiceOver
 func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMode) {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	switch {
-	case domainMatches(host, "youtube.com", "youtu.be", "ytimg.com", "googlevideo.com", "youtube-nocookie.com"):
+	case domainMatches(host, "youtube.com", "youtu.be", "ytimg.com", "ggpht.com", "googlevideo.com", "youtube-nocookie.com"):
 		return "youtube", ModeStrictAffinity
 	case domainMatches(host, "gemini.google.com", "bard.google.com", "generativelanguage.googleapis.com"):
 		return "gemini", ModeStrictAffinity
@@ -145,6 +146,12 @@ func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMo
 		return "claude", ModeStrictAffinity
 	case domainMatches(host, "telegram.org", "t.me", "telegram.me", "telegram.dog"):
 		return "telegram", ModeStrictAffinity
+	case domainMatches(host, "accounts.google.com", "oauth2.googleapis.com", "securetoken.googleapis.com", "pay.google.com", "payments.google.com", "payments.googleusercontent.com"):
+		return "google_account", ModeStrictAffinity
+	case domainMatches(host, "challenges.cloudflare.com", "turnstile.cloudflare.com"):
+		return "cloudflare_challenge", ModeStrictAffinity
+	case domainMatches(host, "whatsapp.com", "whatsapp.net", "wa.me"):
+		return "whatsapp", ModeStrictAffinity
 	}
 	if host == "" {
 		return "unknown", defaultMode

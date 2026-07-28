@@ -52,6 +52,12 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
 		if publishErr == nil && disposition == IngestAccepted {
+			o.pool.businessTLSFailures.Add(1)
+			if snapshot := o.pool.catalog.load(); snapshot != nil {
+				if candidate, loaded := snapshot.Candidate(o.evidence.Handle.NodeID); loaded {
+					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, evidence.At)
+				}
+			}
 			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
 			o.pool.scheduleFailureProbe(o.evidence.Handle)
 			o.pool.persistState()

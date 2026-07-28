@@ -34,6 +34,17 @@ type AdaptiveCandidateStatus struct {
 	Reason                string    `json:"reason,omitempty"`
 }
 
+type AdaptiveSwitchAudit struct {
+	ServiceID  string    `json:"service_id"`
+	OldNodeID  string    `json:"old_node_id,omitempty"`
+	OldTag     string    `json:"old_tag,omitempty"`
+	NewNodeID  string    `json:"new_node_id,omitempty"`
+	NewTag     string    `json:"new_tag,omitempty"`
+	Reason     string    `json:"reason"`
+	Failure    string    `json:"failure,omitempty"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
 type AdaptivePoolStatus struct {
 	Shadow                          bool                      `json:"shadow"`
 	Generation                      uint64                    `json:"generation"`
@@ -72,6 +83,9 @@ type AdaptivePoolStatus struct {
 	ObservationIdentityFailureTotal uint64                    `json:"observation_identity_failure_total"`
 	ObservationPanicTotal           uint64                    `json:"observation_panic_total"`
 	ObservationPermitBusyTotal      uint64                    `json:"observation_permit_busy_total"`
+	BusinessTLSFailuresTotal        uint64                    `json:"business_tls_failures_total"`
+	TransportFailuresTotal          uint64                    `json:"transport_failures_total"`
+	SelectionSwitchesTotal          uint64                    `json:"selection_switches_total"`
 	Mode                            string                    `json:"mode"`
 	Pinned                          string                    `json:"pinned,omitempty"`
 	ActiveLeases                    int                       `json:"active_leases"`
@@ -85,6 +99,7 @@ type AdaptivePoolStatus struct {
 	DeltaFallbackTotal              uint64                    `json:"delta_fallback_total"`
 	UpdatedAt                       time.Time                 `json:"updated_at,omitempty"`
 	Candidates                      []AdaptiveCandidateStatus `json:"candidates"`
+	RecentSwitches                  []AdaptiveSwitchAudit     `json:"recent_switches,omitempty"`
 }
 
 type AdaptivePoolGroup interface {
