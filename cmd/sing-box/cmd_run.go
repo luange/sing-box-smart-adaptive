@@ -171,6 +171,13 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 }
 
 func run() error {
+	diagnosticServer, err := startRuntimeDiagnostics()
+	if err != nil {
+		return E.Cause(err, "start runtime diagnostics")
+	}
+	if diagnosticServer != nil {
+		defer diagnosticServer.Close()
+	}
 	optionsList, err := readConfig()
 	if err != nil {
 		return err
