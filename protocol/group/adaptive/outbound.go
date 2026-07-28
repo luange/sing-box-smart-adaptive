@@ -359,16 +359,26 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
 	pool.loadPersistentState()
-	pool.stateWriter = newAdaptiveStateWriter(pool)
 	return pool, nil
 }
 
 func (p *AdaptivePool) Start() error {
+	// Configuration checks construct outbounds but do not start them. Starting
+	// the writer in New leaked one goroutine and retained the entire validation
+	// Box on every reload because an unstarted outbound manager has nothing to
+	// close. Background ownership begins only with the real runtime lifecycle.
+	if p.stateWriter == nil {
+		p.stateWriter = newAdaptiveStateWriter(p)
+	}
 	if err := p.source.Start(p.onSourceUpdated); err != nil {
+		p.stateWriter.Close()
+		p.stateWriter = nil
 		return err
 	}
 	if err := p.rebuild(); err != nil {
 		_ = p.source.Close()
+		p.stateWriter.Close()
+		p.stateWriter = nil
 		return err
 	}
 	return nil

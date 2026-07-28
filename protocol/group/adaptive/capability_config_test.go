@@ -76,6 +76,9 @@ func TestAdaptivePoolCapabilityConfigIsExplicitAndDoesNotFetchDuringNew(t *testi
 	if pool.capabilityProvider == nil || pool.capabilityController != nil {
 		t.Fatal("valid capability config fetched or started before publish")
 	}
+	if pool.stateWriter != nil {
+		t.Fatal("configuration construction started the state writer before runtime Start")
+	}
 	if pool.statePersistenceFailures.Load() != 1 {
 		t.Fatalf("corrupt state blocked New or was not reported: %d", pool.statePersistenceFailures.Load())
 	}
