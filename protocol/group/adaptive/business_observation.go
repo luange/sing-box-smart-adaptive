@@ -1,6 +1,7 @@
 package adaptive
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -174,7 +175,7 @@ func (c *observedConn) observeRead(count int) {
 func (c *observedConn) Read(payload []byte) (int, error) {
 	count, err := c.Conn.Read(payload)
 	c.observeRead(count)
-	if count == 0 && err != nil && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+	if count == 0 && actionableEarlyTLSError(err) && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
 		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
 	}
 	if errors.Is(err, io.EOF) {
@@ -182,6 +183,17 @@ func (c *observedConn) Read(payload []byte) (int, error) {
 		c.observation.release()
 	}
 	return count, err
+}
+
+func actionableEarlyTLSError(err error) bool {
+	// A zero-byte EOF is ambiguous: browsers routinely abandon speculative
+	// address/HTTP3 races and some proxy transports surface that local decision
+	// as EOF. Penalizing it caused healthy AI nodes to flap. Explicit reset,
+	// timeout, and protocol errors remain actionable evidence.
+	return err != nil &&
+		!errors.Is(err, io.EOF) &&
+		!errors.Is(err, net.ErrClosed) &&
+		!errors.Is(err, context.Canceled)
 }
 
 func (c *observedConn) Close() error {

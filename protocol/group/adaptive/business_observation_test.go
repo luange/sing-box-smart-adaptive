@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -88,34 +89,57 @@ func TestTCPNoPayloadDoesNotCreateServiceFailure(t *testing.T) {
 	}
 }
 
-func TestTCPEarlyTLSFailurePenalizesServiceAndInvalidatesLease(t *testing.T) {
+func TestTCPEarlyTLSResetPenalizesServiceAndInvalidatesLease(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
-	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{83}, "tls-eof", newTestOutbound("tls-eof")))
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{83}, "tls-reset", newTestOutbound("tls-reset")))
 	service := testBusinessService(N.NetworkTCP)
 	handle := snapshot.Candidates[0].Handle
 	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
 
-	local, peer := net.Pipe()
-	wrapped := pool.wrapBusinessConn(local, snapshot, snapshot.Candidates[0], service, time.Now())
+	wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{readErr: syscall.ECONNRESET}, snapshot, snapshot.Candidates[0], service, time.Now())
 	clientHello := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
-	writeDone := make(chan error, 1)
-	go func() { _, writeErr := wrapped.Write(clientHello); writeDone <- writeErr }()
-	read := make([]byte, len(clientHello))
-	if _, err := io.ReadFull(peer, read); err != nil {
+	if _, err := wrapped.Write(clientHello); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
+	if count, err := wrapped.Read(make([]byte, 1)); count != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("early TLS reset changed: count=%d err=%v", count, err)
 	}
-	_ = peer.Close()
-	if count, err := wrapped.Read(make([]byte, 1)); count != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("early TLS EOF changed: count=%d err=%v", count, err)
-	}
-	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 1 || status.Successes != 0 || status.Reason != io.EOF.Error() {
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 1 || status.Successes != 0 || status.Reason != syscall.ECONNRESET.Error() {
 		t.Fatalf("early TLS failure was not reduced: %+v", status)
 	}
 	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
 		t.Fatal("failed TLS lease was retained")
+	}
+	_ = wrapped.Close()
+}
+
+type earlyTLSErrorConn struct {
+	readErr error
+}
+
+func (c *earlyTLSErrorConn) Read([]byte) (int, error)        { return 0, c.readErr }
+func (*earlyTLSErrorConn) Write(payload []byte) (int, error) { return len(payload), nil }
+func (*earlyTLSErrorConn) Close() error                      { return nil }
+func (*earlyTLSErrorConn) LocalAddr() net.Addr               { return &net.TCPAddr{Port: 1} }
+func (*earlyTLSErrorConn) RemoteAddr() net.Addr              { return &net.TCPAddr{Port: 2} }
+func (*earlyTLSErrorConn) SetDeadline(time.Time) error       { return nil }
+func (*earlyTLSErrorConn) SetReadDeadline(time.Time) error   { return nil }
+func (*earlyTLSErrorConn) SetWriteDeadline(time.Time) error  { return nil }
+
+func TestTCPEarlyTLSEOFIsAmbiguousAndDoesNotPenalize(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{87}, "tls-eof", newTestOutbound("tls-eof")))
+	service := testBusinessService(N.NetworkTCP)
+	handle := snapshot.Candidates[0].Handle
+	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+	wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{readErr: io.EOF}, snapshot, snapshot.Candidates[0], service, time.Now())
+	_, _ = wrapped.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01})
+	_, _ = wrapped.Read(make([]byte, 1))
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 0 {
+		t.Fatalf("ambiguous TLS EOF polluted service health: %+v", status)
+	}
+	if _, loaded := pool.leases.Peek(service.Session, time.Now()); !loaded {
+		t.Fatal("ambiguous TLS EOF invalidated the service lease")
 	}
 	_ = wrapped.Close()
 }
