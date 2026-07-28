@@ -110,22 +110,27 @@ type CapabilitySuiteRequest struct {
 // in scheduler closures, while the shared scheduler coordinator remains pure
 // ownership data. Verdict publication is restricted to ProbeObservationSink.
 type CapabilityProbeSuite struct {
-	clock      Clock
-	scheduler  *ProbeScheduler
-	targets    ProbeTargetProvider
-	runner     *CapabilityProbeRunner
-	aggregator *ProbeAggregator
-	sessions   CapabilityObservationSessionFactory
+	clock          Clock
+	scheduler      *ProbeScheduler
+	targets        ProbeTargetProvider
+	runner         *CapabilityProbeRunner
+	aggregator     *ProbeAggregator
+	sessions       CapabilityObservationSessionFactory
+	exitIdentities *ExitIdentityStore
 }
 
-func NewCapabilityProbeSuite(clock Clock, scheduler *ProbeScheduler, targets ProbeTargetProvider, runner *CapabilityProbeRunner, aggregator *ProbeAggregator, sessions CapabilityObservationSessionFactory) (*CapabilityProbeSuite, error) {
+func NewCapabilityProbeSuite(clock Clock, scheduler *ProbeScheduler, targets ProbeTargetProvider, runner *CapabilityProbeRunner, aggregator *ProbeAggregator, sessions CapabilityObservationSessionFactory, exitIdentities ...*ExitIdentityStore) (*CapabilityProbeSuite, error) {
 	if clock == nil {
 		clock = realClock{}
 	}
 	if scheduler == nil || targets == nil || runner == nil || aggregator == nil || sessions == nil {
 		return nil, errors.New("adaptive capability probe suite dependency is nil")
 	}
-	return &CapabilityProbeSuite{clock: clock, scheduler: scheduler, targets: targets, runner: runner, aggregator: aggregator, sessions: sessions}, nil
+	var identityStore *ExitIdentityStore
+	if len(exitIdentities) > 0 {
+		identityStore = exitIdentities[0]
+	}
+	return &CapabilityProbeSuite{clock: clock, scheduler: scheduler, targets: targets, runner: runner, aggregator: aggregator, sessions: sessions, exitIdentities: identityStore}, nil
 }
 
 func (s *CapabilityProbeSuite) Run(ctx context.Context, request CapabilitySuiteRequest) (ProbeRunResult, error) {
@@ -442,6 +447,13 @@ func (s *CapabilityProbeSuite) probeTask(spec ProbeRunSpec, node CapabilitySuite
 			holder.access.Unlock()
 			classification := ProbeSampleClassification{Class: ProbeSampleDeferred, Failure: FailureCanceled}
 			if set && scheduled.Outcome != OutcomeDeferred {
+				if target.Capability == ProbeCapabilityExitIdentity && raw.hasIdentityToken && s.exitIdentities != nil {
+					changed, accepted := s.exitIdentities.Observe(node.Handle, raw.identityToken)
+					raw.identityChanged = changed
+					if !accepted {
+						raw.hasIdentityToken = false
+					}
+				}
 				classification = ClassifyProbeResult(target, raw, s.clock.Now())
 			}
 			sample := ProbeSample{

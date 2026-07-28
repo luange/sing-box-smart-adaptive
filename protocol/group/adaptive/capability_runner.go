@@ -119,10 +119,16 @@ func (r *CapabilityProbeRunner) Run(ctx context.Context, dialer N.Dialer, target
 	}
 	if target.Capability == ProbeCapabilityRange && target.Range != nil {
 		limit = target.Range.Len() + 1
+	} else if target.Capability == ProbeCapabilityExitIdentity {
+		limit = 65
 	}
 	payload, readErr := io.ReadAll(io.LimitReader(response.Body, limit))
 	result.BytesRead = int64(len(payload))
-	if len(payload) > 0 {
+	if target.Capability == ProbeCapabilityExitIdentity {
+		if result.StatusCode == http.StatusOK && len(payload) <= 64 {
+			result.identityToken, result.hasIdentityToken = tokenizeExitIdentity(payload)
+		}
+	} else if len(payload) > 0 {
 		prefixLength := min(len(payload), probePayloadPrefix)
 		result.PayloadPrefix = append([]byte(nil), payload[:prefixLength]...)
 		result.Digest = sha256.Sum256(payload)

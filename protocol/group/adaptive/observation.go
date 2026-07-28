@@ -43,6 +43,7 @@ const (
 	FailureProtocol  FailureClass = "protocol"
 	FailureHTTPBlock FailureClass = "http_block"
 	FailureNoPayload FailureClass = "no_payload"
+	FailureIdentity  FailureClass = "identity_changed"
 	FailureCanceled  FailureClass = "canceled"
 )
 

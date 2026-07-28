@@ -82,6 +82,8 @@ type AdaptivePoolStatus struct {
 	CapabilitySuiteFailures         uint64                    `json:"capability_suite_failures"`
 	CapabilityLastFailureStage      string                    `json:"capability_last_failure_stage,omitempty"`
 	CapabilityTargetGeneration      uint64                    `json:"capability_target_generation"`
+	ExitIdentityBaselines           uint64                    `json:"exit_identity_baselines"`
+	ExitIdentityChangesTotal        uint64                    `json:"exit_identity_changes_total"`
 	StateEntries                    int                       `json:"state_entries"`
 	StateEvictions                  uint64                    `json:"state_evictions"`
 	StatePersistenceFailures        uint64                    `json:"state_persistence_failures"`

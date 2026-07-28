@@ -41,13 +41,14 @@ const (
 type ProbeCapability string
 
 const (
-	ProbeCapabilityEndpoint ProbeCapability = "endpoint"
-	ProbeCapabilityTLS      ProbeCapability = "tls"
-	ProbeCapabilityAuthHTTP ProbeCapability = "auth_http"
-	ProbeCapabilityWebWAF   ProbeCapability = "web_waf"
-	ProbeCapabilityHTTP     ProbeCapability = "http"
-	ProbeCapabilityHTTP3    ProbeCapability = "http3"
-	ProbeCapabilityRange    ProbeCapability = "range"
+	ProbeCapabilityEndpoint     ProbeCapability = "endpoint"
+	ProbeCapabilityTLS          ProbeCapability = "tls"
+	ProbeCapabilityAuthHTTP     ProbeCapability = "auth_http"
+	ProbeCapabilityWebWAF       ProbeCapability = "web_waf"
+	ProbeCapabilityHTTP         ProbeCapability = "http"
+	ProbeCapabilityHTTP3        ProbeCapability = "http3"
+	ProbeCapabilityRange        ProbeCapability = "range"
+	ProbeCapabilityExitIdentity ProbeCapability = "exit_identity"
 )
 
 const minimumProbeTargetValidity = 30 * time.Second
@@ -119,7 +120,7 @@ func NewProbeTarget(rawURL string, generation uint64, capability ProbeCapability
 	if generation == 0 || issuedAt.IsZero() || !expiresAt.After(issuedAt) {
 		return ProbeTarget{}, errors.New("adaptive probe target lifetime is invalid")
 	}
-	if capability != ProbeCapabilityEndpoint && capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF && capability != ProbeCapabilityHTTP && capability != ProbeCapabilityHTTP3 && capability != ProbeCapabilityRange {
+	if capability != ProbeCapabilityEndpoint && capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF && capability != ProbeCapabilityHTTP && capability != ProbeCapabilityHTTP3 && capability != ProbeCapabilityRange && capability != ProbeCapabilityExitIdentity {
 		return ProbeTarget{}, errors.New("adaptive probe target capability is invalid")
 	}
 	if capability == ProbeCapabilityRange && (byteRange == nil || byteRange.Len() == 0) {
@@ -131,7 +132,7 @@ func NewProbeTarget(rawURL string, generation uint64, capability ProbeCapability
 	executionHost := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	target := ProbeTarget{
 		ID: id, Generation: generation, Host: redactProbeHost(executionHost), Capability: capability,
-		RequireTLS: strings.EqualFold(parsed.Scheme, "https"), RequirePayload: capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF,
+		RequireTLS: strings.EqualFold(parsed.Scheme, "https"), RequirePayload: capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF && capability != ProbeCapabilityExitIdentity,
 		Range: cloneProbeRange(byteRange), IssuedAt: issuedAt, ExpiresAt: expiresAt,
 		secretURL: &redactedProbeURL{value: rawURL}, secretHost: &redactedProbeURL{value: executionHost},
 	}
@@ -373,6 +374,9 @@ type ProbeRawResult struct {
 	Digest              [32]byte
 	HasDigest           bool
 	Delay               time.Duration
+	identityToken       [16]byte
+	hasIdentityToken    bool
+	identityChanged     bool
 }
 
 type ProbeSampleClass string
@@ -419,6 +423,15 @@ func ClassifyProbeResult(target ProbeTarget, raw ProbeRawResult, now time.Time) 
 		return ProbeSampleClassification{Class: ProbeSampleNodeFailure, Failure: FailureTLS}
 	}
 	if target.Capability == ProbeCapabilityTLS {
+		return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
+	}
+	if target.Capability == ProbeCapabilityExitIdentity {
+		if !raw.hasIdentityToken {
+			return ProbeSampleClassification{Class: ProbeSampleTargetFault, Failure: FailureProtocol}
+		}
+		if raw.identityChanged {
+			return ProbeSampleClassification{Class: ProbeSampleNodeFailure, Failure: FailureIdentity}
+		}
 		return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
 	}
 	if target.Capability == ProbeCapabilityAuthHTTP {

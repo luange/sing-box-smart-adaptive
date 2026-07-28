@@ -15,11 +15,12 @@ type builtinServiceTarget struct {
 }
 
 var builtinAIServiceTargets = map[string]builtinServiceTarget{
-	"youtube":     {url: "https://www.youtube.com/", capability: ProbeCapabilityTLS},
-	"gemini":      {url: "https://www.google.com/", capability: ProbeCapabilityTLS},
-	"openai_api":  {url: "https://api.openai.com/v1/models", capability: ProbeCapabilityAuthHTTP},
-	"chatgpt_web": {url: "https://chatgpt.com/", capability: ProbeCapabilityWebWAF},
-	"claude":      {url: "https://api.anthropic.com/v1/models", capability: ProbeCapabilityAuthHTTP},
+	"youtube":       {url: "https://www.youtube.com/", capability: ProbeCapabilityTLS},
+	"gemini":        {url: "https://www.google.com/", capability: ProbeCapabilityTLS},
+	"openai_api":    {url: "https://api.openai.com/v1/models", capability: ProbeCapabilityAuthHTTP},
+	"chatgpt_web":   {url: "https://chatgpt.com/", capability: ProbeCapabilityWebWAF},
+	"claude":        {url: "https://api.anthropic.com/v1/models", capability: ProbeCapabilityAuthHTTP},
+	"exit_identity": {url: "https://api.ipify.org/", capability: ProbeCapabilityExitIdentity},
 }
 
 // BuiltinYouTubeTLSTargetProvider supplies a non-secret service target. It is
@@ -53,6 +54,29 @@ func NewBuiltinAIServiceTLSTargetProvider(clock Clock) (*BuiltinYouTubeTLSTarget
 		clock: clock, services: []string{"youtube", "gemini", "openai_api", "chatgpt_web", "claude"},
 		snapshots: make(map[string]*ProbeTargetSnapshot),
 	}
+	if err := provider.Refresh(context.Background()); err != nil {
+		return nil, err
+	}
+	return provider, nil
+}
+
+func NewBuiltinCapabilityTargetProvider(clock Clock, includeYouTube, includeAI, includeExitIdentity bool) (*BuiltinYouTubeTLSTargetProvider, error) {
+	if clock == nil {
+		clock = realClock{}
+	}
+	services := make([]string, 0, 6)
+	if includeAI {
+		services = append(services, "youtube", "gemini", "openai_api", "chatgpt_web", "claude")
+	} else if includeYouTube {
+		services = append(services, "youtube")
+	}
+	if includeExitIdentity {
+		services = append(services, "exit_identity")
+	}
+	if len(services) == 0 {
+		return nil, errors.New("adaptive builtin capability set is empty")
+	}
+	provider := &BuiltinYouTubeTLSTargetProvider{clock: clock, services: services, snapshots: make(map[string]*ProbeTargetSnapshot)}
 	if err := provider.Refresh(context.Background()); err != nil {
 		return nil, err
 	}

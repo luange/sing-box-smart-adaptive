@@ -15,6 +15,7 @@ type AdaptivePoolCapabilityOptions struct {
 	Enabled             bool               `json:"enabled,omitempty"`
 	BuiltinYouTubeTLS   bool               `json:"builtin_youtube_tls,omitempty"`
 	BuiltinAIServiceTLS bool               `json:"builtin_ai_service_tls,omitempty"`
+	BuiltinExitIdentity bool               `json:"builtin_exit_identity,omitempty"`
 	ManifestURL         string             `json:"manifest_url,omitempty"`
 	TrustedKeys         map[string]string  `json:"trusted_keys,omitempty"`
 	RefreshInterval     badoption.Duration `json:"refresh_interval,omitempty"`

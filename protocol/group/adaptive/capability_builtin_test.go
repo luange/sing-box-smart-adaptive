@@ -75,3 +75,25 @@ func TestBuiltinAIServiceTargetsUseIndependentSafeProbeSemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestBuiltinExitIdentityCanShareBuiltinProvider(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
+	provider, err := NewBuiltinCapabilityTargetProvider(&fakeClock{now: now}, true, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.ServiceIDs(); len(got) != 2 || got[0] != "youtube" || got[1] != "exit_identity" {
+		t.Fatalf("unexpected builtin services: %v", got)
+	}
+	snapshot, err := provider.Snapshot(context.Background(), "exit_identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := snapshot.executionTargets(now)
+	if err != nil || len(targets) != 1 || targets[0].Capability != ProbeCapabilityExitIdentity {
+		t.Fatalf("unexpected exit identity target: targets=%+v err=%v", targets, err)
+	}
+	if formatted := fmt.Sprintf("%+v %#v", snapshot, targets[0]); strings.Contains(formatted, "ipify") {
+		t.Fatalf("exit identity endpoint leaked through formatting: %s", formatted)
+	}
+}

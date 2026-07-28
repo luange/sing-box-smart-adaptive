@@ -142,6 +142,7 @@ type AdaptivePool struct {
 	capabilityTimeout       time.Duration
 	capabilityQuorum        int
 	capabilityCommonModeMin int
+	exitIdentityStore       *ExitIdentityStore
 	capabilityInitFailures  atomic.Uint64
 	closing                 atomic.Bool
 }
@@ -187,7 +188,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			capabilityTimeout = defaultCapabilityTimeout
 		}
 		if capabilityQuorum == 0 {
-			if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS {
+			if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
 				capabilityQuorum = 1
 			} else {
 				capabilityQuorum = 2
@@ -202,20 +203,14 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		if options.Capability.BuiltinYouTubeTLS && options.Capability.BuiltinAIServiceTLS {
 			return nil, errors.New("adaptive builtin capability modes are ambiguous")
 		}
-		if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS {
+		if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
 			if capabilityQuorum != 1 {
 				return nil, errors.New("adaptive builtin capability requires quorum 1")
 			}
 			if options.Capability.ManifestURL != "" || len(options.Capability.TrustedKeys) != 0 {
 				return nil, errors.New("adaptive builtin capability cannot use manifest trust options")
 			}
-			var builtinProvider *BuiltinYouTubeTLSTargetProvider
-			var providerErr error
-			if options.Capability.BuiltinAIServiceTLS {
-				builtinProvider, providerErr = NewBuiltinAIServiceTLSTargetProvider(nil)
-			} else {
-				builtinProvider, providerErr = NewBuiltinYouTubeTLSTargetProvider(nil)
-			}
+			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, options.Capability.BuiltinAIServiceTLS, options.Capability.BuiltinExitIdentity)
 			if providerErr != nil {
 				return nil, errors.New("adaptive builtin capability is invalid")
 			}
@@ -237,6 +232,14 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			capabilityProvider = trustedProvider
 			capabilityServiceIDs = []string{youtubeProbeServiceID}
 		}
+	}
+	var exitIdentityStore *ExitIdentityStore
+	if options.Capability.Enabled && options.Capability.BuiltinExitIdentity {
+		identityStore, identityErr := NewExitIdentityStore(tag)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		exitIdentityStore = identityStore
 	}
 	stateRetention := time.Duration(options.State.Retention)
 	if stateRetention <= 0 {
@@ -334,6 +337,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		capabilityTimeout:       capabilityTimeout,
 		capabilityQuorum:        capabilityQuorum,
 		capabilityCommonModeMin: capabilityCommonModeMin,
+		exitIdentityStore:       exitIdentityStore,
 		probeRunner:             urltest.URLTest,
 		statePath:               statePath,
 		groupID:                 tag,
@@ -1187,6 +1191,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	p.lifecycleAccess.Unlock()
 	status.CapabilityEnabled = capabilityEnabled
 	status.CapabilityInitFailures = p.capabilityInitFailures.Load()
+	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal = p.exitIdentityStore.Stats()
 	for _, serviceID := range sortedCapabilityControllerIDs(capabilityControllers) {
 		capabilityStatus := capabilityControllers[serviceID].Status()
 		status.CapabilityRunning = status.CapabilityRunning || capabilityStatus.Running
@@ -1395,7 +1400,7 @@ func (p *AdaptivePool) startCapabilityControllerLocked(snapshot *ExecutionSnapsh
 		parent = context.Background()
 	}
 	for _, serviceID := range serviceIDs {
-		suite, err := NewCapabilityProbeSuite(nil, p.scheduler, p.capabilityProvider, runner, NewProbeAggregator(ProbeAggregatorConfig{}, nil, nil), sessions)
+		suite, err := NewCapabilityProbeSuite(nil, p.scheduler, p.capabilityProvider, runner, NewProbeAggregator(ProbeAggregatorConfig{}, nil, nil), sessions, p.exitIdentityStore)
 		if err != nil {
 			p.capabilityInitFailures.Add(1)
 			closeCapabilityControllers(controllers)

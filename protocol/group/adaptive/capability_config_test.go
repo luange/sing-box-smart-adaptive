@@ -148,3 +148,24 @@ func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing
 		t.Fatal("overlapping builtin capability modes were accepted")
 	}
 }
+
+func TestAdaptivePoolBuiltinExitIdentityConfiguresProcessStore(t *testing.T) {
+	ctx := service.ContextWith[adapter.OutboundManager](context.Background(), &capabilityConfigOutboundManager{})
+	options := option.AdaptivePoolOutboundOptions{
+		GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"node"}},
+		State:             option.AdaptivePoolStateOptions{Path: filepath.Join(t.TempDir(), "adaptive-state")},
+		Capability: option.AdaptivePoolCapabilityOptions{
+			Enabled: true, BuiltinExitIdentity: true,
+			RefreshInterval: badoption.Duration(time.Minute), Timeout: badoption.Duration(time.Second), Quorum: 1, CommonModeMinNodes: 2,
+		},
+	}
+	outbound, err := New(ctx, nil, nil, "builtin-exit-identity", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := outbound.(*AdaptivePool)
+	defer pool.Close()
+	if pool.exitIdentityStore == nil || len(pool.capabilityServiceIDs) != 1 || pool.capabilityServiceIDs[0] != "exit_identity" {
+		t.Fatalf("exit identity capability was not configured: services=%v store=%v", pool.capabilityServiceIDs, pool.exitIdentityStore)
+	}
+}

@@ -159,6 +159,37 @@ func TestCapabilityProbeRunnerRequiresRealHTTP3(t *testing.T) {
 	}
 }
 
+func TestCapabilityProbeRunnerExitIdentityKeepsAddressOutOfResult(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	target, err := NewProbeTarget("https://api.ipify.org/", 1, ProbeCapabilityExitIdentity, now.Add(-time.Minute), now.Add(time.Hour), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = NewExitIdentityStore("runner-exit-identity"); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewCapabilityProbeRunner(&fakeClock{now: now})
+	runner.httpClientFactory = func(context.Context, N.Dialer, ProbeTarget) (probeHTTPClient, error) {
+		return &probeHTTPClientFunc{do: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, TLS: &tls.ConnectionState{}, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("203.0.113.25\n"))}, nil
+		}}, nil
+	}
+	result := runner.Run(context.Background(), newTestOutbound("runner-exit-identity"), target)
+	if !result.hasIdentityToken || result.HasDigest || len(result.PayloadPrefix) != 0 || result.BytesRead == 0 {
+		t.Fatalf("unexpected exit identity result shape: %+v", result)
+	}
+	if formatted := fmt.Sprintf("%+v", result); strings.Contains(formatted, "203.0.113.25") {
+		t.Fatalf("raw exit identity leaked through result formatting: %s", formatted)
+	}
+	if classification := ClassifyProbeResult(target, result, now); classification.Class != ProbeSampleSuccess {
+		t.Fatalf("valid exit identity was rejected: %+v", classification)
+	}
+	result.identityChanged = true
+	if classification := ClassifyProbeResult(target, result, now); classification.Class != ProbeSampleNodeFailure || classification.Failure != FailureIdentity {
+		t.Fatalf("exit identity change was not classified: %+v", classification)
+	}
+}
+
 func TestCapabilityProbeRunnerRedirectPolicyAndInvalidTargets(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	target := testProbeTarget(t, "runner-http", 1, ProbeCapabilityHTTP, now)
