@@ -44,6 +44,40 @@ func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
 	}
 }
 
+func TestServiceResolverSharesBrowserIdentityWithoutMergingHealthServices(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.2:1000")}
+	hosts := []string{
+		"chatgpt.com",
+		"auth.openai.com.cdn.cloudflare.net",
+		"challenges.cloudflare.com",
+		"claude.ai",
+		"gemini.google.com",
+		"accounts.google.com",
+	}
+	var identity SessionKey
+	services := make(map[string]struct{})
+	for index, host := range hosts {
+		resolved := resolver.Resolve(client, M.ParseSocksaddr(host+":443"), N.NetworkTCP)
+		if resolved.Mode != ModeStrictAffinity || resolved.AffinityID != "browser_identity" {
+			t.Fatalf("browser identity mismatch host=%s resolved=%+v", host, resolved)
+		}
+		if index == 0 {
+			identity = resolved.Session
+		} else if resolved.Session != identity {
+			t.Fatalf("browser identity split at host=%s", host)
+		}
+		services[resolved.ID] = struct{}{}
+	}
+	if len(services) < 5 {
+		t.Fatalf("health service IDs were incorrectly collapsed: %v", services)
+	}
+	api := resolver.Resolve(client, M.ParseSocksaddr("api.openai.com:443"), N.NetworkTCP)
+	if api.Session == identity || api.AffinityID != "openai_api" {
+		t.Fatalf("OpenAI API incorrectly shared browser identity: %+v", api)
+	}
+}
+
 func TestServiceResolverFakeIPAndQUICMetadataPriority(t *testing.T) {
 	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
 	metadata := &adapter.InboundContext{

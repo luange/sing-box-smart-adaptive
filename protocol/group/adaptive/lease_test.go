@@ -60,6 +60,28 @@ func TestLeaseManagerIsBounded(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewalSlidesExpiryWithoutChangingIdentity(t *testing.T) {
+	manager := NewSessionLeaseManager(8)
+	key := SessionKey{7}
+	handle := NodeHandle{NodeID: NodeID{9}, Slot: 3, Version: 4}
+	now := time.Unix(1_700_000_000, 0)
+	_, reservation, err := manager.Reserve(context.Background(), key, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := reservation.CommitHandle(handle, "chatgpt_web", ModeStrictAffinity, time.Minute, now)
+	renewed := manager.RenewHandle(key, handle, time.Hour, now.Add(30*time.Second))
+	if renewed.NodeID != lease.NodeID || renewed.NodeSlot != lease.NodeSlot || renewed.NodeVersion != lease.NodeVersion {
+		t.Fatalf("renewal changed identity: before=%+v after=%+v", lease, renewed)
+	}
+	if !renewed.ExpiresAt.Equal(now.Add(30*time.Second + time.Hour)) {
+		t.Fatalf("renewal did not slide expiry: %v", renewed.ExpiresAt)
+	}
+	if changed := manager.RenewHandle(key, NodeHandle{NodeID: NodeID{8}}, time.Hour, now); changed != (SessionLease{}) {
+		t.Fatalf("mismatched identity renewed lease: %+v", changed)
+	}
+}
+
 func TestControlClearRejectsStaleReservationCommit(t *testing.T) {
 	manager := NewSessionLeaseManager(8)
 	key := SessionKey{1}

@@ -196,7 +196,7 @@ func TestAdaptivePoolReusesNodeAcrossYouTubeDomains(t *testing.T) {
 	}
 }
 
-func TestStrictAffinityFailureSwitchesAndReplacesLease(t *testing.T) {
+func TestStrictAffinityFailureRetainsIdentityUntilBreakerOpens(t *testing.T) {
 	hasher := testIdentityHasher(t)
 	failedOutbound := newDialTestOutbound("failed", 0, errors.New("failed"))
 	workingOutbound := newDialTestOutbound("working", 0, nil)
@@ -222,18 +222,28 @@ func TestStrictAffinityFailureSwitchesAndReplacesLease(t *testing.T) {
 	}
 	reservation.CommitHandle(failed.Handle, service.ID, service.Mode, time.Minute, time.Now())
 	ctx := adapter.WithContext(context.Background(), metadata)
+	if _, err = pool.DialContext(ctx, N.NetworkTCP, destination); err == nil {
+		t.Fatal("single leased-node failure unexpectedly fell through to a new identity")
+	}
+	lease, loaded := leases.Peek(service.Session, time.Now())
+	if !loaded || lease.NodeID != failed.ID {
+		t.Fatalf("transient failure changed strict identity: loaded=%v lease=%+v", loaded, lease)
+	}
+	if failedOutbound.dials.Load() != 1 || workingOutbound.dials.Load() != 0 {
+		t.Fatalf("transient strict failure attempted another identity: failed=%d working=%d", failedOutbound.dials.Load(), workingOutbound.dials.Load())
+	}
+	for range 3 {
+		health.Observe(Observation{NodeID: failed.ID, NodeSlot: failed.Handle.Slot, NodeVersion: failed.Handle.Version, Scope: DomainTransport, Transport: N.NetworkTCP, Outcome: OutcomeFailure})
+	}
 	conn, err := pool.DialContext(ctx, N.NetworkTCP, destination)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.Close()
 	(<-workingOutbound.peers).Close()
-	lease, loaded := leases.Peek(service.Session, time.Now())
+	lease, loaded = leases.Peek(service.Session, time.Now())
 	if !loaded || lease.NodeID != working.ID || lease.NodeSlot != working.Handle.Slot || lease.NodeVersion != working.Handle.Version {
-		t.Fatalf("successful fallback did not replace strict lease: loaded=%v lease=%+v", loaded, lease)
-	}
-	if failedOutbound.dials.Load() != 1 || workingOutbound.dials.Load() != 1 {
-		t.Fatalf("strict failover attempts are wrong: failed=%d working=%d", failedOutbound.dials.Load(), workingOutbound.dials.Load())
+		t.Fatalf("breaker failover did not replace strict lease: loaded=%v lease=%+v", loaded, lease)
 	}
 }
 

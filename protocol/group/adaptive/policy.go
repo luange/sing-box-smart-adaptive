@@ -160,8 +160,11 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	if mode == ModeStrictAffinity && lease != nil {
 		for index, candidate := range eligible {
 			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
-				moveCandidateFirst(eligible, index)
-				return e.plan(snapshot, mode, ReasonLease, service, limitCandidates(eligible, e.maxAttempts)), nil
+				// An established identity lease must not hedge or immediately fall
+				// through to another egress. Retain the leased node until its
+				// breaker excludes it; the next connection then performs bounded
+				// failover and commits one new identity.
+				return e.plan(snapshot, mode, ReasonLease, service, []Candidate{eligible[index]}), nil
 			}
 		}
 		// The leased handle is no longer eligible. Start a bounded sequential

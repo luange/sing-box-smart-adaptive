@@ -150,26 +150,32 @@ func TestTCPEarlyTLSEOFIsAmbiguousAndDoesNotPenalize(t *testing.T) {
 	_ = wrapped.Close()
 }
 
-func TestDestinationTransportFailureInvalidatesStickyLease(t *testing.T) {
+func TestDestinationTransportFailureInvalidatesStickyLeaseAtBreakerThreshold(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{85}, "dial-timeout", newTestOutbound("dial-timeout")))
 	service := testBusinessService(N.NetworkTCP)
 	handle := snapshot.Candidates[0].Handle
 	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
-	permit, allowed := health.TryAcquireConnectionPermitHandle(handle, service.Transport, time.Now())
-	if !allowed {
-		t.Fatal("transport attempt was not admitted")
-	}
-	attempt, err := pool.beginObservationAttempt(snapshot, snapshot.Candidates[0], permit, service.Transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool.completeTransportAttempt(attempt, service, context.DeadlineExceeded, time.Second, false, false)
-	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
-		t.Fatal("failed destination transport lease was retained")
+	for failure := 1; failure <= 3; failure++ {
+		permit, allowed := health.TryAcquireConnectionPermitHandle(handle, service.Transport, time.Now())
+		if !allowed {
+			t.Fatal("transport attempt was not admitted")
+		}
+		attempt, err := pool.beginObservationAttempt(snapshot, snapshot.Candidates[0], permit, service.Transport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.completeTransportAttempt(attempt, service, context.DeadlineExceeded, time.Second, false, false)
+		_, loaded := pool.leases.Peek(service.Session, time.Now())
+		if failure < 3 && !loaded {
+			t.Fatalf("transient transport failure %d invalidated lease", failure)
+		}
+		if failure == 3 && loaded {
+			t.Fatal("breaker-open destination transport lease was retained")
+		}
 	}
 	status := health.StatusHandle(handle, DomainTransport, service.Transport, "")
-	if status.Failures != 1 || status.Reason != context.DeadlineExceeded.Error() {
+	if status.Failures != 3 || status.Reason != context.DeadlineExceeded.Error() || status.Breaker != BreakerOpen {
 		t.Fatalf("transport failure was not reduced: %+v", status)
 	}
 }

@@ -209,6 +209,22 @@ func (m *SessionLeaseManager) ReplaceHandle(key SessionKey, expected, next NodeH
 	return lease
 }
 
+func (m *SessionLeaseManager) RenewHandle(key SessionKey, expected NodeHandle, ttl time.Duration, now time.Time) SessionLease {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	m.access.Lock()
+	defer m.access.Unlock()
+	record := m.leases[key]
+	if record == nil || record.lease.NodeID != expected.NodeID || record.lease.NodeSlot != expected.Slot || record.lease.NodeVersion != expected.Version {
+		return SessionLease{}
+	}
+	record.lease.ExpiresAt = now.Add(ttl)
+	record.lease.UpdatedAt = now
+	m.lru.MoveToFront(record.element)
+	return record.lease
+}
+
 func (m *SessionLeaseManager) RetireNodeVersion(nodeID NodeID, nodeVersion uint64) {
 	m.RetireNodeHandle(NodeHandle{NodeID: nodeID, Version: nodeVersion})
 }

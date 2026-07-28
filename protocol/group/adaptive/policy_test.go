@@ -43,7 +43,7 @@ func TestPolicyKeepsHealthySessionLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Reason != ReasonLease || plan.Candidates[0].ID != first.ID || len(plan.Candidates) != 2 {
+	if plan.Reason != ReasonLease || plan.Candidates[0].ID != first.ID || len(plan.Candidates) != 1 {
 		t.Fatalf("healthy lease was not retained: %+v", plan)
 	}
 }

@@ -727,6 +727,8 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 			reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 		} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
 			p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
+		} else {
+			p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 		}
 		p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 	}
@@ -818,7 +820,8 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
 			}
 		}
-		if modeUsesLease(service.Mode) {
+		status := p.health.StatusHandle(evidence.Handle, DomainTransport, service.Transport, "")
+		if modeUsesLease(service.Mode) && (status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown) {
 			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
 			p.persistState()
 		}
@@ -968,6 +971,8 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 				reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 			} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
 				p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
+			} else {
+				p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 			}
 			p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 		}

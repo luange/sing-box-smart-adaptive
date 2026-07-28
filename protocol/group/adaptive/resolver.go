@@ -25,11 +25,12 @@ const (
 )
 
 type ServiceContext struct {
-	ID        string
-	Session   SessionKey
-	Mode      PolicyMode
-	Host      string
-	Transport string
+	ID         string
+	AffinityID string
+	Session    SessionKey
+	Mode       PolicyMode
+	Host       string
+	Transport  string
 }
 
 type ServiceResolver struct {
@@ -72,11 +73,21 @@ func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination 
 		}, "\x00")
 	}
 	return ServiceContext{
-		ID:        serviceID,
-		Session:   r.hasher.Session(clientScope, serviceID),
-		Mode:      mode,
-		Host:      host,
-		Transport: transport,
+		ID:         serviceID,
+		AffinityID: serviceAffinityFamily(serviceID),
+		Session:    r.hasher.Session(clientScope, serviceAffinityFamily(serviceID)),
+		Mode:       mode,
+		Host:       host,
+		Transport:  transport,
+	}
+}
+
+func serviceAffinityFamily(serviceID string) string {
+	switch serviceID {
+	case "chatgpt_web", "claude", "gemini", "google_account", "cloudflare_challenge":
+		return "browser_identity"
+	default:
+		return serviceID
 	}
 }
 
@@ -140,7 +151,7 @@ func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMo
 		return "gemini", ModeStrictAffinity
 	case host == "api.openai.com" || domainMatches(host, "platform.openai.com"):
 		return "openai_api", ModeStrictAffinity
-	case domainMatches(host, "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com"):
+	case domainMatches(host, "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com", "openai.com.cdn.cloudflare.net", "oaistatic.com.cdn.cloudflare.net", "chatgpt.com.cdn.cloudflare.net"):
 		return "chatgpt_web", ModeStrictAffinity
 	case domainMatches(host, "claude.ai", "anthropic.com"):
 		return "claude", ModeStrictAffinity
