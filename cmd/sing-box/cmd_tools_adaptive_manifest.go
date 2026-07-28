@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,12 +23,19 @@ import (
 )
 
 var (
-	adaptiveManifestListen   string
-	adaptiveManifestPath     string
-	adaptiveManifestSpecPath string
-	adaptiveManifestKeyPath  string
-	adaptiveManifestTLSCert  string
-	adaptiveManifestTLSKey   string
+	adaptiveManifestListen     string
+	adaptiveManifestPath       string
+	adaptiveManifestSpecPath   string
+	adaptiveManifestKeyPath    string
+	adaptiveManifestTLSCert    string
+	adaptiveManifestTLSKey     string
+	adaptiveManifestURLFile    string
+	adaptiveManifestOutput     string
+	adaptiveManifestGeneration uint64
+	adaptiveManifestValidFor   time.Duration
+	adaptiveManifestRangeStart int64
+	adaptiveManifestRangeEnd   int64
+	adaptiveManifestForce      bool
 )
 
 var commandToolsAdaptiveManifest = &cobra.Command{Use: "adaptive-manifest", Short: "AdaptivePool signed probe manifest control plane"}
@@ -34,6 +46,17 @@ var commandToolsAdaptiveManifestServe = &cobra.Command{
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := serveAdaptiveManifest(); err != nil {
+			log.Fatal(err)
+		}
+	},
+}
+
+var commandToolsAdaptiveManifestPrepareYouTube = &cobra.Command{
+	Use:   "prepare-youtube-range",
+	Short: "Prepare a private signed-URL Range manifest specification",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := prepareAdaptiveYouTubeRangeManifest(); err != nil {
 			log.Fatal(err)
 		}
 	},
@@ -50,7 +73,107 @@ func init() {
 		_ = commandToolsAdaptiveManifestServe.MarkFlagRequired(name)
 	}
 	commandToolsAdaptiveManifest.AddCommand(commandToolsAdaptiveManifestServe)
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().StringVar(&adaptiveManifestURLFile, "url-file", "", "Mode-0600 file containing one fresh googlevideo HTTPS URL")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().StringVarP(&adaptiveManifestOutput, "output", "o", "", "Private manifest specification output (mode 0600)")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().Uint64Var(&adaptiveManifestGeneration, "generation", 0, "Monotonic manifest generation (defaults to current Unix nanoseconds)")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().DurationVar(&adaptiveManifestValidFor, "valid-for", 30*time.Minute, "Manifest validity window")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().Int64Var(&adaptiveManifestRangeStart, "range-start", 0, "First payload byte")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().Int64Var(&adaptiveManifestRangeEnd, "range-end", 65535, "Last payload byte")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().BoolVar(&adaptiveManifestForce, "force", false, "Replace an existing output file")
+	_ = commandToolsAdaptiveManifestPrepareYouTube.MarkFlagRequired("url-file")
+	_ = commandToolsAdaptiveManifestPrepareYouTube.MarkFlagRequired("output")
+	commandToolsAdaptiveManifest.AddCommand(commandToolsAdaptiveManifestPrepareYouTube)
 	commandTools.AddCommand(commandToolsAdaptiveManifest)
+}
+
+func prepareAdaptiveYouTubeRangeManifest() error {
+	urlContent, err := readLimitedRegularFile(adaptiveManifestURLFile, 16*1024, true)
+	if err != nil {
+		return err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableCompression = true
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+			if !isGoogleVideoURL(request.URL) {
+				return errors.New("adaptive media redirect rejected")
+			}
+			return nil
+		},
+	}
+	spec, err := prepareAdaptiveYouTubeRangeSpec(time.Now().UTC(), client, urlContent, adaptiveManifestGeneration, adaptiveManifestValidFor, adaptiveManifestRangeStart, adaptiveManifestRangeEnd)
+	if err != nil {
+		return err
+	}
+	document, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return errors.New("adaptive manifest specification encoding failed")
+	}
+	return writeExclusiveSecretFile(adaptiveManifestOutput, append(document, '\n'), adaptiveManifestForce)
+}
+
+func prepareAdaptiveYouTubeRangeSpec(now time.Time, client *http.Client, urlContent []byte, generation uint64, validFor time.Duration, rangeStart, rangeEnd int64) (adaptive.ProbeManifestPayload, error) {
+	if client == nil || validFor < time.Minute || validFor > 6*time.Hour || rangeStart < 0 || rangeEnd < rangeStart || rangeEnd-rangeStart+1 > 1024*1024 {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube Range policy is invalid")
+	}
+	rawURL := strings.TrimSpace(string(urlContent))
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !isGoogleVideoURL(parsed) || parsed.RawQuery == "" || parsed.Fragment != "" || parsed.User != nil {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube signed URL is invalid")
+	}
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube Range request is invalid")
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	request.Header.Set("Range", "bytes="+strconv.FormatInt(rangeStart, 10)+"-"+strconv.FormatInt(rangeEnd, 10))
+	request.Header.Set("User-Agent", "sing-box-adaptive-manifest/1")
+	response, err := client.Do(request)
+	if err != nil {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube Range fetch failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusPartialContent || !strings.HasPrefix(strings.TrimSpace(response.Header.Get("Content-Range")), "bytes "+strconv.FormatInt(rangeStart, 10)+"-"+strconv.FormatInt(rangeEnd, 10)+"/") {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube endpoint did not honor the requested Range")
+	}
+	wanted := rangeEnd - rangeStart + 1
+	payload, err := io.ReadAll(io.LimitReader(response.Body, wanted+1))
+	if err != nil || int64(len(payload)) != wanted {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube Range payload length is invalid")
+	}
+	if bytes.Contains(bytes.ToLower(payload[:min(len(payload), 64)]), []byte("<html")) {
+		return adaptive.ProbeManifestPayload{}, errors.New("adaptive YouTube Range returned an HTML payload")
+	}
+	digest := sha256.Sum256(payload)
+	if generation == 0 {
+		generation = uint64(now.UnixNano())
+	}
+	issuedAt := now.Add(-5 * time.Second)
+	redirectHosts := []string{strings.ToLower(parsed.Hostname())}
+	if response.Request != nil && response.Request.URL != nil {
+		finalHost := strings.ToLower(response.Request.URL.Hostname())
+		if finalHost != "" && finalHost != redirectHosts[0] {
+			redirectHosts = append(redirectHosts, finalHost)
+		}
+	}
+	return adaptive.ProbeManifestPayload{
+		SourceID: adaptive.YouTubeTargetSourceID, ServiceID: adaptive.YouTubeProbeServiceID,
+		Generation: generation, IssuedAt: issuedAt, ExpiresAt: now.Add(validFor),
+		Targets: []adaptive.ProbeManifestTarget{{
+			URL: rawURL, Capability: adaptive.ProbeCapabilityRange, RangeStart: &rangeStart, RangeEnd: &rangeEnd,
+			ExpectedDigest: hex.EncodeToString(digest[:]), RedirectHosts: redirectHosts,
+		}},
+	}, nil
+}
+
+func isGoogleVideoURL(parsed *url.URL) bool {
+	if parsed == nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Port() != "" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	return host == "googlevideo.com" || strings.HasSuffix(host, ".googlevideo.com")
 }
 
 func serveAdaptiveManifest() error {
