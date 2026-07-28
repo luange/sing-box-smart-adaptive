@@ -56,7 +56,8 @@ func (s *SwitchAuditStore) RecordSelection(session SessionKey, serviceID string,
 	if failed {
 		delete(s.pending, session)
 	}
-	if !failed && (previous.NodeID == (NodeID{}) || previous == candidate.Handle) {
+	sameNode := previous.NodeID == candidate.Handle.NodeID && previous.Slot == candidate.Handle.Slot && previous.Version == candidate.Handle.Version
+	if !failed && (previous.NodeID == (NodeID{}) || sameNode) {
 		s.access.Unlock()
 		return
 	}
@@ -67,16 +68,21 @@ func (s *SwitchAuditStore) RecordSelection(session SessionKey, serviceID string,
 	if failed {
 		event.OldNodeID, event.OldTag = pending.node.NodeID.String(), pending.tag
 		event.Failure = string(pending.failure)
-		event.Reason = "failure_failover"
+		if pending.node.NodeID == candidate.ID && pending.node.Slot == candidate.Handle.Slot && pending.node.Version == candidate.Handle.Version {
+			event.Reason = "failure_retry"
+		} else {
+			event.Reason = "failure_failover"
+			s.total++
+		}
 	} else {
 		event.OldNodeID = previous.NodeID.String()
+		s.total++
 	}
 	s.entries = append(s.entries, event)
 	if len(s.entries) > switchAuditLimit {
 		copy(s.entries, s.entries[len(s.entries)-switchAuditLimit:])
 		s.entries = s.entries[:switchAuditLimit]
 	}
-	s.total++
 	s.access.Unlock()
 }
 

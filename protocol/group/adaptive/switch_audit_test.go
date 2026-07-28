@@ -40,3 +40,19 @@ func TestSwitchAuditIsBounded(t *testing.T) {
 		t.Fatalf("switch audit bound failed: entries=%d total=%d", len(entries), total)
 	}
 }
+
+func TestSwitchAuditIgnoresLeaseBornRevisionAndDoesNotCountFailureRetryAsSwitch(t *testing.T) {
+	store := NewSwitchAuditStore()
+	session := SessionKey{9}
+	candidate := Candidate{ID: NodeID{9}, Handle: NodeHandle{NodeID: NodeID{9}, Slot: 2, Version: 3, BornRevision: 4}, PrimaryTag: "same"}
+	store.RecordSelection(session, "chatgpt_web", NodeHandle{NodeID: candidate.ID, Slot: 2, Version: 3}, candidate, ReasonLease, time.Now())
+	if entries, total := store.Snapshot(); len(entries) != 0 || total != 0 {
+		t.Fatalf("unchanged lease was audited: entries=%+v total=%d", entries, total)
+	}
+	store.RecordFailure(session, "chatgpt_web", candidate, FailureTLS, time.Now())
+	store.RecordSelection(session, "chatgpt_web", NodeHandle{}, candidate, ReasonStrictNew, time.Now())
+	entries, total := store.Snapshot()
+	if len(entries) != 1 || entries[0].Reason != "failure_retry" || total != 0 {
+		t.Fatalf("failure retry was counted as switch: entries=%+v total=%d", entries, total)
+	}
+}
