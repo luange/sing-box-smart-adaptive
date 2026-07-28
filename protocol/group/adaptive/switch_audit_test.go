@@ -11,14 +11,14 @@ func TestSwitchAuditJoinsFailureWithReplacementWithoutPrivateDestination(t *test
 	session := SessionKey{1}
 	old := Candidate{ID: NodeID{1}, Handle: NodeHandle{NodeID: NodeID{1}, Slot: 1, Version: 1}, PrimaryTag: "old-node"}
 	next := Candidate{ID: NodeID{2}, Handle: NodeHandle{NodeID: NodeID{2}, Slot: 2, Version: 1}, PrimaryTag: "new-node"}
-	store.RecordFailure(session, "chatgpt_web", old, FailureTLS, time.Now())
+	store.RecordFailure(session, "chatgpt_web", old, FailureTLS, "business_tls", time.Now())
 	store.RecordSelection(session, "chatgpt_web", NodeHandle{}, next, ReasonStrictNew, time.Now())
 	entries, total := store.Snapshot()
 	if total != 1 || len(entries) != 1 {
 		t.Fatalf("switch audit missing: total=%d entries=%+v", total, entries)
 	}
 	event := entries[0]
-	if event.OldNodeID != old.ID.String() || event.NewNodeID != next.ID.String() || event.Failure != string(FailureTLS) || event.Reason != "failure_failover" {
+	if event.OldNodeID != old.ID.String() || event.NewNodeID != next.ID.String() || event.Failure != string(FailureTLS) || event.FailureSource != "business_tls" || event.Reason != "failure_failover" {
 		t.Fatalf("switch audit mismatch: %+v", event)
 	}
 	if strings.Contains(event.ServiceID+event.OldTag+event.NewTag, "?") || strings.Contains(event.ServiceID+event.OldTag+event.NewTag, "token") {
@@ -32,7 +32,7 @@ func TestSwitchAuditIsBounded(t *testing.T) {
 		session := SessionKey{byte(index + 1)}
 		old := Candidate{ID: NodeID{byte(index + 1)}, Handle: NodeHandle{NodeID: NodeID{byte(index + 1)}, Slot: 1, Version: 1}, PrimaryTag: "old"}
 		next := Candidate{ID: NodeID{byte(index + 2)}, Handle: NodeHandle{NodeID: NodeID{byte(index + 2)}, Slot: 2, Version: 1}, PrimaryTag: "new"}
-		store.RecordFailure(session, "service:test", old, FailureConnect, time.Now())
+		store.RecordFailure(session, "service:test", old, FailureConnect, "destination_transport", time.Now())
 		store.RecordSelection(session, "service:test", NodeHandle{}, next, ReasonRanked, time.Now())
 	}
 	entries, total := store.Snapshot()
@@ -49,7 +49,7 @@ func TestSwitchAuditIgnoresLeaseBornRevisionAndDoesNotCountFailureRetryAsSwitch(
 	if entries, total := store.Snapshot(); len(entries) != 0 || total != 0 {
 		t.Fatalf("unchanged lease was audited: entries=%+v total=%d", entries, total)
 	}
-	store.RecordFailure(session, "chatgpt_web", candidate, FailureTLS, time.Now())
+	store.RecordFailure(session, "chatgpt_web", candidate, FailureTLS, "business_tls", time.Now())
 	store.RecordSelection(session, "chatgpt_web", NodeHandle{}, candidate, ReasonStrictNew, time.Now())
 	entries, total := store.Snapshot()
 	if len(entries) != 1 || entries[0].Reason != "failure_retry" || total != 0 {

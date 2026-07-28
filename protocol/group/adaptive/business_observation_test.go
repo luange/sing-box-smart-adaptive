@@ -161,6 +161,42 @@ func TestTCPOrdinaryEarlyEOFDoesNotPenalizeService(t *testing.T) {
 	_ = wrapped.Close()
 }
 
+func TestTCPLocalCloseDoesNotBecomeTLSFailure(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{86}, "tls-local-close", newTestOutbound("tls-local-close")))
+	service := testBusinessService(N.NetworkTCP)
+	handle := snapshot.Candidates[0].Handle
+	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+
+	local, peer := net.Pipe()
+	wrapped := pool.wrapBusinessConn(local, snapshot, snapshot.Candidates[0], service, time.Now())
+	clientHello := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
+	writeDone := make(chan error, 1)
+	go func() { _, writeErr := wrapped.Write(clientHello); writeDone <- writeErr }()
+	read := make([]byte, len(clientHello))
+	if _, err := io.ReadFull(peer, read); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() { _, readErr := wrapped.Read(make([]byte, 1)); readDone <- readErr }()
+	if err := wrapped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; err == nil {
+		t.Fatal("read unexpectedly succeeded after local close")
+	}
+	_ = peer.Close()
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 0 {
+		t.Fatalf("local close was misclassified as TLS failure: %+v", status)
+	}
+	if _, loaded := pool.leases.Peek(service.Session, time.Now()); !loaded {
+		t.Fatal("local close invalidated the service lease")
+	}
+}
+
 type zeroReadConn struct{ net.Conn }
 
 func (*zeroReadConn) Read([]byte) (int, error) { return 0, nil }

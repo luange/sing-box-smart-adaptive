@@ -48,8 +48,8 @@ func TestAdaptivePoolCapabilityLifecycleUsesOwnedSchedulerAndObservationPipeline
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		status := pool.AdaptiveStatus()
-		if status.CapabilityCyclesCompleted == 1 {
-			if !status.CapabilityEnabled || status.CapabilityRunning || status.CapabilityTargetGeneration != 1 || status.CapabilityInitFailures != 0 || status.CapabilityRefreshFailures != 0 || status.CapabilityViewFailures != 0 || status.CapabilitySuiteFailures != 0 {
+		if status.CapabilityCyclesCompleted == 1 && !status.CapabilityRunning {
+			if !status.CapabilityEnabled || status.CapabilityTargetGeneration != 1 || status.CapabilityInitFailures != 0 || status.CapabilityRefreshFailures != 0 || status.CapabilityViewFailures != 0 || status.CapabilitySuiteFailures != 0 {
 				t.Fatalf("unexpected capability lifecycle status: %+v", status)
 			}
 			break

@@ -15,6 +15,7 @@ type pendingSwitchFailure struct {
 	node      NodeHandle
 	tag       string
 	failure   FailureClass
+	source    string
 	at        time.Time
 }
 
@@ -29,7 +30,7 @@ func NewSwitchAuditStore() *SwitchAuditStore {
 	return &SwitchAuditStore{pending: make(map[SessionKey]pendingSwitchFailure)}
 }
 
-func (s *SwitchAuditStore) RecordFailure(session SessionKey, serviceID string, candidate Candidate, failure FailureClass, at time.Time) {
+func (s *SwitchAuditStore) RecordFailure(session SessionKey, serviceID string, candidate Candidate, failure FailureClass, source string, at time.Time) {
 	if s == nil || session == (SessionKey{}) || candidate.ID == (NodeID{}) || serviceID == "" {
 		return
 	}
@@ -42,7 +43,7 @@ func (s *SwitchAuditStore) RecordFailure(session SessionKey, serviceID string, c
 		}
 	}
 	if len(s.pending) < pendingSwitchLimit {
-		s.pending[session] = pendingSwitchFailure{serviceID: serviceID, node: candidate.Handle, tag: safePersistentTag(candidate.PrimaryTag), failure: failure, at: at}
+		s.pending[session] = pendingSwitchFailure{serviceID: serviceID, node: candidate.Handle, tag: safePersistentTag(candidate.PrimaryTag), failure: failure, source: source, at: at}
 	}
 	s.access.Unlock()
 }
@@ -68,6 +69,7 @@ func (s *SwitchAuditStore) RecordSelection(session SessionKey, serviceID string,
 	if failed {
 		event.OldNodeID, event.OldTag = pending.node.NodeID.String(), pending.tag
 		event.Failure = string(pending.failure)
+		event.FailureSource = pending.source
 		if pending.node.NodeID == candidate.ID && pending.node.Slot == candidate.Handle.Slot && pending.node.Version == candidate.Handle.Version {
 			event.Reason = "failure_retry"
 		} else {

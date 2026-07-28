@@ -795,7 +795,7 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 		p.transportFailures.Add(1)
 		if snapshot := p.catalog.load(); snapshot != nil {
 			if candidate, loaded := snapshot.Candidate(evidence.Handle.NodeID); loaded {
-				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, evidence.At)
+				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
 			}
 		}
 		if modeUsesLease(service.Mode) {

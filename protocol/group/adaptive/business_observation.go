@@ -55,7 +55,7 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 			o.pool.businessTLSFailures.Add(1)
 			if snapshot := o.pool.catalog.load(); snapshot != nil {
 				if candidate, loaded := snapshot.Candidate(o.evidence.Handle.NodeID); loaded {
-					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, evidence.At)
+					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, "business_tls", evidence.At)
 				}
 			}
 			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
@@ -161,6 +161,7 @@ type observedConn struct {
 	readBytes   atomic.Int64
 	writeBytes  atomic.Int64
 	tlsStarted  atomic.Bool
+	localClosed atomic.Bool
 }
 
 func (c *observedConn) observeRead(count int) {
@@ -173,7 +174,7 @@ func (c *observedConn) observeRead(count int) {
 func (c *observedConn) Read(payload []byte) (int, error) {
 	count, err := c.Conn.Read(payload)
 	c.observeRead(count)
-	if count == 0 && err != nil && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+	if count == 0 && err != nil && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
 		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
 	}
 	if errors.Is(err, io.EOF) {
@@ -185,6 +186,10 @@ func (c *observedConn) Read(payload []byte) (int, error) {
 
 func (c *observedConn) Close() error {
 	c.closeOnce.Do(func() {
+		// Browsers abandon speculative TCP/TLS connections when another address,
+		// HTTP/3, or a pooled connection wins. Mark the local close first so the
+		// unblocked Read cannot be misclassified as a remote TLS failure.
+		c.localClosed.Store(true)
 		c.observeThroughput()
 		c.closeErr = c.Conn.Close()
 		c.observation.release()

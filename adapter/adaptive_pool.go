@@ -35,14 +35,15 @@ type AdaptiveCandidateStatus struct {
 }
 
 type AdaptiveSwitchAudit struct {
-	ServiceID  string    `json:"service_id"`
-	OldNodeID  string    `json:"old_node_id,omitempty"`
-	OldTag     string    `json:"old_tag,omitempty"`
-	NewNodeID  string    `json:"new_node_id,omitempty"`
-	NewTag     string    `json:"new_tag,omitempty"`
-	Reason     string    `json:"reason"`
-	Failure    string    `json:"failure,omitempty"`
-	OccurredAt time.Time `json:"occurred_at"`
+	ServiceID     string    `json:"service_id"`
+	OldNodeID     string    `json:"old_node_id,omitempty"`
+	OldTag        string    `json:"old_tag,omitempty"`
+	NewNodeID     string    `json:"new_node_id,omitempty"`
+	NewTag        string    `json:"new_tag,omitempty"`
+	Reason        string    `json:"reason"`
+	Failure       string    `json:"failure,omitempty"`
+	FailureSource string    `json:"failure_source,omitempty"`
+	OccurredAt    time.Time `json:"occurred_at"`
 }
 
 type AdaptiveServiceLease struct {
