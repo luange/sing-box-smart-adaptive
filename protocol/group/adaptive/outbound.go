@@ -662,6 +662,9 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	if p.shadow {
 		return nil, errors.New("adaptive_pool is running in shadow mode and cannot carry traffic")
 	}
+	if err := p.waitUntilPublished(ctx); err != nil {
+		return nil, err
+	}
 	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkName(network))
 	snapshot := p.catalog.load()
 	var lease SessionLease
@@ -703,6 +706,46 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	}
 	p.setLatest(candidate.PrimaryTag)
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
+}
+
+func (p *AdaptivePool) waitUntilPublished(ctx context.Context) error {
+	p.lifecycleAccess.Lock()
+	phase := p.publishPhase
+	published := p.published
+	retired := p.retired
+	p.lifecycleAccess.Unlock()
+	// Zero is used by isolated/unit pools which do not participate in the
+	// runtime epoch publication protocol.
+	if phase == 0 || published {
+		return nil
+	}
+	if retired || phase == publishPhaseRollingBack || phase == publishPhaseRetired {
+		return errors.New("adaptive pool runtime epoch is unavailable")
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("adaptive pool runtime epoch publication timed out")
+		case <-ticker.C:
+			p.lifecycleAccess.Lock()
+			published = p.published
+			phase = p.publishPhase
+			retired = p.retired
+			p.lifecycleAccess.Unlock()
+			if published {
+				return nil
+			}
+			if retired || phase == publishPhaseRollingBack || phase == publishPhaseRetired {
+				return errors.New("adaptive pool runtime epoch is unavailable")
+			}
+		}
+	}
 }
 
 func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, service ServiceContext) AttemptBegin {
@@ -804,6 +847,9 @@ func (p *AdaptivePool) sharedObservationIngestor() *ObservationIngestor {
 func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if p.shadow {
 		return nil, errors.New("adaptive_pool is running in shadow mode and cannot carry traffic")
+	}
+	if err := p.waitUntilPublished(ctx); err != nil {
+		return nil, err
 	}
 	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkUDP)
 	snapshot := p.catalog.load()

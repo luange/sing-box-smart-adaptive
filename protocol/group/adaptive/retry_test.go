@@ -339,6 +339,38 @@ func TestBreakerAllDeferredNeverReturnsNilConnectionAndNilError(t *testing.T) {
 	}
 }
 
+func TestDialWaitsForRuntimeEpochPublication(t *testing.T) {
+	pool := &AdaptivePool{publishPhase: publishPhasePrepared}
+	done := make(chan error, 1)
+	go func() { done <- pool.waitUntilPublished(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("startup gate returned before publication: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	pool.lifecycleAccess.Lock()
+	pool.publishPhase = publishPhaseActive
+	pool.published = true
+	pool.lifecycleAccess.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startup gate did not release after publication")
+	}
+}
+
+func TestDialPublicationGateHonorsCancellation(t *testing.T) {
+	pool := &AdaptivePool{publishPhase: publishPhasePrepared}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pool.waitUntilPublished(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("startup gate ignored cancellation: %v", err)
+	}
+}
+
 func TestBulkRunnerDoesNotSpeculateButFailsOverImmediately(t *testing.T) {
 	first := newDialTestOutbound("bulk-slow", 120*time.Millisecond, nil)
 	second := newDialTestOutbound("bulk-unused", 0, nil)
