@@ -52,3 +52,15 @@ func TestPrepareAdaptiveYouTubeRangeSpecNeverIncludesURLInErrors(t *testing.T) {
 		t.Fatalf("private URL leaked through preparation error: %v", err)
 	}
 }
+
+func TestPrepareAdaptiveYouTubeRangeCommandHasNoInheritedShorthandConflict(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("adaptive manifest command parsing panicked: %v", recovered)
+		}
+	}()
+	command, _, err := mainCommand.Find([]string{"tools", "adaptive-manifest", "prepare-youtube-range", "--help"})
+	if err != nil || command != commandToolsAdaptiveManifestPrepareYouTube {
+		t.Fatalf("adaptive manifest command was not resolvable: command=%v err=%v", command, err)
+	}
+}

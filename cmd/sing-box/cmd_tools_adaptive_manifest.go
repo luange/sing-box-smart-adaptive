@@ -74,7 +74,7 @@ func init() {
 	}
 	commandToolsAdaptiveManifest.AddCommand(commandToolsAdaptiveManifestServe)
 	commandToolsAdaptiveManifestPrepareYouTube.Flags().StringVar(&adaptiveManifestURLFile, "url-file", "", "Mode-0600 file containing one fresh googlevideo HTTPS URL")
-	commandToolsAdaptiveManifestPrepareYouTube.Flags().StringVarP(&adaptiveManifestOutput, "output", "o", "", "Private manifest specification output (mode 0600)")
+	commandToolsAdaptiveManifestPrepareYouTube.Flags().StringVar(&adaptiveManifestOutput, "output", "", "Private manifest specification output (mode 0600)")
 	commandToolsAdaptiveManifestPrepareYouTube.Flags().Uint64Var(&adaptiveManifestGeneration, "generation", 0, "Monotonic manifest generation (defaults to current Unix nanoseconds)")
 	commandToolsAdaptiveManifestPrepareYouTube.Flags().DurationVar(&adaptiveManifestValidFor, "valid-for", 30*time.Minute, "Manifest validity window")
 	commandToolsAdaptiveManifestPrepareYouTube.Flags().Int64Var(&adaptiveManifestRangeStart, "range-start", 0, "First payload byte")
