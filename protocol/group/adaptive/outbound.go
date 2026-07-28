@@ -1191,7 +1191,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	p.lifecycleAccess.Unlock()
 	status.CapabilityEnabled = capabilityEnabled
 	status.CapabilityInitFailures = p.capabilityInitFailures.Load()
-	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal = p.exitIdentityStore.Stats()
+	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal, status.ExitIdentitySaturatedNodes = p.exitIdentityStore.Stats()
 	for _, serviceID := range sortedCapabilityControllerIDs(capabilityControllers) {
 		capabilityStatus := capabilityControllers[serviceID].Status()
 		status.CapabilityRunning = status.CapabilityRunning || capabilityStatus.Running

@@ -11,10 +11,17 @@ import (
 )
 
 const maxProcessExitIdentityEntries = 65536
+const maxExitIdentityVariantsPerNode = 16
+
+type exitIdentityNodeState struct {
+	variants  [][16]byte
+	saturated bool
+}
 
 type exitIdentityGroupState struct {
-	identities map[NodeID][16]byte
-	changes    uint64
+	identities     map[NodeID]*exitIdentityNodeState
+	changes        uint64
+	saturatedNodes uint64
 }
 
 var processExitIdentities struct {
@@ -71,11 +78,19 @@ func (s *ExitIdentityStore) Compare(handle NodeHandle, token [16]byte) (changed 
 	if group == nil {
 		return false, true
 	}
-	previous, loaded := group.identities[handle.NodeID]
+	node, loaded := group.identities[handle.NodeID]
 	if !loaded {
 		return false, true
 	}
-	return !hmac.Equal(previous[:], token[:]), true
+	for _, known := range node.variants {
+		if hmac.Equal(known[:], token[:]) {
+			return false, true
+		}
+	}
+	if node.saturated {
+		return false, true
+	}
+	return true, true
 }
 
 func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
@@ -86,10 +101,10 @@ func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
 	defer processExitIdentities.access.Unlock()
 	group := processExitIdentities.groups[s.groupID]
 	if group == nil {
-		group = &exitIdentityGroupState{identities: make(map[NodeID][16]byte)}
+		group = &exitIdentityGroupState{identities: make(map[NodeID]*exitIdentityNodeState)}
 		processExitIdentities.groups[s.groupID] = group
 	}
-	previous, loaded := group.identities[handle.NodeID]
+	node, loaded := group.identities[handle.NodeID]
 	if !loaded {
 		entries := 0
 		for _, state := range processExitIdentities.groups {
@@ -98,26 +113,36 @@ func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
 		if entries >= maxProcessExitIdentityEntries {
 			return false
 		}
-		group.identities[handle.NodeID] = token
+		group.identities[handle.NodeID] = &exitIdentityNodeState{variants: [][16]byte{token}}
 		return true
 	}
-	if hmac.Equal(previous[:], token[:]) {
+	for _, known := range node.variants {
+		if hmac.Equal(known[:], token[:]) {
+			return true
+		}
+	}
+	if node.saturated {
 		return true
 	}
-	group.identities[handle.NodeID] = token
+	if len(node.variants) >= maxExitIdentityVariantsPerNode {
+		node.saturated = true
+		group.saturatedNodes++
+		return true
+	}
+	node.variants = append(node.variants, token)
 	group.changes++
 	return true
 }
 
-func (s *ExitIdentityStore) Stats() (baselines, changes uint64) {
+func (s *ExitIdentityStore) Stats() (baselines, changes, saturated uint64) {
 	if s == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	processExitIdentities.access.Lock()
 	defer processExitIdentities.access.Unlock()
 	group := processExitIdentities.groups[s.groupID]
 	if group == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	return uint64(len(group.identities)), group.changes
+	return uint64(len(group.identities)), group.changes, group.saturatedNodes
 }

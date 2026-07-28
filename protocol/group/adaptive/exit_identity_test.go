@@ -19,8 +19,8 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if changed, accepted := store.Compare(handle, first); changed || !accepted {
 		t.Fatalf("first identity did not establish a baseline: changed=%v accepted=%v", changed, accepted)
 	}
-	if baselines, changes := store.Stats(); baselines != 0 || changes != 0 {
-		t.Fatalf("comparison committed identity state: baselines=%d changes=%d", baselines, changes)
+	if baselines, changes, saturated := store.Stats(); baselines != 0 || changes != 0 || saturated != 0 {
+		t.Fatalf("comparison committed identity state: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
 	}
 	if !store.Commit(handle, first) {
 		t.Fatal("first identity commit failed")
@@ -34,8 +34,11 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if !store.Commit(handle, second) {
 		t.Fatal("changed identity commit failed")
 	}
-	if baselines, changes := store.Stats(); baselines != 1 || changes != 1 {
-		t.Fatalf("unexpected identity stats: baselines=%d changes=%d", baselines, changes)
+	if changed, accepted := store.Compare(handle, first); changed || !accepted {
+		t.Fatal("previously observed rotating identity was counted again")
+	}
+	if baselines, changes, saturated := store.Stats(); baselines != 1 || changes != 1 || saturated != 0 {
+		t.Fatalf("unexpected identity stats: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
 	}
 
 	// A reload creates a new wrapper but retains the process-local baseline.
@@ -43,8 +46,30 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if baselines, changes := reloaded.Stats(); baselines != 1 || changes != 1 {
-		t.Fatalf("process-local baseline did not survive wrapper reload: baselines=%d changes=%d", baselines, changes)
+	if baselines, changes, saturated := reloaded.Stats(); baselines != 1 || changes != 1 || saturated != 0 {
+		t.Fatalf("process-local baseline did not survive wrapper reload: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
+	}
+}
+
+func TestExitIdentityStoreBoundsRotatingVariants(t *testing.T) {
+	store, err := NewExitIdentityStore("test-exit-identity-variant-bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := NodeHandle{NodeID: NodeID{9}, Slot: 1, Version: 1}
+	for index := 0; index < maxExitIdentityVariantsPerNode+2; index++ {
+		token := [16]byte{byte(index + 1)}
+		changed, accepted := store.Compare(handle, token)
+		if !accepted || index > 0 && index < maxExitIdentityVariantsPerNode && !changed {
+			t.Fatalf("variant %d comparison failed: changed=%v accepted=%v", index, changed, accepted)
+		}
+		if !store.Commit(handle, token) {
+			t.Fatalf("variant %d commit failed", index)
+		}
+	}
+	baselines, changes, saturated := store.Stats()
+	if baselines != 1 || changes != maxExitIdentityVariantsPerNode-1 || saturated != 1 {
+		t.Fatalf("variant bound failed: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
 	}
 }
 
