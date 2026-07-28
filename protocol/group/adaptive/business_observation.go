@@ -54,6 +54,10 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 		o.pool.recordObservationResult(disposition, publishErr)
 		if publishErr == nil && disposition == IngestAccepted {
 			o.pool.businessTLSFailures.Add(1)
+			status := o.pool.health.StatusHandle(o.evidence.Handle, DomainService, "", o.service.ID)
+			if status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
+				return
+			}
 			if snapshot := o.pool.catalog.load(); snapshot != nil {
 				if candidate, loaded := snapshot.Candidate(o.evidence.Handle.NodeID); loaded {
 					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, "business_tls", evidence.At)

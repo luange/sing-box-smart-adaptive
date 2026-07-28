@@ -96,21 +96,27 @@ func TestTCPEarlyTLSResetPenalizesServiceAndInvalidatesLease(t *testing.T) {
 	handle := snapshot.Candidates[0].Handle
 	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
 
-	wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{readErr: syscall.ECONNRESET}, snapshot, snapshot.Candidates[0], service, time.Now())
-	clientHello := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
-	if _, err := wrapped.Write(clientHello); err != nil {
-		t.Fatal(err)
+	for attempt := 1; attempt <= 3; attempt++ {
+		wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{readErr: syscall.ECONNRESET}, snapshot, snapshot.Candidates[0], service, time.Now())
+		clientHello := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
+		if _, err := wrapped.Write(clientHello); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := wrapped.Read(make([]byte, 1)); count != 0 || !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("early TLS reset changed: count=%d err=%v", count, err)
+		}
+		_ = wrapped.Close()
+		_, loaded := pool.leases.Peek(service.Session, time.Now())
+		if attempt < 3 && !loaded {
+			t.Fatalf("transient TLS failure %d invalidated the lease", attempt)
+		}
+		if attempt == 3 && loaded {
+			t.Fatal("breaker-open TLS lease was retained")
+		}
 	}
-	if count, err := wrapped.Read(make([]byte, 1)); count != 0 || !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("early TLS reset changed: count=%d err=%v", count, err)
+	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 3 || status.Successes != 0 || status.Reason != syscall.ECONNRESET.Error() || status.Breaker != BreakerOpen {
+		t.Fatalf("early TLS failures did not open the breaker: %+v", status)
 	}
-	if status := serviceStatus(health, handle, N.NetworkTCP); status.Failures != 1 || status.Successes != 0 || status.Reason != syscall.ECONNRESET.Error() {
-		t.Fatalf("early TLS failure was not reduced: %+v", status)
-	}
-	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
-		t.Fatal("failed TLS lease was retained")
-	}
-	_ = wrapped.Close()
 }
 
 type earlyTLSErrorConn struct {
