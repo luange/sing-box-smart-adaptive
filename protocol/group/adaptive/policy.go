@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing-box/common/nodeweight"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -62,6 +63,7 @@ type PolicyEngine struct {
 	maxAttempts   int
 	manualFailure string
 	bulkSequence  *atomic.Uint64
+	nodeWeights   *nodeweight.Matcher
 }
 
 func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string) *PolicyEngine {
@@ -77,6 +79,13 @@ func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string)
 func (e *PolicyEngine) BindBulkSequence(sequence *atomic.Uint64) *PolicyEngine {
 	if e != nil && sequence != nil {
 		e.bulkSequence = sequence
+	}
+	return e
+}
+
+func (e *PolicyEngine) BindNodeWeights(weights *nodeweight.Matcher) *PolicyEngine {
+	if e != nil {
+		e.nodeWeights = weights
 	}
 	return e
 }
@@ -152,6 +161,8 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		if rightDelay == 0 {
 			rightDelay = 10 * time.Second
 		}
+		leftDelay = weightedDelay(leftDelay, e.nodeWeights.Weight(eligible[i].PrimaryTag))
+		rightDelay = weightedDelay(rightDelay, e.nodeWeights.Weight(eligible[j].PrimaryTag))
 		if leftDelay != rightDelay {
 			return leftDelay < rightDelay
 		}
@@ -196,6 +207,13 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	default:
 		return DecisionPlan{}, errors.New("adaptive policy mode is invalid")
 	}
+}
+
+func weightedDelay(delay time.Duration, weight float64) time.Duration {
+	if weight <= 0 {
+		weight = nodeweight.Default
+	}
+	return time.Duration(float64(delay) / weight)
 }
 
 func modeUsesLease(mode PolicyMode) bool {

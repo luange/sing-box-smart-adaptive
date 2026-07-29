@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/nodeweight"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -45,6 +46,32 @@ func TestPolicyKeepsHealthySessionLease(t *testing.T) {
 	}
 	if plan.Reason != ReasonLease || plan.Candidates[0].ID != first.ID || len(plan.Candidates) != 1 {
 		t.Fatalf("healthy lease was not retained: %+v", plan)
+	}
+}
+
+func TestPolicyWeightBreaksTiesButNeverOverridesHealth(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	preferred := Candidate{ID: NodeID{41}, Handle: NodeHandle{NodeID: NodeID{41}, Slot: 1, Version: 1}, PrimaryTag: "preferred"}
+	normal := Candidate{ID: NodeID{42}, Handle: NodeHandle{NodeID: NodeID{42}, Slot: 2, Version: 1}, PrimaryTag: "normal"}
+	for _, candidate := range []Candidate{preferred, normal} {
+		health.Observe(Observation{NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	}
+	weights, err := nodeweight.New([]nodeweight.Rule{{Match: "preferred", Weight: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewPolicyEngine(health, 2, "fallback").BindNodeWeights(weights)
+	service := ServiceContext{ID: "site:example.com", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	plan, err := engine.Plan(testExecutionSnapshot(normal, preferred), service, nil, nil)
+	if err != nil || plan.Candidates[0].ID != preferred.ID {
+		t.Fatalf("weight did not break healthy tie: plan=%+v err=%v", plan, err)
+	}
+	for range 3 {
+		health.Observe(Observation{NodeID: preferred.ID, NodeSlot: preferred.Handle.Slot, NodeVersion: preferred.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeFailure})
+	}
+	plan, err = engine.Plan(testExecutionSnapshot(preferred, normal), service, nil, nil)
+	if err != nil || plan.Candidates[0].ID != normal.ID {
+		t.Fatalf("weight overrode health breaker: plan=%+v err=%v", plan, err)
 	}
 }
 

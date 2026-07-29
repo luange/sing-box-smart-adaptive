@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/nodefilter"
+	"github.com/sagernet/sing-box/common/nodeweight"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -85,6 +86,7 @@ type AdaptivePool struct {
 	identityKey                [32]byte
 	identityKeyNew             bool
 	identityHasher             *IdentityHasher
+	nodeWeights                *nodeweight.Matcher
 	catalog                    *CatalogPort
 	health                     *HealthStore
 	resolver                   *ServiceResolver
@@ -307,6 +309,14 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	if err != nil {
 		return nil, err
 	}
+	weightRules := make([]nodeweight.Rule, len(options.NodeWeights))
+	for index, rule := range options.NodeWeights {
+		weightRules[index] = nodeweight.Rule{Match: rule.Match, Weight: rule.Weight}
+	}
+	nodeWeights, err := nodeweight.New(weightRules)
+	if err != nil {
+		return nil, err
+	}
 	sourceRuntime, err := NewA48SourceRuntimeV1(ctx, hasher, SourceRuntimeConfig{
 		StaticTags:    options.Outbounds,
 		ProviderTags:  options.Providers,
@@ -352,11 +362,12 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		identityKey:             identityKey,
 		identityKeyNew:          keyNew,
 		identityHasher:          hasher,
+		nodeWeights:             nodeWeights,
 		catalog:                 catalog,
 		health:                  health,
 		resolver:                resolver,
 		leases:                  NewSessionLeaseManager(maxLeases),
-		policy:                  NewPolicyEngine(health, maxAttempts, manualFailure),
+		policy:                  NewPolicyEngine(health, maxAttempts, manualFailure).BindNodeWeights(nodeWeights),
 		policyMaxAttempts:       maxAttempts,
 		manualFailure:           manualFailure,
 		runner:                  NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
@@ -433,7 +444,7 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 		p.health = shared.health
 		p.leases = shared.leases
 		p.control = shared.control
-		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).BindBulkSequence(&p.control.bulkSequence)
+		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights).BindBulkSequence(&p.control.bulkSequence)
 	}
 	p.lifecycleAccess.Unlock()
 	if err = p.persistStateDurable(); err != nil {
@@ -1173,6 +1184,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			NodeSlot:              candidate.Handle.Slot,
 			NodeVersion:           candidate.Handle.Version,
 			Tag:                   candidate.PrimaryTag,
+			Weight:                p.nodeWeights.Weight(candidate.PrimaryTag),
 			Aliases:               append([]string(nil), candidate.Aliases...),
 			IdentityStable:        candidate.IdentityStable,
 			State:                 state,

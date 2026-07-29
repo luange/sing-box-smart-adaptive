@@ -195,6 +195,7 @@ type SmartCandidateStatus struct {
 	Tag           string  `json:"tag"`
 	State         string  `json:"state"`
 	Score         float64 `json:"score"`
+	Weight        float64 `json:"weight,omitempty"`
 	Reliability   float64 `json:"reliability"`
 	ConnectMS     float64 `json:"connect_ms,omitempty"`
 	FirstByteMS   float64 `json:"first_byte_ms,omitempty"`

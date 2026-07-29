@@ -18,6 +18,7 @@ type AdaptiveCandidateStatus struct {
 	NodeSlot              uint64    `json:"node_slot"`
 	NodeVersion           uint64    `json:"node_version"`
 	Tag                   string    `json:"tag"`
+	Weight                float64   `json:"weight,omitempty"`
 	Aliases               []string  `json:"aliases,omitempty"`
 	IdentityStable        bool      `json:"identity_stable"`
 	State                 string    `json:"state"`

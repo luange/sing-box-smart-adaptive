@@ -24,7 +24,13 @@ type GroupCommonOption struct {
 	Exclude         *badoption.Regexp          `json:"exclude,omitempty"`
 	Include         *badoption.Regexp          `json:"include,omitempty"`
 	ExcludeNodes    badoption.Listable[string] `json:"exclude_nodes,omitempty"`
+	NodeWeights     []NodeWeightOptions        `json:"node_weights,omitempty"`
 	UseAllProviders bool                       `json:"use_all_providers,omitempty"`
+}
+
+type NodeWeightOptions struct {
+	Match  string  `json:"match"`
+	Weight float64 `json:"weight"`
 }
 
 type URLTestFallbackOptions struct {

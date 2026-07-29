@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/nodefilter"
+	"github.com/sagernet/sing-box/common/nodeweight"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -184,6 +185,7 @@ type Smart struct {
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	manualExclude   *nodefilter.Matcher
+	nodeWeights     *nodeweight.Matcher
 	useAllProviders bool
 
 	access          sync.RWMutex
@@ -278,6 +280,14 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if err != nil {
 		return nil, err
 	}
+	weightRules := make([]nodeweight.Rule, len(options.NodeWeights))
+	for index, rule := range options.NodeWeights {
+		weightRules[index] = nodeweight.Rule{Match: rule.Match, Weight: rule.Weight}
+	}
+	nodeWeights, err := nodeweight.New(weightRules)
+	if err != nil {
+		return nil, err
+	}
 	probeInterval := time.Duration(options.ProbeInterval)
 	if probeInterval <= 0 {
 		probeInterval = defaultSmartProbeInterval
@@ -360,6 +370,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		manualExclude:   manualExclude,
+		nodeWeights:     nodeWeights,
 		useAllProviders: options.UseAllProviders,
 
 		candidateByTag: make(map[string]adapter.Outbound),
@@ -1129,8 +1140,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		})
 	}
 	for index := range ranking.ranks {
+		weight := s.nodeWeights.Weight(ranking.ranks[index].outbound.Tag())
 		ranking.ranks[index].profile = profile
-		ranking.ranks[index].status.Score = smartScoreForProfile(ranking.ranks[index].estimate, profile, s.exploration, totalSamples)
+		ranking.ranks[index].status.Score = smartScoreForProfile(ranking.ranks[index].estimate, profile, s.exploration, totalSamples) / weight
+		ranking.ranks[index].status.Weight = weight
 		ranking.ranks[index].status.Reason = smartEstimateReason(ranking.ranks[index].estimate)
 		ranking.ranks[index].estimate = smartEstimate{}
 	}
