@@ -82,18 +82,20 @@ func TestBuiltinExitIdentityCanShareBuiltinProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := provider.ServiceIDs(); len(got) != 2 || got[0] != "youtube" || got[1] != "exit_identity" {
+	if got := provider.ServiceIDs(); len(got) != 3 || got[0] != "youtube" || got[1] != "exit_identity_v4" || got[2] != "exit_identity_v6" {
 		t.Fatalf("unexpected builtin services: %v", got)
 	}
-	snapshot, err := provider.Snapshot(context.Background(), "exit_identity")
-	if err != nil {
-		t.Fatal(err)
-	}
-	targets, err := snapshot.executionTargets(now)
-	if err != nil || len(targets) != 1 || targets[0].Capability != ProbeCapabilityExitIdentity {
-		t.Fatalf("unexpected exit identity target: targets=%+v err=%v", targets, err)
-	}
-	if formatted := fmt.Sprintf("%+v %#v", snapshot, targets[0]); strings.Contains(formatted, "ipify") {
-		t.Fatalf("exit identity endpoint leaked through formatting: %s", formatted)
+	for _, serviceID := range []string{"exit_identity_v4", "exit_identity_v6"} {
+		snapshot, err := provider.Snapshot(context.Background(), serviceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets, err := snapshot.executionTargets(now)
+		if err != nil || len(targets) != 1 || targets[0].Capability != ProbeCapabilityExitIdentity {
+			t.Fatalf("unexpected exit identity target: service=%s targets=%+v err=%v", serviceID, targets, err)
+		}
+		if formatted := fmt.Sprintf("%+v %#v", snapshot, targets[0]); strings.Contains(formatted, "ipify") {
+			t.Fatalf("exit identity endpoint leaked through formatting: %s", formatted)
+		}
 	}
 }

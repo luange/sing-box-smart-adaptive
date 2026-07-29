@@ -35,6 +35,8 @@ func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
 	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000")}
 	tests := map[string]string{
 		"accounts.google.com": "google_account", "payments.google.com": "google_account",
+		"appleid.apple.com": "apple_account", "smp-device-content.g.aaplimg.com": "apple_account",
+		"login.microsoftonline.com": "microsoft_account", "aadcdn.msauth.net": "microsoft_account",
 		"challenges.cloudflare.com": "cloudflare_challenge", "web.whatsapp.com": "whatsapp", "mmg.whatsapp.net": "whatsapp",
 	}
 	for host, expected := range tests {
@@ -54,6 +56,8 @@ func TestServiceResolverSharesBrowserIdentityWithoutMergingHealthServices(t *tes
 		"claude.ai",
 		"gemini.google.com",
 		"accounts.google.com",
+		"appleid.apple.com",
+		"login.microsoftonline.com",
 	}
 	var identity SessionKey
 	services := make(map[string]struct{})
@@ -69,7 +73,7 @@ func TestServiceResolverSharesBrowserIdentityWithoutMergingHealthServices(t *tes
 		}
 		services[resolved.ID] = struct{}{}
 	}
-	if len(services) < 5 {
+	if len(services) < 7 {
 		t.Fatalf("health service IDs were incorrectly collapsed: %v", services)
 	}
 	api := resolver.Resolve(client, M.ParseSocksaddr("api.openai.com:443"), N.NetworkTCP)

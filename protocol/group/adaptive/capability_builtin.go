@@ -15,12 +15,13 @@ type builtinServiceTarget struct {
 }
 
 var builtinAIServiceTargets = map[string]builtinServiceTarget{
-	"youtube":       {url: "https://www.youtube.com/", capability: ProbeCapabilityTLS},
-	"gemini":        {url: "https://www.google.com/", capability: ProbeCapabilityTLS},
-	"openai_api":    {url: "https://api.openai.com/v1/models", capability: ProbeCapabilityAuthHTTP},
-	"chatgpt_web":   {url: "https://chatgpt.com/", capability: ProbeCapabilityWebWAF},
-	"claude":        {url: "https://api.anthropic.com/v1/models", capability: ProbeCapabilityAuthHTTP},
-	"exit_identity": {url: "https://api.ipify.org/", capability: ProbeCapabilityExitIdentity},
+	"youtube":          {url: "https://www.youtube.com/", capability: ProbeCapabilityTLS},
+	"gemini":           {url: "https://www.google.com/", capability: ProbeCapabilityTLS},
+	"openai_api":       {url: "https://api.openai.com/v1/models", capability: ProbeCapabilityAuthHTTP},
+	"chatgpt_web":      {url: "https://chatgpt.com/", capability: ProbeCapabilityWebWAF},
+	"claude":           {url: "https://api.anthropic.com/v1/models", capability: ProbeCapabilityAuthHTTP},
+	"exit_identity_v4": {url: "https://api4.ipify.org/", capability: ProbeCapabilityExitIdentity},
+	"exit_identity_v6": {url: "https://api6.ipify.org/", capability: ProbeCapabilityExitIdentity},
 }
 
 // BuiltinYouTubeTLSTargetProvider supplies a non-secret service target. It is
@@ -71,7 +72,7 @@ func NewBuiltinCapabilityTargetProvider(clock Clock, includeYouTube, includeAI, 
 		services = append(services, "youtube")
 	}
 	if includeExitIdentity {
-		services = append(services, "exit_identity")
+		services = append(services, "exit_identity_v4", "exit_identity_v6")
 	}
 	if len(services) == 0 {
 		return nil, errors.New("adaptive builtin capability set is empty")

@@ -24,6 +24,12 @@ type Matcher struct {
 	rules []compiledRule
 }
 
+type Match struct {
+	Weight float64
+	Rule   string
+	Exact  bool
+}
+
 func New(rules []Rule) (*Matcher, error) {
 	matcher := &Matcher{rules: make([]compiledRule, 0, len(rules))}
 	for _, rule := range rules {
@@ -44,12 +50,18 @@ func New(rules []Rule) (*Matcher, error) {
 }
 
 func (m *Matcher) Weight(tag string) float64 {
+	return m.Explain(tag).Weight
+}
+
+func (m *Matcher) Explain(tag string) Match {
 	if m == nil || len(m.rules) == 0 {
-		return Default
+		return Match{Weight: Default}
 	}
 	tag = strings.ToLower(tag)
 	bestWeight := Default
 	bestLength := -1
+	bestRule := ""
+	bestExact := false
 	for _, rule := range m.rules {
 		matched := tag == rule.match
 		if !rule.exact {
@@ -67,7 +79,9 @@ func (m *Matcher) Weight(tag string) float64 {
 		if length >= bestLength {
 			bestLength = length
 			bestWeight = rule.weight
+			bestRule = rule.match
+			bestExact = rule.exact
 		}
 	}
-	return bestWeight
+	return Match{Weight: bestWeight, Rule: bestRule, Exact: bestExact}
 }

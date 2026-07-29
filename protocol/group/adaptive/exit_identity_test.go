@@ -12,7 +12,7 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 		t.Fatal("valid public address was rejected")
 	}
 	second, valid := tokenizeExitIdentity([]byte("2001:4860:4860::8888"))
-	if !valid || first == second {
+	if !valid || first == second || first.family != 4 || second.family != 6 {
 		t.Fatal("independent public identities did not produce independent keyed tokens")
 	}
 	handle := NodeHandle{NodeID: NodeID{1}, Slot: 2, Version: 3}
@@ -28,8 +28,8 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if changed, accepted := store.Compare(handle, first); changed || !accepted {
 		t.Fatalf("stable identity changed: changed=%v accepted=%v", changed, accepted)
 	}
-	if changed, accepted := store.Compare(handle, second); !changed || !accepted {
-		t.Fatalf("identity change was missed: changed=%v accepted=%v", changed, accepted)
+	if changed, accepted := store.Compare(handle, second); changed || !accepted {
+		t.Fatalf("new address family did not establish an independent baseline: changed=%v accepted=%v", changed, accepted)
 	}
 	if !store.Commit(handle, second) {
 		t.Fatal("changed identity commit failed")
@@ -37,8 +37,11 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if changed, accepted := store.Compare(handle, first); changed || !accepted {
 		t.Fatal("previously observed rotating identity was counted again")
 	}
-	if baselines, changes, saturated := store.Stats(); baselines != 1 || changes != 1 || saturated != 0 {
+	if baselines, changes, saturated := store.Stats(); baselines != 1 || changes != 0 || saturated != 0 {
 		t.Fatalf("unexpected identity stats: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
+	}
+	if ipv4, ipv6, dual := store.FamilyStats(); ipv4 != 1 || ipv6 != 1 || dual != 1 {
+		t.Fatalf("unexpected family stats: ipv4=%d ipv6=%d dual=%d", ipv4, ipv6, dual)
 	}
 
 	// A reload creates a new wrapper but retains the process-local baseline.
@@ -46,7 +49,7 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if baselines, changes, saturated := reloaded.Stats(); baselines != 1 || changes != 1 || saturated != 0 {
+	if baselines, changes, saturated := reloaded.Stats(); baselines != 1 || changes != 0 || saturated != 0 {
 		t.Fatalf("process-local baseline did not survive wrapper reload: baselines=%d changes=%d saturated=%d", baselines, changes, saturated)
 	}
 }
@@ -58,7 +61,7 @@ func TestExitIdentityStoreBoundsRotatingVariants(t *testing.T) {
 	}
 	handle := NodeHandle{NodeID: NodeID{9}, Slot: 1, Version: 1}
 	for index := 0; index < maxExitIdentityVariantsPerNode+2; index++ {
-		token := [16]byte{byte(index + 1)}
+		token := exitIdentityToken{digest: [16]byte{byte(index + 1)}, family: 4}
 		changed, accepted := store.Compare(handle, token)
 		if !accepted || index > 0 && index < maxExitIdentityVariantsPerNode && !changed {
 			t.Fatalf("variant %d comparison failed: changed=%v accepted=%v", index, changed, accepted)

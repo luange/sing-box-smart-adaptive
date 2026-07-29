@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,6 +147,8 @@ type AdaptivePool struct {
 	capabilityQuorum        int
 	capabilityCommonModeMin int
 	exitIdentityStore       *ExitIdentityStore
+	aiIPv6Policy            string
+	aiIPv6Blocked           atomic.Uint64
 	capabilityInitFailures  atomic.Uint64
 	closing                 atomic.Bool
 }
@@ -153,6 +156,13 @@ type AdaptivePool struct {
 func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.AdaptivePoolOutboundOptions) (adapter.Outbound, error) {
 	if len(options.Outbounds)+len(options.Providers) == 0 && !options.UseAllProviders {
 		return nil, errors.New("adaptive_pool requires outbound or provider sources")
+	}
+	aiIPv6Policy := strings.ToLower(strings.TrimSpace(options.Policy.AIIPv6Policy))
+	if aiIPv6Policy == "" {
+		aiIPv6Policy = "allow"
+	}
+	if aiIPv6Policy != "allow" && aiIPv6Policy != "block" {
+		return nil, errors.New("adaptive AI IPv6 policy is invalid")
 	}
 	probeURL := options.Probe.URL
 	if probeURL == "" {
@@ -354,6 +364,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		capabilityQuorum:        capabilityQuorum,
 		capabilityCommonModeMin: capabilityCommonModeMin,
 		exitIdentityStore:       exitIdentityStore,
+		aiIPv6Policy:            aiIPv6Policy,
 		probeRunner:             urltest.URLTest,
 		statePath:               statePath,
 		groupID:                 tag,
@@ -701,6 +712,9 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		return nil, err
 	}
 	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkName(network))
+	if p.blockAIIPv6(serviceContext, destination) {
+		return nil, errors.New("adaptive AI IPv6 destination blocked by policy")
+	}
 	snapshot := p.catalog.load()
 	var lease SessionLease
 	var reservation *LeaseReservation
@@ -745,6 +759,19 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	}
 	p.setLatest(candidate.PrimaryTag)
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
+}
+
+func (p *AdaptivePool) blockAIIPv6(service ServiceContext, destination M.Socksaddr) bool {
+	if p == nil || p.aiIPv6Policy != "block" || !destination.Addr.IsValid() || !destination.Addr.Is6() || destination.Addr.Is4In6() {
+		return false
+	}
+	switch service.ID {
+	case "openai_api", "chatgpt_web", "claude", "gemini", "google_account", "apple_account", "microsoft_account", "cloudflare_challenge":
+		p.aiIPv6Blocked.Add(1)
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *AdaptivePool) waitUntilPublished(ctx context.Context) error {
@@ -898,6 +925,9 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 		return nil, err
 	}
 	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkUDP)
+	if p.blockAIIPv6(serviceContext, destination) {
+		return nil, errors.New("adaptive AI IPv6 destination blocked by policy")
+	}
 	snapshot := p.catalog.load()
 	var lease SessionLease
 	var reservation *LeaseReservation
@@ -1099,6 +1129,8 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	status.ObservationPermitBusyTotal = p.observationPermitBusy.Load()
 	status.BusinessTLSFailuresTotal = p.businessTLSFailures.Load()
 	status.TransportFailuresTotal = p.transportFailures.Load()
+	status.AIIPv6Policy = p.aiIPv6Policy
+	status.AIIPv6BlockedTotal = p.aiIPv6Blocked.Load()
 	status.RecentSwitches, status.SelectionSwitchesTotal = p.switchAudit.Snapshot()
 	status.DeltaAppliedTotal = p.deltaAppliedTotal.Load()
 	status.DeltaFallbackTotal = p.deltaFallbackTotal.Load()
@@ -1145,7 +1177,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			tag = safePersistentTag(candidate.PrimaryTag)
 		}
 		status.ServiceLeases = append(status.ServiceLeases, adapter.AdaptiveServiceLease{
-			ServiceID: lease.ServiceID, Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
+			ServiceID: lease.ServiceID, AffinityID: serviceAffinityFamily(lease.ServiceID), Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
 			ExpiresAt: lease.ExpiresAt, UpdatedAt: lease.UpdatedAt,
 		})
 	}
@@ -1177,6 +1209,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 		if health.Breaker != BreakerClosed {
 			state = string(health.Breaker)
 		}
+		weightMatch := p.nodeWeights.Explain(candidate.PrimaryTag)
 		status.Candidates = append(status.Candidates, adapter.AdaptiveCandidateStatus{
 			NodeID:                candidate.ID.String(),
 			EndpointID:            candidate.EndpointID.String(),
@@ -1184,7 +1217,9 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			NodeSlot:              candidate.Handle.Slot,
 			NodeVersion:           candidate.Handle.Version,
 			Tag:                   candidate.PrimaryTag,
-			Weight:                p.nodeWeights.Weight(candidate.PrimaryTag),
+			Weight:                weightMatch.Weight,
+			WeightRule:            weightMatch.Rule,
+			WeightRuleExact:       weightMatch.Exact,
 			Aliases:               append([]string(nil), candidate.Aliases...),
 			IdentityStable:        candidate.IdentityStable,
 			State:                 state,
@@ -1215,6 +1250,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	status.CapabilityEnabled = capabilityEnabled
 	status.CapabilityInitFailures = p.capabilityInitFailures.Load()
 	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal, status.ExitIdentitySaturatedNodes = p.exitIdentityStore.Stats()
+	status.ExitIdentityIPv4Baselines, status.ExitIdentityIPv6Baselines, status.ExitIdentityDualStackNodes = p.exitIdentityStore.FamilyStats()
 	for _, serviceID := range sortedCapabilityControllerIDs(capabilityControllers) {
 		capabilityStatus := capabilityControllers[serviceID].Status()
 		status.CapabilityRunning = status.CapabilityRunning || capabilityStatus.Running

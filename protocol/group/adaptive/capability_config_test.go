@@ -165,7 +165,29 @@ func TestAdaptivePoolBuiltinExitIdentityConfiguresProcessStore(t *testing.T) {
 	}
 	pool := outbound.(*AdaptivePool)
 	defer pool.Close()
-	if pool.exitIdentityStore == nil || len(pool.capabilityServiceIDs) != 1 || pool.capabilityServiceIDs[0] != "exit_identity" {
+	if pool.exitIdentityStore == nil || len(pool.capabilityServiceIDs) != 2 || pool.capabilityServiceIDs[0] != "exit_identity_v4" || pool.capabilityServiceIDs[1] != "exit_identity_v6" {
 		t.Fatalf("exit identity capability was not configured: services=%v store=%v", pool.capabilityServiceIDs, pool.exitIdentityStore)
+	}
+}
+
+func TestAdaptivePoolAIIPv6PolicyIsExplicit(t *testing.T) {
+	ctx := service.ContextWith[adapter.OutboundManager](context.Background(), &capabilityConfigOutboundManager{})
+	options := option.AdaptivePoolOutboundOptions{
+		GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"node"}},
+		State:             option.AdaptivePoolStateOptions{Path: filepath.Join(t.TempDir(), "adaptive-state")},
+		Policy:            option.AdaptivePoolPolicyOptions{AIIPv6Policy: "block"},
+	}
+	outbound, err := New(ctx, nil, nil, "ai-ipv6-policy", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := outbound.(*AdaptivePool)
+	defer pool.Close()
+	if pool.aiIPv6Policy != "block" {
+		t.Fatalf("unexpected AI IPv6 policy: %s", pool.aiIPv6Policy)
+	}
+	options.Policy.AIIPv6Policy = "prefer-v4"
+	if _, err = New(ctx, nil, nil, "invalid-ai-ipv6-policy", options); err == nil {
+		t.Fatal("invalid AI IPv6 policy was accepted")
 	}
 }

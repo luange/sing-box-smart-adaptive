@@ -1140,10 +1140,13 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		})
 	}
 	for index := range ranking.ranks {
-		weight := s.nodeWeights.Weight(ranking.ranks[index].outbound.Tag())
+		weightMatch := s.nodeWeights.Explain(ranking.ranks[index].outbound.Tag())
+		weight := weightMatch.Weight
 		ranking.ranks[index].profile = profile
 		ranking.ranks[index].status.Score = smartScoreForProfile(ranking.ranks[index].estimate, profile, s.exploration, totalSamples) / weight
 		ranking.ranks[index].status.Weight = weight
+		ranking.ranks[index].status.WeightRule = weightMatch.Rule
+		ranking.ranks[index].status.WeightExact = weightMatch.Exact
 		ranking.ranks[index].status.Reason = smartEstimateReason(ranking.ranks[index].estimate)
 		ranking.ranks[index].estimate = smartEstimate{}
 	}

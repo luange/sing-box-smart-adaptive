@@ -374,7 +374,7 @@ type ProbeRawResult struct {
 	Digest              [32]byte
 	HasDigest           bool
 	Delay               time.Duration
-	identityToken       [16]byte
+	identityToken       exitIdentityToken
 	hasIdentityToken    bool
 	identityChanged     bool
 }

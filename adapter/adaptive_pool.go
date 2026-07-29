@@ -19,6 +19,8 @@ type AdaptiveCandidateStatus struct {
 	NodeVersion           uint64    `json:"node_version"`
 	Tag                   string    `json:"tag"`
 	Weight                float64   `json:"weight,omitempty"`
+	WeightRule            string    `json:"weight_rule,omitempty"`
+	WeightRuleExact       bool      `json:"weight_rule_exact,omitempty"`
 	Aliases               []string  `json:"aliases,omitempty"`
 	IdentityStable        bool      `json:"identity_stable"`
 	State                 string    `json:"state"`
@@ -48,12 +50,13 @@ type AdaptiveSwitchAudit struct {
 }
 
 type AdaptiveServiceLease struct {
-	ServiceID string    `json:"service_id"`
-	Mode      string    `json:"mode"`
-	NodeID    string    `json:"node_id"`
-	Tag       string    `json:"tag,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ServiceID  string    `json:"service_id"`
+	AffinityID string    `json:"affinity_id,omitempty"`
+	Mode       string    `json:"mode"`
+	NodeID     string    `json:"node_id"`
+	Tag        string    `json:"tag,omitempty"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type AdaptivePoolStatus struct {
@@ -86,6 +89,11 @@ type AdaptivePoolStatus struct {
 	ExitIdentityBaselines           uint64                    `json:"exit_identity_baselines"`
 	ExitIdentityChangesTotal        uint64                    `json:"exit_identity_changes_total"`
 	ExitIdentitySaturatedNodes      uint64                    `json:"exit_identity_saturated_nodes"`
+	ExitIdentityIPv4Baselines       uint64                    `json:"exit_identity_ipv4_baselines"`
+	ExitIdentityIPv6Baselines       uint64                    `json:"exit_identity_ipv6_baselines"`
+	ExitIdentityDualStackNodes      uint64                    `json:"exit_identity_dual_stack_nodes"`
+	AIIPv6Policy                    string                    `json:"ai_ipv6_policy,omitempty"`
+	AIIPv6BlockedTotal              uint64                    `json:"ai_ipv6_blocked_total"`
 	StateEntries                    int                       `json:"state_entries"`
 	StateEvictions                  uint64                    `json:"state_evictions"`
 	StatePersistenceFailures        uint64                    `json:"state_persistence_failures"`

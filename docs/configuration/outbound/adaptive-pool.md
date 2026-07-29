@@ -14,6 +14,11 @@ epoch-local outbound only at execution time.
   "type": "adaptive_pool",
   "tag": "adaptive",
   "providers": ["subscription"],
+  "exclude_nodes": ["=subscription/retired-node"],
+  "node_weights": [
+    { "match": "Gcore", "weight": 0.25 },
+    { "match": "=subscription/preferred-node", "weight": 2.0 }
+  ],
   "shadow": true,
   "probe": {
     "url": "https://www.gstatic.com/generate_204",
@@ -30,7 +35,8 @@ epoch-local outbound only at execution time.
     "max_attempts": 3,
     "attempt_timeout": "4s",
     "hedge_delay": "450ms",
-    "manual_failure": "fallback"
+    "manual_failure": "fallback",
+    "ai_ipv6_policy": "block"
   },
   "state": {
     "path": "adaptive-state-adaptive",
@@ -39,6 +45,26 @@ epoch-local outbound only at execution time.
   }
 }
 ```
+
+## Manual candidate policy
+
+`exclude_nodes` removes known-bad candidates by complete name or keyword. A
+value beginning with `=` is an exact, case-insensitive match; other values are
+case-insensitive substrings. `exclude` and `include` remain regular-expression
+filters applied at the group boundary.
+
+`node_weights` changes preference only among otherwise eligible candidates. A
+weight below `1` lowers preference, `1` is neutral, and a weight above `1`
+raises preference. It never re-enables an excluded, unhealthy, service-blocked,
+or open-breaker node. Exact matches begin with `=`. If several keyword rules
+match, the longest rule wins; an exact rule always wins. The status API exposes
+`weight`, `weight_rule`, and `weight_rule_exact` for every candidate.
+
+`policy.ai_ipv6_policy` accepts `allow` (default) or `block`. `block` rejects
+IPv6 destinations classified as ChatGPT/OpenAI, Claude, Gemini, Google account,
+or Cloudflare challenge traffic so a dual-stack client can retry through IPv4.
+It does not alter non-AI IPv6 traffic. This is a safety guard, not a substitute
+for routing IPv6 through the transparent proxy.
 
 ## Rollout
 
@@ -75,6 +101,13 @@ as a common target incident instead of penalizing every node. A 5xx response is
 a target fault. No API key, cookie, response header, or query string is stored.
 Builtin modes use one target per service and therefore require `quorum: 1`.
 The two builtin modes and signed-manifest mode are mutually exclusive.
+
+`builtin_exit_identity` uses the same scheduler and observation pipeline to
+probe separate IPv4 and IPv6 identity endpoints. Raw addresses are converted
+to process-local keyed tokens and are never exposed or persisted. Status shows
+IPv4 baselines, IPv6 baselines, dual-stack nodes, changes, and saturated
+rotating identities. All identity baselines disappear when the sing-box
+process exits.
 
 ## API and dashboards
 

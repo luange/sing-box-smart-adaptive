@@ -13,9 +13,18 @@ import (
 const maxProcessExitIdentityEntries = 65536
 const maxExitIdentityVariantsPerNode = 16
 
-type exitIdentityNodeState struct {
+type exitIdentityFamilyState struct {
 	variants  [][16]byte
 	saturated bool
+}
+
+type exitIdentityNodeState struct {
+	families map[uint8]*exitIdentityFamilyState
+}
+
+type exitIdentityToken struct {
+	digest [16]byte
+	family uint8
 }
 
 type exitIdentityGroupState struct {
@@ -54,10 +63,14 @@ func NewExitIdentityStore(groupID string) (*ExitIdentityStore, error) {
 	return &ExitIdentityStore{groupID: groupID}, nil
 }
 
-func tokenizeExitIdentity(value []byte) ([16]byte, bool) {
+func tokenizeExitIdentity(value []byte) (exitIdentityToken, bool) {
 	address, err := netip.ParseAddr(strings.TrimSpace(string(value)))
 	if err != nil || !address.IsValid() || address.IsUnspecified() || address.IsLoopback() || address.IsPrivate() || address.IsMulticast() {
-		return [16]byte{}, false
+		return exitIdentityToken{}, false
+	}
+	family := uint8(6)
+	if address.Is4() || address.Is4In6() {
+		family = 4
 	}
 	canonical := address.Unmap().String()
 	digest := hmac.New(sha256.New, processExitIdentities.key[:])
@@ -65,11 +78,11 @@ func tokenizeExitIdentity(value []byte) ([16]byte, bool) {
 	sum := digest.Sum(nil)
 	var token [16]byte
 	copy(token[:], sum[:len(token)])
-	return token, true
+	return exitIdentityToken{digest: token, family: family}, true
 }
 
-func (s *ExitIdentityStore) Compare(handle NodeHandle, token [16]byte) (changed bool, accepted bool) {
-	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token == ([16]byte{}) {
+func (s *ExitIdentityStore) Compare(handle NodeHandle, token exitIdentityToken) (changed bool, accepted bool) {
+	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token.digest == ([16]byte{}) || token.family != 4 && token.family != 6 {
 		return false, false
 	}
 	processExitIdentities.access.Lock()
@@ -82,19 +95,23 @@ func (s *ExitIdentityStore) Compare(handle NodeHandle, token [16]byte) (changed 
 	if !loaded {
 		return false, true
 	}
-	for _, known := range node.variants {
-		if hmac.Equal(known[:], token[:]) {
+	family := node.families[token.family]
+	if family == nil {
+		return false, true
+	}
+	for _, known := range family.variants {
+		if hmac.Equal(known[:], token.digest[:]) {
 			return false, true
 		}
 	}
-	if node.saturated {
+	if family.saturated {
 		return false, true
 	}
 	return true, true
 }
 
-func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
-	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token == ([16]byte{}) {
+func (s *ExitIdentityStore) Commit(handle NodeHandle, token exitIdentityToken) bool {
+	if s == nil || s.groupID == "" || handle.NodeID == (NodeID{}) || token.digest == ([16]byte{}) || token.family != 4 && token.family != 6 {
 		return false
 	}
 	processExitIdentities.access.Lock()
@@ -113,25 +130,61 @@ func (s *ExitIdentityStore) Commit(handle NodeHandle, token [16]byte) bool {
 		if entries >= maxProcessExitIdentityEntries {
 			return false
 		}
-		group.identities[handle.NodeID] = &exitIdentityNodeState{variants: [][16]byte{token}}
+		group.identities[handle.NodeID] = &exitIdentityNodeState{families: map[uint8]*exitIdentityFamilyState{
+			token.family: {variants: [][16]byte{token.digest}},
+		}}
 		return true
 	}
-	for _, known := range node.variants {
-		if hmac.Equal(known[:], token[:]) {
+	family := node.families[token.family]
+	if family == nil {
+		if node.families == nil {
+			node.families = make(map[uint8]*exitIdentityFamilyState)
+		}
+		node.families[token.family] = &exitIdentityFamilyState{variants: [][16]byte{token.digest}}
+		return true
+	}
+	for _, known := range family.variants {
+		if hmac.Equal(known[:], token.digest[:]) {
 			return true
 		}
 	}
-	if node.saturated {
+	if family.saturated {
 		return true
 	}
-	if len(node.variants) >= maxExitIdentityVariantsPerNode {
-		node.saturated = true
+	if len(family.variants) >= maxExitIdentityVariantsPerNode {
+		family.saturated = true
 		group.saturatedNodes++
 		return true
 	}
-	node.variants = append(node.variants, token)
+	family.variants = append(family.variants, token.digest)
 	group.changes++
 	return true
+}
+
+func (s *ExitIdentityStore) FamilyStats() (ipv4, ipv6, dualStack uint64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	processExitIdentities.access.Lock()
+	defer processExitIdentities.access.Unlock()
+	group := processExitIdentities.groups[s.groupID]
+	if group == nil {
+		return 0, 0, 0
+	}
+	for _, node := range group.identities {
+		_, has4 := node.families[4]
+		_, has6 := node.families[6]
+		if has4 {
+			ipv4++
+		}
+		if has6 {
+			ipv6++
+		}
+		if has4 && has6 {
+			dualStack++
+		}
+	}
+	return
 }
 
 func (s *ExitIdentityStore) Stats() (baselines, changes, saturated uint64) {

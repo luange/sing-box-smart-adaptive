@@ -196,6 +196,8 @@ type SmartCandidateStatus struct {
 	State         string  `json:"state"`
 	Score         float64 `json:"score"`
 	Weight        float64 `json:"weight,omitempty"`
+	WeightRule    string  `json:"weight_rule,omitempty"`
+	WeightExact   bool    `json:"weight_rule_exact,omitempty"`
 	Reliability   float64 `json:"reliability"`
 	ConnectMS     float64 `json:"connect_ms,omitempty"`
 	FirstByteMS   float64 `json:"first_byte_ms,omitempty"`

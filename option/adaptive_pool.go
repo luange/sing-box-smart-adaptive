@@ -33,6 +33,7 @@ type AdaptivePoolPolicyOptions struct {
 	AttemptTimeout   badoption.Duration `json:"attempt_timeout,omitempty"`
 	HedgeDelay       badoption.Duration `json:"hedge_delay,omitempty"`
 	ManualFailure    string             `json:"manual_failure,omitempty"`
+	AIIPv6Policy     string             `json:"ai_ipv6_policy,omitempty"`
 }
 
 type AdaptivePoolProbeOptions struct {

@@ -84,7 +84,7 @@ func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination 
 
 func serviceAffinityFamily(serviceID string) string {
 	switch serviceID {
-	case "chatgpt_web", "claude", "gemini", "google_account", "cloudflare_challenge":
+	case "chatgpt_web", "claude", "gemini", "google_account", "apple_account", "microsoft_account", "cloudflare_challenge":
 		return "browser_identity"
 	default:
 		return serviceID
@@ -159,6 +159,10 @@ func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMo
 		return "telegram", ModeStrictAffinity
 	case domainMatches(host, "accounts.google.com", "oauth2.googleapis.com", "securetoken.googleapis.com", "pay.google.com", "payments.google.com", "payments.googleusercontent.com"):
 		return "google_account", ModeStrictAffinity
+	case domainMatches(host, "appleid.apple.com", "idmsa.apple.com", "appleid.cdn-apple.com", "aaplimg.com"):
+		return "apple_account", ModeStrictAffinity
+	case domainMatches(host, "login.microsoftonline.com", "login.live.com", "account.live.com", "msauth.net", "msftauth.net"):
+		return "microsoft_account", ModeStrictAffinity
 	case domainMatches(host, "challenges.cloudflare.com", "turnstile.cloudflare.com"):
 		return "cloudflare_challenge", ModeStrictAffinity
 	case domainMatches(host, "whatsapp.com", "whatsapp.net", "wa.me"):
