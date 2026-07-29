@@ -1,9 +1,21 @@
 package adaptive
 
-import "testing"
+import (
+	"strconv"
+	"sync/atomic"
+	"testing"
+)
+
+var exitIdentityTestSequence atomic.Uint64
+
+func uniqueExitIdentityTestGroup(t *testing.T) string {
+	t.Helper()
+	return t.Name() + "-" + strconv.FormatUint(exitIdentityTestSequence.Add(1), 10)
+}
 
 func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) {
-	store, err := NewExitIdentityStore("test-exit-identity-store")
+	groupID := uniqueExitIdentityTestGroup(t)
+	store, err := NewExitIdentityStore(groupID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +57,7 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 	}
 
 	// A reload creates a new wrapper but retains the process-local baseline.
-	reloaded, err := NewExitIdentityStore("test-exit-identity-store")
+	reloaded, err := NewExitIdentityStore(groupID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +67,7 @@ func TestExitIdentityStoreIsProcessLocalKeyedAndCountsOnlyChanges(t *testing.T) 
 }
 
 func TestExitIdentityStoreBoundsRotatingVariants(t *testing.T) {
-	store, err := NewExitIdentityStore("test-exit-identity-variant-bound")
+	store, err := NewExitIdentityStore(uniqueExitIdentityTestGroup(t))
 	if err != nil {
 		t.Fatal(err)
 	}
