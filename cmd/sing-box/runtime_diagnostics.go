@@ -14,10 +14,23 @@ const runtimeDiagnosticsEnvironment = "SING_BOX_RUNTIME_DIAGNOSTICS"
 // requested for an isolated process. The fixed loopback listener prevents the
 // diagnostic surface from being exposed by a production configuration.
 func startRuntimeDiagnostics() (*http.Server, error) {
-	if os.Getenv(runtimeDiagnosticsEnvironment) == "" {
+	configured := os.Getenv(runtimeDiagnosticsEnvironment)
+	if configured == "" {
 		return nil, nil
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:6060")
+	address := "127.0.0.1:6060"
+	if configured != "1" && configured != "true" {
+		address = configured
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, errors.New("invalid runtime diagnostics address")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return nil, errors.New("runtime diagnostics must listen on loopback")
+	}
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, err
 	}
