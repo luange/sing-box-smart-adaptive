@@ -145,8 +145,8 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 			return leftScore.HealthPriority < rightScore.HealthPriority
 		}
 		if mode == ModeBulk {
-			leftService := e.health.StatusHandle(eligible[i].Handle, DomainService, serviceHealthTransport(service), service.ID)
-			rightService := e.health.StatusHandle(eligible[j].Handle, DomainService, serviceHealthTransport(service), service.ID)
+			leftService := e.health.StatusHandle(eligible[i].Handle, DomainService, "", service.ID)
+			rightService := e.health.StatusHandle(eligible[j].Handle, DomainService, "", service.ID)
 			leftKnown, rightKnown := leftService.ThroughputSamples >= 2, rightService.ThroughputSamples >= 2
 			if leftKnown != rightKnown {
 				return leftKnown
@@ -238,7 +238,7 @@ func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContex
 		{name: serviceHealthTransport(service), status: e.health.StatusHandle(candidate.Handle, DomainTransport, serviceHealthTransport(service), "")},
 	}
 	if service.ID != "" {
-		statuses = append(statuses, namedStatus{name: "service:" + service.ID + "/" + serviceHealthTransport(service), status: e.health.StatusHandle(candidate.Handle, DomainService, serviceHealthTransport(service), service.ID)})
+		statuses = append(statuses, namedStatus{name: "service:" + service.ID, status: e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID)})
 	}
 	priority := healthPriority(HealthHealthy)
 	var delay time.Duration

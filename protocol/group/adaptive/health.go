@@ -318,7 +318,7 @@ func (s *HealthStore) TryAcquireAttemptPermitHandle(handle NodeHandle, service S
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, transport: serviceHealthTransport(service), service: service.ID}}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
 	return s.tryAcquirePermit(keys, at)
 }
 
@@ -433,7 +433,7 @@ func (s *HealthStore) CanAttemptHandle(handle NodeHandle, service ServiceContext
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, transport: serviceHealthTransport(service), service: service.ID}}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
 	s.access.Lock()
 	defer s.access.Unlock()
 	for _, key := range keys {
@@ -621,25 +621,6 @@ func (s *HealthStore) StatusHandle(handle NodeHandle, domain FailureDomain, tran
 	s.access.RLock()
 	defer s.access.RUnlock()
 	record := s.entries[healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, transport: transport, service: service}]
-	if record == nil && domain == DomainService && transport != "" {
-		// Process-local compatibility: family-aware readers may consume a
-		// generic service record produced before family qualification was added.
-		record = s.entries[healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, service: service}]
-	}
-	if record == nil && domain == DomainService && transport == "" {
-		// Compatibility/diagnostic queries without a family return the most
-		// restrictive recent family-specific result rather than hiding it.
-		var selected *healthRecord
-		for key, candidate := range s.entries {
-			if key.nodeID != handle.NodeID || key.nodeSlot != handle.Slot || key.nodeVersion != handle.Version || key.domain != domain || key.service != service {
-				continue
-			}
-			if selected == nil || healthPriority(candidate.status.Health) > healthPriority(selected.status.Health) || healthPriority(candidate.status.Health) == healthPriority(selected.status.Health) && candidate.status.LastUpdated.After(selected.status.LastUpdated) {
-				selected = candidate
-			}
-		}
-		record = selected
-	}
 	if record == nil && domain == DomainTransport && !strings.Contains(transport, "/") {
 		var selected *healthRecord
 		for key, candidate := range s.entries {
@@ -665,14 +646,6 @@ func (s *HealthStore) StatusHandle(handle NodeHandle, domain FailureDomain, tran
 func (s *HealthStore) recordForKeyLocked(key healthKey) (*healthRecord, healthKey) {
 	if record := s.entries[key]; record != nil {
 		return record, key
-	}
-	if key.domain == DomainService && key.transport != "" {
-		legacyKey := key
-		legacyKey.transport = ""
-		if record := s.entries[legacyKey]; record != nil {
-			return record, legacyKey
-		}
-		return nil, key
 	}
 	if key.domain != DomainTransport {
 		return nil, key

@@ -328,10 +328,6 @@ func healthObservationForDomain(e ObservationEvidence, domain DomainEvidence) Ob
 	}
 	if domain.Domain == DomainService {
 		observation.Service = e.ServiceID
-		// Service eligibility is address-family specific. Keep IPv4 and IPv6
-		// conclusions independent so a regional block or challenge observed on
-		// one stack cannot poison the other stack for the same node.
-		observation.Transport = e.NetworkPath
 	}
 	return observation
 }
