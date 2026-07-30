@@ -120,17 +120,56 @@ func TestTCPEarlyTLSResetPenalizesServiceAndInvalidatesLease(t *testing.T) {
 }
 
 type earlyTLSErrorConn struct {
-	readErr error
+	readErr  error
+	writeErr error
 }
 
-func (c *earlyTLSErrorConn) Read([]byte) (int, error)        { return 0, c.readErr }
-func (*earlyTLSErrorConn) Write(payload []byte) (int, error) { return len(payload), nil }
-func (*earlyTLSErrorConn) Close() error                      { return nil }
-func (*earlyTLSErrorConn) LocalAddr() net.Addr               { return &net.TCPAddr{Port: 1} }
-func (*earlyTLSErrorConn) RemoteAddr() net.Addr              { return &net.TCPAddr{Port: 2} }
-func (*earlyTLSErrorConn) SetDeadline(time.Time) error       { return nil }
-func (*earlyTLSErrorConn) SetReadDeadline(time.Time) error   { return nil }
-func (*earlyTLSErrorConn) SetWriteDeadline(time.Time) error  { return nil }
+func (c *earlyTLSErrorConn) Read([]byte) (int, error) { return 0, c.readErr }
+func (c *earlyTLSErrorConn) Write(payload []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return len(payload), nil
+}
+func (*earlyTLSErrorConn) Close() error                     { return nil }
+func (*earlyTLSErrorConn) LocalAddr() net.Addr              { return &net.TCPAddr{Port: 1} }
+func (*earlyTLSErrorConn) RemoteAddr() net.Addr             { return &net.TCPAddr{Port: 2} }
+func (*earlyTLSErrorConn) SetDeadline(time.Time) error      { return nil }
+func (*earlyTLSErrorConn) SetReadDeadline(time.Time) error  { return nil }
+func (*earlyTLSErrorConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestTCPWriteFailureUsesConfidenceWithoutChangingPayloadSemantics(t *testing.T) {
+	tests := []struct {
+		name               string
+		err                error
+		attempts           int
+		wantBreakerFailure uint64
+		wantQualityFailure uint64
+		wantBreaker        BreakerState
+	}{
+		{name: "broken-pipe", err: syscall.EPIPE, attempts: 3, wantBreakerFailure: 3, wantBreaker: BreakerOpen},
+		{name: "timeout", err: context.DeadlineExceeded, attempts: 1, wantQualityFailure: 1, wantBreaker: BreakerClosed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			health := NewHealthStore(time.Hour, 32)
+			pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{97}, "write-"+test.name, newTestOutbound("write-"+test.name)))
+			service := testBusinessService(N.NetworkTCP)
+			for range test.attempts {
+				wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{writeErr: test.err}, snapshot, snapshot.Candidates[0], service, time.Now())
+				payload := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
+				if count, err := wrapped.Write(payload); count != 0 || !errors.Is(err, test.err) {
+					t.Fatalf("write semantics changed: count=%d err=%v", count, err)
+				}
+				_ = wrapped.Close()
+			}
+			status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkTCP)
+			if status.Failures != test.wantBreakerFailure || status.NonBreakerFailures != test.wantQualityFailure || status.Breaker != test.wantBreaker {
+				t.Fatalf("write failure confidence mismatch: %+v", status)
+			}
+		})
+	}
+}
 
 func TestTCPEarlyTLSEOFIsAmbiguousAndDoesNotPenalize(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
@@ -380,6 +419,7 @@ func TestTCPThroughputReducerFailureDoesNotPolluteHealth(t *testing.T) {
 type extendedMemoryConn struct {
 	readPayload []byte
 	readErr     error
+	writeErr    error
 	readIndex   int
 	local       net.Addr
 	remote      net.Addr
@@ -459,7 +499,10 @@ func TestExtendedConnAmbiguousTLSErrorsDoNotOpenBreaker(t *testing.T) {
 		})
 	}
 }
-func (c *extendedMemoryConn) WriteBuffer(buffer *buf.Buffer) error { c.lastWrite = buffer; return nil }
+func (c *extendedMemoryConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.lastWrite = buffer
+	return c.writeErr
+}
 func (c *extendedMemoryConn) ReadFrom(reader io.Reader) (int64, error) {
 	return io.Copy(io.Discard, reader)
 }

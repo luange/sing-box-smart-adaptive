@@ -260,6 +260,17 @@ func (c *observedConn) observeThroughput() {
 	c.observation.observeThroughput(c.readBytes.Load()+c.writeBytes.Load(), time.Since(c.startedAt))
 }
 
+func (c *observedConn) observeWriteFailure(err error) {
+	if c == nil || err == nil || c.localClosed.Load() || !c.tlsStarted.Load() {
+		return
+	}
+	failure, confidence, actionable := classifyEarlyTLSFailure(err)
+	if !actionable {
+		return
+	}
+	c.observation.observeTLSFailure(time.Since(c.startedAt), failure, confidence, errorReason(err))
+}
+
 func (c *observedConn) Write(payload []byte) (int, error) {
 	if isTLSClientHello(payload) {
 		c.tlsStarted.Store(true)
@@ -267,6 +278,9 @@ func (c *observedConn) Write(payload []byte) (int, error) {
 	count, err := c.Conn.Write(payload)
 	if count > 0 {
 		c.writeBytes.Add(int64(count))
+	}
+	if err != nil {
+		c.observeWriteFailure(err)
 	}
 	return count, err
 }
@@ -280,6 +294,9 @@ func (c *observedConn) ReadFrom(reader io.Reader) (int64, error) {
 		count, err := readerFrom.ReadFrom(reader)
 		if count > 0 {
 			c.writeBytes.Add(count)
+		}
+		if err != nil {
+			c.observeWriteFailure(err)
 		}
 		if err == nil || errors.Is(err, io.EOF) {
 			c.observeThroughput()
@@ -350,6 +367,9 @@ func (c *observedExtendedConn) WriteBuffer(buffer *buf.Buffer) error {
 	err := c.extended.WriteBuffer(buffer)
 	if err == nil && count > 0 {
 		c.writeBytes.Add(int64(count))
+	}
+	if err != nil {
+		c.observeWriteFailure(err)
 	}
 	return err
 }
