@@ -148,7 +148,11 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	}
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	// SIGHUP belongs exclusively to the outer serialized reload loop. Letting
+	// this startup guard receive it can cancel a newly created Box while the
+	// previous reload is still completing, turning a burst of reload requests
+	// into a fatal "start service: context canceled" race.
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
 	defer func() {
 		signal.Stop(osSignals)
 		close(osSignals)
