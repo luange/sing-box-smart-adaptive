@@ -199,7 +199,7 @@ func (c *CapabilityProbeController) Start(parent context.Context) error {
 		}()
 		retryDelay := min(c.interval, capabilityStartupRetry)
 		for {
-			if _, runErr := c.RunOnce(ctx); runErr == nil {
+			if _, runErr := c.RunOnce(ctx); runErr == nil || !errors.Is(runErr, ErrCapabilityView) {
 				break
 			}
 			timer := time.NewTimer(retryDelay)

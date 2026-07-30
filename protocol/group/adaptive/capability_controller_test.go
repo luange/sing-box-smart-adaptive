@@ -249,3 +249,21 @@ func TestCapabilityProbeControllerRetriesInitialViewFailureBeforeInterval(t *tes
 	}
 	t.Fatalf("controller waited for full interval after startup view failure: %+v", controller.Status())
 }
+
+func TestCapabilityProbeControllerDoesNotTightRetrySuiteFailure(t *testing.T) {
+	provider := new(controllerTargetProvider)
+	suite := &controllerSuiteRunner{err: errors.New("deterministic probe failure")}
+	controller, err := NewCapabilityProbeController(nil, provider, suite, controllerExecutionSnapshot, 11, time.Hour, time.Second, 1, 2, controllerBridge())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = controller.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	time.Sleep(600 * time.Millisecond)
+	status := controller.Status()
+	if status.CyclesStarted != 1 || status.SuiteFailures != 1 || suite.calls != 1 {
+		t.Fatalf("suite failure entered startup retry loop: status=%+v suite_calls=%d", status, suite.calls)
+	}
+}
