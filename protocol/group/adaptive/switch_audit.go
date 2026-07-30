@@ -63,7 +63,7 @@ func (s *SwitchAuditStore) RecordSelection(session SessionKey, serviceID string,
 		return
 	}
 	event := adapter.AdaptiveSwitchAudit{
-		ServiceID: serviceID, NewNodeID: candidate.ID.String(), NewTag: safePersistentTag(candidate.PrimaryTag),
+		ServiceID: serviceID, SessionID: session.String(), NewNodeID: candidate.ID.String(), NewTag: safePersistentTag(candidate.PrimaryTag),
 		Reason: string(reason), OccurredAt: at,
 	}
 	if failed {

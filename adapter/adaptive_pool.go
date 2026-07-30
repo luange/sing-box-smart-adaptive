@@ -39,6 +39,7 @@ type AdaptiveCandidateStatus struct {
 
 type AdaptiveSwitchAudit struct {
 	ServiceID     string    `json:"service_id"`
+	SessionID     string    `json:"session_id,omitempty"`
 	OldNodeID     string    `json:"old_node_id,omitempty"`
 	OldTag        string    `json:"old_tag,omitempty"`
 	NewNodeID     string    `json:"new_node_id,omitempty"`
@@ -52,6 +53,7 @@ type AdaptiveSwitchAudit struct {
 type AdaptiveServiceLease struct {
 	ServiceID  string    `json:"service_id"`
 	AffinityID string    `json:"affinity_id,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
 	Mode       string    `json:"mode"`
 	NodeID     string    `json:"node_id"`
 	Tag        string    `json:"tag,omitempty"`

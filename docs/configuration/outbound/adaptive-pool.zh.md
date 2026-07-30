@@ -43,6 +43,10 @@ breaker、吞吐和 evidence 字段。
 规则始终优先。状态 API 会逐节点返回 `weight`、`weight_rule` 和
 `weight_rule_exact`，可直接确认规则是否真正生效。
 
+服务租约和切换审计会返回16位十六进制 `session_id`。它只是用于关联同一个
+匿名客户端/服务亲和会话的截断带密钥摘要，不包含源地址、进程、用户名、目标、
+token或凭据。
+
 示例：
 
 ```json
@@ -62,8 +66,11 @@ breaker、吞吐和 evidence 字段。
 }
 ```
 
+Apple和Microsoft OAuth域名会与ChatGPT、Claude、Gemini、Google登录及
+Cloudflare challenge共用 `browser_identity` 租约。
+
 `policy.ai_ipv6_policy` 支持 `allow`（默认）和 `block`。`block` 会拒绝已识别为
-ChatGPT/OpenAI、Claude、Gemini、Google 登录或 Cloudflare challenge 的 IPv6
+ChatGPT/OpenAI、Claude、Gemini、Google/Apple/Microsoft登录或Cloudflare challenge的IPv6
 目标，使双栈客户端回落到 IPv4；非 AI 的 IPv6 业务不受影响。这个参数只是
 安全门禁，不能代替把 IPv6 流量正确纳入透明代理/PBR。
 

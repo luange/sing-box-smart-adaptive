@@ -19,6 +19,13 @@ func (id NodeID) String() string {
 	return hex.EncodeToString(id[:])
 }
 
+func (key SessionKey) String() string {
+	// Session keys are already keyed, process-independent opaque identities.
+	// Expose only half of the digest so operators can correlate lease and switch
+	// records without recovering client, process, inbound or destination data.
+	return hex.EncodeToString(key[:8])
+}
+
 type IdentityHasher struct {
 	key [32]byte
 }

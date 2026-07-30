@@ -18,7 +18,7 @@ func TestSwitchAuditJoinsFailureWithReplacementWithoutPrivateDestination(t *test
 		t.Fatalf("switch audit missing: total=%d entries=%+v", total, entries)
 	}
 	event := entries[0]
-	if event.OldNodeID != old.ID.String() || event.NewNodeID != next.ID.String() || event.Failure != string(FailureTLS) || event.FailureSource != "business_tls" || event.Reason != "failure_failover" {
+	if event.SessionID != session.String() || event.OldNodeID != old.ID.String() || event.NewNodeID != next.ID.String() || event.Failure != string(FailureTLS) || event.FailureSource != "business_tls" || event.Reason != "failure_failover" {
 		t.Fatalf("switch audit mismatch: %+v", event)
 	}
 	if strings.Contains(event.ServiceID+event.OldTag+event.NewTag, "?") || strings.Contains(event.ServiceID+event.OldTag+event.NewTag, "token") {

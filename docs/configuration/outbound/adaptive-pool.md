@@ -60,9 +60,17 @@ or open-breaker node. Exact matches begin with `=`. If several keyword rules
 match, the longest rule wins; an exact rule always wins. The status API exposes
 `weight`, `weight_rule`, and `weight_rule_exact` for every candidate.
 
+Service leases and switch audits include a 16-hex-character `session_id`.
+It is a truncated keyed digest used only to correlate events for one anonymous
+client/service affinity; it does not contain the source address, process,
+username, destination, token, or credential.
+
 `policy.ai_ipv6_policy` accepts `allow` (default) or `block`. `block` rejects
 IPv6 destinations classified as ChatGPT/OpenAI, Claude, Gemini, Google account,
-or Cloudflare challenge traffic so a dual-stack client can retry through IPv4.
+Apple and Microsoft OAuth domains join the same `browser_identity` lease as
+ChatGPT, Claude, Gemini, Google login, and Cloudflare challenge traffic.
+`ai_ipv6_policy: block` rejects IPv6 destinations in those identity families so
+a dual-stack client can retry through IPv4.
 It does not alter non-AI IPv6 traffic. This is a safety guard, not a substitute
 for routing IPv6 through the transparent proxy.
 

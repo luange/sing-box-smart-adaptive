@@ -1177,7 +1177,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			tag = safePersistentTag(candidate.PrimaryTag)
 		}
 		status.ServiceLeases = append(status.ServiceLeases, adapter.AdaptiveServiceLease{
-			ServiceID: lease.ServiceID, AffinityID: serviceAffinityFamily(lease.ServiceID), Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
+			ServiceID: lease.ServiceID, AffinityID: serviceAffinityFamily(lease.ServiceID), SessionID: lease.Key.String(), Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
 			ExpiresAt: lease.ExpiresAt, UpdatedAt: lease.UpdatedAt,
 		})
 	}

@@ -20,6 +20,13 @@ type testOutbound struct {
 	outbound.Adapter
 }
 
+func TestSessionKeyStringIsOpaqueAndBounded(t *testing.T) {
+	key := SessionKey{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	if got := key.String(); got != "0102030405060708" || len(got) != 16 {
+		t.Fatalf("unexpected opaque session ID: %q", got)
+	}
+}
+
 func TestCatalogScalesAndDeduplicatesFiveHundredNodes(t *testing.T) {
 	hasher := testIdentityHasher(t)
 	roots := make([]A48SourceRoot, 0, 1000)
