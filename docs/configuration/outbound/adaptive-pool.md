@@ -99,7 +99,7 @@ Supported service capabilities are `tls`, `auth_http`, `http`, `http3`, and `ran
 `http3` is available only in `with_quic` builds and rejects HTTP/2 fallback.
 
 `builtin_youtube_tls` enables the fixed, credential-free YouTube TLS target.
-`builtin_ai_service_tls` replaces it with five isolated service probes:
+`service_qualification` enables five isolated service qualification probes:
 YouTube TLS, Google-backed Gemini TLS, unauthenticated OpenAI and Anthropic
 model-list requests, and a browser-shaped ChatGPT web/WAF request. For the
 unauthenticated probes, HTTP 401 proves that the service path is reachable.

@@ -12,16 +12,16 @@ type AdaptivePoolOutboundOptions struct {
 }
 
 type AdaptivePoolCapabilityOptions struct {
-	Enabled             bool               `json:"enabled,omitempty"`
-	BuiltinYouTubeTLS   bool               `json:"builtin_youtube_tls,omitempty"`
-	BuiltinAIServiceTLS bool               `json:"builtin_ai_service_tls,omitempty"`
-	BuiltinExitIdentity bool               `json:"builtin_exit_identity,omitempty"`
-	ManifestURL         string             `json:"manifest_url,omitempty"`
-	TrustedKeys         map[string]string  `json:"trusted_keys,omitempty"`
-	RefreshInterval     badoption.Duration `json:"refresh_interval,omitempty"`
-	Timeout             badoption.Duration `json:"timeout,omitempty"`
-	Quorum              int                `json:"quorum,omitempty"`
-	CommonModeMinNodes  int                `json:"common_mode_min_nodes,omitempty"`
+	Enabled              bool               `json:"enabled,omitempty"`
+	BuiltinYouTubeTLS    bool               `json:"builtin_youtube_tls,omitempty"`
+	ServiceQualification bool               `json:"service_qualification,omitempty"`
+	BuiltinExitIdentity  bool               `json:"builtin_exit_identity,omitempty"`
+	ManifestURL          string             `json:"manifest_url,omitempty"`
+	TrustedKeys          map[string]string  `json:"trusted_keys,omitempty"`
+	RefreshInterval      badoption.Duration `json:"refresh_interval,omitempty"`
+	Timeout              badoption.Duration `json:"timeout,omitempty"`
+	Quorum               int                `json:"quorum,omitempty"`
+	CommonModeMinNodes   int                `json:"common_mode_min_nodes,omitempty"`
 }
 
 type AdaptivePoolPolicyOptions struct {

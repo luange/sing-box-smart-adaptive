@@ -130,7 +130,7 @@ func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing
 		GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"node"}},
 		State:             option.AdaptivePoolStateOptions{Path: filepath.Join(t.TempDir(), "adaptive-state")},
 		Capability: option.AdaptivePoolCapabilityOptions{
-			Enabled: true, BuiltinAIServiceTLS: true,
+			Enabled: true, ServiceQualification: true,
 			RefreshInterval: badoption.Duration(time.Minute), Timeout: badoption.Duration(time.Second), Quorum: 1, CommonModeMinNodes: 2,
 		},
 	}

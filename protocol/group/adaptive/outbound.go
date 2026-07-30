@@ -201,7 +201,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			capabilityTimeout = defaultCapabilityTimeout
 		}
 		if capabilityQuorum == 0 {
-			if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
+			if options.Capability.BuiltinYouTubeTLS || options.Capability.ServiceQualification || options.Capability.BuiltinExitIdentity {
 				capabilityQuorum = 1
 			} else {
 				capabilityQuorum = 2
@@ -213,17 +213,17 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		if capabilityCommonModeMin < 2 {
 			return nil, errors.New("adaptive capability common-mode threshold is invalid")
 		}
-		if options.Capability.BuiltinYouTubeTLS && options.Capability.BuiltinAIServiceTLS {
+		if options.Capability.BuiltinYouTubeTLS && options.Capability.ServiceQualification {
 			return nil, errors.New("adaptive builtin capability modes are ambiguous")
 		}
-		if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
+		if options.Capability.BuiltinYouTubeTLS || options.Capability.ServiceQualification || options.Capability.BuiltinExitIdentity {
 			if capabilityQuorum != 1 {
 				return nil, errors.New("adaptive builtin capability requires quorum 1")
 			}
 			if options.Capability.ManifestURL != "" || len(options.Capability.TrustedKeys) != 0 {
 				return nil, errors.New("adaptive builtin capability cannot use manifest trust options")
 			}
-			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, options.Capability.BuiltinAIServiceTLS, options.Capability.BuiltinExitIdentity)
+			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, options.Capability.ServiceQualification, options.Capability.BuiltinExitIdentity)
 			if providerErr != nil {
 				return nil, errors.New("adaptive builtin capability is invalid")
 			}
