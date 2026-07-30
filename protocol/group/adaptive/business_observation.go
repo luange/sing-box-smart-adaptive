@@ -31,7 +31,7 @@ type businessObservation struct {
 	releaseOnce    sync.Once
 }
 
-func (o *businessObservation) observeTLSFailure(delay time.Duration, reason string) {
+func (o *businessObservation) observeTLSFailure(delay time.Duration, failure FailureClass, confidence ObservationConfidence, reason string) {
 	if o == nil {
 		return
 	}
@@ -44,16 +44,16 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 		evidence := o.evidence
 		evidence.Source = SourceTLS
 		evidence.Stage = StageServiceApplication
-		evidence.Confidence = ConfidenceHigh
+		evidence.Confidence = confidence
 		evidence.Outcome = OutcomeFailure
-		evidence.Failure = FailureTLS
+		evidence.Failure = failure
 		evidence.Delay = delay
 		evidence.At = time.Now()
 		evidence.Reason = reason
 		reducer := &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
-		if publishErr == nil && disposition == IngestAccepted {
+		if publishErr == nil && disposition == IngestAccepted && confidence >= ConfidenceHigh {
 			o.pool.businessTLSFailures.Add(1)
 			status := o.pool.health.StatusHandle(o.evidence.Handle, DomainService, "", o.service.ID)
 			if status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
@@ -72,11 +72,15 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 }
 
 func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) {
-	if o == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
+	if o == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 		return
 	}
 	o.failureOnce.Do(func() {
 		confidence := ConfidenceLow
+		failure := FailureConnect
+		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+			failure = FailureTimeout
+		}
 		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
 			confidence = ConfidenceHigh
 		}
@@ -86,7 +90,7 @@ func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) 
 		evidence.NetworkPath = serviceHealthTransport(o.service)
 		evidence.Confidence = confidence
 		evidence.Outcome = OutcomeFailure
-		evidence.Failure = FailureConnect
+		evidence.Failure = failure
 		evidence.Delay = delay
 		evidence.At = time.Now()
 		evidence.Reason = errorReason(err)
@@ -215,8 +219,8 @@ func (c *observedConn) observeRead(count int) {
 func (c *observedConn) Read(payload []byte) (int, error) {
 	count, err := c.Conn.Read(payload)
 	c.observeRead(count)
-	if count == 0 && actionableEarlyTLSError(err) && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
-		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
+	if failure, confidence, actionable := classifyEarlyTLSFailure(err); count == 0 && actionable && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+		c.observation.observeTLSFailure(time.Since(c.startedAt), failure, confidence, errorReason(err))
 	}
 	if errors.Is(err, io.EOF) {
 		c.observeThroughput()
@@ -225,15 +229,18 @@ func (c *observedConn) Read(payload []byte) (int, error) {
 	return count, err
 }
 
-func actionableEarlyTLSError(err error) bool {
+func classifyEarlyTLSFailure(err error) (FailureClass, ObservationConfidence, bool) {
 	// A zero-byte EOF is ambiguous: browsers routinely abandon speculative
 	// address/HTTP3 races and some proxy transports surface that local decision
 	// as EOF. Penalizing it caused healthy AI nodes to flap. Explicit reset,
 	// timeout, and protocol errors remain actionable evidence.
-	return err != nil &&
-		!errors.Is(err, io.EOF) &&
-		!errors.Is(err, net.ErrClosed) &&
-		!errors.Is(err, context.Canceled)
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return FailureNone, 0, false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+		return FailureTimeout, ConfidenceLow, true
+	}
+	return FailureTLS, ConfidenceHigh, true
 }
 
 func (c *observedConn) Close() error {
@@ -326,8 +333,8 @@ func (c *observedExtendedConn) ReadBuffer(buffer *buf.Buffer) error {
 	before := buffer.Len()
 	err := c.extended.ReadBuffer(buffer)
 	c.observeRead(buffer.Len() - before)
-	if buffer.Len() == before && err != nil && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
-		c.observation.observeTLSFailure(time.Since(c.startedAt), errorReason(err))
+	if failure, confidence, actionable := classifyEarlyTLSFailure(err); buffer.Len() == before && actionable && !c.localClosed.Load() && c.readBytes.Load() == 0 && c.tlsStarted.Load() && time.Since(c.startedAt) <= 15*time.Second {
+		c.observation.observeTLSFailure(time.Since(c.startedAt), failure, confidence, errorReason(err))
 	}
 	if errors.Is(err, io.EOF) {
 		c.observation.release()

@@ -379,6 +379,7 @@ func TestTCPThroughputReducerFailureDoesNotPolluteHealth(t *testing.T) {
 
 type extendedMemoryConn struct {
 	readPayload []byte
+	readErr     error
 	readIndex   int
 	local       net.Addr
 	remote      net.Addr
@@ -412,11 +413,51 @@ func (c *extendedMemoryConn) SetWriteDeadline(at time.Time) error {
 }
 func (c *extendedMemoryConn) ReadBuffer(buffer *buf.Buffer) error {
 	if c.readIndex >= len(c.readPayload) {
+		if c.readErr != nil {
+			return c.readErr
+		}
 		return io.EOF
 	}
 	_, _ = buffer.Write(c.readPayload[c.readIndex:])
 	c.readIndex = len(c.readPayload)
 	return nil
+}
+
+func TestExtendedConnAmbiguousTLSErrorsDoNotOpenBreaker(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		wantQualityFail uint64
+	}{
+		{name: "eof", err: io.EOF},
+		{name: "canceled", err: context.Canceled},
+		{name: "timeout", err: context.DeadlineExceeded, wantQualityFail: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			health := NewHealthStore(time.Hour, 32)
+			pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{96}, "extended-"+test.name, newTestOutbound("extended-"+test.name)))
+			service := testBusinessService(N.NetworkTCP)
+			underlying := &extendedMemoryConn{readErr: test.err, local: &net.TCPAddr{Port: 1001}, remote: &net.TCPAddr{Port: 443}}
+			wrapped := pool.wrapBusinessConn(underlying, snapshot, snapshot.Candidates[0], service, time.Now())
+			extended := wrapped.(N.ExtendedConn)
+			clientHello := buf.As([]byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01})
+			if err := extended.WriteBuffer(clientHello); err != nil {
+				t.Fatal(err)
+			}
+			buffer := buf.New()
+			err := extended.ReadBuffer(buffer)
+			buffer.Release()
+			if !errors.Is(err, test.err) {
+				t.Fatalf("extended error changed: %v", err)
+			}
+			status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkTCP)
+			if status.Failures != 0 || status.NonBreakerFailures != test.wantQualityFail || status.Breaker != BreakerClosed {
+				t.Fatalf("ambiguous extended error polluted breaker: %+v", status)
+			}
+			_ = wrapped.Close()
+		})
+	}
 }
 func (c *extendedMemoryConn) WriteBuffer(buffer *buf.Buffer) error { c.lastWrite = buffer; return nil }
 func (c *extendedMemoryConn) ReadFrom(reader io.Reader) (int64, error) {
@@ -609,11 +650,13 @@ func TestUDPActualResponseReadFromAndReadPacketSettleOnce(t *testing.T) {
 	}
 }
 
-func TestUDPTImeoutDoesNotCreateServiceFailure(t *testing.T) {
+func TestUDPTimeoutCreatesOnlyLowConfidencePathEvidence(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{85}, "udp-timeout", newTestOutbound("udp-timeout")))
 	underlying := &packetMemoryConn{}
-	wrapped := pool.wrapBusinessPacketConn(underlying, snapshot, snapshot.Candidates[0], testBusinessService(N.NetworkUDP), time.Now())
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/any"
+	wrapped := pool.wrapBusinessPacketConn(underlying, snapshot, snapshot.Candidates[0], service, time.Now())
 	pool.runtimeManager.RetireEpoch(pool.groupID, snapshot.RuntimeEpochID)
 	payload := make([]byte, 1)
 	if count, _, err := wrapped.ReadFrom(payload); count != 0 || !errors.Is(err, context.DeadlineExceeded) {
@@ -622,8 +665,8 @@ func TestUDPTImeoutDoesNotCreateServiceFailure(t *testing.T) {
 	if status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkUDP); status.Successes != 0 || status.Failures != 0 {
 		t.Fatalf("UDP timeout created service evidence: %+v", status)
 	}
-	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, N.NetworkUDP, ""); status.Failures != 0 || status.NonBreakerFailures != 0 {
-		t.Fatalf("UDP timeout created transport failure: %+v", status)
+	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/any", ""); status.Failures != 0 || status.NonBreakerFailures != 1 || status.Health != HealthDegraded || status.Breaker != BreakerClosed {
+		t.Fatalf("UDP timeout was not retained as low-confidence path evidence: %+v", status)
 	}
 	pool.runtimeManager.access.RLock()
 	state := pool.runtimeManager.groups[pool.groupID]
