@@ -146,6 +146,7 @@ type AdaptivePool struct {
 	capabilityTimeout       time.Duration
 	capabilityQuorum        int
 	capabilityCommonModeMin int
+	qualificationEnabled    bool
 	exitIdentityStore       *ExitIdentityStore
 	aiIPv6Policy            string
 	aiIPv6Blocked           atomic.Uint64
@@ -374,6 +375,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		capabilityTimeout:       capabilityTimeout,
 		capabilityQuorum:        capabilityQuorum,
 		capabilityCommonModeMin: capabilityCommonModeMin,
+		qualificationEnabled:    qualificationEnabled,
 		exitIdentityStore:       exitIdentityStore,
 		aiIPv6Policy:            aiIPv6Policy,
 		probeRunner:             urltest.URLTest,

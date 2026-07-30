@@ -1,8 +1,10 @@
 package adaptive
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateOpenAIResponsesQualificationStream(t *testing.T) {
@@ -70,5 +72,43 @@ func TestQualificationProtocolRejectsOversizedEventWithoutEcho(t *testing.T) {
 	}
 	if strings.Contains(verdict.FailureClass, "secret") {
 		t.Fatalf("oversized payload leaked through verdict: %+v", verdict)
+	}
+}
+
+func TestQualificationProtocolConsumerUsesObservationPipeline(t *testing.T) {
+	manager := NewRuntimeManager()
+	pool := preparedLifecyclePool(t, manager, "qualification-consumer")
+	pool.ctx = context.Background()
+	pool.qualificationEnabled = true
+	pool.observationIngestor = NewObservationIngestor(nil, nil, time.Minute, 128)
+	if err := pool.OnRuntimeEpochPublish(); err != nil {
+		t.Fatal(err)
+	}
+	pool.OnRuntimeEpochPublishCommit()
+	defer pool.Close()
+
+	stream := "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n"
+	verdict, err := pool.IngestQualificationProtocolStream("chatgpt_web", "node", QualificationProtocolOpenAIResponsesSSE, strings.NewReader(stream))
+	if err != nil || verdict.Outcome != QualificationProtocolEligible {
+		t.Fatalf("qualification stream was not ingested: verdict=%+v err=%v", verdict, err)
+	}
+	snapshot := pool.catalog.Snapshot()
+	service := pool.health.StatusHandle(snapshot.Candidates[0].Handle, DomainService, "", "chatgpt_web")
+	if service.Health != HealthHealthy || service.Successes != 1 {
+		t.Fatalf("qualification evidence did not reach service health: %+v", service)
+	}
+	endpoint := pool.health.EndpointHandle(snapshot.Candidates[0].Handle)
+	if endpoint.Successes != 0 || endpoint.Failures != 0 {
+		t.Fatalf("qualification evidence polluted endpoint health: %+v", endpoint)
+	}
+
+	transient := "data: {\"type\":\"response.created\"}\n"
+	verdict, err = pool.IngestQualificationProtocolStream("chatgpt_web", "node", QualificationProtocolOpenAIResponsesSSE, strings.NewReader(transient))
+	if err != nil || verdict.Outcome != QualificationProtocolTransient {
+		t.Fatalf("transient stream was not isolated: verdict=%+v err=%v", verdict, err)
+	}
+	serviceAfter := pool.health.StatusHandle(snapshot.Candidates[0].Handle, DomainService, "", "chatgpt_web")
+	if serviceAfter.Successes != service.Successes || serviceAfter.Failures != service.Failures {
+		t.Fatalf("transient stream mutated service health: before=%+v after=%+v", service, serviceAfter)
 	}
 }

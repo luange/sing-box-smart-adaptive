@@ -3,8 +3,10 @@ package adaptive
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
+	"time"
 )
 
 type QualificationProtocol string
@@ -172,4 +174,52 @@ func validateGeminiQualificationEvent(payload string) (terminal, eligible bool, 
 
 func qualificationProtocolFailure(outcome QualificationProtocolOutcome, class string) QualificationProtocolVerdict {
 	return QualificationProtocolVerdict{Outcome: outcome, FailureClass: class}
+}
+
+// IngestQualificationProtocolStream is a control-plane consumer for protocol
+// validators. It publishes only settled eligible/blocked conclusions through
+// ObservationIngestor -> Reducer; transient and invalid streams never mutate
+// data-plane eligibility.
+func (p *AdaptivePool) IngestQualificationProtocolStream(serviceID, nodeTag string, protocol QualificationProtocol, reader io.Reader) (QualificationProtocolVerdict, error) {
+	if p == nil || !p.qualificationEnabled {
+		return QualificationProtocolVerdict{}, errors.New("adaptive qualification control is disabled")
+	}
+	snapshot := p.catalog.Snapshot()
+	if snapshot == nil || snapshot.RuntimeEpochID == 0 {
+		return QualificationProtocolVerdict{}, errors.New("adaptive qualification execution view is unavailable")
+	}
+	nodeID, loaded := snapshot.AliasToID[nodeTag]
+	if !loaded {
+		return QualificationProtocolVerdict{}, errors.New("adaptive qualification node is unavailable")
+	}
+	candidate, loaded := snapshot.Candidate(nodeID)
+	if !loaded {
+		return QualificationProtocolVerdict{}, errors.New("adaptive qualification node is unavailable")
+	}
+	verdict := ValidateQualificationProtocolStream(protocol, reader)
+	if verdict.Outcome != QualificationProtocolEligible && verdict.Outcome != QualificationProtocolBlocked {
+		return verdict, nil
+	}
+	lease, err := p.runtimeManager.AcquireEpoch(p.groupID, snapshot.RuntimeEpochID)
+	if err != nil {
+		return verdict, err
+	}
+	defer lease.Release()
+	evidence := ObservationEvidence{
+		RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
+		Handle: candidate.Handle, Source: SourceHTTP, Stage: StageServiceApplication, Confidence: ConfidenceHigh,
+		ServiceID: serviceID, Transport: "tcp", AttemptID: AttemptID(p.attemptSequence.Add(1)), At: time.Now(),
+	}
+	if verdict.Outcome == QualificationProtocolEligible {
+		evidence.Outcome = OutcomeSuccess
+		evidence.Failure = FailureNone
+	} else {
+		evidence.Outcome = OutcomeBlocked
+		evidence.Failure = FailureHTTPBlock
+		evidence.Reason = verdict.FailureClass
+	}
+	reducer := &HealthObservationReducer{Store: p.health, BeforeReduce: p.observationReducerHook}
+	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), RuntimeEpochObservationGuard{Lease: lease}, evidence, reducer)
+	p.recordObservationResult(disposition, publishErr)
+	return verdict, publishErr
 }
