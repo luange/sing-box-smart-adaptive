@@ -213,7 +213,7 @@ func TestPoolSharedIngestorDeduplicatesIndependentCallbacks(t *testing.T) {
 	if disposition, err := PublishSettledObservationGuarded(pool.sharedObservationIngestor(), guard, evidence, reducer); err != nil || disposition != IngestDuplicate {
 		t.Fatalf("independent replay was not deduplicated: %s %v", disposition, err)
 	}
-	if status := health.EndpointHandle(handle); status.Successes != 1 || status.Breaker != BreakerClosed {
+	if status := health.EndpointHandle(handle); status.Successes != 1 || status.Breaker != BreakerHalfOpen || status.RecoverySuccesses != 1 {
 		t.Fatalf("duplicate settled health more than once: %+v", status)
 	}
 }

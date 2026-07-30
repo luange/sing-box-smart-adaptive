@@ -319,8 +319,8 @@ func TestCapabilityProbeSuiteUsesSingleSchedulerAggregatorAndObservationSink(t *
 	if completed != 2 {
 		t.Fatalf("targets bypassed the single scheduler: completed=%d", completed)
 	}
-	if status := health.StatusHandle(handle, DomainService, "", youtubeProbeServiceID); status.Health != HealthHealthy || status.Breaker != BreakerClosed || status.HalfOpen {
-		t.Fatalf("authoritative suite verdict did not settle service permit: %+v", status)
+	if status := health.StatusHandle(handle, DomainService, "", youtubeProbeServiceID); status.Health != HealthDegraded || status.Breaker != BreakerHalfOpen || !status.HalfOpen || status.RecoverySuccesses != 1 {
+		t.Fatalf("authoritative suite verdict did not enter recovery confirmation: %+v", status)
 	}
 	if opened, closed := sessions.stats(); opened != 1 || closed != 1 {
 		t.Fatalf("accepted suite did not own exactly one observation session: opened=%d closed=%d", opened, closed)

@@ -654,8 +654,8 @@ func TestServiceHalfOpenPermitIsAcquiredOnlyAfterPayload(t *testing.T) {
 	if _, err = io.ReadFull(wrapped, payload); err != nil {
 		t.Fatal(err)
 	}
-	if status := health.StatusHandle(handle, DomainService, "", service.ID); status.Breaker != BreakerClosed || status.Successes != 1 {
-		t.Fatalf("payload did not recover service half-open: %+v", status)
+	if status := health.StatusHandle(handle, DomainService, "", service.ID); status.Breaker != BreakerHalfOpen || status.Successes != 1 || status.RecoverySuccesses != 1 {
+		t.Fatalf("payload did not enter service recovery confirmation: %+v", status)
 	}
 	_ = wrapped.Close()
 	_ = peer.Close()

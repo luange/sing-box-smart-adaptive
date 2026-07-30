@@ -32,6 +32,7 @@ type AdaptiveCandidateStatus struct {
 	ThroughputSamples     uint64    `json:"throughput_samples,omitempty"`
 	Successes             uint64    `json:"successes,omitempty"`
 	Failures              uint64    `json:"failures,omitempty"`
+	RecoverySuccesses     int       `json:"recovery_successes,omitempty"`
 	EvidenceWeight        float64   `json:"evidence_weight,omitempty"`
 	OpenUntil             time.Time `json:"open_until,omitempty"`
 	Reason                string    `json:"reason,omitempty"`

@@ -85,6 +85,7 @@ type HealthStatus struct {
 	NonBreakerFailures  uint64
 	EvidenceWeight      float64
 	ConsecutiveFailures int
+	RecoverySuccesses   int
 	CooldownUntil       time.Time
 	Backoff             time.Duration
 	HalfOpen            bool
@@ -111,6 +112,7 @@ type healthRecord struct {
 	status             HealthStatus
 	consecutiveFailure int
 	reopenCount        int
+	recoverySuccesses  int
 	openUntil          time.Time
 	halfOpenToken      uint64
 	version            uint64
@@ -173,62 +175,6 @@ type HealthStore struct {
 	clock      Clock
 	breaker    BreakerConfig
 	nextToken  uint64
-}
-
-func (s *HealthStore) PersistenceSnapshot() []persistedHealthRecord {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	result := make([]persistedHealthRecord, 0, len(s.entries))
-	for _, record := range s.entries {
-		result = append(result, persistedHealthRecord{
-			NodeID: record.key.nodeID, NodeSlot: record.key.nodeSlot, NodeVersion: record.key.nodeVersion,
-			Domain: record.key.domain, Transport: record.key.transport, Service: record.key.service,
-			Health: record.status.Health, Breaker: record.status.Breaker, LastUpdated: record.status.LastUpdated,
-			LastDelay: record.status.LastDelay, Successes: record.status.Successes, Failures: record.status.Failures,
-			ThroughputBPS: record.status.ThroughputBPS, ThroughputSamples: record.status.ThroughputSamples,
-			NonBreakerSuccesses: record.status.NonBreakerSuccesses, NonBreakerFailures: record.status.NonBreakerFailures,
-			EvidenceWeight: record.status.EvidenceWeight, ConsecutiveFailures: record.consecutiveFailure,
-			OpenUntil: record.openUntil, Backoff: record.status.Backoff, ReopenCount: record.reopenCount,
-		})
-	}
-	return result
-}
-
-func (s *HealthStore) RestorePersistence(records []persistedHealthRecord, now time.Time) {
-	s.access.Lock()
-	defer s.access.Unlock()
-	for _, persisted := range records {
-		if persisted.NodeID == (NodeID{}) || persisted.NodeSlot == 0 || persisted.NodeVersion == 0 || persisted.LastUpdated.IsZero() || now.Sub(persisted.LastUpdated) > s.retention || persisted.LastUpdated.After(now.Add(time.Minute)) {
-			continue
-		}
-		key := healthKey{nodeID: persisted.NodeID, nodeSlot: persisted.NodeSlot, nodeVersion: persisted.NodeVersion, domain: persisted.Domain, transport: persisted.Transport, service: persisted.Service}
-		if _, exists := s.entries[key]; exists {
-			continue
-		}
-		status := HealthStatus{Health: persisted.Health, Breaker: persisted.Breaker, LastUpdated: persisted.LastUpdated, LastDelay: persisted.LastDelay, ThroughputBPS: persisted.ThroughputBPS, ThroughputSamples: persisted.ThroughputSamples, Successes: persisted.Successes, Failures: persisted.Failures, NonBreakerSuccesses: persisted.NonBreakerSuccesses, NonBreakerFailures: persisted.NonBreakerFailures, EvidenceWeight: persisted.EvidenceWeight, ConsecutiveFailures: persisted.ConsecutiveFailures, Backoff: persisted.Backoff, Reason: "restored"}
-		openUntil := persisted.OpenUntil
-		if status.Breaker == BreakerHalfOpen {
-			status.Breaker = BreakerClosed
-			openUntil = time.Time{}
-		}
-		if !openUntil.IsZero() && !openUntil.After(now) {
-			status.Breaker = BreakerClosed
-			openUntil = time.Time{}
-			status.CooldownUntil = time.Time{}
-		}
-		if status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
-			status.Breaker = BreakerClosed
-		}
-		if !openUntil.IsZero() {
-			status.CooldownUntil = openUntil
-		}
-		record := &healthRecord{key: key, status: status, consecutiveFailure: persisted.ConsecutiveFailures, reopenCount: persisted.ReopenCount, openUntil: openUntil}
-		record.element = s.lru.PushFront(record)
-		s.entries[key] = record
-	}
-	for len(s.entries) > s.maxEntries {
-		s.removeOldestLocked()
-	}
 }
 
 func NewHealthStore(retention time.Duration, maxEntries int) *HealthStore {
@@ -429,7 +375,7 @@ func (s *HealthStore) tryAcquirePermit(keys []healthKey, at time.Time) (*Attempt
 			}
 			return nil, false
 		}
-		if record.status.Breaker == BreakerOpen || record.status.Breaker == BreakerCooldown {
+		if record.status.Breaker == BreakerOpen || record.status.Breaker == BreakerCooldown || record.status.Breaker == BreakerHalfOpen {
 			record.status.Breaker = BreakerHalfOpen
 			record.status.HalfOpen = true
 			s.nextToken++
@@ -465,7 +411,7 @@ func (s *HealthStore) TryAcquireDomainPermitHandle(handle NodeHandle, domain Fai
 		return nil, false
 	}
 	entry := permitEntry{key: key, version: record.version}
-	if record.status.Breaker == BreakerOpen || record.status.Breaker == BreakerCooldown {
+	if record.status.Breaker == BreakerOpen || record.status.Breaker == BreakerCooldown || record.status.Breaker == BreakerHalfOpen {
 		record.status.Breaker = BreakerHalfOpen
 		record.status.HalfOpen = true
 		s.nextToken++
@@ -510,7 +456,7 @@ func (s *HealthStore) availableLocked(record *healthRecord, now time.Time) bool 
 	case BreakerCooldown:
 		return !now.Before(record.openUntil)
 	case BreakerHalfOpen:
-		return false
+		return record.halfOpenToken == 0
 	default:
 		return true
 	}
@@ -585,7 +531,21 @@ func (s *HealthStore) observeLocked(key healthKey, outcome ObservationOutcome, a
 	if outcome == OutcomeSuccess {
 		record.status.Successes++
 		record.consecutiveFailure = 0
+		if record.status.Breaker == BreakerHalfOpen {
+			record.recoverySuccesses++
+			record.status.RecoverySuccesses = record.recoverySuccesses
+			record.halfOpenToken = 0
+			if record.recoverySuccesses < 2 {
+				record.status.Health = HealthDegraded
+				record.status.Breaker = BreakerHalfOpen
+				record.status.HalfOpen = true
+				record.status.CooldownUntil = time.Time{}
+				record.status.ConsecutiveFailures = 0
+				return
+			}
+		}
 		record.reopenCount = 0
+		record.recoverySuccesses = 0
 		record.openUntil = time.Time{}
 		record.halfOpenToken = 0
 		record.status.Health = HealthHealthy
@@ -593,9 +553,12 @@ func (s *HealthStore) observeLocked(key healthKey, outcome ObservationOutcome, a
 		record.status.HalfOpen = false
 		record.status.CooldownUntil = time.Time{}
 		record.status.Backoff = 0
+		record.status.RecoverySuccesses = 0
 	} else {
 		record.status.Failures++
 		record.consecutiveFailure++
+		record.recoverySuccesses = 0
+		record.status.RecoverySuccesses = 0
 		if record.status.Breaker == BreakerHalfOpen || record.consecutiveFailure >= s.breaker.FailureThreshold {
 			record.status.Health = HealthUnreachable
 			record.reopenCount++
@@ -630,6 +593,8 @@ func (s *HealthStore) openBreakerRecordLocked(record *healthRecord, now time.Tim
 	record.status.CooldownUntil = record.openUntil
 	record.status.Backoff = backoff
 	record.halfOpenToken = 0
+	record.recoverySuccesses = 0
+	record.status.RecoverySuccesses = 0
 }
 
 func (s *HealthStore) Endpoint(nodeID NodeID) HealthStatus {

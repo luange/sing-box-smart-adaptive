@@ -120,7 +120,7 @@ func TestTransportPurposeAndIPFamilyBreakersAreIsolated(t *testing.T) {
 	}
 }
 
-func TestBreakerHalfOpenHasSingleTokenAndClosesOnSuccess(t *testing.T) {
+func TestBreakerHalfOpenRequiresTwoSuccessesAndKeepsSingleToken(t *testing.T) {
 	store, clock := newBreakerTestStore()
 	nodeID := NodeID{2}
 	service := ServiceContext{ID: "youtube", Transport: N.NetworkTCP}
@@ -137,11 +137,44 @@ func TestBreakerHalfOpenHasSingleTokenAndClosesOnSuccess(t *testing.T) {
 	}
 	first.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainService: OutcomeSuccess}, clock.Now(), 25*time.Millisecond, "")
 	status := store.Status(nodeID, DomainService, "", service.ID)
-	if status.Breaker != BreakerClosed || status.Health != HealthHealthy || status.Successes != 1 || status.Failures != 3 || status.ConsecutiveFailures != 0 {
-		t.Fatalf("half-open success was not settled exactly once: %+v", status)
+	if status.Breaker != BreakerHalfOpen || status.Health != HealthDegraded || status.RecoverySuccesses != 1 || status.Successes != 1 || status.Failures != 3 || status.ConsecutiveFailures != 0 {
+		t.Fatalf("first half-open success incorrectly restored the breaker: %+v", status)
 	}
-	if _, allowed = store.TryAcquireAttemptPermit(nodeID, service, clock.Now()); !allowed {
-		t.Fatal("closed breaker did not admit the next request")
+	second, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+	if !allowed {
+		t.Fatal("second recovery confirmation was not admitted")
+	}
+	if _, allowed = store.TryAcquireAttemptPermit(nodeID, service, clock.Now()); allowed {
+		t.Fatal("concurrent attempt bypassed second recovery token")
+	}
+	second.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainService: OutcomeSuccess}, clock.Now(), 20*time.Millisecond, "")
+	status = store.Status(nodeID, DomainService, "", service.ID)
+	if status.Breaker != BreakerClosed || status.Health != HealthHealthy || status.RecoverySuccesses != 0 || status.Successes != 2 || status.Failures != 3 {
+		t.Fatalf("second recovery success did not close the breaker: %+v", status)
+	}
+}
+
+func TestBreakerRecoveryConfirmationFailureReopens(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	nodeID := NodeID{22}
+	service := ServiceContext{ID: "service", Transport: N.NetworkTCP}
+	for range 3 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainService, Service: service.ID, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	clock.Advance(10 * time.Second)
+	first, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+	if !allowed {
+		t.Fatal("first recovery attempt was not admitted")
+	}
+	first.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainService: OutcomeSuccess}, clock.Now(), 0, "")
+	second, allowed := store.TryAcquireAttemptPermit(nodeID, service, clock.Now())
+	if !allowed {
+		t.Fatal("second recovery attempt was not admitted")
+	}
+	second.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainService: OutcomeFailure}, clock.Now(), 0, "still failing")
+	status := store.Status(nodeID, DomainService, "", service.ID)
+	if status.Breaker != BreakerOpen || status.Health != HealthUnreachable || status.RecoverySuccesses != 0 || status.Backoff != 20*time.Second {
+		t.Fatalf("failed recovery confirmation did not reopen with backoff: %+v", status)
 	}
 }
 

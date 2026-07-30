@@ -1234,6 +1234,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			ThroughputSamples:     throughputStatus.Samples,
 			Successes:             health.Successes,
 			Failures:              health.Failures,
+			RecoverySuccesses:     health.RecoverySuccesses,
 			EvidenceWeight:        health.EvidenceWeight,
 			OpenUntil:             health.CooldownUntil,
 			Reason:                health.Reason,

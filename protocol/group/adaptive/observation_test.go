@@ -528,7 +528,19 @@ func TestConfidenceEvidenceUpdatesQualityWithoutBreakerPollution(t *testing.T) {
 	if disposition, err := PublishSettledObservation(ingestor, evidence, settled); err != nil || disposition != IngestAccepted {
 		t.Fatalf("recovery settlement failed: %s %v", disposition, err)
 	}
-	if status = store.EndpointHandle(evidence.Handle); status.Breaker != BreakerClosed || status.Successes != 1 {
-		t.Fatalf("high evidence did not close half-open: %+v", status)
+	if status = store.EndpointHandle(evidence.Handle); status.Breaker != BreakerHalfOpen || status.Successes != 1 || status.RecoverySuccesses != 1 {
+		t.Fatalf("first high evidence did not enter recovery confirmation: %+v", status)
+	}
+	permit, allowed = store.TryAcquireDomainPermitHandle(evidence.Handle, DomainEndpoint, "", "", clock.Now())
+	if !allowed {
+		t.Fatal("second high confidence recovery permit unavailable")
+	}
+	evidence.AttemptID = 8
+	settled = &HealthObservationReducer{Store: store, Settlement: AttemptPermitSettlement{Permit: permit}}
+	if disposition, err := PublishSettledObservation(ingestor, evidence, settled); err != nil || disposition != IngestAccepted {
+		t.Fatalf("second recovery settlement failed: %s %v", disposition, err)
+	}
+	if status = store.EndpointHandle(evidence.Handle); status.Breaker != BreakerClosed || status.Successes != 2 || status.RecoverySuccesses != 0 {
+		t.Fatalf("second high evidence did not close half-open: %+v", status)
 	}
 }
