@@ -55,13 +55,18 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 		o.pool.recordObservationResult(disposition, publishErr)
 		if publishErr == nil && disposition == IngestAccepted && confidence >= ConfidenceHigh {
 			o.pool.businessTLSFailures.Add(1)
+			earlyFailure := o.pool.policy != nil && o.pool.policy.ForgetSelectionAfterEarlyFailure(o.service, o.evidence.Handle, evidence.At)
+			if earlyFailure {
+				o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+			}
 			status := o.pool.health.StatusHandle(o.evidence.Handle, DomainService, "", o.service.ID)
-			if status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
+			if !earlyFailure && status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
 				return
 			}
 			if snapshot := o.pool.catalog.load(); snapshot != nil {
 				if candidate, loaded := snapshot.Candidate(o.evidence.Handle.NodeID); loaded {
 					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, "business_tls", evidence.At)
+					o.pool.recordFailureMemory(candidate, FailureTLS, o.service.ID, serviceHealthTransport(o.service))
 				}
 			}
 			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)

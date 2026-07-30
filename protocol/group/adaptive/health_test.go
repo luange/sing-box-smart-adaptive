@@ -369,3 +369,26 @@ func TestBreakerBackoffJitterIsBounded(t *testing.T) {
 		t.Fatalf("expected jitter to produce more than one backoff value, got %v", seen)
 	}
 }
+
+func TestBreakerBackoffJitterUsesInjectedDeterministicSource(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	store := NewHealthStoreWithClock(time.Hour, 8, clock, BreakerConfig{
+		FailureThreshold: 1, BaseCooldown: 10 * time.Second, MaxCooldown: time.Minute,
+		JitterFraction: 0.2, JitterRandom: func() float64 { return 0.75 },
+	})
+	store.Observe(Observation{NodeID: NodeID{93}, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+	if status := store.Endpoint(NodeID{93}); status.Backoff != 11*time.Second {
+		t.Fatalf("injected jitter was not deterministic: %+v", status)
+	}
+}
+
+func TestHealthReadOnlySnapshotDoesNotChangeWithLiveStore(t *testing.T) {
+	store := NewHealthStore(time.Hour, 8)
+	handle := NodeHandle{NodeID: NodeID{94}, Slot: 1, Version: 1}
+	store.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 10 * time.Millisecond})
+	snapshot := store.ReadOnlySnapshot()
+	store.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 90 * time.Millisecond})
+	if got := snapshot.EndpointHandle(handle); got.Successes != 1 || got.LastDelay != 10*time.Millisecond {
+		t.Fatalf("read snapshot changed with live health: %+v", got)
+	}
+}

@@ -141,10 +141,13 @@ type BreakerConfig struct {
 	// JitterFraction adds symmetric random jitter to open-breaker backoff
 	// (for example 0.2 => ±20%). Zero disables jitter for deterministic tests.
 	JitterFraction float64
+	// JitterRandom is injectable for deterministic fault tests. It must return
+	// a value in [0,1); nil uses the process-safe default source.
+	JitterRandom func() float64
 }
 
 func defaultBreakerConfig() BreakerConfig {
-	return BreakerConfig{FailureThreshold: 3, BaseCooldown: 5 * time.Second, MaxCooldown: 5 * time.Minute, JitterFraction: 0.2}
+	return BreakerConfig{FailureThreshold: 3, BaseCooldown: 5 * time.Second, MaxCooldown: 5 * time.Minute, JitterFraction: 0.2, JitterRandom: rand.Float64}
 }
 
 // AttemptPermit owns only half-open tokens actually acquired by an attempt.
@@ -219,6 +222,9 @@ func NewHealthStoreWithClock(retention time.Duration, maxEntries int, clock Cloc
 	if breaker.JitterFraction > 0.5 {
 		breaker.JitterFraction = 0.5
 	}
+	if breaker.JitterRandom == nil {
+		breaker.JitterRandom = defaults.JitterRandom
+	}
 	return &HealthStore{entries: make(map[healthKey]*healthRecord), retention: retention, maxEntries: maxEntries, clock: clock, breaker: breaker}
 }
 
@@ -289,6 +295,28 @@ func (s *HealthStore) ThroughputByHandle() map[NodeHandle]ThroughputSummary {
 		result[handle] = ThroughputSummary{BPS: math.Expm1(aggregate.weightedLog / float64(aggregate.samples)), Samples: aggregate.samples, UpdatedAt: aggregate.updatedAt}
 	}
 	return result
+}
+
+// ReadOnlySnapshot captures one internally consistent health view for status
+// rendering. The clone has no live half-open ownership and is never used to
+// mutate routing state.
+func (s *HealthStore) ReadOnlySnapshot() *HealthStore {
+	if s == nil {
+		return NewHealthStore(time.Hour, 1)
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	clone := &HealthStore{
+		entries: make(map[healthKey]*healthRecord, len(s.entries)), retention: s.retention,
+		maxEntries: s.maxEntries, clock: s.clock, breaker: s.breaker,
+	}
+	for key, record := range s.entries {
+		copied := *record
+		copied.element = clone.lru.PushFront(&copied)
+		clone.entries[key] = &copied
+	}
+	clone.evictions = s.evictions
+	return clone
 }
 
 func (s *HealthStore) ObserveEvidence(observation Observation, breakerEligible bool, weight float64) {
@@ -675,7 +703,7 @@ func (s *HealthStore) openBreakerRecordLocked(record *healthRecord, now time.Tim
 	if backoff > s.breaker.MaxCooldown {
 		backoff = s.breaker.MaxCooldown
 	}
-	backoff = applyBackoffJitter(backoff, s.breaker.JitterFraction)
+	backoff = applyBackoffJitter(backoff, s.breaker.JitterFraction, s.breaker.JitterRandom)
 	if backoff > s.breaker.MaxCooldown {
 		backoff = s.breaker.MaxCooldown
 	}
@@ -697,12 +725,21 @@ func (s *HealthStore) openBreakerRecordLocked(record *healthRecord, now time.Tim
 	record.status.RecoverySuccesses = 0
 }
 
-func applyBackoffJitter(backoff time.Duration, fraction float64) time.Duration {
+func applyBackoffJitter(backoff time.Duration, fraction float64, random func() float64) time.Duration {
 	if backoff <= 0 || fraction <= 0 {
 		return backoff
 	}
+	if random == nil {
+		random = rand.Float64
+	}
 	// Symmetric jitter in [-fraction, +fraction].
-	scale := 1 + (rand.Float64()*2-1)*fraction
+	sample := random()
+	if sample < 0 {
+		sample = 0
+	} else if sample >= 1 {
+		sample = math.Nextafter(1, 0)
+	}
+	scale := 1 + (sample*2-1)*fraction
 	if scale < 0.1 {
 		scale = 0.1
 	}

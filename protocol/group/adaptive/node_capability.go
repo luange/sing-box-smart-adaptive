@@ -29,7 +29,7 @@ type PathCapability struct {
 	Known               bool      `json:"known"`
 	Health              string    `json:"health,omitempty"`
 	Breaker             string    `json:"breaker,omitempty"`
-	SmoothedDelayMs     uint16    `json:"smoothed_delay_ms,omitempty"`
+	SmoothedDelayMs     uint32    `json:"smoothed_delay_ms,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
 	RecoverySuccesses   int       `json:"recovery_successes,omitempty"`
 	BackoffMs           uint32    `json:"backoff_ms,omitempty"`
@@ -67,7 +67,7 @@ func (s *HealthStore) pathCapability(handle NodeHandle, path string, now time.Ti
 	}
 	cap.Health = string(status.Health)
 	cap.Breaker = string(status.Breaker)
-	cap.SmoothedDelayMs = uint16(max(0, status.RankingDelay().Milliseconds()))
+	cap.SmoothedDelayMs = durationMillis32(status.RankingDelay())
 	cap.ConsecutiveFailures = status.ConsecutiveFailures
 	cap.RecoverySuccesses = status.RecoverySuccesses
 	cap.BackoffMs = uint32(max(0, status.Backoff.Milliseconds()))

@@ -433,3 +433,21 @@ func TestLatencyModeIgnoresAdaptiveStickyCooldown(t *testing.T) {
 		t.Fatalf("latency mode was changed by adaptive stickiness: plan=%+v err=%v", plan, err)
 	}
 }
+
+func TestEarlyFailureRemovesOnlyMatchingRecentStickySelection(t *testing.T) {
+	engine := NewPolicyEngine(NewHealthStore(time.Hour, 8), 2, "fallback")
+	service := ServiceContext{ID: "service", AffinityID: "family", Session: SessionKey{4}, Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	handle := NodeHandle{NodeID: NodeID{105}, Slot: 1, Version: 1}
+	now := time.Now()
+	engine.RememberSelection(engine.stickyKey(service), handle, now)
+	if !engine.ForgetSelectionAfterEarlyFailure(service, handle, now.Add(5*time.Second)) {
+		t.Fatal("recent matching failure did not remove sticky selection")
+	}
+	if _, loaded := engine.stickyPreferred(engine.stickyKey(service), now.Add(6*time.Second)); loaded {
+		t.Fatal("early-failed sticky selection remained active")
+	}
+	engine.RememberSelection(engine.stickyKey(service), handle, now)
+	if engine.ForgetSelectionAfterEarlyFailure(service, handle, now.Add(earlySwitchWindow+time.Second)) {
+		t.Fatal("old failure incorrectly removed stable sticky selection")
+	}
+}

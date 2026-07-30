@@ -20,6 +20,7 @@ var (
 const (
 	defaultSwitchMargin   = 0.15
 	defaultSwitchCooldown = 2 * time.Minute
+	earlySwitchWindow     = 20 * time.Second
 	maxStickyEntries      = 4096
 )
 
@@ -173,6 +174,27 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 	if len(e.sticky) > maxStickyEntries {
 		e.pruneStickyLocked(now)
 	}
+}
+
+// ForgetSelectionAfterEarlyFailure removes a newly selected incumbent when a
+// high-confidence real failure arrives shortly after the switch.
+func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, handle NodeHandle, now time.Time) bool {
+	if e == nil || handle.NodeID == (NodeID{}) {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	key := e.stickyKey(service)
+	e.stickyAccess.Lock()
+	defer e.stickyAccess.Unlock()
+	pref, loaded := e.sticky[key]
+	age := now.Sub(pref.updatedAt)
+	if !loaded || pref.handle != handle || age < 0 || age > earlySwitchWindow {
+		return false
+	}
+	delete(e.sticky, key)
+	return true
 }
 
 func (e *PolicyEngine) stickyKey(service ServiceContext) string {

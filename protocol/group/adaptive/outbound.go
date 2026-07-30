@@ -122,7 +122,7 @@ type AdaptivePool struct {
 	control                    *ControlState
 	switchAudit                *SwitchAuditStore
 	selectionMemoryAccess      sync.Mutex
-	selectionMemory            map[NodeID]selectionMemoryEntry
+	selectionMemory            map[selectionMemoryKey]selectionMemoryEntry
 	catalogAccess              sync.Mutex
 	preparedIdentity           *PreparedIdentity
 	preparedExecution          *PreparedExecution
@@ -401,7 +401,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		adaptiveLeaseTTL:        adaptiveLeaseTTL,
 		control:                 new(ControlState),
 		switchAudit:             NewSwitchAuditStore(),
-		selectionMemory:         make(map[NodeID]selectionMemoryEntry),
+		selectionMemory:         make(map[selectionMemoryKey]selectionMemoryEntry),
 		observationIngestor:     NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
@@ -560,8 +560,8 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	if scheduler != nil {
 		_ = scheduler.Close()
 	}
-	// Drop process-local sticky/audit/dedup maps on retire so reload cycles
-	// cannot accumulate selection or observation state across epochs.
+	// Drop bounded selection/audit views on retire. Observation transactions
+	// remain alive until epoch leases drain so late real failures are not lost.
 	if p.policy != nil {
 		p.policy.Clear()
 	}
@@ -906,11 +906,12 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 		if snapshot := p.catalog.load(); snapshot != nil {
 			if candidate, loaded := snapshot.Candidate(evidence.Handle.NodeID); loaded {
 				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
-				p.recordFailureMemory(candidate, evidence.Failure, service.ID)
+				p.recordFailureMemory(candidate, evidence.Failure, service.ID, serviceHealthTransport(service))
 			}
 		}
 		status := p.health.StatusHandle(evidence.Handle, DomainTransport, serviceHealthTransport(service), "")
-		if modeUsesLease(service.Mode) && (status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown) {
+		earlyFailure := p.policy != nil && p.policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
+		if modeUsesLease(service.Mode) && (earlyFailure || status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown) {
 			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
 			p.persistState()
 		}
@@ -1261,7 +1262,9 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			status.EndpointConflictCount++
 		}
 	}
-	throughput := p.health.ThroughputByHandle()
+	healthView := p.health.ReadOnlySnapshot()
+	policyView := NewPolicyEngine(healthView, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights)
+	throughput := healthView.ThroughputByHandle()
 	for _, candidate := range snapshot.Candidates {
 		status.AliasCount += len(candidate.Aliases)
 	}
@@ -1274,7 +1277,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 		if len(status.Candidates) >= statusCandidateLimit {
 			break
 		}
-		health := p.health.EndpointHandle(candidate.Handle)
+		health := healthView.EndpointHandle(candidate.Handle)
 		throughputStatus := throughput[candidate.Handle]
 		state := string(health.Health)
 		if health.Breaker != BreakerClosed {
@@ -1283,27 +1286,27 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 		weightMatch := p.nodeWeights.Explain(candidate.PrimaryTag)
 		pathStatuses := make([]adapter.AdaptivePathStatus, 0, len(observableHealthPaths))
 		for _, path := range observableHealthPaths {
-			pathHealth := p.health.StatusHandle(candidate.Handle, DomainTransport, path, "")
+			pathHealth := healthView.StatusHandle(candidate.Handle, DomainTransport, path, "")
 			rawTransport := N.NetworkTCP
 			if strings.HasPrefix(path, "udp_") {
 				rawTransport = N.NetworkUDP
 			}
-			score := p.policy.candidateScore(candidate, ServiceContext{Transport: rawTransport, HealthTransport: path})
+			score := policyView.candidateScore(candidate, ServiceContext{Transport: rawTransport, HealthTransport: path})
 			pathStatuses = append(pathStatuses, adapter.AdaptivePathStatus{
 				Path: path, Health: string(pathHealth.Health), Breaker: string(pathHealth.Breaker),
-				LastUpdated: pathHealth.LastUpdated, LastDelay: uint16(max(0, pathHealth.LastDelay.Milliseconds())),
-				SmoothedDelay: uint16(max(0, pathHealth.SmoothedDelay.Milliseconds())), DelaySamples: pathHealth.DelaySamples,
+				LastUpdated: pathHealth.LastUpdated, LastDelay: durationMillis32(pathHealth.LastDelay),
+				SmoothedDelay: durationMillis32(pathHealth.SmoothedDelay), DelaySamples: pathHealth.DelaySamples,
 				BackoffMs: uint32(max(0, pathHealth.Backoff.Milliseconds())), ConsecutiveFailures: pathHealth.ConsecutiveFailures,
 				Successes: pathHealth.Successes, Failures: pathHealth.Failures, RecoverySuccesses: pathHealth.RecoverySuccesses,
 				OpenUntil: pathHealth.CooldownUntil, Reason: pathHealth.Reason,
-				HealthPriority: score.HealthPriority, ObservedDelay: uint16(max(0, score.ObservedDelay.Milliseconds())),
-				WeightedDelay: uint32(max(0, score.WeightedDelay.Milliseconds())), SelectionScore: score.SelectionScore,
+				HealthPriority: score.HealthPriority, ObservedDelay: durationMillis32(score.ObservedDelay),
+				WeightedDelay: durationMillis32(score.WeightedDelay), SelectionScore: score.SelectionScore,
 				DominantEvidence: score.DominantEvidence,
 			})
 		}
-		endpointScore := p.policy.candidateScore(candidate, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
+		endpointScore := policyView.candidateScore(candidate, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
 		viewService := ServiceContext{ID: "status:default", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
-		profile := p.health.BuildCapabilityProfile(candidate.Handle, time.Now())
+		profile := healthView.BuildCapabilityProfile(candidate.Handle, time.Now())
 		if throughputStatus.Samples > 0 {
 			profile.ThroughputBPS = throughputStatus.BPS
 			profile.ThroughputOK = throughputStatus.BPS >= 256*1024
@@ -1336,8 +1339,8 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			Health:                string(health.Health),
 			Breaker:               string(health.Breaker),
 			LastProbeAt:           health.LastUpdated,
-			LastProbeDelay:        uint16(max(0, health.LastDelay.Milliseconds())),
-			SmoothedDelay:         uint16(max(0, health.SmoothedDelay.Milliseconds())),
+			LastProbeDelay:        durationMillis32(health.LastDelay),
+			SmoothedDelay:         durationMillis32(health.SmoothedDelay),
 			DelaySamples:          health.DelaySamples,
 			BackoffMs:             uint32(max(0, health.Backoff.Milliseconds())),
 			ConsecutiveFailures:   health.ConsecutiveFailures,
@@ -1350,18 +1353,20 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			OpenUntil:             health.CooldownUntil,
 			Reason:                health.Reason,
 			HealthPriority:        endpointScore.HealthPriority,
-			ObservedDelay:         uint16(max(0, endpointScore.ObservedDelay.Milliseconds())),
-			WeightedDelay:         uint32(max(0, endpointScore.WeightedDelay.Milliseconds())),
+			ObservedDelay:         durationMillis32(endpointScore.ObservedDelay),
+			WeightedDelay:         durationMillis32(endpointScore.WeightedDelay),
 			SelectionScore:        endpointScore.SelectionScore,
 			DominantEvidence:      endpointScore.DominantEvidence,
-			FilterReason:          p.policy.ExclusionReason(candidate, viewService),
+			FilterReason:          policyView.ExclusionReason(candidate, viewService),
 			LastFailure:           lastFailure,
+			LastFailureService:    memory.serviceID,
+			LastFailurePath:       memory.path,
 			LastSelectionReason:   memory.reason,
 			Capabilities:          adapterCapabilities(profile),
 			Paths:                 pathStatuses,
 		})
 	}
-	status.StateEntries, status.StateEvictions = p.health.Stats()
+	status.StateEntries, status.StateEvictions = healthView.Stats()
 	status.StatePersistenceFailures = p.statePersistenceFailures.Load()
 	p.lifecycleAccess.Lock()
 	scheduler := p.scheduler
@@ -1964,10 +1969,19 @@ func (p *AdaptivePool) leaseTTL(mode PolicyMode) time.Duration {
 }
 
 type selectionMemoryEntry struct {
-	reason    string
-	failure   string
+	reason      string
+	selectionAt time.Time
+	failure     string
+	serviceID   string
+	path        string
+	failureAt   time.Time
+	at          time.Time
+}
+
+type selectionMemoryKey struct {
+	handle    NodeHandle
 	serviceID string
-	at        time.Time
+	path      string
 }
 
 const selectionMemoryLimit = 4096
@@ -1984,20 +1998,32 @@ func (p *AdaptivePool) rememberPolicySelectionWithReason(service ServiceContext,
 	if p.policy != nil {
 		p.policy.RememberSelection(key, candidate.Handle, now)
 	}
-	p.recordSelectionMemory(candidate.ID, string(reason), "", service.ID, now)
+	p.recordSelectionMemory(candidate.Handle, string(reason), "", service.ID, serviceHealthTransport(service), now)
 }
 
-func (p *AdaptivePool) recordSelectionMemory(nodeID NodeID, reason, failure, serviceID string, at time.Time) {
-	if p == nil || nodeID == (NodeID{}) {
+func (p *AdaptivePool) recordSelectionMemory(handle NodeHandle, reason, failure, serviceID, path string, at time.Time) {
+	if p == nil || handle.NodeID == (NodeID{}) {
 		return
 	}
 	p.selectionMemoryAccess.Lock()
 	if p.selectionMemory == nil {
-		p.selectionMemory = make(map[NodeID]selectionMemoryEntry)
+		p.selectionMemory = make(map[selectionMemoryKey]selectionMemoryEntry)
 	}
-	p.selectionMemory[nodeID] = selectionMemoryEntry{reason: reason, failure: failure, serviceID: serviceID, at: at}
+	key := selectionMemoryKey{handle: handle, serviceID: serviceID, path: path}
+	entry := p.selectionMemory[key]
+	if failure != "" {
+		entry.failure = failure
+		entry.serviceID = serviceID
+		entry.path = path
+		entry.failureAt = at
+	} else if reason != "" {
+		entry.reason = reason
+		entry.selectionAt = at
+	}
+	entry.at = at
+	p.selectionMemory[key] = entry
 	if len(p.selectionMemory) > selectionMemoryLimit {
-		var oldest NodeID
+		var oldest selectionMemoryKey
 		var oldestAt time.Time
 		first := true
 		for id, entry := range p.selectionMemory {
@@ -2012,11 +2038,11 @@ func (p *AdaptivePool) recordSelectionMemory(nodeID NodeID, reason, failure, ser
 	p.selectionMemoryAccess.Unlock()
 }
 
-func (p *AdaptivePool) recordFailureMemory(candidate Candidate, failure FailureClass, serviceID string) {
+func (p *AdaptivePool) recordFailureMemory(candidate Candidate, failure FailureClass, serviceID, path string) {
 	if p == nil || candidate.ID == (NodeID{}) {
 		return
 	}
-	p.recordSelectionMemory(candidate.ID, "failure", string(failure), serviceID, time.Now())
+	p.recordSelectionMemory(candidate.Handle, "failure", string(failure), serviceID, path, time.Now())
 }
 
 func (p *AdaptivePool) selectionMemoryFor(nodeID NodeID) selectionMemoryEntry {
@@ -2024,7 +2050,22 @@ func (p *AdaptivePool) selectionMemoryFor(nodeID NodeID) selectionMemoryEntry {
 		return selectionMemoryEntry{}
 	}
 	p.selectionMemoryAccess.Lock()
-	entry := p.selectionMemory[nodeID]
+	var entry selectionMemoryEntry
+	for key, candidate := range p.selectionMemory {
+		if key.handle.NodeID != nodeID {
+			continue
+		}
+		if candidate.selectionAt.After(entry.selectionAt) {
+			entry.reason = candidate.reason
+			entry.selectionAt = candidate.selectionAt
+		}
+		if candidate.failureAt.After(entry.failureAt) {
+			entry.failure = candidate.failure
+			entry.serviceID = candidate.serviceID
+			entry.path = candidate.path
+			entry.failureAt = candidate.failureAt
+		}
+	}
 	p.selectionMemoryAccess.Unlock()
 	return entry
 }
@@ -2034,7 +2075,7 @@ func (p *AdaptivePool) clearSelectionMemory() {
 		return
 	}
 	p.selectionMemoryAccess.Lock()
-	p.selectionMemory = make(map[NodeID]selectionMemoryEntry)
+	p.selectionMemory = make(map[selectionMemoryKey]selectionMemoryEntry)
 	p.selectionMemoryAccess.Unlock()
 }
 
@@ -2059,6 +2100,17 @@ func adapterPathCapability(path PathCapability) adapter.AdaptivePathCapability {
 		}
 	}
 	return adapter.AdaptivePathCapability{Known: path.Known, Available: path.Available, State: state}
+}
+
+func durationMillis32(value time.Duration) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	milliseconds := value.Milliseconds()
+	if milliseconds >= int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(milliseconds)
 }
 
 func loadOrPrepareIdentityKey(path string) ([32]byte, bool, error) {

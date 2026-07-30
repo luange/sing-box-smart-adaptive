@@ -27,8 +27,8 @@ type AdaptiveCandidateStatus struct {
 	Health                string                    `json:"health"`
 	Breaker               string                    `json:"breaker"`
 	LastProbeAt           time.Time                 `json:"last_probe_at,omitempty"`
-	LastProbeDelay        uint16                    `json:"last_probe_delay,omitempty"`
-	SmoothedDelay         uint16                    `json:"smoothed_delay,omitempty"`
+	LastProbeDelay        uint32                    `json:"last_probe_delay,omitempty"`
+	SmoothedDelay         uint32                    `json:"smoothed_delay,omitempty"`
 	DelaySamples          int                       `json:"delay_samples,omitempty"`
 	BackoffMs             uint32                    `json:"backoff_ms,omitempty"`
 	ConsecutiveFailures   int                       `json:"consecutive_failures,omitempty"`
@@ -41,12 +41,14 @@ type AdaptiveCandidateStatus struct {
 	OpenUntil             time.Time                 `json:"open_until,omitempty"`
 	Reason                string                    `json:"reason,omitempty"`
 	HealthPriority        int                       `json:"health_priority,omitempty"`
-	ObservedDelay         uint16                    `json:"observed_delay,omitempty"`
+	ObservedDelay         uint32                    `json:"observed_delay,omitempty"`
 	WeightedDelay         uint32                    `json:"weighted_delay,omitempty"`
 	SelectionScore        uint64                    `json:"selection_score,omitempty"`
 	DominantEvidence      string                    `json:"dominant_evidence,omitempty"`
 	FilterReason          string                    `json:"filter_reason,omitempty"`
 	LastFailure           string                    `json:"last_failure,omitempty"`
+	LastFailureService    string                    `json:"last_failure_service,omitempty"`
+	LastFailurePath       string                    `json:"last_failure_path,omitempty"`
 	LastSelectionReason   string                    `json:"last_selection_reason,omitempty"`
 	Capabilities          *AdaptiveNodeCapabilities `json:"capabilities,omitempty"`
 	Paths                 []AdaptivePathStatus      `json:"paths,omitempty"`
@@ -79,8 +81,8 @@ type AdaptivePathStatus struct {
 	Health              string    `json:"health"`
 	Breaker             string    `json:"breaker"`
 	LastUpdated         time.Time `json:"last_updated,omitempty"`
-	LastDelay           uint16    `json:"last_delay,omitempty"`
-	SmoothedDelay       uint16    `json:"smoothed_delay,omitempty"`
+	LastDelay           uint32    `json:"last_delay,omitempty"`
+	SmoothedDelay       uint32    `json:"smoothed_delay,omitempty"`
 	DelaySamples        int       `json:"delay_samples,omitempty"`
 	BackoffMs           uint32    `json:"backoff_ms,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
@@ -90,7 +92,7 @@ type AdaptivePathStatus struct {
 	OpenUntil           time.Time `json:"open_until,omitempty"`
 	Reason              string    `json:"reason,omitempty"`
 	HealthPriority      int       `json:"health_priority"`
-	ObservedDelay       uint16    `json:"observed_delay,omitempty"`
+	ObservedDelay       uint32    `json:"observed_delay,omitempty"`
 	WeightedDelay       uint32    `json:"weighted_delay,omitempty"`
 	SelectionScore      uint64    `json:"selection_score"`
 	DominantEvidence    string    `json:"dominant_evidence,omitempty"`

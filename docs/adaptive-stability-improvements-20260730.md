@@ -26,6 +26,12 @@
 - capability 每条路径保留 `known/available/state`，未知不伪装成已验证可用。
 - retire 不清空在途 ObservationIngestor。
 - 延迟中位数只采集成功样本；能力过滤不再重复全表扫描吞吐。
+- 新切换节点 20 秒内发生高置信失败会立即撤销 sticky 与 lease。
+- DNS 恢复任务复用 scheduler `ProbeKey`，pending/running/rerun 自动合并。
+- 选择/失败记忆按 `NodeHandle + ServiceID + NetworkPath` 隔离。
+- breaker jitter 使用可注入随机源，故障测试可确定复现。
+- 状态延迟改为 uint32 毫秒，并从单次只读 HealthStore 快照生成。
+- 1000 次 publish/retire 测试结束 live heap 约 2 MiB；真实 Linux SIGHUP RSS 仍需 VM117 验证。
 
 ### 配置
 
