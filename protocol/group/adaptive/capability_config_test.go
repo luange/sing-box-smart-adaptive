@@ -129,8 +129,8 @@ func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing
 	options := option.AdaptivePoolOutboundOptions{
 		GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"node"}},
 		State:             option.AdaptivePoolStateOptions{Path: filepath.Join(t.TempDir(), "adaptive-state")},
-		Capability: option.AdaptivePoolCapabilityOptions{
-			Enabled: true, ServiceQualification: true,
+		Qualification: option.AdaptivePoolQualificationOptions{
+			Enabled:         true,
 			RefreshInterval: badoption.Duration(time.Minute), Timeout: badoption.Duration(time.Second), Quorum: 1, CommonModeMinNodes: 2,
 		},
 	}
@@ -143,6 +143,7 @@ func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing
 	if len(pool.capabilityServiceIDs) != 5 {
 		t.Fatalf("unexpected capability services: %v", pool.capabilityServiceIDs)
 	}
+	options.Capability.Enabled = true
 	options.Capability.BuiltinYouTubeTLS = true
 	if _, err = New(ctx, nil, nil, "ambiguous-ai", options); err == nil {
 		t.Fatal("overlapping builtin capability modes were accepted")

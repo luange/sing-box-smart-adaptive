@@ -23,7 +23,7 @@ token 不得进入状态、日志、错误和持久化。密钥用
 breaker、吞吐和 evidence 字段。
 
 `builtin_youtube_tls` 启用固定且不含凭据的 YouTube TLS 目标。
-`service_qualification` 启用五个相互隔离的服务资格探测：YouTube TLS、跟随 Google
+`qualification.enabled` 启用五个相互隔离的服务资格探测：YouTube TLS、跟随 Google
 可达性的 Gemini TLS、不带凭据的 OpenAI/Anthropic 模型列表请求，以及浏览器形态
 的 ChatGPT 网页/WAF 请求。无认证 API 的 HTTP 401 表示链路可达；网页探测的 2xx
 表示可达，HTTP 403/451 或 `cf-mitigated: challenge` 写入受阻证据。只有严格多数
@@ -59,9 +59,14 @@ token或凭据。
     { "match": "Gcore", "weight": 0.25 },
     { "match": "=airport/优选节点", "weight": 2.0 }
   ],
+  "qualification": {
+    "enabled": true,
+    "refresh_interval": "10m",
+    "timeout": "120s",
+    "quorum": 1
+  },
   "capability": {
     "enabled": true,
-    "service_qualification": true,
     "builtin_exit_identity": true,
     "refresh_interval": "10m",
     "timeout": "120s",
@@ -74,7 +79,7 @@ token或凭据。
 }
 ```
 
-`service_qualification` 默认关闭，可以在任意地区或用途的 AdaptivePool 中单独开启。
+`qualification.enabled` 默认关闭，可以在任意地区或用途的 AdaptivePool 中单独开启。
 资格证据以“节点 + 服务”隔离：例如 ChatGPT 受阻只阻止该节点承载 ChatGPT，节点仍可
 承载普通网页、YouTube、Claude 或其他服务。关闭参数时不创建资格探测控制器，也不会
 读取先前进程的资格结果。

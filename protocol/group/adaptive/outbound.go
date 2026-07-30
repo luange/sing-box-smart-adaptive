@@ -186,11 +186,19 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	}
 	var capabilityProvider RefreshableProbeTargetProvider
 	var capabilityServiceIDs []string
+	qualificationEnabled := options.Qualification.Enabled
+	capabilityEnabled := options.Capability.Enabled || qualificationEnabled
 	capabilityRefresh := time.Duration(options.Capability.RefreshInterval)
 	capabilityTimeout := time.Duration(options.Capability.Timeout)
 	capabilityQuorum := options.Capability.Quorum
 	capabilityCommonModeMin := options.Capability.CommonModeMinNodes
-	if options.Capability.Enabled {
+	if qualificationEnabled {
+		capabilityRefresh = time.Duration(options.Qualification.RefreshInterval)
+		capabilityTimeout = time.Duration(options.Qualification.Timeout)
+		capabilityQuorum = options.Qualification.Quorum
+		capabilityCommonModeMin = options.Qualification.CommonModeMinNodes
+	}
+	if capabilityEnabled {
 		if capabilityRefresh < 0 || capabilityTimeout < 0 || capabilityQuorum < 0 || capabilityCommonModeMin < 0 {
 			return nil, errors.New("adaptive capability policy is invalid")
 		}
@@ -201,7 +209,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			capabilityTimeout = defaultCapabilityTimeout
 		}
 		if capabilityQuorum == 0 {
-			if options.Capability.BuiltinYouTubeTLS || options.Capability.ServiceQualification || options.Capability.BuiltinExitIdentity {
+			if options.Capability.BuiltinYouTubeTLS || qualificationEnabled || options.Capability.BuiltinExitIdentity {
 				capabilityQuorum = 1
 			} else {
 				capabilityQuorum = 2
@@ -213,17 +221,20 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		if capabilityCommonModeMin < 2 {
 			return nil, errors.New("adaptive capability common-mode threshold is invalid")
 		}
-		if options.Capability.BuiltinYouTubeTLS && options.Capability.ServiceQualification {
+		if options.Capability.BuiltinYouTubeTLS && qualificationEnabled {
 			return nil, errors.New("adaptive builtin capability modes are ambiguous")
 		}
-		if options.Capability.BuiltinYouTubeTLS || options.Capability.ServiceQualification || options.Capability.BuiltinExitIdentity {
+		if qualificationEnabled && (options.Capability.ManifestURL != "" || len(options.Capability.TrustedKeys) != 0) {
+			return nil, errors.New("adaptive qualification cannot share a signed capability provider")
+		}
+		if options.Capability.BuiltinYouTubeTLS || qualificationEnabled || options.Capability.BuiltinExitIdentity {
 			if capabilityQuorum != 1 {
 				return nil, errors.New("adaptive builtin capability requires quorum 1")
 			}
 			if options.Capability.ManifestURL != "" || len(options.Capability.TrustedKeys) != 0 {
 				return nil, errors.New("adaptive builtin capability cannot use manifest trust options")
 			}
-			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, options.Capability.ServiceQualification, options.Capability.BuiltinExitIdentity)
+			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, qualificationEnabled, options.Capability.BuiltinExitIdentity)
 			if providerErr != nil {
 				return nil, errors.New("adaptive builtin capability is invalid")
 			}
