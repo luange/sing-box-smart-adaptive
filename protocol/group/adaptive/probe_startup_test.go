@@ -20,26 +20,29 @@ func TestStartupProbeTasksBoundAndStaggerInitialCoverage(t *testing.T) {
 	}
 
 	tasks := pool.startupProbeTasks(snapshot, now)
-	if len(tasks) != 5 {
+	if len(tasks) != 15 {
 		t.Fatalf("unexpected task count: %d", len(tasks))
 	}
-	for index, task := range tasks {
-		if task.Key.NodeID[0] != byte(index+1) {
-			t.Fatalf("startup order is not stable: index=%d node=%d", index, task.Key.NodeID[0])
-		}
-		if task.Interval != 10*time.Minute {
-			t.Fatalf("periodic coverage was not retained: %s", task.Interval)
-		}
-		if task.FailureInterval != time.Minute {
-			t.Fatalf("failed node did not get bounded fast recovery: %s", task.FailureInterval)
+	for candidateIndex := range 5 {
+		for taskOffset := range 3 {
+			task := tasks[candidateIndex*3+taskOffset]
+			if task.Key.NodeID[0] != byte(candidateIndex+1) {
+				t.Fatalf("startup order is not stable: index=%d node=%d", candidateIndex, task.Key.NodeID[0])
+			}
+			if task.Interval != 10*time.Minute {
+				t.Fatalf("periodic coverage was not retained: %s", task.Interval)
+			}
+			if task.FailureInterval != time.Minute {
+				t.Fatalf("failed node did not get bounded fast recovery: %s", task.FailureInterval)
+			}
 		}
 	}
-	if !tasks[0].DueAt.Equal(now) || !tasks[1].DueAt.Equal(now) {
+	if !tasks[0].DueAt.Equal(now) || !tasks[3].DueAt.Equal(now) {
 		t.Fatal("the first worker-sized probe wave was delayed")
 	}
 	wantOffsets := []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second}
 	for index, want := range wantOffsets {
-		if got := tasks[index+2].DueAt.Sub(now); got != want {
+		if got := tasks[(index+2)*3].DueAt.Sub(now); got != want {
 			t.Fatalf("unexpected stagger at %d: got=%s want=%s", index, got, want)
 		}
 	}

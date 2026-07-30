@@ -30,6 +30,7 @@ const (
 	StageServiceApplication   ObservationStage = "service_application"
 	StageResolverBootstrap    ObservationStage = "resolver_bootstrap"
 	StageBusinessDNS          ObservationStage = "business_dns"
+	StageDNSHealth            ObservationStage = "dns_health"
 )
 
 type FailureClass string
@@ -101,7 +102,7 @@ func (e ObservationEvidence) ValidateShape() error {
 		return errors.New("adaptive observation has unknown source")
 	}
 	switch e.Stage {
-	case StageProxyTunnel, StageDestinationTransport, StageServiceApplication, StageResolverBootstrap, StageBusinessDNS:
+	case StageProxyTunnel, StageDestinationTransport, StageServiceApplication, StageResolverBootstrap, StageBusinessDNS, StageDNSHealth:
 	default:
 		return errors.New("adaptive observation has unknown stage")
 	}
@@ -132,7 +133,7 @@ func (e ObservationEvidence) ValidateShape() error {
 	if (e.Stage == StageServiceApplication || e.Stage == StageBusinessDNS) && e.ServiceID == "" {
 		return errors.New("business observation requires service id")
 	}
-	if (e.Source == SourceFirstByte || e.Source == SourceHTTP || e.Source == SourceUDP) && (e.Stage != StageServiceApplication || e.ServiceID == "") {
+	if (e.Source == SourceFirstByte || e.Source == SourceHTTP) && (e.Stage != StageServiceApplication || e.ServiceID == "") {
 		return errors.New("business source requires service application stage and service id")
 	}
 	if e.Source == SourceThroughput {
@@ -144,12 +145,16 @@ func (e ObservationEvidence) ValidateShape() error {
 	}
 	switch e.Source {
 	case SourceDNS:
-		if e.Stage != StageResolverBootstrap && e.Stage != StageBusinessDNS {
+		if e.Stage != StageResolverBootstrap && e.Stage != StageBusinessDNS && e.Stage != StageDNSHealth {
 			return errors.New("dns source has incompatible stage")
 		}
-	case SourceHTTP, SourceFirstByte, SourceUDP, SourceThroughput:
+	case SourceHTTP, SourceFirstByte, SourceThroughput:
 		if e.Stage != StageServiceApplication {
 			return errors.New("business source has incompatible stage")
+		}
+	case SourceUDP:
+		if e.Stage != StageServiceApplication && e.Stage != StageDestinationTransport {
+			return errors.New("UDP source has incompatible stage")
 		}
 	case SourceDial:
 		if e.Stage != StageProxyTunnel && e.Stage != StageDestinationTransport {
@@ -185,7 +190,7 @@ func (e ObservationEvidence) MapDomains() ([]DomainEvidence, error) {
 	switch e.Stage {
 	case StageProxyTunnel:
 		domain = DomainEndpoint
-	case StageDestinationTransport, StageResolverBootstrap:
+	case StageDestinationTransport, StageResolverBootstrap, StageDNSHealth:
 		domain = DomainTransport
 	case StageServiceApplication, StageBusinessDNS:
 		domain = DomainService

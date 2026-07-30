@@ -139,10 +139,10 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
-		leftPriority, leftDelay := e.candidatePriority(eligible[i], service)
-		rightPriority, rightDelay := e.candidatePriority(eligible[j], service)
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
+		leftScore := e.candidateScore(eligible[i], service)
+		rightScore := e.candidateScore(eligible[j], service)
+		if leftScore.HealthPriority != rightScore.HealthPriority {
+			return leftScore.HealthPriority < rightScore.HealthPriority
 		}
 		if mode == ModeBulk {
 			leftService := e.health.StatusHandle(eligible[i].Handle, DomainService, "", service.ID)
@@ -155,16 +155,8 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 				return leftService.ThroughputBPS > rightService.ThroughputBPS
 			}
 		}
-		if leftDelay == 0 {
-			leftDelay = 10 * time.Second
-		}
-		if rightDelay == 0 {
-			rightDelay = 10 * time.Second
-		}
-		leftDelay = weightedDelay(leftDelay, e.nodeWeights.Weight(eligible[i].PrimaryTag))
-		rightDelay = weightedDelay(rightDelay, e.nodeWeights.Weight(eligible[j].PrimaryTag))
-		if leftDelay != rightDelay {
-			return leftDelay < rightDelay
+		if leftScore.WeightedDelay != rightScore.WeightedDelay {
+			return leftScore.WeightedDelay < rightScore.WeightedDelay
 		}
 		return bytes.Compare(eligible[i].ID[:], eligible[j].ID[:]) < 0
 	})
@@ -224,22 +216,52 @@ func modeUsesLease(mode PolicyMode) bool {
 // service-specific evidence. A node that passes a generic URL test but fails a
 // real TCP/UDP connection is therefore ranked below a proven working node.
 func (e *PolicyEngine) candidatePriority(candidate Candidate, service ServiceContext) (int, time.Duration) {
-	statuses := []HealthStatus{
-		e.health.EndpointHandle(candidate.Handle),
-		e.health.StatusHandle(candidate.Handle, DomainTransport, serviceHealthTransport(service), ""),
-		e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID),
+	score := e.candidateScore(candidate, service)
+	return score.HealthPriority, score.ObservedDelay
+}
+
+type CandidateScoreExplanation struct {
+	HealthPriority   int
+	ObservedDelay    time.Duration
+	WeightedDelay    time.Duration
+	SelectionScore   uint64
+	DominantEvidence string
+}
+
+func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContext) CandidateScoreExplanation {
+	type namedStatus struct {
+		name   string
+		status HealthStatus
+	}
+	statuses := []namedStatus{
+		{name: "endpoint", status: e.health.EndpointHandle(candidate.Handle)},
+		{name: serviceHealthTransport(service), status: e.health.StatusHandle(candidate.Handle, DomainTransport, serviceHealthTransport(service), "")},
+	}
+	if service.ID != "" {
+		statuses = append(statuses, namedStatus{name: "service:" + service.ID, status: e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID)})
 	}
 	priority := healthPriority(HealthHealthy)
 	var delay time.Duration
-	for _, status := range statuses {
+	dominant := "endpoint"
+	for _, item := range statuses {
+		status := item.status
 		if current := healthPriority(status.Health); current > priority {
 			priority = current
+			dominant = item.name
 		}
 		if status.LastDelay > 0 && (delay == 0 || status.LastDelay > delay) {
 			delay = status.LastDelay
 		}
 	}
-	return priority, delay
+	if delay == 0 {
+		delay = 10 * time.Second
+	}
+	weighted := weightedDelay(delay, e.nodeWeights.Weight(candidate.PrimaryTag))
+	score := uint64(priority) * 1_000_000_000_000
+	if weighted > 0 {
+		score += uint64(weighted.Microseconds())
+	}
+	return CandidateScoreExplanation{HealthPriority: priority, ObservedDelay: delay, WeightedDelay: weighted, SelectionScore: score, DominantEvidence: dominant}
 }
 
 func hasTrustedBulkThroughput(health *HealthStore, candidates []Candidate, serviceID string) bool {

@@ -260,6 +260,22 @@ func TestPolicyClosedUnknownIsNotHealthyAndDegradedDoesNotBeatSuccess(t *testing
 	}
 }
 
+func TestCandidateScoreExplainsWeightAndHealthPenalty(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	handle := NodeHandle{NodeID: NodeID{61}, Slot: 1, Version: 1}
+	candidate := Candidate{ID: handle.NodeID, Handle: handle, PrimaryTag: "Gcore weighted"}
+	matcher, err := nodeweight.New([]nodeweight.Rule{{Match: "Gcore", Weight: 0.25}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewPolicyEngine(health, 3, "fallback").BindNodeWeights(matcher)
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	score := engine.candidateScore(candidate, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4"})
+	if score.HealthPriority != 1 || score.ObservedDelay != 100*time.Millisecond || score.WeightedDelay != 400*time.Millisecond || score.SelectionScore == 0 || score.DominantEvidence != "tcp/ipv4" {
+		t.Fatalf("score explanation mismatch: %+v", score)
+	}
+}
+
 func TestPolicyReaddedVersionDoesNotInheritBreakerOrLease(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	nodeID := NodeID{44}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
@@ -63,6 +64,41 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, reason stri
 					o.pool.switchAudit.RecordFailure(o.service.Session, o.service.ID, candidate, FailureTLS, "business_tls", evidence.At)
 				}
 			}
+			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+			o.pool.scheduleFailureProbe(o.evidence.Handle)
+			o.pool.persistState()
+		}
+	})
+}
+
+func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) {
+	if o == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
+		return
+	}
+	o.failureOnce.Do(func() {
+		confidence := ConfidenceLow
+		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+			confidence = ConfidenceHigh
+		}
+		evidence := o.evidence
+		evidence.Source = SourceUDP
+		evidence.Stage = StageDestinationTransport
+		evidence.NetworkPath = serviceHealthTransport(o.service)
+		evidence.Confidence = confidence
+		evidence.Outcome = OutcomeFailure
+		evidence.Failure = FailureConnect
+		evidence.Delay = delay
+		evidence.At = time.Now()
+		evidence.Reason = errorReason(err)
+		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
+		o.pool.recordObservationResult(disposition, publishErr)
+		if publishErr != nil || disposition != IngestAccepted || confidence != ConfidenceHigh {
+			return
+		}
+		o.pool.transportFailures.Add(1)
+		status := o.pool.health.StatusHandle(o.evidence.Handle, DomainTransport, evidence.NetworkPath, "")
+		if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown {
 			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
 			o.pool.scheduleFailureProbe(o.evidence.Handle)
 			o.pool.persistState()
@@ -389,7 +425,18 @@ func (c *observedPacketConn) observeRead(count int) {
 func (c *observedPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 	count, source, err := c.PacketConn.ReadFrom(payload)
 	c.observeRead(count)
+	if count == 0 && err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
 	return count, source, err
+}
+
+func (c *observedPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	count, err := c.PacketConn.WriteTo(payload, destination)
+	if count == 0 && err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
+	return count, err
 }
 
 func (c *observedPacketConn) Close() error {
@@ -413,6 +460,9 @@ func (c *observedPacketReaderConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, 
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
 	c.observeRead(buffer.Len() - before)
+	if buffer.Len() == before && err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
 	return destination, err
 }
 
@@ -422,7 +472,11 @@ type observedPacketWriterConn struct {
 }
 
 func (c *observedPacketWriterConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	return c.writer.WritePacket(buffer, destination)
+	err := c.writer.WritePacket(buffer, destination)
+	if err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
+	return err
 }
 
 type observedExtendedPacketConn struct {
@@ -435,9 +489,16 @@ func (c *observedExtendedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
 	c.observeRead(buffer.Len() - before)
+	if buffer.Len() == before && err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
 	return destination, err
 }
 
 func (c *observedExtendedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	return c.writer.WritePacket(buffer, destination)
+	err := c.writer.WritePacket(buffer, destination)
+	if err != nil {
+		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+	}
+	return err
 }

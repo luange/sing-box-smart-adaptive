@@ -1,6 +1,7 @@
 package adaptive
 
 import (
+	"net/netip"
 	"testing"
 	"time"
 
@@ -99,6 +100,19 @@ func TestServiceResolverFakeIPAndQUICMetadataPriority(t *testing.T) {
 	}
 }
 
+func TestServiceResolverNativeQUICSNIOverridesStaleResolverDomain(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	metadata := &adapter.InboundContext{
+		Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000"),
+		Domain: "unrelated.example", SniffHost: "chatgpt.com", Protocol: "quic",
+		Destination: M.ParseSocksaddr("192.0.2.10:443"),
+	}
+	resolved := resolver.Resolve(metadata, metadata.Destination, N.NetworkUDP)
+	if resolved.ID != "chatgpt_web" || resolved.Host != "chatgpt.com" {
+		t.Fatalf("native QUIC SNI did not override stale domain: %+v", resolved)
+	}
+}
+
 func TestServiceResolverSeparatesTransportPurposeAndIPFamily(t *testing.T) {
 	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
 	tests := []struct {
@@ -115,6 +129,8 @@ func TestServiceResolverSeparatesTransportPurposeAndIPFamily(t *testing.T) {
 		{name: "data udp4", destination: "192.0.2.1:443", transport: N.NetworkUDP, expected: "udp_data/ipv4"},
 		{name: "data udp6", destination: "[2001:db8::1]:443", transport: N.NetworkUDP, expected: "udp_data/ipv6"},
 		{name: "unresolved family", destination: "example.com:443", transport: N.NetworkTCP, expected: "tcp/any"},
+		{name: "resolved ipv4 family", metadata: &adapter.InboundContext{DestinationAddresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}, destination: "example.com:443", transport: N.NetworkTCP, expected: "tcp/ipv4"},
+		{name: "resolved mixed family", metadata: &adapter.InboundContext{DestinationAddresses: []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}}, destination: "example.com:443", transport: N.NetworkTCP, expected: "tcp/any"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

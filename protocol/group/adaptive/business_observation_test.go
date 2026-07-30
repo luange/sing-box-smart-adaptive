@@ -538,6 +538,16 @@ type packetResponseOutbound struct {
 	conn net.PacketConn
 }
 
+type failingPacketConn struct{ err error }
+
+func (c *failingPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, c.err }
+func (c *failingPacketConn) WriteTo([]byte, net.Addr) (int, error)  { return 0, c.err }
+func (*failingPacketConn) Close() error                             { return nil }
+func (*failingPacketConn) LocalAddr() net.Addr                      { return &net.UDPAddr{} }
+func (*failingPacketConn) SetDeadline(time.Time) error              { return nil }
+func (*failingPacketConn) SetReadDeadline(time.Time) error          { return nil }
+func (*failingPacketConn) SetWriteDeadline(time.Time) error         { return nil }
+
 func newPacketResponseOutbound(tag string, conn net.PacketConn) *packetResponseOutbound {
 	return &packetResponseOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, tag, []string{N.NetworkUDP}, nil), conn: conn}
 }
@@ -612,6 +622,9 @@ func TestUDPTImeoutDoesNotCreateServiceFailure(t *testing.T) {
 	if status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkUDP); status.Successes != 0 || status.Failures != 0 {
 		t.Fatalf("UDP timeout created service evidence: %+v", status)
 	}
+	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, N.NetworkUDP, ""); status.Failures != 0 || status.NonBreakerFailures != 0 {
+		t.Fatalf("UDP timeout created transport failure: %+v", status)
+	}
 	pool.runtimeManager.access.RLock()
 	state := pool.runtimeManager.groups[pool.groupID]
 	_, retained := state.epochs[snapshot.RuntimeEpochID]
@@ -630,6 +643,25 @@ func TestUDPTImeoutDoesNotCreateServiceFailure(t *testing.T) {
 	if retained {
 		t.Fatal("UDP Close did not release retired epoch")
 	}
+}
+
+func TestUDPExplicitNetworkFailureUpdatesOnlyDataPath(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{94}, "udp-refused", newTestOutbound("udp-refused")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	wrapped := pool.wrapBusinessPacketConn(&failingPacketConn{err: syscall.ECONNREFUSED}, snapshot, snapshot.Candidates[0], service, time.Now())
+	if _, _, err := wrapped.ReadFrom(make([]byte, 1)); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("explicit UDP error changed: %v", err)
+	}
+	status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if status.Failures != 1 || status.Health != HealthDegraded {
+		t.Fatalf("explicit UDP error did not update data path: %+v", status)
+	}
+	if dns := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_dns/ipv4", ""); dns.Failures != 0 || dns.NonBreakerFailures != 0 {
+		t.Fatalf("UDP data error contaminated DNS path: %+v", dns)
+	}
+	_ = wrapped.Close()
 }
 
 func TestServiceHalfOpenPermitIsAcquiredOnlyAfterPayload(t *testing.T) {

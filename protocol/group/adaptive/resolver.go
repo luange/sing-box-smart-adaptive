@@ -24,6 +24,12 @@ const (
 	ModeManual         PolicyMode = "manual"
 )
 
+var observableHealthPaths = [...]string{
+	"tcp/ipv4", "tcp/ipv6",
+	"udp_dns/ipv4", "udp_dns/ipv6",
+	"udp_data/ipv4", "udp_data/ipv6",
+}
+
 type ServiceContext struct {
 	ID              string
 	AffinityID      string
@@ -113,6 +119,23 @@ func resolveHealthTransport(metadata *adapter.InboundContext, destination M.Sock
 			family = healthFamilyIPv4
 		} else if address.Is6() {
 			family = healthFamilyIPv6
+		}
+	} else if metadata != nil && len(metadata.DestinationAddresses) > 0 {
+		resolvedFamily := ""
+		for _, resolved := range metadata.DestinationAddresses {
+			current := healthFamilyIPv6
+			if resolved.Is4() || resolved.Is4In6() {
+				current = healthFamilyIPv4
+			}
+			if resolvedFamily == "" {
+				resolvedFamily = current
+			} else if resolvedFamily != current {
+				resolvedFamily = healthFamilyAny
+				break
+			}
+		}
+		if resolvedFamily != "" {
+			family = resolvedFamily
 		}
 	}
 	return class + "/" + family
@@ -223,6 +246,16 @@ func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMo
 
 func destinationHost(metadata *adapter.InboundContext, destination M.Socksaddr) string {
 	if metadata != nil {
+		// A FakeIP reverse mapping represents the original requested domain and
+		// remains authoritative over a CDN/challenge SNI. For native QUIC, the
+		// sniffed SNI identifies the actual encrypted flow and wins over a stale
+		// resolver-domain cache.
+		if metadata.FakeIP && metadata.Domain != "" {
+			return metadata.Domain
+		}
+		if strings.EqualFold(metadata.Protocol, "quic") && metadata.SniffHost != "" {
+			return metadata.SniffHost
+		}
 		if metadata.Domain != "" {
 			return metadata.Domain
 		}

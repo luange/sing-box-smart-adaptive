@@ -711,8 +711,9 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	if err := p.waitUntilPublished(ctx); err != nil {
 		return nil, err
 	}
-	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkName(network))
-	if p.blockAIIPv6(serviceContext, destination) {
+	metadata := adapter.ContextFrom(ctx)
+	serviceContext := p.resolver.Resolve(metadata, destination, N.NetworkName(network))
+	if p.applyAIIPv6Policy(serviceContext, destination, metadata) {
 		return nil, errors.New("adaptive AI IPv6 destination blocked by policy")
 	}
 	snapshot := p.catalog.load()
@@ -761,13 +762,37 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
 }
 
-func (p *AdaptivePool) blockAIIPv6(service ServiceContext, destination M.Socksaddr) bool {
-	if p == nil || p.aiIPv6Policy != "block" || !destination.Addr.IsValid() || !destination.Addr.Is6() || destination.Addr.Is4In6() {
+func (p *AdaptivePool) applyAIIPv6Policy(service ServiceContext, destination M.Socksaddr, metadata *adapter.InboundContext) bool {
+	if p == nil || p.aiIPv6Policy != "block" || !isAIIdentityService(service.ID) {
 		return false
 	}
-	switch service.ID {
-	case "openai_api", "chatgpt_web", "claude", "gemini", "google_account", "apple_account", "microsoft_account", "cloudflare_challenge":
+	if destination.Addr.IsValid() && destination.Addr.Is6() && !destination.Addr.Is4In6() {
 		p.aiIPv6Blocked.Add(1)
+		return true
+	}
+	if metadata == nil || len(metadata.DestinationAddresses) == 0 {
+		return false
+	}
+	filtered := metadata.DestinationAddresses[:0]
+	removed := false
+	for _, address := range metadata.DestinationAddresses {
+		if address.Is6() && !address.Is4In6() {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, address)
+	}
+	if !removed {
+		return false
+	}
+	p.aiIPv6Blocked.Add(1)
+	metadata.DestinationAddresses = filtered
+	return len(filtered) == 0
+}
+
+func isAIIdentityService(serviceID string) bool {
+	switch serviceID {
+	case "openai_api", "chatgpt_web", "claude", "gemini", "google_account", "apple_account", "microsoft_account", "cloudflare_challenge":
 		return true
 	default:
 		return false
@@ -927,8 +952,9 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	if err := p.waitUntilPublished(ctx); err != nil {
 		return nil, err
 	}
-	serviceContext := p.resolver.Resolve(adapter.ContextFrom(ctx), destination, N.NetworkUDP)
-	if p.blockAIIPv6(serviceContext, destination) {
+	metadata := adapter.ContextFrom(ctx)
+	serviceContext := p.resolver.Resolve(metadata, destination, N.NetworkUDP)
+	if p.applyAIIPv6Policy(serviceContext, destination, metadata) {
 		return nil, errors.New("adaptive AI IPv6 destination blocked by policy")
 	}
 	snapshot := p.catalog.load()
@@ -1093,6 +1119,12 @@ func (p *AdaptivePool) TriggerAdaptiveProbe(ctx context.Context) error {
 		if submission.Err != nil {
 			return submission.Err
 		}
+		for _, family := range []string{"ipv4", "ipv6"} {
+			submission = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, family, time.Now(), 0))
+			if submission.Err != nil {
+				return submission.Err
+			}
+		}
 	}
 	return nil
 }
@@ -1213,6 +1245,24 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			state = string(health.Breaker)
 		}
 		weightMatch := p.nodeWeights.Explain(candidate.PrimaryTag)
+		pathStatuses := make([]adapter.AdaptivePathStatus, 0, len(observableHealthPaths))
+		for _, path := range observableHealthPaths {
+			pathHealth := p.health.StatusHandle(candidate.Handle, DomainTransport, path, "")
+			rawTransport := N.NetworkTCP
+			if strings.HasPrefix(path, "udp_") {
+				rawTransport = N.NetworkUDP
+			}
+			score := p.policy.candidateScore(candidate, ServiceContext{Transport: rawTransport, HealthTransport: path})
+			pathStatuses = append(pathStatuses, adapter.AdaptivePathStatus{
+				Path: path, Health: string(pathHealth.Health), Breaker: string(pathHealth.Breaker),
+				LastUpdated: pathHealth.LastUpdated, LastDelay: uint16(max(0, pathHealth.LastDelay.Milliseconds())),
+				Successes: pathHealth.Successes, Failures: pathHealth.Failures, RecoverySuccesses: pathHealth.RecoverySuccesses,
+				OpenUntil: pathHealth.CooldownUntil, Reason: pathHealth.Reason,
+				HealthPriority: score.HealthPriority, ObservedDelay: uint16(max(0, score.ObservedDelay.Milliseconds())),
+				WeightedDelay: uint32(max(0, score.WeightedDelay.Milliseconds())), SelectionScore: score.SelectionScore,
+				DominantEvidence: score.DominantEvidence,
+			})
+		}
 		status.Candidates = append(status.Candidates, adapter.AdaptiveCandidateStatus{
 			NodeID:                candidate.ID.String(),
 			EndpointID:            candidate.EndpointID.String(),
@@ -1238,6 +1288,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			EvidenceWeight:        health.EvidenceWeight,
 			OpenUntil:             health.CooldownUntil,
 			Reason:                health.Reason,
+			Paths:                 pathStatuses,
 		})
 	}
 	status.StateEntries, status.StateEvictions = p.health.Stats()
@@ -1559,13 +1610,17 @@ func (p *AdaptivePool) startupProbeTasks(snapshot *ExecutionSnapshot, now time.T
 	if spread < 0 {
 		spread = 0
 	}
-	tasks := make([]ProbeTask, 0, len(candidates))
+	tasks := make([]ProbeTask, 0, len(candidates)*3)
 	for index, candidate := range candidates {
 		dueAt := now
 		if index >= immediate && spreadCount > 0 {
 			dueAt = now.Add(time.Duration(index-immediate+1) * spread / time.Duration(spreadCount))
 		}
-		tasks = append(tasks, p.probeTask(snapshot, candidate, dueAt, p.probeCoverage))
+		tasks = append(tasks,
+			p.probeTask(snapshot, candidate, dueAt, p.probeCoverage),
+			p.dnsHealthProbeTask(snapshot, candidate, "ipv4", dueAt, p.probeCoverage),
+			p.dnsHealthProbeTask(snapshot, candidate, "ipv6", dueAt, p.probeCoverage),
+		)
 	}
 	return tasks
 }
@@ -1620,6 +1675,74 @@ func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionS
 		return ProbeResult{Outcome: OutcomeFailure, Delay: elapsed, Reason: probeErr.Error(), Settled: attempt != nil}, delay
 	}
 	return ProbeResult{Outcome: OutcomeSuccess, Delay: time.Duration(delay) * time.Millisecond, Settled: attempt != nil}, delay
+}
+
+func (p *AdaptivePool) runDNSHealthProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate, family string) ProbeResult {
+	current := p.catalog.load()
+	if current == nil || snapshot == nil || current.RuntimeEpochID != snapshot.RuntimeEpochID || current.CatalogRevision != snapshot.CatalogRevision || current.Generation != snapshot.Generation {
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}
+	}
+	currentCandidate, loaded := current.Candidate(candidate.ID)
+	if !loaded || currentCandidate.Handle.Slot != candidate.Handle.Slot || currentCandidate.Handle.Version != candidate.Handle.Version {
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: "candidate handle retired"}
+	}
+	path := "udp_dns/" + family
+	permit, allowed := p.health.TryAcquireDomainPermitHandle(candidate.Handle, DomainTransport, path, "", time.Now())
+	if !allowed {
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: "DNS path breaker deferred"}
+	}
+	attempt, err := p.beginObservationAttempt(current, currentCandidate, permit, N.NetworkUDP, path)
+	if err != nil {
+		permit.ReleaseDeferred()
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: err.Error()}
+	}
+	startedAt := time.Now()
+	execution, loaded := p.catalog.AcquireExecution(ExecutionToken{RuntimeEpochID: current.RuntimeEpochID, CatalogRevision: current.CatalogRevision, Handle: currentCandidate.Handle})
+	if !loaded {
+		p.completeDNSHealthProbe(attempt, ErrExecutionBindingUnavailable, time.Since(startedAt), true)
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: ErrExecutionBindingUnavailable.Error(), Settled: true}
+	}
+	probeErr := runDNSHealthTargets(ctx, execution.Port, family)
+	execution.Release()
+	elapsed := time.Since(startedAt)
+	latest := p.catalog.load()
+	latestCandidate, stillActive := Candidate{}, false
+	if latest != nil {
+		latestCandidate, stillActive = latest.Candidate(candidate.ID)
+	}
+	stale := latest == nil || latest.RuntimeEpochID != snapshot.RuntimeEpochID || latest.CatalogRevision != snapshot.CatalogRevision || latest.Generation != snapshot.Generation || !stillActive || latestCandidate.Handle != candidate.Handle
+	deferred := stale || !p.probeOwnerActive() || (p.ctx != nil && p.ctx.Err() != nil) || (ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded))
+	p.completeDNSHealthProbe(attempt, probeErr, elapsed, deferred)
+	if deferred {
+		return ProbeResult{Outcome: OutcomeDeferred, Delay: elapsed, Reason: "DNS probe identity retired", Settled: true}
+	}
+	if probeErr != nil {
+		return ProbeResult{Outcome: OutcomeFailure, Delay: elapsed, Reason: probeErr.Error(), Settled: true}
+	}
+	return ProbeResult{Outcome: OutcomeSuccess, Delay: elapsed, Settled: true}
+}
+
+func (p *AdaptivePool) completeDNSHealthProbe(attempt *observationAttempt, probeErr error, delay time.Duration, deferred bool) {
+	defer attempt.lease.Release()
+	evidence := attempt.evidence
+	evidence.Source = SourceDNS
+	evidence.Stage = StageDNSHealth
+	evidence.Confidence = ConfidenceHigh
+	evidence.Delay = delay
+	evidence.At = time.Now()
+	evidence.Reason = errorReason(probeErr)
+	switch {
+	case deferred:
+		evidence.Outcome, evidence.Failure = OutcomeDeferred, FailureCanceled
+	case probeErr == nil:
+		evidence.Outcome, evidence.Failure = OutcomeSuccess, FailureNone
+	case errors.Is(probeErr, context.DeadlineExceeded) || isTimeoutError(probeErr):
+		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureTimeout
+	default:
+		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureDNS
+	}
+	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
+	p.recordObservationResult(disposition, publishErr)
 }
 
 func (p *AdaptivePool) probeOwnerActive() bool {
@@ -1682,6 +1805,30 @@ func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidat
 			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
 			return result
 		},
+	}
+}
+
+func (p *AdaptivePool) dnsHealthProbeTask(snapshot *ExecutionSnapshot, candidate Candidate, family string, dueAt time.Time, interval time.Duration) ProbeTask {
+	priority := ProbePriorityOnDemand
+	failureInterval := time.Duration(0)
+	if interval > 0 {
+		priority = ProbePriorityCoverage
+		failureInterval = interval / 4
+		if failureInterval > time.Minute {
+			failureInterval = time.Minute
+		}
+		if failureInterval <= 0 {
+			failureInterval = interval
+		}
+	}
+	return ProbeTask{
+		Key: ProbeKey{
+			RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
+			NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version, Suite: "dns-health", Target: family,
+		},
+		Source: firstOrDefault(candidate.Sources, "static"), Priority: priority, DueAt: dueAt,
+		Interval: interval, FailureInterval: failureInterval, Timeout: max(p.probeTimeout, 5*time.Second),
+		Run: func(ctx context.Context) ProbeResult { return p.runDNSHealthProbe(ctx, snapshot, candidate, family) },
 	}
 }
 

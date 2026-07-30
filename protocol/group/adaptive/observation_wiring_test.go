@@ -107,6 +107,26 @@ func TestDestinationFailuresOpenTransportButNotEndpoint(t *testing.T) {
 	}
 }
 
+func TestAdaptiveStatusExposesAllNetworkHealthPaths(t *testing.T) {
+	health := NewHealthStore(time.Hour, 64)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{93}, "path-status", newTestOutbound("path-status")))
+	handle := snapshot.Candidates[0].Handle
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainTransport, Transport: "udp_dns/ipv6", Outcome: OutcomeFailure, At: time.Now(), Reason: "dns timeout"})
+	status := pool.AdaptiveStatus()
+	if len(status.Candidates) != 1 || len(status.Candidates[0].Paths) != len(observableHealthPaths) {
+		t.Fatalf("network paths missing from status: %+v", status.Candidates)
+	}
+	for _, path := range status.Candidates[0].Paths {
+		if path.Path == "udp_dns/ipv6" {
+			if path.Failures != 1 || path.Health != string(HealthDegraded) || path.Reason != "dns timeout" {
+				t.Fatalf("DNS/IPv6 path status mismatch: %+v", path)
+			}
+			return
+		}
+	}
+	t.Fatal("DNS/IPv6 path was not exposed")
+}
+
 func TestOldProbeTaskDefersUntilCurrentRevisionTaskRuns(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	pool, oldSnapshot := newWiredObservationPool(t, health, wired(NodeID{73}, "probe-v1", newTestOutbound("probe-v1")))

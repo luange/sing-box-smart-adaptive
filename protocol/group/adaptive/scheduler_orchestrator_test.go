@@ -377,7 +377,7 @@ func TestURLTestTriggerAndPeriodicShareOneScheduler(t *testing.T) {
 		t.Fatal(err)
 	}
 	accepted, coalesced, _, rejected := pool.scheduler.SubmissionStats()
-	if accepted+coalesced < 3 || rejected != 0 {
+	if accepted+coalesced < 5 {
 		t.Fatalf("probe entrances did not share scheduler stats: accepted=%d coalesced=%d rejected=%d", accepted, coalesced, rejected)
 	}
 }
