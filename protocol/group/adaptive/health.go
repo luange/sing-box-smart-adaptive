@@ -3,11 +3,15 @@ package adaptive
 import (
 	"container/list"
 	"math"
+	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+const healthDelayRingSize = 10
 
 // FailureDomain is deliberately independent from the observation source. A
 // later observation contract can map dial, TLS, HTTP and UDP evidence into
@@ -77,6 +81,8 @@ type HealthStatus struct {
 	Breaker             BreakerState
 	LastUpdated         time.Time
 	LastDelay           time.Duration
+	SmoothedDelay       time.Duration
+	DelaySamples        int
 	ThroughputBPS       float64
 	ThroughputSamples   uint64
 	Successes           uint64
@@ -116,6 +122,9 @@ type healthRecord struct {
 	openUntil          time.Time
 	halfOpenToken      uint64
 	version            uint64
+	delaySamples       [healthDelayRingSize]time.Duration
+	delayCount         int
+	delayNext          int
 	element            *list.Element
 }
 
@@ -129,10 +138,13 @@ type BreakerConfig struct {
 	FailureThreshold int
 	BaseCooldown     time.Duration
 	MaxCooldown      time.Duration
+	// JitterFraction adds symmetric random jitter to open-breaker backoff
+	// (for example 0.2 => ±20%). Zero disables jitter for deterministic tests.
+	JitterFraction float64
 }
 
 func defaultBreakerConfig() BreakerConfig {
-	return BreakerConfig{FailureThreshold: 3, BaseCooldown: 5 * time.Second, MaxCooldown: 5 * time.Minute}
+	return BreakerConfig{FailureThreshold: 3, BaseCooldown: 5 * time.Second, MaxCooldown: 5 * time.Minute, JitterFraction: 0.2}
 }
 
 // AttemptPermit owns only half-open tokens actually acquired by an attempt.
@@ -201,7 +213,49 @@ func NewHealthStoreWithClock(retention time.Duration, maxEntries int, clock Cloc
 	if breaker.MaxCooldown < breaker.BaseCooldown {
 		breaker.MaxCooldown = defaults.MaxCooldown
 	}
+	if breaker.JitterFraction < 0 {
+		breaker.JitterFraction = defaults.JitterFraction
+	}
+	if breaker.JitterFraction > 0.5 {
+		breaker.JitterFraction = 0.5
+	}
 	return &HealthStore{entries: make(map[healthKey]*healthRecord), retention: retention, maxEntries: maxEntries, clock: clock, breaker: breaker}
+}
+
+func recordHealthDelay(record *healthRecord, delay time.Duration) {
+	if record == nil || delay <= 0 {
+		return
+	}
+	record.delaySamples[record.delayNext] = delay
+	record.delayNext = (record.delayNext + 1) % healthDelayRingSize
+	if record.delayCount < healthDelayRingSize {
+		record.delayCount++
+	}
+	record.status.LastDelay = delay
+	record.status.DelaySamples = record.delayCount
+	record.status.SmoothedDelay = medianHealthDelay(record.delaySamples[:record.delayCount])
+}
+
+func medianHealthDelay(samples []time.Duration) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
+	ordered := append([]time.Duration(nil), samples...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	mid := len(ordered) / 2
+	if len(ordered)%2 == 1 {
+		return ordered[mid]
+	}
+	return (ordered[mid-1] + ordered[mid]) / 2
+}
+
+// RankingDelay prefers the recent median when available so a single noisy
+// sample cannot reshuffle healthy candidates.
+func (s HealthStatus) RankingDelay() time.Duration {
+	if s.SmoothedDelay > 0 {
+		return s.SmoothedDelay
+	}
+	return s.LastDelay
 }
 
 func (s *HealthStore) Observe(observation Observation) {
@@ -274,8 +328,8 @@ func (s *HealthStore) observeQualityLocked(key healthKey, observation Observatio
 	record.status.LastUpdated = observation.At
 	record.status.Reason = observation.Reason
 	record.status.EvidenceWeight += weight
-	if observation.Delay > 0 {
-		record.status.LastDelay = observation.Delay
+	if observation.Outcome == OutcomeSuccess && observation.Delay > 0 {
+		recordHealthDelay(record, observation.Delay)
 	}
 	if observation.ThroughputBPS > 0 && !math.IsNaN(observation.ThroughputBPS) && !math.IsInf(observation.ThroughputBPS, 0) {
 		logValue := math.Log1p(observation.ThroughputBPS)
@@ -444,6 +498,41 @@ func (s *HealthStore) CanAttemptHandle(handle NodeHandle, service ServiceContext
 	return true
 }
 
+// CanAttemptHandleReadOnly reports current availability without advancing a
+// breaker or acquiring a half-open token. Status/API paths must use this form.
+func (s *HealthStore) CanAttemptHandleReadOnly(handle NodeHandle, service ServiceContext, at time.Time) bool {
+	if s == nil {
+		return true
+	}
+	if at.IsZero() {
+		at = s.clock.Now()
+	}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	for _, key := range keys {
+		record, _ := s.recordForKeyLocked(key)
+		if record != nil && !availableReadOnly(record, at) {
+			return false
+		}
+	}
+	return true
+}
+
+func availableReadOnly(record *healthRecord, now time.Time) bool {
+	if record == nil {
+		return true
+	}
+	switch record.status.Breaker {
+	case BreakerOpen, BreakerCooldown:
+		return !now.Before(record.openUntil)
+	case BreakerHalfOpen:
+		return record.halfOpenToken == 0
+	default:
+		return true
+	}
+}
+
 func (s *HealthStore) availableLocked(record *healthRecord, now time.Time) bool {
 	switch record.status.Breaker {
 	case BreakerOpen:
@@ -525,8 +614,8 @@ func (s *HealthStore) observeLocked(key healthKey, outcome ObservationOutcome, a
 	}
 	record.status.LastUpdated = at
 	record.status.Reason = reason
-	if delay > 0 {
-		record.status.LastDelay = delay
+	if outcome == OutcomeSuccess && delay > 0 {
+		recordHealthDelay(record, delay)
 	}
 	if outcome == OutcomeSuccess {
 		record.status.Successes++
@@ -586,6 +675,17 @@ func (s *HealthStore) openBreakerRecordLocked(record *healthRecord, now time.Tim
 	if backoff > s.breaker.MaxCooldown {
 		backoff = s.breaker.MaxCooldown
 	}
+	backoff = applyBackoffJitter(backoff, s.breaker.JitterFraction)
+	if backoff > s.breaker.MaxCooldown {
+		backoff = s.breaker.MaxCooldown
+	}
+	if backoff < s.breaker.BaseCooldown/2 && s.breaker.BaseCooldown > 0 {
+		// Keep a floor so jitter cannot collapse the first open window to near-zero.
+		minBackoff := s.breaker.BaseCooldown / 2
+		if backoff < minBackoff {
+			backoff = minBackoff
+		}
+	}
 	record.openUntil = now.Add(backoff)
 	record.version++
 	record.status.Breaker = BreakerOpen
@@ -595,6 +695,18 @@ func (s *HealthStore) openBreakerRecordLocked(record *healthRecord, now time.Tim
 	record.halfOpenToken = 0
 	record.recoverySuccesses = 0
 	record.status.RecoverySuccesses = 0
+}
+
+func applyBackoffJitter(backoff time.Duration, fraction float64) time.Duration {
+	if backoff <= 0 || fraction <= 0 {
+		return backoff
+	}
+	// Symmetric jitter in [-fraction, +fraction].
+	scale := 1 + (rand.Float64()*2-1)*fraction
+	if scale < 0.1 {
+		scale = 0.1
+	}
+	return time.Duration(float64(backoff) * scale)
 }
 
 func (s *HealthStore) Endpoint(nodeID NodeID) HealthStatus {

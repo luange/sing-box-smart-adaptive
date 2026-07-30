@@ -12,49 +12,88 @@ var (
 )
 
 type AdaptiveCandidateStatus struct {
-	NodeID                string               `json:"node_id"`
-	EndpointID            string               `json:"endpoint_id,omitempty"`
-	EndpointConflictCount int                  `json:"endpoint_conflict_count,omitempty"`
-	NodeSlot              uint64               `json:"node_slot"`
-	NodeVersion           uint64               `json:"node_version"`
-	Tag                   string               `json:"tag"`
-	Weight                float64              `json:"weight,omitempty"`
-	WeightRule            string               `json:"weight_rule,omitempty"`
-	WeightRuleExact       bool                 `json:"weight_rule_exact,omitempty"`
-	Aliases               []string             `json:"aliases,omitempty"`
-	IdentityStable        bool                 `json:"identity_stable"`
-	State                 string               `json:"state"`
-	Health                string               `json:"health"`
-	Breaker               string               `json:"breaker"`
-	LastProbeAt           time.Time            `json:"last_probe_at,omitempty"`
-	LastProbeDelay        uint16               `json:"last_probe_delay,omitempty"`
-	ThroughputBPS         float64              `json:"throughput_bps,omitempty"`
-	ThroughputSamples     uint64               `json:"throughput_samples,omitempty"`
-	Successes             uint64               `json:"successes,omitempty"`
-	Failures              uint64               `json:"failures,omitempty"`
-	RecoverySuccesses     int                  `json:"recovery_successes,omitempty"`
-	EvidenceWeight        float64              `json:"evidence_weight,omitempty"`
-	OpenUntil             time.Time            `json:"open_until,omitempty"`
-	Reason                string               `json:"reason,omitempty"`
-	Paths                 []AdaptivePathStatus `json:"paths,omitempty"`
+	NodeID                string                    `json:"node_id"`
+	EndpointID            string                    `json:"endpoint_id,omitempty"`
+	EndpointConflictCount int                       `json:"endpoint_conflict_count,omitempty"`
+	NodeSlot              uint64                    `json:"node_slot"`
+	NodeVersion           uint64                    `json:"node_version"`
+	Tag                   string                    `json:"tag"`
+	Weight                float64                   `json:"weight,omitempty"`
+	WeightRule            string                    `json:"weight_rule,omitempty"`
+	WeightRuleExact       bool                      `json:"weight_rule_exact,omitempty"`
+	Aliases               []string                  `json:"aliases,omitempty"`
+	IdentityStable        bool                      `json:"identity_stable"`
+	State                 string                    `json:"state"`
+	Health                string                    `json:"health"`
+	Breaker               string                    `json:"breaker"`
+	LastProbeAt           time.Time                 `json:"last_probe_at,omitempty"`
+	LastProbeDelay        uint16                    `json:"last_probe_delay,omitempty"`
+	SmoothedDelay         uint16                    `json:"smoothed_delay,omitempty"`
+	DelaySamples          int                       `json:"delay_samples,omitempty"`
+	BackoffMs             uint32                    `json:"backoff_ms,omitempty"`
+	ConsecutiveFailures   int                       `json:"consecutive_failures,omitempty"`
+	ThroughputBPS         float64                   `json:"throughput_bps,omitempty"`
+	ThroughputSamples     uint64                    `json:"throughput_samples,omitempty"`
+	Successes             uint64                    `json:"successes,omitempty"`
+	Failures              uint64                    `json:"failures,omitempty"`
+	RecoverySuccesses     int                       `json:"recovery_successes,omitempty"`
+	EvidenceWeight        float64                   `json:"evidence_weight,omitempty"`
+	OpenUntil             time.Time                 `json:"open_until,omitempty"`
+	Reason                string                    `json:"reason,omitempty"`
+	HealthPriority        int                       `json:"health_priority,omitempty"`
+	ObservedDelay         uint16                    `json:"observed_delay,omitempty"`
+	WeightedDelay         uint32                    `json:"weighted_delay,omitempty"`
+	SelectionScore        uint64                    `json:"selection_score,omitempty"`
+	DominantEvidence      string                    `json:"dominant_evidence,omitempty"`
+	FilterReason          string                    `json:"filter_reason,omitempty"`
+	LastFailure           string                    `json:"last_failure,omitempty"`
+	LastSelectionReason   string                    `json:"last_selection_reason,omitempty"`
+	Capabilities          *AdaptiveNodeCapabilities `json:"capabilities,omitempty"`
+	Paths                 []AdaptivePathStatus      `json:"paths,omitempty"`
+}
+
+// AdaptiveNodeCapabilities is the partial-availability portrait used by
+// operators and by path-aware selection.
+type AdaptiveNodeCapabilities struct {
+	TCP4          AdaptivePathCapability `json:"tcp4"`
+	TCP6          AdaptivePathCapability `json:"tcp6"`
+	DNSUDPv4      AdaptivePathCapability `json:"dns_udp4"`
+	DNSUDPv6      AdaptivePathCapability `json:"dns_udp6"`
+	DataUDPv4     AdaptivePathCapability `json:"data_udp4"`
+	DataUDPv6     AdaptivePathCapability `json:"data_udp6"`
+	Endpoint      AdaptivePathCapability `json:"endpoint"`
+	ThroughputOK  bool                   `json:"throughput_ok"`
+	ThroughputBPS float64                `json:"throughput_bps,omitempty"`
+	// Known marks whether at least one path has real evidence.
+	Known bool `json:"known"`
+}
+
+type AdaptivePathCapability struct {
+	Known     bool   `json:"known"`
+	Available bool   `json:"available"`
+	State     string `json:"state"`
 }
 
 type AdaptivePathStatus struct {
-	Path              string    `json:"path"`
-	Health            string    `json:"health"`
-	Breaker           string    `json:"breaker"`
-	LastUpdated       time.Time `json:"last_updated,omitempty"`
-	LastDelay         uint16    `json:"last_delay,omitempty"`
-	Successes         uint64    `json:"successes,omitempty"`
-	Failures          uint64    `json:"failures,omitempty"`
-	RecoverySuccesses int       `json:"recovery_successes,omitempty"`
-	OpenUntil         time.Time `json:"open_until,omitempty"`
-	Reason            string    `json:"reason,omitempty"`
-	HealthPriority    int       `json:"health_priority"`
-	ObservedDelay     uint16    `json:"observed_delay,omitempty"`
-	WeightedDelay     uint32    `json:"weighted_delay,omitempty"`
-	SelectionScore    uint64    `json:"selection_score"`
-	DominantEvidence  string    `json:"dominant_evidence,omitempty"`
+	Path                string    `json:"path"`
+	Health              string    `json:"health"`
+	Breaker             string    `json:"breaker"`
+	LastUpdated         time.Time `json:"last_updated,omitempty"`
+	LastDelay           uint16    `json:"last_delay,omitempty"`
+	SmoothedDelay       uint16    `json:"smoothed_delay,omitempty"`
+	DelaySamples        int       `json:"delay_samples,omitempty"`
+	BackoffMs           uint32    `json:"backoff_ms,omitempty"`
+	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
+	Successes           uint64    `json:"successes,omitempty"`
+	Failures            uint64    `json:"failures,omitempty"`
+	RecoverySuccesses   int       `json:"recovery_successes,omitempty"`
+	OpenUntil           time.Time `json:"open_until,omitempty"`
+	Reason              string    `json:"reason,omitempty"`
+	HealthPriority      int       `json:"health_priority"`
+	ObservedDelay       uint16    `json:"observed_delay,omitempty"`
+	WeightedDelay       uint32    `json:"weighted_delay,omitempty"`
+	SelectionScore      uint64    `json:"selection_score"`
+	DominantEvidence    string    `json:"dominant_evidence,omitempty"`
 }
 
 type AdaptiveSwitchAudit struct {

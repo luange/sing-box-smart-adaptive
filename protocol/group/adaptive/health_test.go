@@ -27,7 +27,7 @@ func (c *fakeClock) Advance(duration time.Duration) {
 
 func newBreakerTestStore() (*HealthStore, *fakeClock) {
 	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
-	return NewHealthStoreWithClock(time.Hour, 64, clock, BreakerConfig{FailureThreshold: 3, BaseCooldown: 10 * time.Second, MaxCooldown: 40 * time.Second}), clock
+	return NewHealthStoreWithClock(time.Hour, 64, clock, BreakerConfig{FailureThreshold: 3, BaseCooldown: 10 * time.Second, MaxCooldown: 40 * time.Second, JitterFraction: 0}), clock
 }
 
 func TestHealthStoreIsBoundedAndDeferredIsIgnored(t *testing.T) {
@@ -304,5 +304,68 @@ func TestHealthStoreThroughputUsesQualityEWMAWithoutBreakerMutation(t *testing.T
 	summary := store.ThroughputByHandle()[handle]
 	if summary.Samples != 2 || summary.BPS != status.ThroughputBPS {
 		t.Fatalf("throughput monitoring aggregate diverged: summary=%+v status=%+v", summary, status)
+	}
+}
+
+func TestHealthDelayRingUsesMedianSmoothedDelay(t *testing.T) {
+	store := NewHealthStore(time.Hour, 16)
+	nodeID := NodeID{91}
+	delays := []time.Duration{
+		100 * time.Millisecond,
+		110 * time.Millisecond,
+		90 * time.Millisecond,
+		105 * time.Millisecond,
+		95 * time.Millisecond,
+		1 * time.Second, // outlier must not dominate the median
+	}
+	for _, delay := range delays {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: delay, At: time.Now()})
+	}
+	status := store.Endpoint(nodeID)
+	if status.LastDelay != time.Second {
+		t.Fatalf("last delay should keep the newest sample: %+v", status)
+	}
+	if status.DelaySamples != len(delays) {
+		t.Fatalf("delay sample count mismatch: %+v", status)
+	}
+	// Median of [90,95,100,105,110,1000] = (100+105)/2 = 102.5ms
+	want := (100*time.Millisecond + 105*time.Millisecond) / 2
+	if status.SmoothedDelay != want || status.RankingDelay() != want {
+		t.Fatalf("smoothed median mismatch: got=%s want=%s status=%+v", status.SmoothedDelay, want, status)
+	}
+}
+
+func TestBreakerBackoffJitterIsBounded(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	store := NewHealthStoreWithClock(time.Hour, 16, clock, BreakerConfig{
+		FailureThreshold: 1,
+		BaseCooldown:     10 * time.Second,
+		MaxCooldown:      40 * time.Second,
+		JitterFraction:   0.2,
+	})
+	nodeID := NodeID{92}
+	seen := map[time.Duration]bool{}
+	for range 20 {
+		store.Observe(Observation{NodeID: nodeID, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+		status := store.Endpoint(nodeID)
+		if status.Backoff < 8*time.Second || status.Backoff > 12*time.Second {
+			t.Fatalf("jittered backoff out of bounds: %s", status.Backoff)
+		}
+		seen[status.Backoff] = true
+		// Recover so the next failure reopens from a closed breaker.
+		clock.Advance(status.Backoff)
+		permit, allowed := store.TryAcquireDomainPermit(nodeID, DomainEndpoint, "", "", clock.Now())
+		if !allowed {
+			t.Fatal("half-open recovery was not admitted")
+		}
+		permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeSuccess}, clock.Now(), 0, "")
+		permit, allowed = store.TryAcquireDomainPermit(nodeID, DomainEndpoint, "", "", clock.Now())
+		if !allowed {
+			t.Fatal("confirmation recovery was not admitted")
+		}
+		permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeSuccess}, clock.Now(), 0, "")
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected jitter to produce more than one backoff value, got %v", seen)
 	}
 }

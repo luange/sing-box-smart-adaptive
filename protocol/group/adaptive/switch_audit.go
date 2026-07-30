@@ -98,3 +98,15 @@ func (s *SwitchAuditStore) Snapshot() ([]adapter.AdaptiveSwitchAudit, uint64) {
 	s.access.Unlock()
 	return entries, total
 }
+
+// Clear drops audit history and pending failure correlations. Used on pool
+// close/retire so reload cycles cannot retain unbounded session maps.
+func (s *SwitchAuditStore) Clear() {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	s.entries = nil
+	s.pending = make(map[SessionKey]pendingSwitchFailure)
+	s.access.Unlock()
+}

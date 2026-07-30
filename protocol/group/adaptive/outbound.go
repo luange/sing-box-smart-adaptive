@@ -95,6 +95,8 @@ type AdaptivePool struct {
 	policy                     *PolicyEngine
 	policyMaxAttempts          int
 	manualFailure              string
+	switchMargin               float64
+	switchCooldown             time.Duration
 	runner                     *AttemptRunner
 	defaultMode                PolicyMode
 	strictLeaseTTL             time.Duration
@@ -119,6 +121,8 @@ type AdaptivePool struct {
 	stateWriter                *adaptiveStateWriter
 	control                    *ControlState
 	switchAudit                *SwitchAuditStore
+	selectionMemoryAccess      sync.Mutex
+	selectionMemory            map[NodeID]selectionMemoryEntry
 	catalogAccess              sync.Mutex
 	preparedIdentity           *PreparedIdentity
 	preparedExecution          *PreparedExecution
@@ -285,6 +289,14 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
 	}
+	switchMargin := defaultSwitchMargin
+	if options.Policy.SwitchMargin != nil {
+		switchMargin = *options.Policy.SwitchMargin
+	}
+	switchCooldown := time.Duration(options.Policy.SwitchCooldown)
+	if options.Policy.SwitchCooldown == 0 {
+		switchCooldown = defaultSwitchCooldown
+	}
 	attemptTimeout := time.Duration(options.Policy.AttemptTimeout)
 	if attemptTimeout <= 0 {
 		attemptTimeout = defaultAttemptTimeout
@@ -378,15 +390,18 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		health:                  health,
 		resolver:                resolver,
 		leases:                  NewSessionLeaseManager(maxLeases),
-		policy:                  NewPolicyEngine(health, maxAttempts, manualFailure).BindNodeWeights(nodeWeights),
+		policy:                  NewPolicyEngine(health, maxAttempts, manualFailure).BindNodeWeights(nodeWeights).BindSwitchStability(switchMargin, switchCooldown),
 		policyMaxAttempts:       maxAttempts,
 		manualFailure:           manualFailure,
+		switchMargin:            switchMargin,
+		switchCooldown:          switchCooldown,
 		runner:                  NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
 		defaultMode:             defaultMode,
 		strictLeaseTTL:          strictLeaseTTL,
 		adaptiveLeaseTTL:        adaptiveLeaseTTL,
 		control:                 new(ControlState),
 		switchAudit:             NewSwitchAuditStore(),
+		selectionMemory:         make(map[NodeID]selectionMemoryEntry),
 		observationIngestor:     NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
@@ -455,7 +470,7 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 		p.health = shared.health
 		p.leases = shared.leases
 		p.control = shared.control
-		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights).BindBulkSequence(&p.control.bulkSequence)
+		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights).BindSwitchStability(p.switchMargin, p.switchCooldown).BindBulkSequence(&p.control.bulkSequence)
 	}
 	p.lifecycleAccess.Unlock()
 	if err = p.persistStateDurable(); err != nil {
@@ -545,6 +560,15 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	if scheduler != nil {
 		_ = scheduler.Close()
 	}
+	// Drop process-local sticky/audit/dedup maps on retire so reload cycles
+	// cannot accumulate selection or observation state across epochs.
+	if p.policy != nil {
+		p.policy.Clear()
+	}
+	if p.switchAudit != nil {
+		p.switchAudit.Clear()
+	}
+	p.clearSelectionMemory()
 }
 
 func (p *AdaptivePool) Close() error {
@@ -758,6 +782,7 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		}
 		p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 	}
+	p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 	p.setLatest(candidate.PrimaryTag)
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
 }
@@ -881,6 +906,7 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 		if snapshot := p.catalog.load(); snapshot != nil {
 			if candidate, loaded := snapshot.Candidate(evidence.Handle.NodeID); loaded {
 				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
+				p.recordFailureMemory(candidate, evidence.Failure, service.ID)
 			}
 		}
 		status := p.health.StatusHandle(evidence.Handle, DomainTransport, serviceHealthTransport(service), "")
@@ -912,6 +938,15 @@ func (p *AdaptivePool) scheduleFailureProbe(handle NodeHandle) {
 		return
 	}
 	_ = scheduler.Submit(p.probeTask(snapshot, candidate, time.Now(), 0))
+	// Real path failures should also accelerate the matching recovery track so
+	// UDP-DNS / family breakers are not waiting only on the generic HTTP probe.
+	for _, family := range []string{"ipv4", "ipv6"} {
+		path := "udp_dns/" + family
+		status := p.health.StatusHandle(handle, DomainTransport, path, "")
+		if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable || status.Health == HealthDegraded {
+			_ = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, family, time.Now(), 0))
+		}
+	}
 }
 
 type observationAttempt struct {
@@ -1046,6 +1081,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 			}
 			p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 		}
+		p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 		p.setLatest(candidate.PrimaryTag)
 		return p.wrapBusinessPacketConn(packetConn, snapshot, candidate, serviceContext, startedAt), nil
 	}
@@ -1256,12 +1292,33 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			pathStatuses = append(pathStatuses, adapter.AdaptivePathStatus{
 				Path: path, Health: string(pathHealth.Health), Breaker: string(pathHealth.Breaker),
 				LastUpdated: pathHealth.LastUpdated, LastDelay: uint16(max(0, pathHealth.LastDelay.Milliseconds())),
+				SmoothedDelay: uint16(max(0, pathHealth.SmoothedDelay.Milliseconds())), DelaySamples: pathHealth.DelaySamples,
+				BackoffMs: uint32(max(0, pathHealth.Backoff.Milliseconds())), ConsecutiveFailures: pathHealth.ConsecutiveFailures,
 				Successes: pathHealth.Successes, Failures: pathHealth.Failures, RecoverySuccesses: pathHealth.RecoverySuccesses,
 				OpenUntil: pathHealth.CooldownUntil, Reason: pathHealth.Reason,
 				HealthPriority: score.HealthPriority, ObservedDelay: uint16(max(0, score.ObservedDelay.Milliseconds())),
 				WeightedDelay: uint32(max(0, score.WeightedDelay.Milliseconds())), SelectionScore: score.SelectionScore,
 				DominantEvidence: score.DominantEvidence,
 			})
+		}
+		endpointScore := p.policy.candidateScore(candidate, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
+		viewService := ServiceContext{ID: "status:default", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
+		profile := p.health.BuildCapabilityProfile(candidate.Handle, time.Now())
+		if throughputStatus.Samples > 0 {
+			profile.ThroughputBPS = throughputStatus.BPS
+			profile.ThroughputOK = throughputStatus.BPS >= 256*1024
+		}
+		memory := p.selectionMemoryFor(candidate.ID)
+		lastFailure := health.Reason
+		if memory.failure != "" {
+			lastFailure = memory.failure
+		}
+		// Prefer the most recent path failure reason when endpoint is clean.
+		for _, pathStatus := range pathStatuses {
+			if pathStatus.Reason != "" && (pathStatus.Breaker == string(BreakerOpen) || pathStatus.Breaker == string(BreakerCooldown) || pathStatus.Health == string(HealthUnreachable)) {
+				lastFailure = pathStatus.Path + ":" + pathStatus.Reason
+				break
+			}
 		}
 		status.Candidates = append(status.Candidates, adapter.AdaptiveCandidateStatus{
 			NodeID:                candidate.ID.String(),
@@ -1280,6 +1337,10 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			Breaker:               string(health.Breaker),
 			LastProbeAt:           health.LastUpdated,
 			LastProbeDelay:        uint16(max(0, health.LastDelay.Milliseconds())),
+			SmoothedDelay:         uint16(max(0, health.SmoothedDelay.Milliseconds())),
+			DelaySamples:          health.DelaySamples,
+			BackoffMs:             uint32(max(0, health.Backoff.Milliseconds())),
+			ConsecutiveFailures:   health.ConsecutiveFailures,
 			ThroughputBPS:         throughputStatus.BPS,
 			ThroughputSamples:     throughputStatus.Samples,
 			Successes:             health.Successes,
@@ -1288,6 +1349,15 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			EvidenceWeight:        health.EvidenceWeight,
 			OpenUntil:             health.CooldownUntil,
 			Reason:                health.Reason,
+			HealthPriority:        endpointScore.HealthPriority,
+			ObservedDelay:         uint16(max(0, endpointScore.ObservedDelay.Milliseconds())),
+			WeightedDelay:         uint32(max(0, endpointScore.WeightedDelay.Milliseconds())),
+			SelectionScore:        endpointScore.SelectionScore,
+			DominantEvidence:      endpointScore.DominantEvidence,
+			FilterReason:          p.policy.ExclusionReason(candidate, viewService),
+			LastFailure:           lastFailure,
+			LastSelectionReason:   memory.reason,
+			Capabilities:          adapterCapabilities(profile),
 			Paths:                 pathStatuses,
 		})
 	}
@@ -1891,6 +1961,104 @@ func (p *AdaptivePool) leaseTTL(mode PolicyMode) time.Duration {
 		return p.strictLeaseTTL
 	}
 	return p.adaptiveLeaseTTL
+}
+
+type selectionMemoryEntry struct {
+	reason    string
+	failure   string
+	serviceID string
+	at        time.Time
+}
+
+const selectionMemoryLimit = 4096
+
+func (p *AdaptivePool) rememberPolicySelectionWithReason(service ServiceContext, candidate Candidate, reason DecisionReason) {
+	if p == nil {
+		return
+	}
+	key := ""
+	if p.policy != nil {
+		key = p.policy.stickyKey(service)
+	}
+	now := time.Now()
+	if p.policy != nil {
+		p.policy.RememberSelection(key, candidate.Handle, now)
+	}
+	p.recordSelectionMemory(candidate.ID, string(reason), "", service.ID, now)
+}
+
+func (p *AdaptivePool) recordSelectionMemory(nodeID NodeID, reason, failure, serviceID string, at time.Time) {
+	if p == nil || nodeID == (NodeID{}) {
+		return
+	}
+	p.selectionMemoryAccess.Lock()
+	if p.selectionMemory == nil {
+		p.selectionMemory = make(map[NodeID]selectionMemoryEntry)
+	}
+	p.selectionMemory[nodeID] = selectionMemoryEntry{reason: reason, failure: failure, serviceID: serviceID, at: at}
+	if len(p.selectionMemory) > selectionMemoryLimit {
+		var oldest NodeID
+		var oldestAt time.Time
+		first := true
+		for id, entry := range p.selectionMemory {
+			if first || entry.at.Before(oldestAt) {
+				oldest = id
+				oldestAt = entry.at
+				first = false
+			}
+		}
+		delete(p.selectionMemory, oldest)
+	}
+	p.selectionMemoryAccess.Unlock()
+}
+
+func (p *AdaptivePool) recordFailureMemory(candidate Candidate, failure FailureClass, serviceID string) {
+	if p == nil || candidate.ID == (NodeID{}) {
+		return
+	}
+	p.recordSelectionMemory(candidate.ID, "failure", string(failure), serviceID, time.Now())
+}
+
+func (p *AdaptivePool) selectionMemoryFor(nodeID NodeID) selectionMemoryEntry {
+	if p == nil {
+		return selectionMemoryEntry{}
+	}
+	p.selectionMemoryAccess.Lock()
+	entry := p.selectionMemory[nodeID]
+	p.selectionMemoryAccess.Unlock()
+	return entry
+}
+
+func (p *AdaptivePool) clearSelectionMemory() {
+	if p == nil {
+		return
+	}
+	p.selectionMemoryAccess.Lock()
+	p.selectionMemory = make(map[NodeID]selectionMemoryEntry)
+	p.selectionMemoryAccess.Unlock()
+}
+
+func adapterCapabilities(profile NodeCapabilityProfile) *adapter.AdaptiveNodeCapabilities {
+	known := profile.TCP4.Known || profile.TCP6.Known || profile.DNSUDPv4.Known || profile.DNSUDPv6.Known ||
+		profile.DataUDPv4.Known || profile.DataUDPv6.Known || profile.Endpoint.Known || profile.ThroughputBPS > 0
+	return &adapter.AdaptiveNodeCapabilities{
+		TCP4: adapterPathCapability(profile.TCP4), TCP6: adapterPathCapability(profile.TCP6),
+		DNSUDPv4: adapterPathCapability(profile.DNSUDPv4), DNSUDPv6: adapterPathCapability(profile.DNSUDPv6),
+		DataUDPv4: adapterPathCapability(profile.DataUDPv4), DataUDPv6: adapterPathCapability(profile.DataUDPv6),
+		Endpoint: adapterPathCapability(profile.Endpoint), ThroughputOK: profile.ThroughputOK,
+		ThroughputBPS: profile.ThroughputBPS, Known: known,
+	}
+}
+
+func adapterPathCapability(path PathCapability) adapter.AdaptivePathCapability {
+	state := "unknown"
+	if path.Known {
+		state = "available"
+		if !path.Available {
+			state = "unavailable"
+		}
+	}
+	return adapter.AdaptivePathCapability{Known: path.Known, Available: path.Available, State: state}
 }
 
 func loadOrPrepareIdentityKey(path string) ([32]byte, bool, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,12 @@ import (
 var (
 	ErrNoEligibleCandidates      = errors.New("adaptive pool has no eligible candidates")
 	ErrStrictAffinityUnavailable = errors.New("adaptive strict-affinity lease is unavailable")
+)
+
+const (
+	defaultSwitchMargin   = 0.15
+	defaultSwitchCooldown = 2 * time.Minute
+	maxStickyEntries      = 4096
 )
 
 type DecisionReason string
@@ -27,6 +34,8 @@ const (
 	ReasonBulkSpread      DecisionReason = "bulk_spread"
 	ReasonBulkThroughput  DecisionReason = "bulk_throughput"
 	ReasonWarmingFallback DecisionReason = "warming_fallback"
+	ReasonStickyMargin    DecisionReason = "sticky_margin"
+	ReasonSwitchCooldown  DecisionReason = "switch_cooldown"
 )
 
 type DecisionPlan struct {
@@ -58,12 +67,22 @@ func (p DecisionPlan) TryAcquireAttemptPermit(nodeID NodeID, at time.Time) (*Att
 	return p.health.TryAcquireConnectionPermitHandle(handle, serviceHealthTransport(p.service), at)
 }
 
+type stickyPreference struct {
+	handle    NodeHandle
+	until     time.Time
+	updatedAt time.Time
+}
+
 type PolicyEngine struct {
-	health        *HealthStore
-	maxAttempts   int
-	manualFailure string
-	bulkSequence  *atomic.Uint64
-	nodeWeights   *nodeweight.Matcher
+	health         *HealthStore
+	maxAttempts    int
+	manualFailure  string
+	bulkSequence   *atomic.Uint64
+	nodeWeights    *nodeweight.Matcher
+	switchMargin   float64
+	switchCooldown time.Duration
+	stickyAccess   sync.Mutex
+	sticky         map[string]stickyPreference
 }
 
 func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string) *PolicyEngine {
@@ -73,7 +92,15 @@ func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string)
 	if manualFailure == "" {
 		manualFailure = "fallback"
 	}
-	return &PolicyEngine{health: health, maxAttempts: maxAttempts, manualFailure: manualFailure, bulkSequence: new(atomic.Uint64)}
+	return &PolicyEngine{
+		health:         health,
+		maxAttempts:    maxAttempts,
+		manualFailure:  manualFailure,
+		bulkSequence:   new(atomic.Uint64),
+		switchMargin:   defaultSwitchMargin,
+		switchCooldown: defaultSwitchCooldown,
+		sticky:         make(map[string]stickyPreference),
+	}
 }
 
 func (e *PolicyEngine) BindBulkSequence(sequence *atomic.Uint64) *PolicyEngine {
@@ -88,6 +115,120 @@ func (e *PolicyEngine) BindNodeWeights(weights *nodeweight.Matcher) *PolicyEngin
 		e.nodeWeights = weights
 	}
 	return e
+}
+
+func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duration) *PolicyEngine {
+	if e == nil {
+		return e
+	}
+	if margin < 0 {
+		margin = defaultSwitchMargin
+	}
+	if margin > 0.5 {
+		margin = 0.5
+	}
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	e.switchMargin = margin
+	e.switchCooldown = cooldown
+	return e
+}
+
+// Clear drops sticky selection state. Called on pool retire/reload so process
+// lifetime health conclusions and sticky maps cannot leak across epochs.
+func (e *PolicyEngine) Clear() {
+	if e == nil {
+		return
+	}
+	e.stickyAccess.Lock()
+	e.sticky = make(map[string]stickyPreference)
+	e.stickyAccess.Unlock()
+}
+
+// RememberSelection records the live egress for a service affinity so later
+// plans can apply delay hysteresis and a short switch cooldown.
+func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time.Time) {
+	if e == nil || key == "" || handle.NodeID == (NodeID{}) {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	e.stickyAccess.Lock()
+	defer e.stickyAccess.Unlock()
+	if e.sticky == nil {
+		e.sticky = make(map[string]stickyPreference)
+	}
+	previous, hadPrevious := e.sticky[key]
+	until := previous.until
+	if !hadPrevious || previous.handle != handle {
+		if e.switchCooldown > 0 {
+			until = now.Add(e.switchCooldown)
+		} else {
+			until = time.Time{}
+		}
+	}
+	e.sticky[key] = stickyPreference{handle: handle, until: until, updatedAt: now}
+	if len(e.sticky) > maxStickyEntries {
+		e.pruneStickyLocked(now)
+	}
+}
+
+func (e *PolicyEngine) stickyKey(service ServiceContext) string {
+	base := service.ID
+	if service.AffinityID != "" {
+		base = service.AffinityID
+	}
+	if service.Session != (SessionKey{}) {
+		return service.Session.String() + "\x00" + base
+	}
+	return base
+}
+
+func (e *PolicyEngine) stickyPreferred(key string, now time.Time) (stickyPreference, bool) {
+	if e == nil || key == "" {
+		return stickyPreference{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	e.stickyAccess.Lock()
+	defer e.stickyAccess.Unlock()
+	pref, loaded := e.sticky[key]
+	if !loaded || pref.handle.NodeID == (NodeID{}) {
+		return stickyPreference{}, false
+	}
+	// Keep the last known preference even after cooldown so delay margin can
+	// still damp ranking noise; cooldown only strengthens stickiness.
+	if !pref.until.IsZero() && now.After(pref.until.Add(24*time.Hour)) {
+		delete(e.sticky, key)
+		return stickyPreference{}, false
+	}
+	return pref, true
+}
+
+func (e *PolicyEngine) pruneStickyLocked(now time.Time) {
+	for key, pref := range e.sticky {
+		if pref.until.IsZero() && now.Sub(pref.updatedAt) > 24*time.Hour {
+			delete(e.sticky, key)
+			continue
+		}
+		if !pref.until.IsZero() && now.After(pref.until.Add(24*time.Hour)) {
+			delete(e.sticky, key)
+		}
+	}
+	for len(e.sticky) > maxStickyEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, pref := range e.sticky {
+			if oldestKey == "" || pref.updatedAt.Before(oldest) {
+				oldestKey = key
+				oldest = pref.updatedAt
+			}
+		}
+		delete(e.sticky, oldestKey)
+	}
 }
 
 func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext, lease *SessionLease, pinned *NodeID) (DecisionPlan, error) {
@@ -160,6 +301,15 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 		return bytes.Compare(eligible[i].ID[:], eligible[j].ID[:]) < 0
 	})
+	reason := ReasonRanked
+	if pinned != nil {
+		reason = ReasonFallback
+	}
+	if mode == ModeAdaptive {
+		if stickyReason, ok := e.applyStickyStability(eligible, service, time.Now()); ok {
+			reason = stickyReason
+		}
+	}
 	if mode == ModeStrictAffinity && lease != nil {
 		for index, candidate := range eligible {
 			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
@@ -173,10 +323,6 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		// The leased handle is no longer eligible. Start a bounded sequential
 		// failover plan; DialContext replaces the lease only after a candidate
 		// actually connects.
-	}
-	reason := ReasonRanked
-	if pinned != nil {
-		reason = ReasonFallback
 	}
 	switch mode {
 	case ModeStrictAffinity:
@@ -195,10 +341,62 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	case ModeAdaptive:
 		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeLatency:
-		return e.plan(snapshot, mode, ReasonRanked, service, limitCandidates(eligible, e.maxAttempts)), nil
+		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
 	default:
 		return DecisionPlan{}, errors.New("adaptive policy mode is invalid")
 	}
+}
+
+func (e *PolicyEngine) applyStickyStability(eligible []Candidate, service ServiceContext, now time.Time) (DecisionReason, bool) {
+	pref, loaded := e.stickyPreferred(e.stickyKey(service), now)
+	if !loaded {
+		return "", false
+	}
+	incumbentIndex := -1
+	for index, candidate := range eligible {
+		if candidate.Handle == pref.handle || candidate.ID == pref.handle.NodeID && candidate.Handle.Slot == pref.handle.Slot && candidate.Handle.Version == pref.handle.Version {
+			incumbentIndex = index
+			break
+		}
+	}
+	if incumbentIndex <= 0 {
+		return "", false
+	}
+	challenger := eligible[0]
+	incumbent := eligible[incumbentIndex]
+	challengerScore := e.candidateScore(challenger, service)
+	incumbentScore := e.candidateScore(incumbent, service)
+	// A clearly healthier challenger always wins.
+	if challengerScore.HealthPriority < incumbentScore.HealthPriority {
+		return "", false
+	}
+	inCooldown := e.switchCooldown > 0 && !pref.until.IsZero() && !now.After(pref.until)
+	if inCooldown {
+		moveCandidateFirst(eligible, incumbentIndex)
+		return ReasonSwitchCooldown, true
+	}
+	if challengerScore.HealthPriority > incumbentScore.HealthPriority {
+		moveCandidateFirst(eligible, incumbentIndex)
+		return ReasonStickyMargin, true
+	}
+	if !significantlyFaster(challengerScore.WeightedDelay, incumbentScore.WeightedDelay, e.switchMargin) {
+		moveCandidateFirst(eligible, incumbentIndex)
+		return ReasonStickyMargin, true
+	}
+	return "", false
+}
+
+func significantlyFaster(challenger, incumbent time.Duration, margin float64) bool {
+	if incumbent <= 0 {
+		return true
+	}
+	if challenger <= 0 {
+		return false
+	}
+	if margin <= 0 {
+		return challenger < incumbent
+	}
+	return float64(challenger) <= float64(incumbent)*(1-margin)
 }
 
 func weightedDelay(delay time.Duration, weight float64) time.Duration {
@@ -223,9 +421,11 @@ func (e *PolicyEngine) candidatePriority(candidate Candidate, service ServiceCon
 type CandidateScoreExplanation struct {
 	HealthPriority   int
 	ObservedDelay    time.Duration
+	SmoothedDelay    time.Duration
 	WeightedDelay    time.Duration
 	SelectionScore   uint64
 	DominantEvidence string
+	ManualWeight     float64
 }
 
 func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContext) CandidateScoreExplanation {
@@ -242,6 +442,7 @@ func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContex
 	}
 	priority := healthPriority(HealthHealthy)
 	var delay time.Duration
+	var smoothed time.Duration
 	dominant := "endpoint"
 	for _, item := range statuses {
 		status := item.status
@@ -249,19 +450,38 @@ func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContex
 			priority = current
 			dominant = item.name
 		}
-		if status.LastDelay > 0 && (delay == 0 || status.LastDelay > delay) {
-			delay = status.LastDelay
+		ranking := status.RankingDelay()
+		if ranking > 0 && (delay == 0 || ranking > delay) {
+			delay = ranking
+		}
+		if status.SmoothedDelay > 0 && (smoothed == 0 || status.SmoothedDelay > smoothed) {
+			smoothed = status.SmoothedDelay
 		}
 	}
 	if delay == 0 {
 		delay = 10 * time.Second
 	}
-	weighted := weightedDelay(delay, e.nodeWeights.Weight(candidate.PrimaryTag))
+	if smoothed == 0 {
+		smoothed = delay
+	}
+	weight := nodeweight.Default
+	if e != nil && e.nodeWeights != nil {
+		weight = e.nodeWeights.Weight(candidate.PrimaryTag)
+	}
+	weighted := weightedDelay(smoothed, weight)
 	score := uint64(priority) * 1_000_000_000_000
 	if weighted > 0 {
 		score += uint64(weighted.Microseconds())
 	}
-	return CandidateScoreExplanation{HealthPriority: priority, ObservedDelay: delay, WeightedDelay: weighted, SelectionScore: score, DominantEvidence: dominant}
+	return CandidateScoreExplanation{
+		HealthPriority:   priority,
+		ObservedDelay:    delay,
+		SmoothedDelay:    smoothed,
+		WeightedDelay:    weighted,
+		SelectionScore:   score,
+		DominantEvidence: dominant,
+		ManualWeight:     weight,
+	}
 }
 
 func hasTrustedBulkThroughput(health *HealthStore, candidates []Candidate, serviceID string) bool {
@@ -281,7 +501,30 @@ func (e *PolicyEngine) plan(snapshot *ExecutionSnapshot, mode PolicyMode, reason
 }
 
 func (e *PolicyEngine) candidateBlocked(candidate Candidate, service ServiceContext) bool {
-	return !e.health.CanAttemptHandle(candidate.Handle, service, time.Time{})
+	if e == nil || e.health == nil {
+		return false
+	}
+	if !e.health.CanAttemptHandle(candidate.Handle, service, time.Time{}) {
+		return true
+	}
+	profile := e.health.BuildCapabilityProfile(candidate.Handle, time.Time{})
+	ok, _ := profile.SupportsService(service)
+	return !ok
+}
+
+// ExclusionReason explains why a candidate is out of the plan for a service.
+func (e *PolicyEngine) ExclusionReason(candidate Candidate, service ServiceContext) string {
+	if e == nil || e.health == nil {
+		return ""
+	}
+	if reason := e.health.ExplainExclusion(candidate.Handle, service, time.Time{}); reason != "" {
+		return reason
+	}
+	profile := e.health.BuildCapabilityProfile(candidate.Handle, time.Time{})
+	if ok, reason := profile.SupportsService(service); !ok {
+		return reason
+	}
+	return ""
 }
 
 func candidateSupports(candidate Candidate, transport string) bool {

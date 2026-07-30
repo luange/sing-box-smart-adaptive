@@ -32,8 +32,14 @@ type AdaptivePoolPolicyOptions struct {
 	MaxAttempts      int                `json:"max_attempts,omitempty"`
 	AttemptTimeout   badoption.Duration `json:"attempt_timeout,omitempty"`
 	HedgeDelay       badoption.Duration `json:"hedge_delay,omitempty"`
-	ManualFailure    string             `json:"manual_failure,omitempty"`
-	AIIPv6Policy     string             `json:"ai_ipv6_policy,omitempty"`
+	// SwitchMargin requires a challenger to be this fraction faster (0.15 =
+	// 15%) before replacing a sticky healthy incumbent. Zero uses the default.
+	SwitchMargin *float64 `json:"switch_margin,omitempty"`
+	// SwitchCooldown keeps the previous healthy egress preferred for this
+	// duration after a selection change. Zero uses the default; negative disables.
+	SwitchCooldown badoption.Duration `json:"switch_cooldown,omitempty"`
+	ManualFailure string             `json:"manual_failure,omitempty"`
+	AIIPv6Policy  string             `json:"ai_ipv6_policy,omitempty"`
 }
 
 type AdaptivePoolProbeOptions struct {

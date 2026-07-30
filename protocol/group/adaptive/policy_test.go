@@ -325,3 +325,111 @@ func TestBulkPolicyExploitsThroughputAndPeriodicallyExplores(t *testing.T) {
 		t.Fatalf("bulk policy starved unknown candidate instead of exploring: %+v", plan)
 	}
 }
+
+func TestPolicySwitchMarginKeepsIncumbentOnSmallLatencyGain(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	incumbent := Candidate{ID: NodeID{71}, Handle: NodeHandle{NodeID: NodeID{71}, Slot: 1, Version: 1}, PrimaryTag: "incumbent"}
+	challenger := Candidate{ID: NodeID{72}, Handle: NodeHandle{NodeID: NodeID{72}, Slot: 2, Version: 1}, PrimaryTag: "challenger"}
+	health.Observe(Observation{NodeID: incumbent.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	health.Observe(Observation{NodeID: challenger.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 90 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, 0)
+	service := ServiceContext{ID: "chatgpt_web", AffinityID: "browser-family", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	engine.RememberSelection(service.AffinityID, incumbent.Handle, time.Now())
+	plan, err := engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Reason != ReasonStickyMargin || plan.Candidates[0].ID != incumbent.ID {
+		t.Fatalf("15%% margin did not keep incumbent: %+v", plan)
+	}
+
+	// Challenger is 20% faster: must replace.
+	health.Observe(Observation{NodeID: challenger.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 80 * time.Millisecond})
+	plan, err = engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidates[0].ID != challenger.ID {
+		t.Fatalf("materially faster challenger was blocked: %+v", plan)
+	}
+}
+
+func TestPolicySwitchCooldownPrefersIncumbentInsideWindow(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	incumbent := Candidate{ID: NodeID{81}, Handle: NodeHandle{NodeID: NodeID{81}, Slot: 1, Version: 1}, PrimaryTag: "incumbent"}
+	challenger := Candidate{ID: NodeID{82}, Handle: NodeHandle{NodeID: NodeID{82}, Slot: 2, Version: 1}, PrimaryTag: "challenger"}
+	health.Observe(Observation{NodeID: incumbent.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 120 * time.Millisecond})
+	health.Observe(Observation{NodeID: challenger.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, time.Minute)
+	service := ServiceContext{ID: "claude", AffinityID: "ai-session", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	now := time.Now()
+	engine.RememberSelection(service.AffinityID, incumbent.Handle, now)
+	plan, err := engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Reason != ReasonSwitchCooldown || plan.Candidates[0].ID != incumbent.ID {
+		t.Fatalf("cooldown window did not retain incumbent: %+v", plan)
+	}
+}
+
+func TestPolicySmoothedDelayPreventsSingleSpikeReordering(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	stable := Candidate{ID: NodeID{91}, Handle: NodeHandle{NodeID: NodeID{91}, Slot: 1, Version: 1}, PrimaryTag: "stable"}
+	spiky := Candidate{ID: NodeID{92}, Handle: NodeHandle{NodeID: NodeID{92}, Slot: 2, Version: 1}, PrimaryTag: "spiky"}
+	for _, delay := range []time.Duration{50, 52, 48, 51, 49} {
+		health.Observe(Observation{NodeID: stable.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: delay * time.Millisecond})
+	}
+	for _, delay := range []time.Duration{40, 42, 41, 43, 39} {
+		health.Observe(Observation{NodeID: spiky.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: delay * time.Millisecond})
+	}
+	// One bad sample on the normally faster node.
+	health.Observe(Observation{NodeID: spiky.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 500 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0, 0)
+	service := ServiceContext{ID: "site:example.com", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	plan, err := engine.Plan(testExecutionSnapshot(stable, spiky), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidates[0].ID != spiky.ID {
+		t.Fatalf("median delay still preferred the spiked last sample incorrectly: %+v", plan.Candidates)
+	}
+	// Spiky median stays ~41ms, stable ~50ms, so spiky remains first despite last=500ms.
+	if health.EndpointHandle(spiky.Handle).LastDelay != 500*time.Millisecond {
+		t.Fatal("expected last delay to retain the spike")
+	}
+	if health.EndpointHandle(spiky.Handle).SmoothedDelay >= health.EndpointHandle(stable.Handle).SmoothedDelay {
+		t.Fatalf("smoothed delay failed to suppress spike: spiky=%s stable=%s", health.EndpointHandle(spiky.Handle).SmoothedDelay, health.EndpointHandle(stable.Handle).SmoothedDelay)
+	}
+}
+
+func TestPolicyStickyPreferenceIsSessionScoped(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	incumbent := Candidate{ID: NodeID{101}, Handle: NodeHandle{NodeID: NodeID{101}, Slot: 1, Version: 1}, PrimaryTag: "incumbent"}
+	challenger := Candidate{ID: NodeID{102}, Handle: NodeHandle{NodeID: NodeID{102}, Slot: 2, Version: 1}, PrimaryTag: "challenger"}
+	health.Observe(Observation{NodeID: incumbent.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	health.Observe(Observation{NodeID: challenger.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, time.Minute)
+	first := ServiceContext{ID: "chatgpt_web", AffinityID: "browser", Session: SessionKey{1}, Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	second := ServiceContext{ID: "chatgpt_web", AffinityID: "browser", Session: SessionKey{2}, Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	engine.RememberSelection(engine.stickyKey(first), incumbent.Handle, time.Now())
+	plan, err := engine.Plan(testExecutionSnapshot(challenger, incumbent), second, nil, nil)
+	if err != nil || plan.Candidates[0].ID != challenger.ID {
+		t.Fatalf("one session contaminated another sticky preference: plan=%+v err=%v", plan, err)
+	}
+}
+
+func TestLatencyModeIgnoresAdaptiveStickyCooldown(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	slow := Candidate{ID: NodeID{103}, Handle: NodeHandle{NodeID: NodeID{103}, Slot: 1, Version: 1}, PrimaryTag: "slow"}
+	fast := Candidate{ID: NodeID{104}, Handle: NodeHandle{NodeID: NodeID{104}, Slot: 2, Version: 1}, PrimaryTag: "fast"}
+	health.Observe(Observation{NodeID: slow.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 120 * time.Millisecond})
+	health.Observe(Observation{NodeID: fast.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 30 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, time.Minute)
+	service := ServiceContext{ID: "latency", AffinityID: "latency", Session: SessionKey{3}, Mode: ModeLatency, Transport: N.NetworkTCP}
+	engine.RememberSelection(engine.stickyKey(service), slow.Handle, time.Now())
+	plan, err := engine.Plan(testExecutionSnapshot(fast, slow), service, nil, nil)
+	if err != nil || plan.Candidates[0].ID != fast.ID || plan.Reason != ReasonRanked {
+		t.Fatalf("latency mode was changed by adaptive stickiness: plan=%+v err=%v", plan, err)
+	}
+}
