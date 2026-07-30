@@ -70,6 +70,7 @@ type ObservationEvidence struct {
 	Outcome          ObservationOutcome
 	ServiceID        string
 	Transport        string
+	NetworkPath      string
 	AttemptID        AttemptID
 	Delay            time.Duration
 	ThroughputBPS    float64
@@ -106,6 +107,9 @@ func (e ObservationEvidence) ValidateShape() error {
 	}
 	if e.Transport != "tcp" && e.Transport != "udp" {
 		return errors.New("adaptive observation has unknown transport")
+	}
+	if e.NetworkPath != "" && e.NetworkPath != "tcp/any" && e.NetworkPath != "tcp/ipv4" && e.NetworkPath != "tcp/ipv6" && e.NetworkPath != "udp_dns/any" && e.NetworkPath != "udp_dns/ipv4" && e.NetworkPath != "udp_dns/ipv6" && e.NetworkPath != "udp_data/any" && e.NetworkPath != "udp_data/ipv4" && e.NetworkPath != "udp_data/ipv6" {
+		return errors.New("adaptive observation has unknown network path")
 	}
 	if e.Confidence != ConfidenceLow && e.Confidence != ConfidenceMedium && e.Confidence != ConfidenceHigh && e.Confidence != ConfidenceAuthoritative {
 		return errors.New("adaptive observation has unsupported confidence")
@@ -312,7 +316,10 @@ func (r *HealthObservationReducer) Reduce(e ObservationEvidence, domains []Domai
 func healthObservationForDomain(e ObservationEvidence, domain DomainEvidence) Observation {
 	observation := Observation{NodeID: e.Handle.NodeID, NodeSlot: e.Handle.Slot, NodeVersion: e.Handle.Version, Scope: domain.Domain, Outcome: domain.Outcome, Delay: e.Delay, ThroughputBPS: e.ThroughputBPS, At: e.At, Reason: e.Reason}
 	if domain.Domain == DomainTransport {
-		observation.Transport = e.Transport
+		observation.Transport = e.NetworkPath
+		if observation.Transport == "" {
+			observation.Transport = e.Transport
+		}
 	}
 	if domain.Domain == DomainService {
 		observation.Service = e.ServiceID

@@ -93,6 +93,33 @@ func TestBreakerFailureDomainsAreIsolated(t *testing.T) {
 	}
 }
 
+func TestTransportPurposeAndIPFamilyBreakersAreIsolated(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	handle := NodeHandle{NodeID: NodeID{91}, Slot: 1, Version: 1}
+	tcp4 := ServiceContext{ID: "site:example.com", Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4"}
+	tcp6 := ServiceContext{ID: "site:example.com", Transport: N.NetworkTCP, HealthTransport: "tcp/ipv6"}
+	udpDNS4 := ServiceContext{ID: "site:example.com", Transport: N.NetworkUDP, HealthTransport: "udp_dns/ipv4"}
+	udpData4 := ServiceContext{ID: "site:example.com", Transport: N.NetworkUDP, HealthTransport: "udp_data/ipv4"}
+	for range 3 {
+		store.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainTransport, Transport: tcp4.HealthTransport, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	if store.CanAttemptHandle(handle, tcp4, clock.Now()) {
+		t.Fatal("failed TCP/IPv4 path remained available")
+	}
+	if !store.CanAttemptHandle(handle, tcp6, clock.Now()) {
+		t.Fatal("TCP/IPv4 failure contaminated TCP/IPv6")
+	}
+	for range 3 {
+		store.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainTransport, Transport: udpDNS4.HealthTransport, Outcome: OutcomeFailure, At: clock.Now()})
+	}
+	if store.CanAttemptHandle(handle, udpDNS4, clock.Now()) {
+		t.Fatal("failed UDP-DNS/IPv4 path remained available")
+	}
+	if !store.CanAttemptHandle(handle, udpData4, clock.Now()) {
+		t.Fatal("UDP-DNS/IPv4 failure contaminated UDP-Data/IPv4")
+	}
+}
+
 func TestBreakerHalfOpenHasSingleTokenAndClosesOnSuccess(t *testing.T) {
 	store, clock := newBreakerTestStore()
 	nodeID := NodeID{2}

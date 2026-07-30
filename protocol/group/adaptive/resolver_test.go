@@ -99,6 +99,36 @@ func TestServiceResolverFakeIPAndQUICMetadataPriority(t *testing.T) {
 	}
 }
 
+func TestServiceResolverSeparatesTransportPurposeAndIPFamily(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	tests := []struct {
+		name        string
+		metadata    *adapter.InboundContext
+		destination string
+		transport   string
+		expected    string
+	}{
+		{name: "tcp4", destination: "192.0.2.1:443", transport: N.NetworkTCP, expected: "tcp/ipv4"},
+		{name: "tcp6", destination: "[2001:db8::1]:443", transport: N.NetworkTCP, expected: "tcp/ipv6"},
+		{name: "dns udp4 by port", destination: "8.8.8.8:53", transport: N.NetworkUDP, expected: "udp_dns/ipv4"},
+		{name: "dns udp6 by protocol", metadata: &adapter.InboundContext{Protocol: "dns"}, destination: "[2001:4860:4860::8888]:5353", transport: N.NetworkUDP, expected: "udp_dns/ipv6"},
+		{name: "data udp4", destination: "192.0.2.1:443", transport: N.NetworkUDP, expected: "udp_data/ipv4"},
+		{name: "data udp6", destination: "[2001:db8::1]:443", transport: N.NetworkUDP, expected: "udp_data/ipv6"},
+		{name: "unresolved family", destination: "example.com:443", transport: N.NetworkTCP, expected: "tcp/any"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolved := resolver.Resolve(test.metadata, M.ParseSocksaddr(test.destination), test.transport)
+			if resolved.HealthTransport != test.expected {
+				t.Fatalf("health transport mismatch: got=%q want=%q resolved=%+v", resolved.HealthTransport, test.expected, resolved)
+			}
+			if resolved.Transport != test.transport {
+				t.Fatalf("business transport changed: got=%q want=%q", resolved.Transport, test.transport)
+			}
+		})
+	}
+}
+
 func TestServiceResolverTemporaryOverrideExpires(t *testing.T) {
 	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
 	now := time.Unix(1_700_000_000, 0)

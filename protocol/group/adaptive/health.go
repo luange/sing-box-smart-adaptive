@@ -3,6 +3,7 @@ package adaptive
 import (
 	"container/list"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -371,7 +372,7 @@ func (s *HealthStore) TryAcquireAttemptPermitHandle(handle NodeHandle, service S
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: service.Transport}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
 	return s.tryAcquirePermit(keys, at)
 }
 
@@ -416,7 +417,8 @@ func (s *HealthStore) tryAcquirePermit(keys []healthKey, at time.Time) (*Attempt
 	defer s.access.Unlock()
 	entries := make([]permitEntry, 0, len(keys))
 	for _, key := range keys {
-		record := s.entries[key]
+		record, resolvedKey := s.recordForKeyLocked(key)
+		key = resolvedKey
 		if record == nil {
 			entries = append(entries, permitEntry{key: key})
 			continue
@@ -485,11 +487,11 @@ func (s *HealthStore) CanAttemptHandle(handle NodeHandle, service ServiceContext
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: service.Transport}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
 	s.access.Lock()
 	defer s.access.Unlock()
 	for _, key := range keys {
-		if record := s.entries[key]; record != nil && !s.availableLocked(record, at) {
+		if record, _ := s.recordForKeyLocked(key); record != nil && !s.availableLocked(record, at) {
 			return false
 		}
 	}
@@ -654,10 +656,46 @@ func (s *HealthStore) StatusHandle(handle NodeHandle, domain FailureDomain, tran
 	s.access.RLock()
 	defer s.access.RUnlock()
 	record := s.entries[healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, transport: transport, service: service}]
+	if record == nil && domain == DomainTransport && !strings.Contains(transport, "/") {
+		var selected *healthRecord
+		for key, candidate := range s.entries {
+			if key.nodeID != handle.NodeID || key.nodeSlot != handle.Slot || key.nodeVersion != handle.Version || key.domain != domain || key.service != service || !strings.HasPrefix(key.transport, transport+"/") {
+				continue
+			}
+			if selected == nil || candidate.status.Breaker > selected.status.Breaker || candidate.status.LastUpdated.After(selected.status.LastUpdated) {
+				selected = candidate
+			}
+		}
+		record = selected
+	}
 	if record == nil {
 		return HealthStatus{Health: HealthUnknown, Breaker: BreakerClosed}
 	}
 	return record.status
+}
+
+// recordForKeyLocked keeps old process-local health records useful while a
+// caller starts supplying purpose/family-qualified transport keys. New
+// observations always create the qualified key; the fallback disappears with
+// the process, matching AdaptivePool's process-lifetime health contract.
+func (s *HealthStore) recordForKeyLocked(key healthKey) (*healthRecord, healthKey) {
+	if record := s.entries[key]; record != nil {
+		return record, key
+	}
+	if key.domain != DomainTransport {
+		return nil, key
+	}
+	if separator := strings.IndexByte(key.transport, '/'); separator > 0 {
+		legacyKey := key
+		legacyKey.transport = key.transport[:separator]
+		if strings.HasPrefix(legacyKey.transport, "udp_") {
+			legacyKey.transport = "udp"
+		}
+		if record := s.entries[legacyKey]; record != nil {
+			return record, legacyKey
+		}
+	}
+	return nil, key
 }
 
 func (s *HealthStore) RetireNodeVersion(nodeID NodeID, nodeVersion uint64) {

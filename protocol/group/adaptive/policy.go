@@ -53,9 +53,9 @@ func (p DecisionPlan) TryAcquireAttemptPermit(nodeID NodeID, at time.Time) (*Att
 		}
 	}
 	if p.allowBlocked {
-		return p.health.TryAcquireConnectionFallbackPermitHandle(handle, p.service.Transport, at)
+		return p.health.TryAcquireConnectionFallbackPermitHandle(handle, serviceHealthTransport(p.service), at)
 	}
-	return p.health.TryAcquireConnectionPermitHandle(handle, p.service.Transport, at)
+	return p.health.TryAcquireConnectionPermitHandle(handle, serviceHealthTransport(p.service), at)
 }
 
 type PolicyEngine struct {
@@ -226,7 +226,7 @@ func modeUsesLease(mode PolicyMode) bool {
 func (e *PolicyEngine) candidatePriority(candidate Candidate, service ServiceContext) (int, time.Duration) {
 	statuses := []HealthStatus{
 		e.health.EndpointHandle(candidate.Handle),
-		e.health.StatusHandle(candidate.Handle, DomainTransport, service.Transport, ""),
+		e.health.StatusHandle(candidate.Handle, DomainTransport, serviceHealthTransport(service), ""),
 		e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID),
 	}
 	priority := healthPriority(HealthHealthy)

@@ -25,12 +25,13 @@ const (
 )
 
 type ServiceContext struct {
-	ID         string
-	AffinityID string
-	Session    SessionKey
-	Mode       PolicyMode
-	Host       string
-	Transport  string
+	ID              string
+	AffinityID      string
+	Session         SessionKey
+	Mode            PolicyMode
+	Host            string
+	Transport       string
+	HealthTransport string
 }
 
 type ServiceResolver struct {
@@ -73,13 +74,55 @@ func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination 
 		}, "\x00")
 	}
 	return ServiceContext{
-		ID:         serviceID,
-		AffinityID: serviceAffinityFamily(serviceID),
-		Session:    r.hasher.Session(clientScope, serviceAffinityFamily(serviceID)),
-		Mode:       mode,
-		Host:       host,
-		Transport:  transport,
+		ID:              serviceID,
+		AffinityID:      serviceAffinityFamily(serviceID),
+		Session:         r.hasher.Session(clientScope, serviceAffinityFamily(serviceID)),
+		Mode:            mode,
+		Host:            host,
+		Transport:       transport,
+		HealthTransport: resolveHealthTransport(metadata, destination, transport),
 	}
+}
+
+const (
+	healthTransportTCP     = "tcp"
+	healthTransportUDPDNS  = "udp_dns"
+	healthTransportUDPData = "udp_data"
+	healthFamilyAny        = "any"
+	healthFamilyIPv4       = "ipv4"
+	healthFamilyIPv6       = "ipv6"
+)
+
+func resolveHealthTransport(metadata *adapter.InboundContext, destination M.Socksaddr, transport string) string {
+	class := transport
+	if transport == "udp" {
+		class = healthTransportUDPData
+		if destination.Port == 53 || metadata != nil && strings.EqualFold(metadata.Protocol, "dns") {
+			class = healthTransportUDPDNS
+		}
+	} else if transport == "tcp" {
+		class = healthTransportTCP
+	}
+	address := destination.Addr
+	if !address.IsValid() && metadata != nil {
+		address = metadata.Destination.Addr
+	}
+	family := healthFamilyAny
+	if address.IsValid() {
+		if address.Is4() || address.Is4In6() {
+			family = healthFamilyIPv4
+		} else if address.Is6() {
+			family = healthFamilyIPv6
+		}
+	}
+	return class + "/" + family
+}
+
+func serviceHealthTransport(service ServiceContext) string {
+	if service.HealthTransport != "" {
+		return service.HealthTransport
+	}
+	return service.Transport
 }
 
 func serviceAffinityFamily(serviceID string) string {

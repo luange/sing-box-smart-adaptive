@@ -819,7 +819,7 @@ func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, service Ser
 		return nil
 	}
 	return func(candidate Candidate, permit *AttemptPermit) (AttemptComplete, error) {
-		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, service.Transport)
+		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, service.Transport, serviceHealthTransport(service))
 		if err != nil {
 			return nil, err
 		}
@@ -858,7 +858,7 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
 			}
 		}
-		status := p.health.StatusHandle(evidence.Handle, DomainTransport, service.Transport, "")
+		status := p.health.StatusHandle(evidence.Handle, DomainTransport, serviceHealthTransport(service), "")
 		if modeUsesLease(service.Mode) && (status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown) {
 			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
 			p.persistState()
@@ -896,12 +896,15 @@ type observationAttempt struct {
 	reducer  *HealthObservationReducer
 }
 
-func (p *AdaptivePool) beginObservationAttempt(snapshot *ExecutionSnapshot, candidate Candidate, permit *AttemptPermit, transport string) (*observationAttempt, error) {
+func (p *AdaptivePool) beginObservationAttempt(snapshot *ExecutionSnapshot, candidate Candidate, permit *AttemptPermit, transport string, networkPath ...string) (*observationAttempt, error) {
 	lease, err := p.runtimeManager.AcquireEpoch(p.groupID, snapshot.RuntimeEpochID)
 	if err != nil {
 		return nil, err
 	}
 	evidence := ObservationEvidence{RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation, Handle: candidate.Handle, AttemptID: AttemptID(p.attemptSequence.Add(1)), Transport: transport}
+	if len(networkPath) > 0 {
+		evidence.NetworkPath = networkPath[0]
+	}
 	guard := RuntimeEpochObservationGuard{Lease: lease}
 	reducer := &HealthObservationReducer{Store: p.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: p.observationReducerHook}
 	return &observationAttempt{lease: lease, evidence: evidence, guard: guard, reducer: reducer}, nil
@@ -958,7 +961,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 		}
 		var observation *observationAttempt
 		if snapshot != nil && snapshot.RuntimeEpochID != 0 && snapshot.CatalogRevision != 0 && p.runtimeManager != nil {
-			observation, err = p.beginObservationAttempt(snapshot, candidate, permit, N.NetworkUDP)
+			observation, err = p.beginObservationAttempt(snapshot, candidate, permit, N.NetworkUDP, serviceHealthTransport(serviceContext))
 			if err != nil {
 				permit.ReleaseDeferred()
 				attemptErrors = append(attemptErrors, E.Cause(err, "prepare adaptive UDP observation ", candidate.PrimaryTag))

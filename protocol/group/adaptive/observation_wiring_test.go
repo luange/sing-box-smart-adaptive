@@ -89,7 +89,7 @@ func TestDestinationFailuresOpenTransportButNotEndpoint(t *testing.T) {
 	if endpoint := health.EndpointHandle(handle); endpoint.Breaker != BreakerClosed || endpoint.Failures != 0 {
 		t.Fatalf("destination failure polluted endpoint: %+v", endpoint)
 	}
-	if transport := health.StatusHandle(handle, DomainTransport, N.NetworkTCP, ""); transport.Breaker != BreakerOpen || transport.Failures != 3 {
+	if transport := health.StatusHandle(handle, DomainTransport, "tcp/any", ""); transport.Breaker != BreakerOpen || transport.Failures != 3 {
 		t.Fatalf("transport breaker did not open: %+v", transport)
 	}
 
@@ -102,7 +102,7 @@ func TestDestinationFailuresOpenTransportButNotEndpoint(t *testing.T) {
 	if endpoint := udpHealth.EndpointHandle(udpHandle); endpoint.Breaker != BreakerClosed || endpoint.Failures != 0 {
 		t.Fatalf("UDP destination failure polluted endpoint: %+v", endpoint)
 	}
-	if transport := udpHealth.StatusHandle(udpHandle, DomainTransport, N.NetworkUDP, ""); transport.Breaker != BreakerOpen || transport.Failures != 3 {
+	if transport := udpHealth.StatusHandle(udpHandle, DomainTransport, "udp_data/any", ""); transport.Breaker != BreakerOpen || transport.Failures != 3 {
 		t.Fatalf("UDP transport breaker did not open: %+v", transport)
 	}
 }
@@ -294,10 +294,10 @@ func TestHedgeLoserCancellationDoesNotPolluteTransport(t *testing.T) {
 	conn.Close()
 	(<-fast.peers).Close()
 	time.Sleep(20 * time.Millisecond)
-	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, N.NetworkTCP, ""); status.Failures != 0 {
+	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "tcp/any", ""); status.Failures != 0 {
 		t.Fatalf("hedge loser polluted transport: %+v", status)
 	}
-	if status := health.StatusHandle(snapshot.Candidates[1].Handle, DomainTransport, N.NetworkTCP, ""); status.Successes != 1 {
+	if status := health.StatusHandle(snapshot.Candidates[1].Handle, DomainTransport, "tcp/any", ""); status.Successes != 1 {
 		t.Fatalf("hedge winner was not observed once: %+v", status)
 	}
 }
