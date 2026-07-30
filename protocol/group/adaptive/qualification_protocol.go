@@ -181,6 +181,16 @@ func qualificationProtocolFailure(outcome QualificationProtocolOutcome, class st
 // ObservationIngestor -> Reducer; transient and invalid streams never mutate
 // data-plane eligibility.
 func (p *AdaptivePool) IngestQualificationProtocolStream(serviceID, nodeTag string, protocol QualificationProtocol, reader io.Reader) (QualificationProtocolVerdict, error) {
+	return p.IngestQualificationProtocolStreamForPath(serviceID, nodeTag, "tcp/any", protocol, reader)
+}
+
+// IngestQualificationProtocolStreamForPath preserves independent eligibility
+// evidence for IPv4 and IPv6. networkPath must be tcp/ipv4, tcp/ipv6 or
+// tcp/any when the control plane cannot prove the selected address family.
+func (p *AdaptivePool) IngestQualificationProtocolStreamForPath(serviceID, nodeTag, networkPath string, protocol QualificationProtocol, reader io.Reader) (QualificationProtocolVerdict, error) {
+	if networkPath != "tcp/any" && networkPath != "tcp/ipv4" && networkPath != "tcp/ipv6" {
+		return QualificationProtocolVerdict{}, errors.New("adaptive qualification network path is invalid")
+	}
 	if p == nil || !p.qualificationEnabled {
 		return QualificationProtocolVerdict{}, errors.New("adaptive qualification control is disabled")
 	}
@@ -208,7 +218,7 @@ func (p *AdaptivePool) IngestQualificationProtocolStream(serviceID, nodeTag stri
 	evidence := ObservationEvidence{
 		RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
 		Handle: candidate.Handle, Source: SourceHTTP, Stage: StageServiceApplication, Confidence: ConfidenceHigh,
-		ServiceID: serviceID, Transport: "tcp", AttemptID: AttemptID(p.attemptSequence.Add(1)), At: time.Now(),
+		ServiceID: serviceID, Transport: "tcp", NetworkPath: networkPath, AttemptID: AttemptID(p.attemptSequence.Add(1)), At: time.Now(),
 	}
 	if verdict.Outcome == QualificationProtocolEligible {
 		evidence.Outcome = OutcomeSuccess

@@ -112,3 +112,41 @@ func TestQualificationProtocolConsumerUsesObservationPipeline(t *testing.T) {
 		t.Fatalf("transient stream mutated service health: before=%+v after=%+v", service, serviceAfter)
 	}
 }
+
+func TestQualificationProtocolKeepsIPv4AndIPv6Independent(t *testing.T) {
+	manager := NewRuntimeManager()
+	pool := preparedLifecyclePool(t, manager, "qualification-family")
+	pool.ctx = context.Background()
+	pool.qualificationEnabled = true
+	pool.observationIngestor = NewObservationIngestor(nil, nil, time.Minute, 128)
+	if err := pool.OnRuntimeEpochPublish(); err != nil {
+		t.Fatal(err)
+	}
+	pool.OnRuntimeEpochPublishCommit()
+	defer pool.Close()
+
+	eligible := "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n"
+	blocked := "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"redacted\"}}\n"
+	if _, err := pool.IngestQualificationProtocolStreamForPath("chatgpt_web", "node", "tcp/ipv4", QualificationProtocolOpenAIResponsesSSE, strings.NewReader(eligible)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.IngestQualificationProtocolStreamForPath("chatgpt_web", "node", "tcp/ipv6", QualificationProtocolOpenAIResponsesSSE, strings.NewReader(blocked)); err != nil {
+		t.Fatal(err)
+	}
+	handle := pool.catalog.Snapshot().Candidates[0].Handle
+	v4 := pool.health.StatusHandle(handle, DomainService, "tcp/ipv4", "chatgpt_web")
+	v6 := pool.health.StatusHandle(handle, DomainService, "tcp/ipv6", "chatgpt_web")
+	if v4.Health != HealthHealthy || v4.Successes != 1 || v4.Failures != 0 {
+		t.Fatalf("IPv4 qualification was polluted: %+v", v4)
+	}
+	if v6.Health != HealthDegraded || v6.Successes != 0 || v6.Failures != 1 {
+		t.Fatalf("IPv6 qualification was not isolated: %+v", v6)
+	}
+	engine := NewPolicyEngine(pool.health, 3, "fallback")
+	candidate := pool.catalog.Snapshot().Candidates[0]
+	v4Score := engine.candidateScore(candidate, ServiceContext{ID: "chatgpt_web", Transport: "tcp", HealthTransport: "tcp/ipv4"})
+	v6Score := engine.candidateScore(candidate, ServiceContext{ID: "chatgpt_web", Transport: "tcp", HealthTransport: "tcp/ipv6"})
+	if v6Score.HealthPriority <= v4Score.HealthPriority || v6Score.DominantEvidence != "service:chatgpt_web/tcp/ipv6" {
+		t.Fatalf("policy did not isolate the blocked IPv6 family: ipv4=%+v ipv6=%+v", v4Score, v6Score)
+	}
+}
