@@ -535,3 +535,20 @@ done
 
 *维护：有生产换核或重大决策时，请同步更新 §0 速览表、§14 指纹与 §15 日志。*
 | 2026-07-31 | worktree 重命名 a51-beta4-adaptive；源码同步到 v1.14.0-beta.4-reF1nd（rc19-beta4-adaptive） |
+
+
+---
+
+## 附录 A · rc32 beta.4 源码线（2026-07-31）
+
+| 项 | 值 |
+|----|-----|
+| Worktree | `.../work/a51-beta4-adaptive`（原 a51-beta1-adaptive 已改名） |
+| 分支 | `rc19-beta4-adaptive` → GitHub `adaptive/rc32-beta4` |
+| 基线 | `v1.14.0-beta.4-reF1nd` (`1a9ba9269`) |
+| Port commit | `be3981d3e` |
+| CI 版本串 | `1.14.0-beta.4-reF1nd-luan-adaptive.rc32-beta4-port` |
+| Release | https://github.com/luange/sing-box-luan-smart/releases/tag/adaptive-1.14.0-beta.4-reF1nd-luan-adaptive.rc32-beta4-port |
+| NAS | `rc32/sing-box-linux-amd64` |
+| 生产核 | **仍为 rc31（beta.3）直到主动换核** |
+| 报告 | `outputs/adaptive-rc32-beta4-port-20260731.md` |
