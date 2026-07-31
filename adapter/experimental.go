@@ -171,6 +171,12 @@ type PreMatchOutboundGroup interface {
 	SelectPreMatchOutbound(metadata *InboundContext, selectOutbound func(Outbound) (Outbound, PreMatchAction)) (Outbound, PreMatchAction)
 }
 
+// PreMatchDisabledOutbound keeps transparent flows on the L4 outbound path.
+// Groups use it when resolving to a leaf would bypass retry or observation.
+type PreMatchDisabledOutbound interface {
+	DisablePreMatch()
+}
+
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
@@ -183,6 +189,70 @@ type LoadBalanceGroup interface {
 
 type SelectorGroup interface {
 	Selected() Outbound
+}
+
+type SmartCandidateStatus struct {
+	Tag           string  `json:"tag"`
+	State         string  `json:"state"`
+	Score         float64 `json:"score"`
+	Weight        float64 `json:"weight,omitempty"`
+	WeightRule    string  `json:"weight_rule,omitempty"`
+	WeightExact   bool    `json:"weight_rule_exact,omitempty"`
+	Reliability   float64 `json:"reliability"`
+	ConnectMS     float64 `json:"connect_ms,omitempty"`
+	FirstByteMS   float64 `json:"first_byte_ms,omitempty"`
+	ThroughputBPS float64 `json:"throughput_bps,omitempty"`
+	Samples       float64 `json:"samples"`
+	Reason        string  `json:"reason,omitempty"`
+}
+
+type SmartGroupStatus struct {
+	Selected                  string                 `json:"selected,omitempty"`
+	Pinned                    string                 `json:"pinned,omitempty"`
+	Network                   string                 `json:"network,omitempty"`
+	Site                      string                 `json:"site,omitempty"`
+	Reason                    string                 `json:"reason,omitempty"`
+	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
+	CandidateCount            int                    `json:"candidate_count"`
+	CandidateDetailsCount     int                    `json:"candidate_details_count"`
+	CandidateDetailsTruncated bool                   `json:"candidate_details_truncated"`
+	StateCounts               map[string]int         `json:"state_counts"`
+	TemporaryOverride         string                 `json:"temporary_override,omitempty"`
+	OverrideExpiresAt         *time.Time             `json:"override_expires_at,omitempty"`
+	OverrideRemainingSeconds  int64                  `json:"override_remaining_seconds,omitempty"`
+	OverrideReason            string                 `json:"override_reason,omitempty"`
+	ReachTests                []SmartReachTestStatus `json:"reach_tests,omitempty"`
+	Candidates                []SmartCandidateStatus `json:"candidates"`
+}
+
+type SmartReachCandidateStatus struct {
+	Tag        string    `json:"tag"`
+	State      string    `json:"state"`
+	HTTPStatus int       `json:"http_status,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	CheckedAt  time.Time `json:"checked_at,omitempty"`
+}
+
+type SmartReachTestStatus struct {
+	Tag                       string                      `json:"tag"`
+	Preset                    string                      `json:"preset,omitempty"`
+	Domains                   []string                    `json:"domains"`
+	URL                       string                      `json:"url"`
+	CheckedAt                 time.Time                   `json:"checked_at,omitempty"`
+	StateCounts               map[string]int              `json:"state_counts"`
+	CandidateCount            int                         `json:"candidate_count"`
+	CandidateDetailsCount     int                         `json:"candidate_details_count"`
+	CandidateDetailsTruncated bool                        `json:"candidate_details_truncated"`
+	Candidates                []SmartReachCandidateStatus `json:"candidates"`
+}
+
+type SmartGroup interface {
+	URLTestGroup
+	SmartStatus() SmartGroupStatus
+	SelectOutbound(tag string) bool
+	ClearSelection()
+	SelectTemporaryOutbound(tag string, ttl time.Duration, reason string) bool
+	ClearTemporarySelection()
 }
 
 func OutboundTag(detour Outbound) string {

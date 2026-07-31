@@ -204,6 +204,7 @@ nav:
           - DNS: configuration/outbound/dns.md
           - Selector: configuration/outbound/selector.md
           - URLTest: configuration/outbound/urltest.md
+          - AdaptivePool: configuration/outbound/adaptive-pool.md
       - Provider:
           - configuration/provider/index.md
           - Dialer Fields Override: configuration/provider/override_dialer.md
