@@ -17,19 +17,18 @@ token 不得进入状态、日志、错误和持久化。密钥用
 `sing-box generate adaptive-manifest-key` 生成，服务用
 `sing-box tools adaptive-manifest serve` 启动；私钥文件必须为 0600。
 
-能力探测支持 `tls`、`auth_http`、`http`、`http3`、`range`。`http3` 仅在 `with_quic`
-构建启用，并明确拒绝 HTTP/2 回退。Clash API 在 `/adaptive-pools/v1` 提供状态、
+生产能力探测支持 `tls`、`http`、`http3`、`range`。`http3` 仅在 `with_quic`
+构建启用，并明确拒绝 HTTP/2 回退。`auth_http` / WebWAF 类 AI 可达性探测代码
+仍保留但已**封存**，不得在生产配置启用。Clash API 在 `/adaptive-pools/v1` 提供状态、
 探测、服务覆盖和 SSE 事件；代理对象也包含 generation、revision、lease、队列、
 breaker、吞吐和 evidence 字段。
 
 `builtin_youtube_tls` 启用固定且不含凭据的 YouTube TLS 目标。
-`builtin_ai_service_tls` 改为五个相互隔离的服务探测：YouTube TLS、跟随 Google
-可达性的 Gemini TLS、不带凭据的 OpenAI/Anthropic 模型列表请求，以及浏览器形态
-的 ChatGPT 网页/WAF 请求。无认证 API 的 HTTP 401 表示链路可达；网页探测的 2xx
-表示可达，HTTP 403/451 或 `cf-mitigated: challenge` 写入受阻证据。只有严格多数
-节点同类失败才作为共同目标故障，5xx 不惩罚节点。请求不会持久化 API key、Cookie、
-响应头或查询参数。内置模式每个服务只有一个
-目标，因此必须使用 `quorum: 1`；两个内置模式和签名 manifest 模式互斥。
+`builtin_ai_service_tls` 已**封存**：JSON 字段仍可解析以兼容旧配置，但
+AdaptivePool 构造时会拒绝启用。ChatGPT/Claude/Gemini 服务可用性不属于当前
+Smart 生产范围；应依赖真实业务失败反馈、节点健康、租约与 `ai_ipv6_policy`。
+内置 YouTube / 出口身份模式每个服务只有一个目标，因此必须使用 `quorum: 1`；
+内置模式与签名 manifest 模式互斥。
 
 ## 人工节点策略
 
@@ -66,8 +65,8 @@ token或凭据。
 }
 ```
 
-Apple和Microsoft OAuth域名会与ChatGPT、Claude、Gemini、Google登录及
-Cloudflare challenge共用 `browser_identity` 租约。
+每个身份类产品使用**独立**租约/黏性脊（`chatgpt_web`、`claude`、`gemini`、各账号族等），
+不再共用 `browser_identity` 大袋，避免一个产品熔断拖垮另一个产品的出口。
 
 `policy.ai_ipv6_policy` 支持 `allow`（默认）和 `block`。`block` 会拒绝已识别为
 ChatGPT/OpenAI、Claude、Gemini、Google/Apple/Microsoft登录或Cloudflare challenge的IPv6

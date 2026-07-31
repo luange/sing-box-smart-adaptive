@@ -20,12 +20,13 @@ func TestStartupProbeTasksBoundAndStaggerInitialCoverage(t *testing.T) {
 	}
 
 	tasks := pool.startupProbeTasks(snapshot, now)
-	if len(tasks) != 15 {
+	// 5 candidates × (HTTP + DNS/IPv4) — DNS/IPv6 is not auto-scheduled.
+	if len(tasks) != 10 {
 		t.Fatalf("unexpected task count: %d", len(tasks))
 	}
 	for candidateIndex := range 5 {
-		for taskOffset := range 3 {
-			task := tasks[candidateIndex*3+taskOffset]
+		for taskOffset := range 2 {
+			task := tasks[candidateIndex*2+taskOffset]
 			if task.Key.NodeID[0] != byte(candidateIndex+1) {
 				t.Fatalf("startup order is not stable: index=%d node=%d", candidateIndex, task.Key.NodeID[0])
 			}
@@ -37,12 +38,13 @@ func TestStartupProbeTasksBoundAndStaggerInitialCoverage(t *testing.T) {
 			}
 		}
 	}
-	if !tasks[0].DueAt.Equal(now) || !tasks[3].DueAt.Equal(now) {
+	// First wave: concurrency=2 candidates × 2 tasks = indices 0..3 immediate.
+	if !tasks[0].DueAt.Equal(now) || !tasks[2].DueAt.Equal(now) {
 		t.Fatal("the first worker-sized probe wave was delayed")
 	}
 	wantOffsets := []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second}
 	for index, want := range wantOffsets {
-		if got := tasks[(index+2)*3].DueAt.Sub(now); got != want {
+		if got := tasks[(index+2)*2].DueAt.Sub(now); got != want {
 			t.Fatalf("unexpected stagger at %d: got=%s want=%s", index, got, want)
 		}
 	}

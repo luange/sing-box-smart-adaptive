@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -138,6 +139,23 @@ func (*earlyTLSErrorConn) SetDeadline(time.Time) error      { return nil }
 func (*earlyTLSErrorConn) SetReadDeadline(time.Time) error  { return nil }
 func (*earlyTLSErrorConn) SetWriteDeadline(time.Time) error { return nil }
 
+func TestTCPWriteOpaqueLocalErrorDoesNotPenalizeNode(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{0x98}, "write-local", newTestOutbound("write-local")))
+	service := testBusinessService(N.NetworkTCP)
+	localErr := errors.New("multipart body canceled")
+	wrapped := pool.wrapBusinessConn(&earlyTLSErrorConn{writeErr: localErr}, snapshot, snapshot.Candidates[0], service, time.Now())
+	payload := []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x01}
+	if _, err := wrapped.Write(payload); !errors.Is(err, localErr) {
+		t.Fatalf("write error changed: %v", err)
+	}
+	_ = wrapped.Close()
+	status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkTCP)
+	if status.Failures != 0 || status.NonBreakerFailures != 0 || status.Breaker == BreakerOpen {
+		t.Fatalf("opaque local Write error must not penalize node: %+v", status)
+	}
+}
+
 func TestTCPWriteFailureUsesConfidenceWithoutChangingPayloadSemantics(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -148,6 +166,7 @@ func TestTCPWriteFailureUsesConfidenceWithoutChangingPayloadSemantics(t *testing
 		wantBreaker        BreakerState
 	}{
 		{name: "broken-pipe", err: syscall.EPIPE, attempts: 3, wantBreakerFailure: 3, wantBreaker: BreakerOpen},
+		// Timeout is low-confidence: records quality, does not open breaker.
 		{name: "timeout", err: context.DeadlineExceeded, attempts: 1, wantQualityFailure: 1, wantBreaker: BreakerClosed},
 	}
 	for _, test := range tests {
@@ -191,10 +210,13 @@ func TestTCPEarlyTLSEOFIsAmbiguousAndDoesNotPenalize(t *testing.T) {
 
 func TestDestinationTransportFailureInvalidatesStickyLeaseAtBreakerThreshold(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
-	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{85}, "dial-timeout", newTestOutbound("dial-timeout")))
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{85}, "dial-refused", newTestOutbound("dial-refused")))
 	service := testBusinessService(N.NetworkTCP)
 	handle := snapshot.Candidates[0].Handle
 	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+	// Hard connect failures (not timeouts) open breakers. Dial timeouts are
+	// medium-confidence quality-only (see TestDialTimeoutIsMediumConfidenceQualityOnly).
+	hardErr := syscall.ECONNREFUSED
 	for failure := 1; failure <= 3; failure++ {
 		permit, allowed := health.TryAcquireConnectionPermitHandle(handle, service.Transport, time.Now())
 		if !allowed {
@@ -204,7 +226,9 @@ func TestDestinationTransportFailureInvalidatesStickyLeaseAtBreakerThreshold(t *
 		if err != nil {
 			t.Fatal(err)
 		}
-		pool.completeTransportAttempt(attempt, service, context.DeadlineExceeded, time.Second, false, false)
+		pool.completeTransportAttempt(attempt, service, M.Socksaddr{}, DialAttemptResult{
+			Err: hardErr, Delay: time.Second,
+		})
 		_, loaded := pool.leases.Peek(service.Session, time.Now())
 		if failure < 3 && !loaded {
 			t.Fatalf("transient transport failure %d invalidated lease", failure)
@@ -213,8 +237,9 @@ func TestDestinationTransportFailureInvalidatesStickyLeaseAtBreakerThreshold(t *
 			t.Fatal("breaker-open destination transport lease was retained")
 		}
 	}
-	status := health.StatusHandle(handle, DomainTransport, service.Transport, "")
-	if status.Failures != 3 || status.Reason != context.DeadlineExceeded.Error() || status.Breaker != BreakerOpen {
+	// Bare Transport=tcp is normalized to tcp/any when no family is known.
+	status := health.StatusHandle(handle, DomainTransport, "tcp/any", "")
+	if status.Failures != 3 || status.Breaker != BreakerOpen {
 		t.Fatalf("transport failure was not reduced: %+v", status)
 	}
 }
@@ -708,7 +733,8 @@ func TestUDPTimeoutCreatesOnlyLowConfidencePathEvidence(t *testing.T) {
 	if status := serviceStatus(health, snapshot.Candidates[0].Handle, N.NetworkUDP); status.Successes != 0 || status.Failures != 0 {
 		t.Fatalf("UDP timeout created service evidence: %+v", status)
 	}
-	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/any", ""); status.Failures != 0 || status.NonBreakerFailures != 1 || status.Health != HealthDegraded || status.Breaker != BreakerClosed {
+	// Low-confidence timeout is metrics-only: counters/weight, no Health flip.
+	if status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/any", ""); status.Failures != 0 || status.NonBreakerFailures != 1 || status.Breaker != BreakerClosed || status.Health == HealthUnreachable {
 		t.Fatalf("UDP timeout was not retained as low-confidence path evidence: %+v", status)
 	}
 	pool.runtimeManager.access.RLock()
@@ -891,3 +917,275 @@ var (
 	_ N.PacketReader = (*packetMemoryConn)(nil)
 	_ N.PacketWriter = (*packetMemoryConn)(nil)
 )
+
+func TestReadFromLocalReaderErrorsDoNotPenalizeNode(t *testing.T) {
+	if !isNodeNetworkIOError(syscall.ECONNRESET) {
+		t.Fatal("ECONNRESET must count as network I/O")
+	}
+	if isNodeNetworkIOError(io.ErrUnexpectedEOF) {
+		t.Fatal("unexpected EOF from upstream reader must not count as network I/O")
+	}
+	if isNodeNetworkIOError(errors.New("file read failed")) {
+		t.Fatal("opaque local reader errors must not count as network I/O")
+	}
+	// Arbitrary OpError must not count; only dial/read/write + network syscall.
+	if isNodeNetworkIOError(&net.OpError{Op: "file", Err: errors.New("local open failed")}) {
+		t.Fatal("non-network OpError must not count as node network I/O")
+	}
+	if isNodeNetworkIOError(&net.OpError{Op: "write", Err: errors.New("multipart body canceled")}) {
+		t.Fatal("write OpError wrapping local reader failure must not count")
+	}
+	if !isNodeNetworkIOError(&net.OpError{Op: "write", Err: syscall.ECONNRESET}) {
+		t.Fatal("write OpError with ECONNRESET must count as network I/O")
+	}
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{0x55}, "readfrom", newTestOutbound("readfrom")))
+	handle := snapshot.Candidates[0].Handle
+	service := testBusinessService(N.NetworkTCP)
+	// Conn Write path uses ECONNRESET via ReaderFrom simulation.
+	conn := &readFromErrorConn{err: errors.New("multipart body canceled")}
+	wrapped := pool.wrapBusinessConn(conn, snapshot, snapshot.Candidates[0], service, time.Now())
+	// Mark TLS started so observeWriteFailure would fire if called unconditionally.
+	if oc, ok := wrapped.(*observedConn); ok {
+		oc.tlsStarted.Store(true)
+		_, _ = oc.ReadFrom(strings.NewReader("hello"))
+	} else {
+		t.Fatalf("expected observedConn, got %T", wrapped)
+	}
+	if status := health.StatusHandle(handle, DomainService, "", service.ID); status.Failures != 0 {
+		t.Fatalf("local ReadFrom error penalized service health: %+v", status)
+	}
+	// Network class error through ReadFrom still counts.
+	conn2 := &readFromErrorConn{err: syscall.ECONNRESET}
+	wrapped2 := pool.wrapBusinessConn(conn2, snapshot, snapshot.Candidates[0], service, time.Now())
+	if oc, ok := wrapped2.(*observedConn); ok {
+		oc.tlsStarted.Store(true)
+		_, _ = oc.ReadFrom(strings.NewReader("hello"))
+	}
+	if status := health.StatusHandle(handle, DomainService, "", service.ID); status.Failures == 0 {
+		t.Fatalf("network ReadFrom error did not attribute to node: %+v", status)
+	}
+}
+
+type readFromErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c *readFromErrorConn) Read([]byte) (int, error)  { return 0, io.EOF }
+func (c *readFromErrorConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *readFromErrorConn) Close() error               { return nil }
+func (c *readFromErrorConn) LocalAddr() net.Addr        { return &net.TCPAddr{} }
+func (c *readFromErrorConn) RemoteAddr() net.Addr       { return &net.TCPAddr{} }
+func (c *readFromErrorConn) SetDeadline(time.Time) error      { return nil }
+func (c *readFromErrorConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *readFromErrorConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *readFromErrorConn) ReadFrom(r io.Reader) (int64, error) {
+	if r != nil {
+		_, _ = io.Copy(io.Discard, r)
+	}
+	return 0, c.err
+}
+
+func TestUDPDataSuccessUpdatesTransportPath(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{96}, "udp-data-ok", newTestOutbound("udp-data-ok")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	underlying := &packetMemoryConn{payload: []byte("payload-ok"), source: &net.UDPAddr{IP: net.ParseIP("198.51.100.9"), Port: 443}}
+	wrapped := pool.wrapBusinessPacketConn(underlying, snapshot, snapshot.Candidates[0], service, time.Now())
+	if _, _, err := wrapped.ReadFrom(make([]byte, 64)); err != nil {
+		t.Fatal(err)
+	}
+	path := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if path.Successes != 1 || path.Failures != 0 || path.Health != HealthHealthy {
+		t.Fatalf("UDP data success missing transport path evidence: %+v", path)
+	}
+	if dns := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_dns/ipv4", ""); dns.Successes != 0 {
+		t.Fatalf("UDP data success contaminated DNS path: %+v", dns)
+	}
+	if svc := health.StatusHandle(snapshot.Candidates[0].Handle, DomainService, "", service.ID); svc.Successes != 1 {
+		t.Fatalf("UDP data success missing service evidence: %+v", svc)
+	}
+	_ = wrapped.Close()
+}
+
+func TestUDPDNSSuccessRequiresResponseShape(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{97}, "udp-dns-ok", newTestOutbound("udp-dns-ok")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_dns/ipv4"
+	// Valid DNS response header: ID=0x1234, QR=1, rcode=0, qd=0 an=0
+	dnsOK := []byte{0x12, 0x34, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	wrapped := pool.wrapBusinessPacketConn(&packetMemoryConn{payload: dnsOK, source: &net.UDPAddr{IP: net.ParseIP("198.51.100.53"), Port: 53}}, snapshot, snapshot.Candidates[0], service, time.Now())
+	if _, _, err := wrapped.ReadFrom(make([]byte, 64)); err != nil {
+		t.Fatal(err)
+	}
+	path := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_dns/ipv4", "")
+	if path.Successes != 1 || path.Health != HealthHealthy {
+		t.Fatalf("DNS-shaped UDP success missing path evidence: %+v", path)
+	}
+	_ = wrapped.Close()
+
+	// Garbage must not elevate DNS path.
+	health2 := NewHealthStore(time.Hour, 32)
+	pool2, snapshot2 := newWiredObservationPool(t, health2, wired(NodeID{98}, "udp-dns-junk", newTestOutbound("udp-dns-junk")))
+	service2 := testBusinessService(N.NetworkUDP)
+	service2.ID = "dns-junk"
+	service2.HealthTransport = "udp_dns/ipv4"
+	wrapped2 := pool2.wrapBusinessPacketConn(&packetMemoryConn{payload: []byte("not-dns!!!!"), source: &net.UDPAddr{IP: net.ParseIP("198.51.100.53"), Port: 53}}, snapshot2, snapshot2.Candidates[0], service2, time.Now())
+	if _, _, err := wrapped2.ReadFrom(make([]byte, 64)); err != nil {
+		t.Fatal(err)
+	}
+	if path := health2.StatusHandle(snapshot2.Candidates[0].Handle, DomainTransport, "udp_dns/ipv4", ""); path.Successes != 0 {
+		t.Fatalf("non-DNS payload elevated DNS path: %+v", path)
+	}
+	// Garbage on a DNS path must not wash service half-open either.
+	if svc := health2.StatusHandle(snapshot2.Candidates[0].Handle, DomainService, "", service2.ID); svc.Successes != 0 {
+		t.Fatalf("non-DNS payload must not settle service success: %+v", svc)
+	}
+	_ = wrapped2.Close()
+}
+
+func TestPayloadSuccessLearnsWhenServicePermitBusy(t *testing.T) {
+	// Use real wall clock: observePayload stamps evidence.At with time.Now(), and
+	// HealthStore prune is keyed off that wall time (must not mix fake clocks).
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Nanosecond, MaxCooldown: time.Second, JitterFraction: 0})
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{99}, "busy-learn", newTestOutbound("busy-learn")))
+	handle := snapshot.Candidates[0].Handle
+	service := testBusinessService(N.NetworkTCP)
+	// Open service breaker then enter half-open so a token is required.
+	now := time.Now()
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version, Scope: DomainService, Service: service.ID, Outcome: OutcomeFailure, At: now.Add(-time.Millisecond)})
+	if before := health.StatusHandle(handle, DomainService, "", service.ID); before.Breaker != BreakerOpen {
+		t.Fatalf("setup open failed: %+v", before)
+	}
+	owner, ok := health.TryAcquireDomainPermitHandle(handle, DomainService, "", service.ID, time.Now())
+	if !ok || owner == nil {
+		t.Fatal("expected half-open service permit")
+	}
+	if mid := health.StatusHandle(handle, DomainService, "", service.ID); mid.Breaker != BreakerHalfOpen {
+		t.Fatalf("expected half-open after acquire: %+v", mid)
+	}
+	// Concurrent payload while owner holds the token: quality learn, no steal.
+	observation, err := pool.beginBusinessObservation(snapshot, snapshot.Candidates[0], service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation.observePayload(SourceFirstByte, time.Millisecond)
+	status := health.StatusHandle(handle, DomainService, "", service.ID)
+	if status.NonBreakerSuccesses < 1 {
+		t.Fatalf("busy payload did not quality-learn: %+v", status)
+	}
+	if status.Successes != 0 || status.RecoverySuccesses != 0 || status.Breaker != BreakerHalfOpen || status.Failures != 1 {
+		t.Fatalf("busy learn must not settle half-open without owner token: %+v", status)
+	}
+	if pool.observationPermitBusy.Load() == 0 {
+		t.Fatal("expected permit-busy counter increment")
+	}
+	owner.ReleaseDeferred()
+	observation.release()
+}
+
+func TestDialTimeoutIsMediumConfidenceQualityOnly(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{100}, "dial-timeout", newTestOutbound("dial-timeout")))
+	handle := snapshot.Candidates[0].Handle
+	service := testBusinessService(N.NetworkTCP)
+	service.HealthTransport = "tcp/ipv4"
+	permit, ok := health.TryAcquireConnectionPermitHandle(handle, "tcp/ipv4", time.Now())
+	if !ok {
+		t.Fatal("permit")
+	}
+	attempt, err := pool.beginObservationAttempt(snapshot, snapshot.Candidates[0], permit, N.NetworkTCP, "tcp/ipv4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.completeTransportAttempt(attempt, service, M.ParseSocksaddr("1.2.3.4:443"), DialAttemptResult{
+		Candidate: snapshot.Candidates[0], Err: context.DeadlineExceeded, Delay: time.Second,
+	})
+	status := health.StatusHandle(handle, DomainTransport, "tcp/ipv4", "")
+	if status.Failures != 0 || status.NonBreakerFailures != 1 || status.Breaker != BreakerClosed || status.Health != HealthDegraded {
+		t.Fatalf("single dial timeout must be quality-only medium conf: %+v", status)
+	}
+}
+
+func TestDialTimeoutEscalatesToUnreachableWithoutHardErrno(t *testing.T) {
+	// FailureThreshold default is 3: three medium timeouts → HealthUnreachable,
+	// path leaves Plan, lease is dropped — without opening a breaker on one RTT.
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 3, BaseCooldown: time.Second, MaxCooldown: time.Minute, JitterFraction: 0})
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{101}, "timeout-hole", newTestOutbound("timeout-hole")))
+	handle := snapshot.Candidates[0].Handle
+	service := testBusinessService(N.NetworkTCP)
+	service.HealthTransport = "tcp/ipv4"
+	service.Mode = ModeAdaptive
+	pool.leases.ReplaceHandle(service.Session, NodeHandle{}, handle, service.ID, service.Mode, time.Hour, time.Now())
+	for i := 0; i < 3; i++ {
+		permit, ok := health.TryAcquireConnectionPermitHandle(handle, "tcp/ipv4", time.Now())
+		if !ok {
+			t.Fatalf("permit %d", i)
+		}
+		attempt, err := pool.beginObservationAttempt(snapshot, snapshot.Candidates[0], permit, N.NetworkTCP, "tcp/ipv4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.completeTransportAttempt(attempt, service, M.ParseSocksaddr("1.2.3.4:443"), DialAttemptResult{
+			Candidate: snapshot.Candidates[0], Err: context.DeadlineExceeded, Delay: time.Second,
+		})
+	}
+	status := health.StatusHandle(handle, DomainTransport, "tcp/ipv4", "")
+	if status.NonBreakerFailures != 3 || status.Health != HealthUnreachable || status.Breaker != BreakerClosed {
+		t.Fatalf("timeout blackhole escalation mismatch: %+v", status)
+	}
+	if _, loaded := pool.leases.Peek(service.Session, time.Now()); loaded {
+		t.Fatal("unreachable timeout path retained sticky lease")
+	}
+	if health.RequiredPathKnownBlocked(handle, service, time.Now()) != true {
+		t.Fatal("unreachable timeout path still eligible in plan")
+	}
+}
+
+func TestDomainPermitResolvesQualifiedTransportKey(t *testing.T) {
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Millisecond, MaxCooldown: time.Second, JitterFraction: 0})
+	handle := NodeHandle{NodeID: NodeID{102}, Slot: 1, Version: 1}
+	// Open the qualified ledger.
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure, At: time.Now().Add(-time.Millisecond)})
+	// Acquire via bare class must resolve to the same open record (not a fresh key).
+	permit, ok := health.TryAcquireDomainPermitHandle(handle, DomainTransport, N.NetworkTCP, "", time.Now())
+	if !ok || permit == nil {
+		t.Fatal("expected half-open via bare tcp key resolution")
+	}
+	status := health.StatusHandle(handle, DomainTransport, "tcp/ipv4", "")
+	if status.Breaker != BreakerHalfOpen {
+		t.Fatalf("bare tcp acquire missed qualified open ledger: %+v", status)
+	}
+	// Second acquire while token held must fail (same record).
+	if _, ok := health.TryAcquireDomainPermitHandle(handle, DomainTransport, "tcp/any", "", time.Now()); ok {
+		t.Fatal("second acquire bypassed half-open owner via alternate key")
+	}
+	permit.ReleaseDeferred()
+}
+
+func TestQualityUnreachableRecoversOnMediumSuccess(t *testing.T) {
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 2, BaseCooldown: time.Second, MaxCooldown: time.Minute, JitterFraction: 0})
+	handle := NodeHandle{NodeID: NodeID{110}, Slot: 1, Version: 1}
+	path := "tcp/ipv4"
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		health.ObserveEvidence(Observation{
+			NodeID: handle.NodeID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: path,
+			Outcome: OutcomeFailure, At: now, Reason: "timeout",
+		}, false, 0.6)
+	}
+	if st := health.StatusHandle(handle, DomainTransport, path, ""); st.Health != HealthUnreachable {
+		t.Fatalf("setup unreachable: %+v", st)
+	}
+	health.ObserveEvidence(Observation{
+		NodeID: handle.NodeID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: path,
+		Outcome: OutcomeSuccess, Delay: 20 * time.Millisecond, At: now.Add(time.Second),
+	}, false, 0.6)
+	st := health.StatusHandle(handle, DomainTransport, path, "")
+	if st.Health != HealthHealthy || st.NonBreakerFailures != 0 {
+		t.Fatalf("medium success did not clear quality blackhole: %+v", st)
+	}
+}

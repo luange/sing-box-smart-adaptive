@@ -321,10 +321,16 @@ func (r *HealthObservationReducer) Reduce(e ObservationEvidence, domains []Domai
 func healthObservationForDomain(e ObservationEvidence, domain DomainEvidence) Observation {
 	observation := Observation{NodeID: e.Handle.NodeID, NodeSlot: e.Handle.Slot, NodeVersion: e.Handle.Version, Scope: domain.Domain, Outcome: domain.Outcome, Delay: e.Delay, ThroughputBPS: e.ThroughputBPS, At: e.At, Reason: e.Reason}
 	if domain.Domain == DomainTransport {
-		observation.Transport = e.NetworkPath
-		if observation.Transport == "" {
-			observation.Transport = e.Transport
+		// B1: always write qualified ledger keys so StatusHandle/permit/rank
+		// never disagree on bare "tcp"/"udp" vs "tcp/any"/"udp_data/any".
+		path := e.NetworkPath
+		if path == "" {
+			path = e.Transport
 		}
+		if normalized := normalizeHealthTransportPath(path); normalized != "" {
+			path = normalized
+		}
+		observation.Transport = path
 	}
 	if domain.Domain == DomainService {
 		observation.Service = e.ServiceID

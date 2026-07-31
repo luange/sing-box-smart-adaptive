@@ -1,7 +1,6 @@
 package adaptive
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -97,6 +96,7 @@ type AdaptivePool struct {
 	manualFailure              string
 	switchMargin               float64
 	switchCooldown             time.Duration
+	affinityMode               string
 	runner                     *AttemptRunner
 	defaultMode                PolicyMode
 	strictLeaseTTL             time.Duration
@@ -143,9 +143,8 @@ type AdaptivePool struct {
 	schedulerGen            uint64
 	capabilityProvider      RefreshableProbeTargetProvider
 	capabilityServiceIDs    []string
-	capabilityRunner        *CapabilityProbeRunner
-	capabilityController    *CapabilityProbeController
-	capabilityControllers   map[string]*CapabilityProbeController
+	capabilityRunner      *CapabilityProbeRunner
+	capabilityControllers map[string]*CapabilityProbeController
 	capabilityRefresh       time.Duration
 	capabilityTimeout       time.Duration
 	capabilityQuorum        int
@@ -205,7 +204,7 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			capabilityTimeout = defaultCapabilityTimeout
 		}
 		if capabilityQuorum == 0 {
-			if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
+			if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinExitIdentity {
 				capabilityQuorum = 1
 			} else {
 				capabilityQuorum = 2
@@ -217,17 +216,18 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		if capabilityCommonModeMin < 2 {
 			return nil, errors.New("adaptive capability common-mode threshold is invalid")
 		}
-		if options.Capability.BuiltinYouTubeTLS && options.Capability.BuiltinAIServiceTLS {
-			return nil, errors.New("adaptive builtin capability modes are ambiguous")
+		if options.Capability.BuiltinAIServiceTLS {
+			// Sealed: keep the JSON field for migration, but refuse production enablement.
+			return nil, errors.New("adaptive builtin_ai_service_tls is sealed and disabled; use builtin_youtube_tls, builtin_exit_identity, or a signed manifest")
 		}
-		if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinAIServiceTLS || options.Capability.BuiltinExitIdentity {
+		if options.Capability.BuiltinYouTubeTLS || options.Capability.BuiltinExitIdentity {
 			if capabilityQuorum != 1 {
 				return nil, errors.New("adaptive builtin capability requires quorum 1")
 			}
 			if options.Capability.ManifestURL != "" || len(options.Capability.TrustedKeys) != 0 {
 				return nil, errors.New("adaptive builtin capability cannot use manifest trust options")
 			}
-			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, options.Capability.BuiltinAIServiceTLS, options.Capability.BuiltinExitIdentity)
+			builtinProvider, providerErr := NewBuiltinCapabilityTargetProvider(nil, options.Capability.BuiltinYouTubeTLS, false, options.Capability.BuiltinExitIdentity)
 			if providerErr != nil {
 				return nil, errors.New("adaptive builtin capability is invalid")
 			}
@@ -296,6 +296,12 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	switchCooldown := time.Duration(options.Policy.SwitchCooldown)
 	if options.Policy.SwitchCooldown == 0 {
 		switchCooldown = defaultSwitchCooldown
+	}
+	affinityMode := options.Policy.AffinityMode
+	switch affinityMode {
+	case "", "service", "disabled":
+	default:
+		return nil, E.New("unknown adaptive affinity_mode: ", affinityMode)
 	}
 	attemptTimeout := time.Duration(options.Policy.AttemptTimeout)
 	if attemptTimeout <= 0 {
@@ -390,11 +396,15 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		health:                  health,
 		resolver:                resolver,
 		leases:                  NewSessionLeaseManager(maxLeases),
-		policy:                  NewPolicyEngine(health, maxAttempts, manualFailure).BindNodeWeights(nodeWeights).BindSwitchStability(switchMargin, switchCooldown),
-		policyMaxAttempts:       maxAttempts,
-		manualFailure:           manualFailure,
-		switchMargin:            switchMargin,
-		switchCooldown:          switchCooldown,
+		policy: NewPolicyEngine(health, maxAttempts, manualFailure).
+			BindNodeWeights(nodeWeights).
+			BindSwitchStability(switchMargin, switchCooldown).
+			BindAffinityMode(affinityMode),
+		policyMaxAttempts: maxAttempts,
+		manualFailure:     manualFailure,
+		switchMargin:      switchMargin,
+		switchCooldown:    switchCooldown,
+		affinityMode:      affinityMode,
 		runner:                  NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
 		defaultMode:             defaultMode,
 		strictLeaseTTL:          strictLeaseTTL,
@@ -470,7 +480,11 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 		p.health = shared.health
 		p.leases = shared.leases
 		p.control = shared.control
-		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights).BindSwitchStability(p.switchMargin, p.switchCooldown).BindBulkSequence(&p.control.bulkSequence)
+		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).
+			BindNodeWeights(p.nodeWeights).
+			BindSwitchStability(p.switchMargin, p.switchCooldown).
+			BindAffinityMode(p.affinityMode).
+			BindBulkSequence(&p.control.bulkSequence)
 	}
 	p.lifecycleAccess.Unlock()
 	if err = p.persistStateDurable(); err != nil {
@@ -530,9 +544,8 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	p.lifecycleAccess.Lock()
 	p.retired = true
 	p.publishPhase = publishPhaseRetired
+	// D/C: single controller map is the only ownership path.
 	capabilityControllers := p.capabilityControllers
-	legacyCapabilityController := p.capabilityController
-	p.capabilityController = nil
 	p.capabilityControllers = nil
 	scheduler := p.scheduler
 	p.scheduler = nil
@@ -540,14 +553,7 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	ownerGeneration := p.schedulerGen
 	p.schedulerGen = 0
 	p.lifecycleAccess.Unlock()
-	for _, capabilityController := range capabilityControllers {
-		capabilityController.Close()
-	}
-	if legacyCapabilityController != nil {
-		if current, loaded := capabilityControllers[youtubeProbeServiceID]; !loaded || current != legacyCapabilityController {
-			legacyCapabilityController.Close()
-		}
-	}
+	closeCapabilityControllers(capabilityControllers)
 	p.catalogAccess.Lock()
 	epochID := p.runtimeIdentity.EpochID
 	p.catalogAccess.Unlock()
@@ -763,7 +769,7 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		return nil, err
 	}
 	startedAt := time.Now()
-	conn, candidate, err := p.runner.Dial(ctx, network, destination, plan, p.beginDialAttempt(snapshot, serviceContext))
+	conn, candidate, err := p.runner.Dial(ctx, network, destination, plan, p.beginDialAttempt(snapshot, serviceContext, destination))
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()
@@ -781,6 +787,11 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 			p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 		}
 		p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
+	}
+	// Business TLS/write failures must charge the family that actually connected.
+	// (Selection sticky is by node handle, not path — do not invent path sticky.)
+	if path := observedHealthTransport(serviceContext, destination, conn.RemoteAddr()); path != "" {
+		serviceContext.HealthTransport = path
 	}
 	p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 	p.setLatest(candidate.PrimaryTag)
@@ -864,28 +875,42 @@ func (p *AdaptivePool) waitUntilPublished(ctx context.Context) error {
 	}
 }
 
-func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, service ServiceContext) AttemptBegin {
+func (p *AdaptivePool) beginDialAttempt(snapshot *ExecutionSnapshot, service ServiceContext, destination M.Socksaddr) AttemptBegin {
 	if snapshot == nil || snapshot.RuntimeEpochID == 0 || snapshot.CatalogRevision == 0 || p.runtimeManager == nil {
 		return nil
 	}
+	// Prefer destination IP family when known (literal dial); */any remains until
+	// a live RemoteAddr is available on completion.
+	path := observedHealthTransport(service, destination, nil)
 	return func(candidate Candidate, permit *AttemptPermit) (AttemptComplete, error) {
-		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, service.Transport, serviceHealthTransport(service))
+		attempt, err := p.beginObservationAttempt(snapshot, candidate, permit, service.Transport, path)
 		if err != nil {
 			return nil, err
 		}
 		return func(result DialAttemptResult) {
-			p.completeTransportAttempt(attempt, service, result.Err, result.Delay, result.Deferred, result.Panic)
+			p.completeTransportAttempt(attempt, service, destination, result)
 		}, nil
 	}
 }
 
-func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, service ServiceContext, attemptErr error, delay time.Duration, deferred, implementationFailure bool) {
+func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, service ServiceContext, destination M.Socksaddr, result DialAttemptResult) {
 	defer attempt.lease.Release()
+	attemptErr := result.Err
+	delay := result.Delay
+	deferred := result.Deferred
+	implementationFailure := result.Panic
 	evidence := attempt.evidence
+	// Pin the health ledger to the address family that was actually dialed when
+	// known; otherwise a single dual-stack failure collapses into tcp/any and
+	// falsely poisons the peer family.
+	evidence.NetworkPath = observedHealthTransport(service, destination, result.RemoteAddr)
+	if evidence.NetworkPath == "" {
+		evidence.NetworkPath = attempt.evidence.NetworkPath
+	}
 	evidence.Source = SourceDial
 	evidence.Confidence = ConfidenceHigh
 	evidence.Delay = delay
-	evidence.At = time.Now()
+	evidence.At = p.health.Now()
 	evidence.Reason = errorReason(attemptErr)
 	switch {
 	case deferred || errors.Is(attemptErr, context.Canceled):
@@ -894,8 +919,12 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 		evidence.Stage, evidence.Outcome, evidence.Failure = StageProxyTunnel, OutcomeFailure, FailureProtocol
 	case attemptErr == nil:
 		evidence.Stage, evidence.Outcome, evidence.Failure = StageDestinationTransport, OutcomeSuccess, FailureNone
-	case errors.Is(attemptErr, context.DeadlineExceeded):
+	case errors.Is(attemptErr, context.DeadlineExceeded) || isTimeoutError(attemptErr):
+		// Timeouts start as medium (quality). After enough medium timeouts the
+		// ledger becomes HealthUnreachable (see observeQualityLocked) so the
+		// node leaves Plan — without treating one slow RTT as a hard open.
 		evidence.Stage, evidence.Outcome, evidence.Failure = StageDestinationTransport, OutcomeFailure, FailureTimeout
+		evidence.Confidence = ConfidenceMedium
 	default:
 		evidence.Stage, evidence.Outcome, evidence.Failure = StageDestinationTransport, OutcomeFailure, FailureConnect
 	}
@@ -903,15 +932,18 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 	p.recordObservationResult(disposition, publishErr)
 	if publishErr == nil && disposition == IngestAccepted && evidence.Outcome == OutcomeFailure && evidence.Stage == StageDestinationTransport {
 		p.transportFailures.Add(1)
+		path := evidence.NetworkPath
 		if snapshot := p.catalog.load(); snapshot != nil {
 			if candidate, loaded := snapshot.Candidate(evidence.Handle.NodeID); loaded {
 				p.switchAudit.RecordFailure(service.Session, service.ID, candidate, evidence.Failure, "destination_transport", evidence.At)
-				p.recordFailureMemory(candidate, evidence.Failure, service.ID, serviceHealthTransport(service))
+				p.recordFailureMemory(candidate, evidence.Failure, service.ID, path)
 			}
 		}
-		status := p.health.StatusHandle(evidence.Handle, DomainTransport, serviceHealthTransport(service), "")
+		status := p.health.StatusHandle(evidence.Handle, DomainTransport, path, "")
 		earlyFailure := p.policy != nil && p.policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
-		if modeUsesLease(service.Mode) && (earlyFailure || status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown) {
+		// Invalidate lease on breaker open OR quality-escalated unreachable (timeout blackhole).
+		pathDead := status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable
+		if modeUsesLease(service.Mode) && (earlyFailure || pathDead) {
 			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
 			p.persistState()
 		}
@@ -923,32 +955,6 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 // scheduler. Submit coalesces an on-demand probe with an active or pending
 // periodic probe, so an outage cannot create a second scheduler or an
 // unbounded probe fan-out.
-func (p *AdaptivePool) scheduleFailureProbe(handle NodeHandle) {
-	p.lifecycleAccess.Lock()
-	scheduler := p.scheduler
-	p.lifecycleAccess.Unlock()
-	if scheduler == nil {
-		return
-	}
-	snapshot := p.catalog.load()
-	if snapshot == nil {
-		return
-	}
-	candidate, loaded := snapshot.Candidate(handle.NodeID)
-	if !loaded || candidate.Handle.Slot != handle.Slot || candidate.Handle.Version != handle.Version {
-		return
-	}
-	_ = scheduler.Submit(p.probeTask(snapshot, candidate, time.Now(), 0))
-	// Real path failures should also accelerate the matching recovery track so
-	// UDP-DNS / family breakers are not waiting only on the generic HTTP probe.
-	for _, family := range []string{"ipv4", "ipv6"} {
-		path := "udp_dns/" + family
-		status := p.health.StatusHandle(handle, DomainTransport, path, "")
-		if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable || status.Health == HealthDegraded {
-			_ = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, family, time.Now(), 0))
-		}
-	}
-}
 
 type observationAttempt struct {
 	lease    *RuntimeEpochIdentityLease
@@ -1023,7 +1029,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 		}
 		var observation *observationAttempt
 		if snapshot != nil && snapshot.RuntimeEpochID != 0 && snapshot.CatalogRevision != 0 && p.runtimeManager != nil {
-			observation, err = p.beginObservationAttempt(snapshot, candidate, permit, N.NetworkUDP, serviceHealthTransport(serviceContext))
+			observation, err = p.beginObservationAttempt(snapshot, candidate, permit, N.NetworkUDP, observedHealthTransport(serviceContext, destination, nil))
 			if err != nil {
 				permit.ReleaseDeferred()
 				attemptErrors = append(attemptErrors, E.Cause(err, "prepare adaptive UDP observation ", candidate.PrimaryTag))
@@ -1031,12 +1037,14 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 			}
 		}
 		startedAt := time.Now()
-		settle := func(attemptErr error, deferred bool) {
+		settle := func(attemptErr error, deferred bool, remote net.Addr) {
 			if observation == nil {
 				permit.ReleaseDeferred()
 				return
 			}
-			p.completeTransportAttempt(observation, serviceContext, attemptErr, time.Since(startedAt), deferred, false)
+			p.completeTransportAttempt(observation, serviceContext, destination, DialAttemptResult{
+				Candidate: candidate, Err: attemptErr, Delay: time.Since(startedAt), Deferred: deferred, RemoteAddr: remote,
+			})
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, p.runner.attemptTimeout)
 		var packetConn net.PacketConn
@@ -1058,18 +1066,21 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 			attemptErr = ctx.Err()
 		}
 		if parentCanceled {
-			settle(attemptErr, true)
+			settle(attemptErr, true, nil)
 			attemptErrors = append(attemptErrors, attemptErr)
 			continue
 		}
 		if attemptErr != nil {
-			settle(attemptErr, false)
+			settle(attemptErr, false, nil)
 			attemptErrors = append(attemptErrors, E.Cause(attemptErr, "adaptive UDP candidate ", candidate.PrimaryTag))
 			continue
 		}
-		// PacketConn creation proves destination transport setup only. Actual UDP
-		// response evidence and its epoch lease belong to B2b.
-		settle(nil, false)
+		// ListenPacket only proves the outbound accepted the bind. Do NOT publish
+		// high-confidence transport success here — that would half-open-recover a
+		// path before any datagram is answered. Real path evidence comes from
+		// wrapBusinessPacketConn Read* (or active dns_health). Deferred settles the
+		// dial permit without writing health success.
+		settle(nil, true, nil)
 		if modeUsesLease(serviceContext.Mode) {
 			previous := NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}
 			ttl := p.leaseTTL(serviceContext.Mode)
@@ -1081,6 +1092,9 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 				p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 			}
 			p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
+		}
+		if path := observedHealthTransport(serviceContext, destination, nil); path != "" {
+			serviceContext.HealthTransport = path
 		}
 		p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 		p.setLatest(candidate.PrimaryTag)
@@ -1156,11 +1170,9 @@ func (p *AdaptivePool) TriggerAdaptiveProbe(ctx context.Context) error {
 		if submission.Err != nil {
 			return submission.Err
 		}
-		for _, family := range []string{"ipv4", "ipv6"} {
-			submission = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, family, time.Now(), 0))
-			if submission.Err != nil {
-				return submission.Err
-			}
+		submission = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, "ipv4", time.Now(), 0))
+		if submission.Err != nil {
+			return submission.Err
 		}
 	}
 	return nil
@@ -1169,9 +1181,6 @@ func (p *AdaptivePool) TriggerAdaptiveProbe(ctx context.Context) error {
 func (p *AdaptivePool) TriggerAdaptiveCapabilityProbe(ctx context.Context) error {
 	p.lifecycleAccess.Lock()
 	controllers := cloneCapabilityControllers(p.capabilityControllers)
-	if len(controllers) == 0 && p.capabilityController != nil {
-		controllers = map[string]*CapabilityProbeController{youtubeProbeServiceID: p.capabilityController}
-	}
 	p.lifecycleAccess.Unlock()
 	if len(controllers) == 0 {
 		return adapter.ErrAdaptiveCapabilityUnavailable
@@ -1186,233 +1195,6 @@ func (p *AdaptivePool) TriggerAdaptiveCapabilityProbe(ctx context.Context) error
 		}
 	}
 	return nil
-}
-
-func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
-	snapshot := p.catalog.load()
-	status := adapter.AdaptivePoolStatus{Shadow: p.shadow, UpdatedAt: time.Now()}
-	status.MissedObservations = p.missedObservations.Load()
-	status.ObservationStaleTotal = p.observationStale.Load()
-	status.ObservationDuplicateTotal = p.observationDuplicate.Load()
-	status.ObservationBackpressureTotal = p.observationBackpressure.Load()
-	status.ObservationReducerFailureTotal = p.observationReducerFailure.Load()
-	status.ObservationIdentityFailureTotal = p.observationIdentityFailure.Load()
-	status.ObservationPanicTotal = p.observationPanic.Load()
-	status.ObservationPermitBusyTotal = p.observationPermitBusy.Load()
-	status.BusinessTLSFailuresTotal = p.businessTLSFailures.Load()
-	status.TransportFailuresTotal = p.transportFailures.Load()
-	status.AIIPv6Policy = p.aiIPv6Policy
-	status.AIIPv6BlockedTotal = p.aiIPv6Blocked.Load()
-	status.RecentSwitches, status.SelectionSwitchesTotal = p.switchAudit.Snapshot()
-	status.DeltaAppliedTotal = p.deltaAppliedTotal.Load()
-	status.DeltaFallbackTotal = p.deltaFallbackTotal.Load()
-	if p.control == nil {
-		p.control = new(ControlState)
-	}
-	p.control.access.RLock()
-	status.Pinned = p.control.pinnedTag
-	if p.shadow {
-		status.Mode = "shadow"
-	} else if p.control.pinned != (NodeID{}) {
-		status.Mode = string(ModeManual)
-	} else {
-		status.Mode = string(p.defaultMode)
-	}
-	p.control.access.RUnlock()
-	status.ActiveLeases, status.LeaseEvictions = p.leases.Stats()
-	status.BulkSequence = p.control.bulkSequence.Load()
-	status.ControlRevision = p.control.revision.Load()
-	if p.resolver != nil {
-		status.ServiceOverrideCount = len(p.resolver.Overrides(time.Now()))
-	}
-	if p.catalog != nil {
-		bindings := p.catalog.BindingStats()
-		status.ActiveBindingCount = bindings.Active
-		status.RetiredBindingCount = bindings.Retired
-	}
-	if snapshot == nil {
-		return status
-	}
-	leaseSnapshot := p.leases.PersistenceSnapshot(time.Now())
-	slices.SortFunc(leaseSnapshot, func(left, right SessionLease) int {
-		if left.ServiceID != right.ServiceID {
-			return bytes.Compare([]byte(left.ServiceID), []byte(right.ServiceID))
-		}
-		return bytes.Compare(left.NodeID[:], right.NodeID[:])
-	})
-	for _, lease := range leaseSnapshot {
-		if len(status.ServiceLeases) >= statusCandidateLimit {
-			break
-		}
-		tag := ""
-		if candidate, loaded := snapshot.Candidate(lease.NodeID); loaded && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
-			tag = safePersistentTag(candidate.PrimaryTag)
-		}
-		status.ServiceLeases = append(status.ServiceLeases, adapter.AdaptiveServiceLease{
-			ServiceID: lease.ServiceID, AffinityID: serviceAffinityFamily(lease.ServiceID), SessionID: lease.Key.String(), Mode: string(lease.Mode), NodeID: lease.NodeID.String(), Tag: tag,
-			ExpiresAt: lease.ExpiresAt, UpdatedAt: lease.UpdatedAt,
-		})
-	}
-	status.Generation = snapshot.Generation
-	status.CandidateCount = len(snapshot.Candidates)
-	status.DuplicatesSuppressed = snapshot.DuplicatesSuppressed
-	status.StableIdentityCount = snapshot.StableIdentityCount
-	for _, candidate := range snapshot.Candidates {
-		if candidate.EndpointConflictCount > 1 {
-			status.EndpointConflictCount++
-		}
-	}
-	healthView := p.health.ReadOnlySnapshot()
-	policyView := NewPolicyEngine(healthView, p.policyMaxAttempts, p.manualFailure).BindNodeWeights(p.nodeWeights)
-	throughput := healthView.ThroughputByHandle()
-	for _, candidate := range snapshot.Candidates {
-		status.AliasCount += len(candidate.Aliases)
-	}
-	if len(snapshot.Candidates) > statusCandidateLimit {
-		status.Candidates = make([]adapter.AdaptiveCandidateStatus, 0, statusCandidateLimit)
-	} else {
-		status.Candidates = make([]adapter.AdaptiveCandidateStatus, 0, len(snapshot.Candidates))
-	}
-	for _, candidate := range snapshot.Candidates {
-		if len(status.Candidates) >= statusCandidateLimit {
-			break
-		}
-		health := healthView.EndpointHandle(candidate.Handle)
-		throughputStatus := throughput[candidate.Handle]
-		state := string(health.Health)
-		if health.Breaker != BreakerClosed {
-			state = string(health.Breaker)
-		}
-		weightMatch := p.nodeWeights.Explain(candidate.PrimaryTag)
-		pathStatuses := make([]adapter.AdaptivePathStatus, 0, len(observableHealthPaths))
-		for _, path := range observableHealthPaths {
-			pathHealth := healthView.StatusHandle(candidate.Handle, DomainTransport, path, "")
-			rawTransport := N.NetworkTCP
-			if strings.HasPrefix(path, "udp_") {
-				rawTransport = N.NetworkUDP
-			}
-			score := policyView.candidateScore(candidate, ServiceContext{Transport: rawTransport, HealthTransport: path})
-			pathStatuses = append(pathStatuses, adapter.AdaptivePathStatus{
-				Path: path, Health: string(pathHealth.Health), Breaker: string(pathHealth.Breaker),
-				LastUpdated: pathHealth.LastUpdated, LastDelay: durationMillis32(pathHealth.LastDelay),
-				SmoothedDelay: durationMillis32(pathHealth.SmoothedDelay), DelaySamples: pathHealth.DelaySamples,
-				BackoffMs: uint32(max(0, pathHealth.Backoff.Milliseconds())), ConsecutiveFailures: pathHealth.ConsecutiveFailures,
-				Successes: pathHealth.Successes, Failures: pathHealth.Failures, RecoverySuccesses: pathHealth.RecoverySuccesses,
-				OpenUntil: pathHealth.CooldownUntil, Reason: pathHealth.Reason,
-				HealthPriority: score.HealthPriority, ObservedDelay: durationMillis32(score.ObservedDelay),
-				WeightedDelay: durationMillis32(score.WeightedDelay), SelectionScore: score.SelectionScore,
-				DominantEvidence: score.DominantEvidence,
-			})
-		}
-		endpointScore := policyView.candidateScore(candidate, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
-		viewService := ServiceContext{ID: "status:default", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
-		profile := healthView.BuildCapabilityProfile(candidate.Handle, time.Now())
-		if throughputStatus.Samples > 0 {
-			profile.ThroughputBPS = throughputStatus.BPS
-			profile.ThroughputOK = throughputStatus.BPS >= 256*1024
-		}
-		memory := p.selectionMemoryFor(candidate.ID)
-		lastFailure := health.Reason
-		if memory.failure != "" {
-			lastFailure = memory.failure
-		}
-		// Prefer the most recent path failure reason when endpoint is clean.
-		for _, pathStatus := range pathStatuses {
-			if pathStatus.Reason != "" && (pathStatus.Breaker == string(BreakerOpen) || pathStatus.Breaker == string(BreakerCooldown) || pathStatus.Health == string(HealthUnreachable)) {
-				lastFailure = pathStatus.Path + ":" + pathStatus.Reason
-				break
-			}
-		}
-		status.Candidates = append(status.Candidates, adapter.AdaptiveCandidateStatus{
-			NodeID:                candidate.ID.String(),
-			EndpointID:            candidate.EndpointID.String(),
-			EndpointConflictCount: candidate.EndpointConflictCount,
-			NodeSlot:              candidate.Handle.Slot,
-			NodeVersion:           candidate.Handle.Version,
-			Tag:                   candidate.PrimaryTag,
-			Weight:                weightMatch.Weight,
-			WeightRule:            weightMatch.Rule,
-			WeightRuleExact:       weightMatch.Exact,
-			Aliases:               append([]string(nil), candidate.Aliases...),
-			IdentityStable:        candidate.IdentityStable,
-			State:                 state,
-			Health:                string(health.Health),
-			Breaker:               string(health.Breaker),
-			LastProbeAt:           health.LastUpdated,
-			LastProbeDelay:        durationMillis32(health.LastDelay),
-			SmoothedDelay:         durationMillis32(health.SmoothedDelay),
-			DelaySamples:          health.DelaySamples,
-			BackoffMs:             uint32(max(0, health.Backoff.Milliseconds())),
-			ConsecutiveFailures:   health.ConsecutiveFailures,
-			ThroughputBPS:         throughputStatus.BPS,
-			ThroughputSamples:     throughputStatus.Samples,
-			Successes:             health.Successes,
-			Failures:              health.Failures,
-			RecoverySuccesses:     health.RecoverySuccesses,
-			EvidenceWeight:        health.EvidenceWeight,
-			OpenUntil:             health.CooldownUntil,
-			Reason:                health.Reason,
-			HealthPriority:        endpointScore.HealthPriority,
-			ObservedDelay:         durationMillis32(endpointScore.ObservedDelay),
-			WeightedDelay:         durationMillis32(endpointScore.WeightedDelay),
-			SelectionScore:        endpointScore.SelectionScore,
-			DominantEvidence:      endpointScore.DominantEvidence,
-			FilterReason:          policyView.ExclusionReason(candidate, viewService),
-			LastFailure:           lastFailure,
-			LastFailureService:    memory.serviceID,
-			LastFailurePath:       memory.path,
-			LastSelectionReason:   memory.reason,
-			Capabilities:          adapterCapabilities(profile),
-			Paths:                 pathStatuses,
-		})
-	}
-	status.StateEntries, status.StateEvictions = healthView.Stats()
-	status.StatePersistenceFailures = p.statePersistenceFailures.Load()
-	p.lifecycleAccess.Lock()
-	scheduler := p.scheduler
-	capabilityControllers := cloneCapabilityControllers(p.capabilityControllers)
-	if len(capabilityControllers) == 0 && p.capabilityController != nil {
-		capabilityControllers = map[string]*CapabilityProbeController{youtubeProbeServiceID: p.capabilityController}
-	}
-	capabilityEnabled := p.capabilityProvider != nil
-	capabilityProvider := p.capabilityProvider
-	p.lifecycleAccess.Unlock()
-	status.CapabilityEnabled = capabilityEnabled
-	status.CapabilityInitFailures = p.capabilityInitFailures.Load()
-	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal, status.ExitIdentitySaturatedNodes = p.exitIdentityStore.Stats()
-	status.ExitIdentityIPv4Baselines, status.ExitIdentityIPv6Baselines, status.ExitIdentityDualStackNodes = p.exitIdentityStore.FamilyStats()
-	for _, serviceID := range sortedCapabilityControllerIDs(capabilityControllers) {
-		capabilityStatus := capabilityControllers[serviceID].Status()
-		status.CapabilityRunning = status.CapabilityRunning || capabilityStatus.Running
-		status.CapabilityCyclesStarted += capabilityStatus.CyclesStarted
-		status.CapabilityCyclesCompleted += capabilityStatus.CyclesCompleted
-		status.CapabilityRefreshFailures += capabilityStatus.RefreshFailures
-		status.CapabilityViewFailures += capabilityStatus.ViewFailures
-		status.CapabilitySuiteFailures += capabilityStatus.SuiteFailures
-		if capabilityStatus.LastFailureStage != "" {
-			status.CapabilityLastFailureStage = serviceID + ":" + capabilityStatus.LastFailureStage
-		}
-	}
-	if capabilityProvider != nil {
-		if targetSnapshot, targetErr := capabilityProvider.Snapshot(context.Background(), youtubeProbeServiceID); targetErr == nil {
-			status.CapabilityTargetGeneration = targetSnapshot.Generation
-		}
-	}
-	if scheduler != nil {
-		status.ProbeQueueDepth, _, _ = scheduler.Stats()
-	}
-	if p.schedulerOwner != nil {
-		owner, generation, accepted, coalesced, deferred, rejected, completed, stalled := p.schedulerOwner.Stats()
-		status.ProbeOwnerEpoch = uint64(owner)
-		status.ProbeOwnerGeneration = generation
-		status.ProbeAcceptedTotal = accepted
-		status.ProbeCoalescedTotal = coalesced
-		status.ProbeDeferredTotal = deferred
-		status.ProbeRejectedTotal = rejected
-		status.ProbeCompletedTotal = completed
-		status.ProbeSchedulerStalledTotal = stalled
-	}
-	return status
 }
 
 func (p *AdaptivePool) onSourceUpdated() error {
@@ -1551,7 +1333,8 @@ func (p *AdaptivePool) startSchedulerLocked() {
 }
 
 func (p *AdaptivePool) startCapabilityControllerLocked(snapshot *ExecutionSnapshot) {
-	if p.capabilityProvider == nil || len(p.capabilityControllers) != 0 || p.capabilityController != nil || p.scheduler == nil || snapshot == nil || snapshot.RuntimeEpochID == 0 {
+	// C1: single map entry-point only — no parallel singular controller field.
+	if p.capabilityProvider == nil || len(p.capabilityControllers) != 0 || p.scheduler == nil || snapshot == nil || snapshot.RuntimeEpochID == 0 {
 		return
 	}
 	refresh := p.capabilityRefresh
@@ -1611,7 +1394,6 @@ func (p *AdaptivePool) startCapabilityControllerLocked(snapshot *ExecutionSnapsh
 		controllers[serviceID] = controller
 	}
 	p.capabilityControllers = controllers
-	p.capabilityController = controllers[youtubeProbeServiceID]
 }
 
 func cloneCapabilityControllers(source map[string]*CapabilityProbeController) map[string]*CapabilityProbeController {
@@ -1652,261 +1434,6 @@ func (p *AdaptivePool) reconcileScheduler(previous, next *ExecutionSnapshot) {
 	}
 }
 
-func (p *AdaptivePool) startupProbeTasks(snapshot *ExecutionSnapshot, now time.Time) []ProbeTask {
-	if snapshot == nil || len(snapshot.Candidates) == 0 {
-		return nil
-	}
-	candidates := slices.Clone(snapshot.Candidates)
-	slices.SortFunc(candidates, func(left, right Candidate) int {
-		if compared := bytes.Compare(left.ID[:], right.ID[:]); compared != 0 {
-			return compared
-		}
-		if left.Handle.Slot < right.Handle.Slot {
-			return -1
-		}
-		if left.Handle.Slot > right.Handle.Slot {
-			return 1
-		}
-		if left.Handle.Version < right.Handle.Version {
-			return -1
-		}
-		if left.Handle.Version > right.Handle.Version {
-			return 1
-		}
-		return 0
-	})
-
-	immediate := min(max(p.probeConcurrency, 1), len(candidates))
-	spreadCount := len(candidates) - immediate
-	spread := p.probeCoverage / 10
-	if spread > 30*time.Second {
-		spread = 30 * time.Second
-	}
-	if spread < 0 {
-		spread = 0
-	}
-	tasks := make([]ProbeTask, 0, len(candidates)*3)
-	for index, candidate := range candidates {
-		dueAt := now
-		if index >= immediate && spreadCount > 0 {
-			dueAt = now.Add(time.Duration(index-immediate+1) * spread / time.Duration(spreadCount))
-		}
-		tasks = append(tasks,
-			p.probeTask(snapshot, candidate, dueAt, p.probeCoverage),
-			p.dnsHealthProbeTask(snapshot, candidate, "ipv4", dueAt, p.probeCoverage),
-			p.dnsHealthProbeTask(snapshot, candidate, "ipv6", dueAt, p.probeCoverage),
-		)
-	}
-	return tasks
-}
-
-func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate) (ProbeResult, uint16) {
-	current := p.catalog.load()
-	if current == nil || snapshot == nil || current.RuntimeEpochID != snapshot.RuntimeEpochID || current.CatalogRevision != snapshot.CatalogRevision || current.Generation != snapshot.Generation {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}, 0
-	}
-	currentCandidate, loaded := current.Candidate(candidate.ID)
-	if !loaded || currentCandidate.Handle.Slot != candidate.Handle.Slot || currentCandidate.Handle.Version != candidate.Handle.Version {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "candidate handle retired"}, 0
-	}
-	permit, allowed := p.health.TryAcquireDomainPermitHandle(candidate.Handle, DomainEndpoint, "", "", time.Now())
-	if !allowed {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint breaker deferred"}, 0
-	}
-	var attempt *observationAttempt
-	var err error
-	if current.RuntimeEpochID != 0 && current.CatalogRevision != 0 && p.runtimeManager != nil {
-		attempt, err = p.beginObservationAttempt(current, currentCandidate, permit, N.NetworkTCP)
-		if err != nil {
-			permit.ReleaseDeferred()
-			return ProbeResult{Outcome: OutcomeDeferred, Reason: err.Error()}, 0
-		}
-	}
-	startedAt := time.Now()
-	execution, loaded := p.catalog.AcquireExecution(ExecutionToken{RuntimeEpochID: current.RuntimeEpochID, CatalogRevision: current.CatalogRevision, Handle: currentCandidate.Handle})
-	if !loaded {
-		p.completeGenericProbe(attempt, ErrExecutionBindingUnavailable, time.Since(startedAt), true)
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: ErrExecutionBindingUnavailable.Error(), Settled: true}, 0
-	}
-	delay, probeErr := p.runProbe(ctx, execution.Port)
-	execution.Release()
-	elapsed := time.Since(startedAt)
-	latest := p.catalog.load()
-	latestCandidate, stillActive := Candidate{}, false
-	if latest != nil {
-		latestCandidate, stillActive = latest.Candidate(candidate.ID)
-	}
-	stale := latest == nil || latest.RuntimeEpochID != snapshot.RuntimeEpochID || latest.CatalogRevision != snapshot.CatalogRevision || latest.Generation != snapshot.Generation || !stillActive || latestCandidate.Handle.Slot != candidate.Handle.Slot || latestCandidate.Handle.Version != candidate.Handle.Version
-	deferred := stale || !p.probeOwnerActive() || (p.ctx != nil && p.ctx.Err() != nil) || (ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded))
-	if attempt == nil {
-		permit.ReleaseDeferred()
-	} else {
-		p.completeGenericProbe(attempt, probeErr, elapsed, deferred)
-	}
-	if deferred {
-		return ProbeResult{Outcome: OutcomeDeferred, Delay: elapsed, Reason: "probe identity retired", Settled: attempt != nil}, delay
-	}
-	if probeErr != nil {
-		return ProbeResult{Outcome: OutcomeFailure, Delay: elapsed, Reason: probeErr.Error(), Settled: attempt != nil}, delay
-	}
-	return ProbeResult{Outcome: OutcomeSuccess, Delay: time.Duration(delay) * time.Millisecond, Settled: attempt != nil}, delay
-}
-
-func (p *AdaptivePool) runDNSHealthProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate, family string) ProbeResult {
-	current := p.catalog.load()
-	if current == nil || snapshot == nil || current.RuntimeEpochID != snapshot.RuntimeEpochID || current.CatalogRevision != snapshot.CatalogRevision || current.Generation != snapshot.Generation {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}
-	}
-	currentCandidate, loaded := current.Candidate(candidate.ID)
-	if !loaded || currentCandidate.Handle.Slot != candidate.Handle.Slot || currentCandidate.Handle.Version != candidate.Handle.Version {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "candidate handle retired"}
-	}
-	path := "udp_dns/" + family
-	permit, allowed := p.health.TryAcquireDomainPermitHandle(candidate.Handle, DomainTransport, path, "", time.Now())
-	if !allowed {
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: "DNS path breaker deferred"}
-	}
-	attempt, err := p.beginObservationAttempt(current, currentCandidate, permit, N.NetworkUDP, path)
-	if err != nil {
-		permit.ReleaseDeferred()
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: err.Error()}
-	}
-	startedAt := time.Now()
-	execution, loaded := p.catalog.AcquireExecution(ExecutionToken{RuntimeEpochID: current.RuntimeEpochID, CatalogRevision: current.CatalogRevision, Handle: currentCandidate.Handle})
-	if !loaded {
-		p.completeDNSHealthProbe(attempt, ErrExecutionBindingUnavailable, time.Since(startedAt), true)
-		return ProbeResult{Outcome: OutcomeDeferred, Reason: ErrExecutionBindingUnavailable.Error(), Settled: true}
-	}
-	probeErr := runDNSHealthTargets(ctx, execution.Port, family)
-	execution.Release()
-	elapsed := time.Since(startedAt)
-	latest := p.catalog.load()
-	latestCandidate, stillActive := Candidate{}, false
-	if latest != nil {
-		latestCandidate, stillActive = latest.Candidate(candidate.ID)
-	}
-	stale := latest == nil || latest.RuntimeEpochID != snapshot.RuntimeEpochID || latest.CatalogRevision != snapshot.CatalogRevision || latest.Generation != snapshot.Generation || !stillActive || latestCandidate.Handle != candidate.Handle
-	deferred := stale || !p.probeOwnerActive() || (p.ctx != nil && p.ctx.Err() != nil) || (ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded))
-	p.completeDNSHealthProbe(attempt, probeErr, elapsed, deferred)
-	if deferred {
-		return ProbeResult{Outcome: OutcomeDeferred, Delay: elapsed, Reason: "DNS probe identity retired", Settled: true}
-	}
-	if probeErr != nil {
-		return ProbeResult{Outcome: OutcomeFailure, Delay: elapsed, Reason: probeErr.Error(), Settled: true}
-	}
-	return ProbeResult{Outcome: OutcomeSuccess, Delay: elapsed, Settled: true}
-}
-
-func (p *AdaptivePool) completeDNSHealthProbe(attempt *observationAttempt, probeErr error, delay time.Duration, deferred bool) {
-	defer attempt.lease.Release()
-	evidence := attempt.evidence
-	evidence.Source = SourceDNS
-	evidence.Stage = StageDNSHealth
-	evidence.Confidence = ConfidenceHigh
-	evidence.Delay = delay
-	evidence.At = time.Now()
-	evidence.Reason = errorReason(probeErr)
-	switch {
-	case deferred:
-		evidence.Outcome, evidence.Failure = OutcomeDeferred, FailureCanceled
-	case probeErr == nil:
-		evidence.Outcome, evidence.Failure = OutcomeSuccess, FailureNone
-	case errors.Is(probeErr, context.DeadlineExceeded) || isTimeoutError(probeErr):
-		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureTimeout
-	default:
-		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureDNS
-	}
-	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
-	p.recordObservationResult(disposition, publishErr)
-}
-
-func (p *AdaptivePool) probeOwnerActive() bool {
-	p.lifecycleAccess.Lock()
-	scheduler := p.scheduler
-	p.lifecycleAccess.Unlock()
-	return scheduler == nil || scheduler.ActiveOwner()
-}
-
-func (p *AdaptivePool) completeGenericProbe(attempt *observationAttempt, probeErr error, delay time.Duration, deferred bool) {
-	defer attempt.lease.Release()
-	evidence := attempt.evidence
-	evidence.Source = SourceProbe
-	evidence.Stage = StageProxyTunnel
-	// A single external target is useful quality evidence, but it cannot
-	// distinguish a node failure from common-mode target failure or blocking.
-	evidence.Confidence = ConfidenceMedium
-	evidence.Delay = delay
-	evidence.At = time.Now()
-	evidence.Reason = errorReason(probeErr)
-	switch {
-	case deferred:
-		evidence.Outcome, evidence.Failure = OutcomeDeferred, FailureCanceled
-	case probeErr == nil:
-		evidence.Outcome, evidence.Failure = OutcomeSuccess, FailureNone
-	case errors.Is(probeErr, context.DeadlineExceeded):
-		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureTimeout
-	default:
-		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureConnect
-	}
-	disposition, publishErr := PublishSettledObservationGuarded(p.sharedObservationIngestor(), attempt.guard, evidence, attempt.reducer)
-	p.recordObservationResult(disposition, publishErr)
-}
-
-func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidate, dueAt time.Time, interval time.Duration) ProbeTask {
-	priority := ProbePriorityOnDemand
-	failureInterval := time.Duration(0)
-	if interval > 0 {
-		priority = ProbePriorityCoverage
-		failureInterval = interval / 4
-		if failureInterval > time.Minute {
-			failureInterval = time.Minute
-		}
-		if failureInterval <= 0 {
-			failureInterval = interval
-		}
-	}
-	return ProbeTask{
-		Key: ProbeKey{
-			RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
-			NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version, Suite: "generic-http", Target: p.probeURL,
-		},
-		Source:          firstOrDefault(candidate.Sources, "static"),
-		Priority:        priority,
-		DueAt:           dueAt,
-		Interval:        interval,
-		FailureInterval: failureInterval,
-		Timeout:         p.probeTimeout,
-		Run: func(ctx context.Context) ProbeResult {
-			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
-			return result
-		},
-	}
-}
-
-func (p *AdaptivePool) dnsHealthProbeTask(snapshot *ExecutionSnapshot, candidate Candidate, family string, dueAt time.Time, interval time.Duration) ProbeTask {
-	priority := ProbePriorityOnDemand
-	failureInterval := time.Duration(0)
-	if interval > 0 {
-		priority = ProbePriorityCoverage
-		failureInterval = interval / 4
-		if failureInterval > time.Minute {
-			failureInterval = time.Minute
-		}
-		if failureInterval <= 0 {
-			failureInterval = interval
-		}
-	}
-	return ProbeTask{
-		Key: ProbeKey{
-			RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
-			NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version, Suite: "dns-health", Target: family,
-		},
-		Source: firstOrDefault(candidate.Sources, "static"), Priority: priority, DueAt: dueAt,
-		Interval: interval, FailureInterval: failureInterval, Timeout: max(p.probeTimeout, 5*time.Second),
-		Run: func(ctx context.Context) ProbeResult { return p.runDNSHealthProbe(ctx, snapshot, candidate, family) },
-	}
-}
-
 func (p *AdaptivePool) applyCommittedTransitions(identity RuntimeIdentity) {
 	if identity.Revision == 0 {
 		return
@@ -1930,13 +1457,6 @@ func (p *AdaptivePool) applyCommittedTransitions(identity RuntimeIdentity) {
 			scheduler.RemoveHandle(handle)
 		}
 	}
-}
-
-func (p *AdaptivePool) runProbe(ctx context.Context, candidate N.Dialer) (uint16, error) {
-	if p.probeRunner == nil {
-		return urltest.URLTest(ctx, p.probeURL, candidate)
-	}
-	return p.probeRunner(ctx, p.probeURL, candidate)
 }
 
 func (p *AdaptivePool) pinnedNodeID() *NodeID {
@@ -1966,151 +1486,6 @@ func (p *AdaptivePool) leaseTTL(mode PolicyMode) time.Duration {
 		return p.strictLeaseTTL
 	}
 	return p.adaptiveLeaseTTL
-}
-
-type selectionMemoryEntry struct {
-	reason      string
-	selectionAt time.Time
-	failure     string
-	serviceID   string
-	path        string
-	failureAt   time.Time
-	at          time.Time
-}
-
-type selectionMemoryKey struct {
-	handle    NodeHandle
-	serviceID string
-	path      string
-}
-
-const selectionMemoryLimit = 4096
-
-func (p *AdaptivePool) rememberPolicySelectionWithReason(service ServiceContext, candidate Candidate, reason DecisionReason) {
-	if p == nil {
-		return
-	}
-	key := ""
-	if p.policy != nil {
-		key = p.policy.stickyKey(service)
-	}
-	now := time.Now()
-	if p.policy != nil {
-		p.policy.RememberSelection(key, candidate.Handle, now)
-	}
-	p.recordSelectionMemory(candidate.Handle, string(reason), "", service.ID, serviceHealthTransport(service), now)
-}
-
-func (p *AdaptivePool) recordSelectionMemory(handle NodeHandle, reason, failure, serviceID, path string, at time.Time) {
-	if p == nil || handle.NodeID == (NodeID{}) {
-		return
-	}
-	p.selectionMemoryAccess.Lock()
-	if p.selectionMemory == nil {
-		p.selectionMemory = make(map[selectionMemoryKey]selectionMemoryEntry)
-	}
-	key := selectionMemoryKey{handle: handle, serviceID: serviceID, path: path}
-	entry := p.selectionMemory[key]
-	if failure != "" {
-		entry.failure = failure
-		entry.serviceID = serviceID
-		entry.path = path
-		entry.failureAt = at
-	} else if reason != "" {
-		entry.reason = reason
-		entry.selectionAt = at
-	}
-	entry.at = at
-	p.selectionMemory[key] = entry
-	if len(p.selectionMemory) > selectionMemoryLimit {
-		var oldest selectionMemoryKey
-		var oldestAt time.Time
-		first := true
-		for id, entry := range p.selectionMemory {
-			if first || entry.at.Before(oldestAt) {
-				oldest = id
-				oldestAt = entry.at
-				first = false
-			}
-		}
-		delete(p.selectionMemory, oldest)
-	}
-	p.selectionMemoryAccess.Unlock()
-}
-
-func (p *AdaptivePool) recordFailureMemory(candidate Candidate, failure FailureClass, serviceID, path string) {
-	if p == nil || candidate.ID == (NodeID{}) {
-		return
-	}
-	p.recordSelectionMemory(candidate.Handle, "failure", string(failure), serviceID, path, time.Now())
-}
-
-func (p *AdaptivePool) selectionMemoryFor(nodeID NodeID) selectionMemoryEntry {
-	if p == nil {
-		return selectionMemoryEntry{}
-	}
-	p.selectionMemoryAccess.Lock()
-	var entry selectionMemoryEntry
-	for key, candidate := range p.selectionMemory {
-		if key.handle.NodeID != nodeID {
-			continue
-		}
-		if candidate.selectionAt.After(entry.selectionAt) {
-			entry.reason = candidate.reason
-			entry.selectionAt = candidate.selectionAt
-		}
-		if candidate.failureAt.After(entry.failureAt) {
-			entry.failure = candidate.failure
-			entry.serviceID = candidate.serviceID
-			entry.path = candidate.path
-			entry.failureAt = candidate.failureAt
-		}
-	}
-	p.selectionMemoryAccess.Unlock()
-	return entry
-}
-
-func (p *AdaptivePool) clearSelectionMemory() {
-	if p == nil {
-		return
-	}
-	p.selectionMemoryAccess.Lock()
-	p.selectionMemory = make(map[selectionMemoryKey]selectionMemoryEntry)
-	p.selectionMemoryAccess.Unlock()
-}
-
-func adapterCapabilities(profile NodeCapabilityProfile) *adapter.AdaptiveNodeCapabilities {
-	known := profile.TCP4.Known || profile.TCP6.Known || profile.DNSUDPv4.Known || profile.DNSUDPv6.Known ||
-		profile.DataUDPv4.Known || profile.DataUDPv6.Known || profile.Endpoint.Known || profile.ThroughputBPS > 0
-	return &adapter.AdaptiveNodeCapabilities{
-		TCP4: adapterPathCapability(profile.TCP4), TCP6: adapterPathCapability(profile.TCP6),
-		DNSUDPv4: adapterPathCapability(profile.DNSUDPv4), DNSUDPv6: adapterPathCapability(profile.DNSUDPv6),
-		DataUDPv4: adapterPathCapability(profile.DataUDPv4), DataUDPv6: adapterPathCapability(profile.DataUDPv6),
-		Endpoint: adapterPathCapability(profile.Endpoint), ThroughputOK: profile.ThroughputOK,
-		ThroughputBPS: profile.ThroughputBPS, Known: known,
-	}
-}
-
-func adapterPathCapability(path PathCapability) adapter.AdaptivePathCapability {
-	state := "unknown"
-	if path.Known {
-		state = "available"
-		if !path.Available {
-			state = "unavailable"
-		}
-	}
-	return adapter.AdaptivePathCapability{Known: path.Known, Available: path.Available, State: state}
-}
-
-func durationMillis32(value time.Duration) uint32 {
-	if value <= 0 {
-		return 0
-	}
-	milliseconds := value.Milliseconds()
-	if milliseconds >= int64(^uint32(0)) {
-		return ^uint32(0)
-	}
-	return uint32(milliseconds)
 }
 
 func loadOrPrepareIdentityKey(path string) ([32]byte, bool, error) {

@@ -134,6 +134,15 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
 
+// Now is the store clock. Observation timestamps should use this so prune,
+// breaker windows, and evidence.At stay on one timeline.
+func (s *HealthStore) Now() time.Time {
+	if s == nil || s.clock == nil {
+		return time.Now()
+	}
+	return s.clock.Now()
+}
+
 type BreakerConfig struct {
 	FailureThreshold int
 	BaseCooldown     time.Duration
@@ -326,6 +335,12 @@ func (s *HealthStore) ObserveEvidence(observation Observation, breakerEligible b
 	if observation.At.IsZero() {
 		observation.At = s.clock.Now()
 	}
+	// Always write the same qualified transport vocabulary as Status/permit.
+	if observation.Scope == DomainTransport {
+		if normalized := normalizeHealthTransportPath(observation.Transport); normalized != "" {
+			observation.Transport = normalized
+		}
+	}
 	s.access.Lock()
 	key := healthKey{nodeID: observation.NodeID, nodeSlot: observation.NodeSlot, nodeVersion: observation.NodeVersion, domain: observation.Scope, transport: observation.Transport, service: observation.Service}
 	if breakerEligible {
@@ -370,20 +385,99 @@ func (s *HealthStore) observeQualityLocked(key healthKey, observation Observatio
 		}
 		record.status.ThroughputSamples++
 	}
+	// Low-weight quality (ConfidenceLow ≈ 0.25) is metrics-only: delay/counters
+	// for permit-busy learning and soft probes — never flip Health enum.
+	// Medium+ quality failures degrade, then mark unreachable at breaker
+	// threshold so pure-timeout blackholes leave the plan without a hard errno.
+	metricsOnly := weight > 0 && weight < 0.5
 	if observation.Outcome == OutcomeSuccess {
 		record.status.NonBreakerSuccesses++
-		if record.status.Breaker == BreakerClosed && record.status.Health != HealthUnreachable {
+		if !metricsOnly && record.status.Breaker == BreakerClosed {
+			// Medium+ success clears a quality blackhole. Without this, timeout
+			// Unreachable could never recover except via a high-conf breaker path.
+			record.status.NonBreakerFailures = 0
 			record.status.Health = HealthHealthy
 		}
 	} else {
 		record.status.NonBreakerFailures++
-		if record.status.Breaker == BreakerClosed && record.status.Health != HealthUnreachable {
-			record.status.Health = HealthDegraded
+		if !metricsOnly && record.status.Breaker == BreakerClosed {
+			threshold := s.breaker.FailureThreshold
+			if threshold <= 0 {
+				threshold = 3
+			}
+			if int(record.status.NonBreakerFailures) >= threshold {
+				record.status.Health = HealthUnreachable
+			} else if record.status.Health != HealthUnreachable {
+				record.status.Health = HealthDegraded
+			}
 		}
 	}
 	for len(s.entries) > s.maxEntries {
 		s.removeOldestLocked()
 	}
+}
+
+// transportLedgerKey normalizes DomainTransport keys so permit/status/observe agree.
+func transportLedgerKey(transport string) string {
+	if normalized := normalizeHealthTransportPath(transport); normalized != "" {
+		return normalized
+	}
+	return transport
+}
+
+// mostRestrictiveTransportRecordLocked maps aggregate keys (tcp/any, bare class
+// after normalize) onto an existing concrete family ledger when one is already
+// open/half-open/cooldown. Prevents parallel any-key permits that bypass a
+// family breaker.
+func (s *HealthStore) mostRestrictiveTransportRecordLocked(handle NodeHandle, transport string) (*healthRecord, healthKey, bool) {
+	if s == nil {
+		return nil, healthKey{}, false
+	}
+	class, family := splitHealthTransport(transport)
+	if class == "" {
+		return nil, healthKey{}, false
+	}
+	prefix := class + "/"
+	if family != "" && family != healthFamilyAny {
+		// Concrete family already — nothing further to pin.
+		return nil, healthKey{}, false
+	}
+	var (
+		selected    *healthRecord
+		selectedKey healthKey
+	)
+	rank := func(st HealthStatus) int {
+		switch st.Breaker {
+		case BreakerHalfOpen:
+			return 4
+		case BreakerOpen:
+			return 3
+		case BreakerCooldown:
+			return 2
+		default:
+			if st.Health == HealthUnreachable {
+				return 1
+			}
+			return 0
+		}
+	}
+	for entryKey, candidate := range s.entries {
+		if entryKey.nodeID != handle.NodeID || entryKey.nodeSlot != handle.Slot || entryKey.nodeVersion != handle.Version || entryKey.domain != DomainTransport {
+			continue
+		}
+		if !strings.HasPrefix(entryKey.transport, prefix) {
+			continue
+		}
+		if selected == nil || rank(candidate.status) > rank(selected.status) ||
+			(rank(candidate.status) == rank(selected.status) && candidate.status.LastUpdated.After(selected.status.LastUpdated)) {
+			selected = candidate
+			selectedKey = entryKey
+		}
+	}
+	if selected == nil || rank(selected.status) == 0 {
+		return nil, healthKey{}, false
+	}
+	return selected, selectedKey, true
 }
 
 // TryAcquireAttemptPermit atomically acquires all required domains. The order
@@ -400,7 +494,11 @@ func (s *HealthStore) TryAcquireAttemptPermitHandle(handle NodeHandle, service S
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	path := serviceHealthTransport(service)
+	if !s.transportPathEligible(handle, path, at) {
+		return nil, false
+	}
+	keys := s.permitKeysForDial(handle, path, service.ID, true)
 	return s.tryAcquirePermit(keys, at)
 }
 
@@ -410,14 +508,50 @@ func (s *HealthStore) TryAcquireConnectionPermitHandle(handle NodeHandle, transp
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: transport}}
+	if !s.transportPathEligible(handle, transport, at) {
+		return nil, false
+	}
+	keys := s.permitKeysForDial(handle, transport, "", false)
 	return s.tryAcquirePermit(keys, at)
+}
+
+// permitKeysForDial builds endpoint/transport(/service) keys for half-open ownership.
+// For dual-stack aggregates: if the collapsed */any key is already blocked but a
+// concrete family is still available, pin the permit to that family — otherwise
+// eligibility would pass and acquisition would still bounce on the any-key.
+// No family preference when both families are unknown (keep the aggregate key).
+func (s *HealthStore) permitKeysForDial(handle NodeHandle, transport, serviceID string, includeService bool) []healthKey {
+	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}}
+	transportKey := transportLedgerKey(transport)
+	if familyA, familyB, isDual := dualStackFamilyPaths(transportKey); isDual && s != nil {
+		now := s.clock.Now()
+		agg := s.pathCapability(handle, transport, now)
+		if agg.Known && !agg.Available {
+			a := s.pathCapability(handle, familyA, now)
+			b := s.pathCapability(handle, familyB, now)
+			switch {
+			case a.Known && a.Available:
+				transportKey = familyA
+			case b.Known && b.Available:
+				transportKey = familyB
+			}
+		}
+	}
+	if transportKey != "" {
+		keys = append(keys, healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: transportKey})
+	}
+	if includeService {
+		keys = append(keys, healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: serviceID})
+	}
+	return keys
 }
 
 // TryAcquireConnectionFallbackPermitHandle permits one bounded last-resort
 // attempt when policy has no normally eligible candidate. It preserves the
 // captured record versions so a successful attempt can close an open breaker,
 // but never competes with an existing half-open owner.
+// Dual-stack family blocks are intentionally not re-checked here: fallback is
+// last-resort and may probe a node the normal plan already filtered out.
 func (s *HealthStore) TryAcquireConnectionFallbackPermitHandle(handle NodeHandle, transport string, at time.Time) (*AttemptPermit, bool) {
 	if at.IsZero() {
 		at = s.clock.Now()
@@ -482,10 +616,21 @@ func (s *HealthStore) TryAcquireDomainPermitHandle(handle NodeHandle, domain Fai
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
+	if domain == DomainTransport {
+		transport = transportLedgerKey(transport)
+	}
 	key := healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, transport: transport, service: service}
 	s.access.Lock()
 	defer s.access.Unlock()
-	record := s.entries[key]
+	// Same qualified→legacy resolution as StatusHandle / tryAcquirePermit so a
+	// half-open token on tcp/ipv4 cannot be bypassed with bare "tcp" / "tcp/any".
+	record, resolvedKey := s.recordForKeyLocked(key)
+	key = resolvedKey
+	if record == nil && domain == DomainTransport {
+		if pinned, pinnedKey, ok := s.mostRestrictiveTransportRecordLocked(handle, key.transport); ok {
+			record, key = pinned, pinnedKey
+		}
+	}
 	if record == nil {
 		return &AttemptPermit{store: s, entries: []permitEntry{{key: key}}}, true
 	}
@@ -511,11 +656,23 @@ func (s *HealthStore) CanAttemptVersion(nodeID NodeID, nodeVersion uint64, servi
 	return s.CanAttemptHandle(NodeHandle{NodeID: nodeID, Version: nodeVersion}, service, at)
 }
 
+// CanAttemptHandle may advance open->cooldown labels as a side effect of
+// inspecting availability. New plan/status code must use PeekAvailable /
+// CanAttemptHandleReadOnly instead. Dial paths should prefer TryAcquire* so
+// half-open tokens are the only intentional write on the attempt boundary.
 func (s *HealthStore) CanAttemptHandle(handle NodeHandle, service ServiceContext, at time.Time) bool {
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	// Transport uses dual-stack-aware eligibility (family ledger), not only the
+	// single aggregate key which may miss concrete tcp/ipv4|ipv6 failures.
+	if !s.transportPathEligible(handle, serviceHealthTransport(service), at) {
+		return false
+	}
+	keys := []healthKey{
+		{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint},
+		{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID},
+	}
 	s.access.Lock()
 	defer s.access.Unlock()
 	for _, key := range keys {
@@ -527,7 +684,9 @@ func (s *HealthStore) CanAttemptHandle(handle NodeHandle, service ServiceContext
 }
 
 // CanAttemptHandleReadOnly reports current availability without advancing a
-// breaker or acquiring a half-open token. Status/API paths must use this form.
+// breaker or acquiring a half-open token. Status/API/Plan paths must use this form.
+// Transport eligibility is dual-stack aware so Plan shares policy with
+// RequiredPathKnownBlocked / SupportsService.
 func (s *HealthStore) CanAttemptHandleReadOnly(handle NodeHandle, service ServiceContext, at time.Time) bool {
 	if s == nil {
 		return true
@@ -535,7 +694,13 @@ func (s *HealthStore) CanAttemptHandleReadOnly(handle NodeHandle, service Servic
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
-	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: serviceHealthTransport(service)}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID}}
+	if !s.transportPathEligible(handle, serviceHealthTransport(service), at) {
+		return false
+	}
+	keys := []healthKey{
+		{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint},
+		{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainService, service: service.ID},
+	}
 	s.access.RLock()
 	defer s.access.RUnlock()
 	for _, key := range keys {
@@ -769,11 +934,14 @@ func (s *HealthStore) StatusVersion(nodeID NodeID, nodeVersion uint64, domain Fa
 func (s *HealthStore) StatusHandle(handle NodeHandle, domain FailureDomain, transport, service string) HealthStatus {
 	s.access.RLock()
 	defer s.access.RUnlock()
-	record := s.entries[healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, transport: transport, service: service}]
+	key := healthKey{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: domain, transport: transport, service: service}
+	// Use the same qualified→legacy resolution as permit acquisition so Plan
+	// pathCapability and TryAcquire never disagree on bare "tcp"/"udp" ledgers.
+	record, _ := s.recordForKeyLocked(key)
 	if record == nil && domain == DomainTransport && !strings.Contains(transport, "/") {
 		var selected *healthRecord
-		for key, candidate := range s.entries {
-			if key.nodeID != handle.NodeID || key.nodeSlot != handle.Slot || key.nodeVersion != handle.Version || key.domain != domain || key.service != service || !strings.HasPrefix(key.transport, transport+"/") {
+		for entryKey, candidate := range s.entries {
+			if entryKey.nodeID != handle.NodeID || entryKey.nodeSlot != handle.Slot || entryKey.nodeVersion != handle.Version || entryKey.domain != domain || entryKey.service != service || !strings.HasPrefix(entryKey.transport, transport+"/") {
 				continue
 			}
 			if selected == nil || candidate.status.Breaker > selected.status.Breaker || candidate.status.LastUpdated.After(selected.status.LastUpdated) {

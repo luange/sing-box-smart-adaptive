@@ -103,3 +103,131 @@ func TestExclusionExplanationDoesNotAdvanceBreaker(t *testing.T) {
 		t.Fatalf("read-only expiry check advanced stored breaker: %+v", current)
 	}
 }
+
+func TestDualStackAnyFailsOpenWhenOneFamilyUnknown(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	handle := NodeHandle{NodeID: NodeID{0x44}, Slot: 1, Version: 1}
+	for range 3 {
+		store.Observe(Observation{
+			NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version,
+			Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure, At: clock.Now(),
+		})
+	}
+	profile := store.BuildCapabilityProfile(handle, clock.Now())
+	if profile.TCP4.Available {
+		t.Fatalf("tcp/ipv4 should be known-bad: %+v", profile.TCP4)
+	}
+	cap := profile.capabilityForPath("tcp/any")
+	if !cap.Available || cap.Known {
+		t.Fatalf("tcp/any must fail-open when ipv6 unknown: %+v", cap)
+	}
+	ok, reason := profile.SupportsService(ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
+	if !ok || reason != "" {
+		t.Fatalf("tcp/any service should remain eligible: ok=%v reason=%q", ok, reason)
+	}
+	// Only when both families are known-bad.
+	for range 3 {
+		store.Observe(Observation{
+			NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version,
+			Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeFailure, At: clock.Now(),
+		})
+	}
+	profile = store.BuildCapabilityProfile(handle, clock.Now())
+	cap = profile.capabilityForPath("tcp/any")
+	if cap.Available || !cap.Known {
+		t.Fatalf("tcp/any must block when both families known-bad: %+v", cap)
+	}
+}
+
+// Plan-level dual-stack: candidateBlocked / Plan must share SupportsService policy.
+func TestPlanDualStackAnyKeepsNodeWhenOneFamilyFails(t *testing.T) {
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute, JitterFraction: 0})
+	good := Candidate{ID: NodeID{0x51}, Handle: NodeHandle{NodeID: NodeID{0x51}, Slot: 1, Version: 1}, PrimaryTag: "good"}
+	partial := Candidate{ID: NodeID{0x52}, Handle: NodeHandle{NodeID: NodeID{0x52}, Slot: 2, Version: 1}, PrimaryTag: "v4-only-bad"}
+	health.Observe(Observation{NodeID: good.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	health.Observe(Observation{NodeID: partial.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 10 * time.Millisecond})
+	// Only IPv4 transport is known-bad; IPv6 remains unknown → tcp/any must stay eligible.
+	health.Observe(Observation{NodeID: partial.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	service := ServiceContext{ID: "site:dual.example", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
+	plan, err := engine.Plan(testExecutionSnapshot(partial, good), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPartial := false
+	for _, candidate := range plan.Candidates {
+		if candidate.ID == partial.ID {
+			foundPartial = true
+		}
+	}
+	if !foundPartial {
+		t.Fatalf("single-family failure eliminated tcp/any candidate: %+v", plan.Candidates)
+	}
+	if health.RequiredPathKnownBlocked(partial.Handle, service, time.Time{}) {
+		t.Fatal("RequiredPathKnownBlocked should fail-open for one-family failure on tcp/any")
+	}
+	if !health.CanAttemptHandleReadOnly(partial.Handle, service, time.Time{}) {
+		t.Fatal("CanAttemptHandleReadOnly should allow tcp/any with one family unknown")
+	}
+	if _, ok := health.TryAcquireConnectionPermitHandle(partial.Handle, "tcp/any", time.Time{}); !ok {
+		t.Fatal("permit should allow tcp/any when only one family is known-bad")
+	}
+}
+
+func TestPlanDualStackAnyDropsNodeWhenBothFamiliesFail(t *testing.T) {
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute, JitterFraction: 0})
+	good := Candidate{ID: NodeID{0x61}, Handle: NodeHandle{NodeID: NodeID{0x61}, Slot: 1, Version: 1}, PrimaryTag: "good"}
+	dead := Candidate{ID: NodeID{0x62}, Handle: NodeHandle{NodeID: NodeID{0x62}, Slot: 2, Version: 1}, PrimaryTag: "both-bad"}
+	health.Observe(Observation{NodeID: good.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 5 * time.Millisecond})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeFailure})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	service := ServiceContext{ID: "site:dual.example", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
+	plan, err := engine.Plan(testExecutionSnapshot(dead, good), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range plan.Candidates {
+		if candidate.ID == dead.ID {
+			t.Fatalf("both-family failure did not eliminate tcp/any candidate: %+v", plan.Candidates)
+		}
+	}
+	if len(plan.Candidates) == 0 || plan.Candidates[0].ID != good.ID {
+		t.Fatalf("expected good candidate only: %+v", plan.Candidates)
+	}
+	if !health.RequiredPathKnownBlocked(dead.Handle, service, time.Time{}) {
+		t.Fatal("RequiredPathKnownBlocked must block when both families known-bad")
+	}
+	if health.CanAttemptHandleReadOnly(dead.Handle, service, time.Time{}) {
+		t.Fatal("CanAttemptHandleReadOnly must deny when both families known-bad")
+	}
+	if _, ok := health.TryAcquireConnectionPermitHandle(dead.Handle, "tcp/any", time.Time{}); ok {
+		t.Fatal("permit must deny tcp/any when both families known-bad")
+	}
+	if reason := engine.ExclusionReason(dead, service); reason == "" {
+		t.Fatal("expected exclusion reason when both families failed")
+	}
+}
+
+func TestPlanDualStackBareTCPUsesFamilyLedger(t *testing.T) {
+	// Bare Transport=tcp (no HealthTransport) must still consult family ledgers.
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute, JitterFraction: 0})
+	good := Candidate{ID: NodeID{0x71}, Handle: NodeHandle{NodeID: NodeID{0x71}, Slot: 1, Version: 1}, PrimaryTag: "good"}
+	dead := Candidate{ID: NodeID{0x72}, Handle: NodeHandle{NodeID: NodeID{0x72}, Slot: 2, Version: 1}, PrimaryTag: "bare-tcp-dead"}
+	health.Observe(Observation{NodeID: good.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 30 * time.Millisecond})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 5 * time.Millisecond})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure})
+	health.Observe(Observation{NodeID: dead.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeFailure})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	service := ServiceContext{ID: "site:bare.example", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	plan, err := engine.Plan(testExecutionSnapshot(dead, good), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range plan.Candidates {
+		if candidate.ID == dead.ID {
+			t.Fatalf("bare tcp plan kept both-family-dead node: %+v", plan.Candidates)
+		}
+	}
+}

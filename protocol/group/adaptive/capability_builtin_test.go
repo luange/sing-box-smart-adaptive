@@ -41,37 +41,16 @@ func TestBuiltinYouTubeTLSTargetProviderIsStaticRedactedAndRefreshable(t *testin
 	}
 }
 
-func TestBuiltinAIServiceTargetsUseIndependentSafeProbeSemantics(t *testing.T) {
+func TestBuiltinAIServiceTargetsRemainSealed(t *testing.T) {
+	// AI service probe framework is sealed; construction must fail and auth_http
+	// / web_waf cannot be reintroduced via NewProbeTarget either.
+	if _, err := NewBuiltinAIServiceTLSTargetProvider(&fakeClock{now: time.Now()}); err == nil {
+		t.Fatal("expected sealed builtin AI service provider construction to fail")
+	}
 	now := time.Date(2026, time.July, 23, 0, 0, 0, 0, time.UTC)
-	provider, err := NewBuiltinAIServiceTLSTargetProvider(&fakeClock{now: now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := map[string]struct {
-		url        string
-		capability ProbeCapability
-	}{
-		"youtube":     {"https://www.youtube.com/", ProbeCapabilityTLS},
-		"gemini":      {"https://www.google.com/", ProbeCapabilityTLS},
-		"openai_api":  {"https://api.openai.com/v1/models", ProbeCapabilityAuthHTTP},
-		"chatgpt_web": {"https://chatgpt.com/", ProbeCapabilityWebWAF},
-		"claude":      {"https://api.anthropic.com/v1/models", ProbeCapabilityAuthHTTP},
-	}
-	for serviceID, wanted := range expected {
-		snapshot, snapshotErr := provider.Snapshot(context.Background(), serviceID)
-		if snapshotErr != nil {
-			t.Fatalf("snapshot %s: %v", serviceID, snapshotErr)
-		}
-		targets, targetsErr := snapshot.executionTargets(now)
-		if targetsErr != nil {
-			t.Fatalf("targets %s: %v", serviceID, targetsErr)
-		}
-		if len(targets) != 1 || targets[0].executionURL() != wanted.url || targets[0].Capability != wanted.capability {
-			t.Fatalf("unexpected %s target: %+v", serviceID, targets)
-		}
-		formatted := fmt.Sprintf("%+v %#v", snapshot, targets[0])
-		if strings.Contains(formatted, "api.openai.com") || strings.Contains(formatted, "api.anthropic.com") || strings.Contains(formatted, "chatgpt.com") || strings.Contains(formatted, "/v1/models") {
-			t.Fatalf("execution endpoint leaked through formatting for %s: %s", serviceID, formatted)
+	for _, capability := range []ProbeCapability{ProbeCapabilityAuthHTTP, ProbeCapabilityWebWAF} {
+		if _, err := NewProbeTarget("https://api.example.test/v1", 1, capability, now.Add(-time.Minute), now.Add(time.Hour), nil, nil); err == nil {
+			t.Fatalf("sealed capability %q must be rejected at construct", capability)
 		}
 	}
 }

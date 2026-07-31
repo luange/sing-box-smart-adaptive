@@ -122,8 +122,12 @@ func TestAdaptiveStatusExposesAllNetworkHealthPaths(t *testing.T) {
 	if candidate.Capabilities == nil || !candidate.Capabilities.Known {
 		t.Fatalf("capability portrait missing from status: %+v", candidate.Capabilities)
 	}
-	if candidate.Capabilities.DNSUDPv6.Available || !candidate.Capabilities.DNSUDPv6.Known || candidate.Capabilities.DNSUDPv6.State != "unavailable" {
+	if candidate.Capabilities.DNSUDPv6.Available || !candidate.Capabilities.DNSUDPv6.Known ||
+		(candidate.Capabilities.DNSUDPv6.State != PathStateOpen && candidate.Capabilities.DNSUDPv6.State != PathStateUnreachable && candidate.Capabilities.DNSUDPv6.State != PathStateCooldown) {
 		t.Fatalf("DNS UDP/IPv6 should be unavailable in capability portrait: %+v", candidate.Capabilities)
+	}
+	if len(candidate.FilterReasons) == 0 {
+		t.Fatalf("expected multi-path filter reasons for broken DNS path: %+v", candidate)
 	}
 	if !candidate.Capabilities.TCP4.Available || candidate.Capabilities.TCP4.Known || candidate.Capabilities.TCP4.State != "unknown" {
 		t.Fatalf("unknown TCP4 path should remain explicitly fail-open: %+v", candidate.Capabilities.TCP4)

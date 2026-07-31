@@ -1,6 +1,7 @@
 package adaptive
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -47,39 +48,45 @@ func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
 	}
 }
 
-func TestServiceResolverSharesBrowserIdentityWithoutMergingHealthServices(t *testing.T) {
+func TestServiceResolverIsolatesProductAffinitySpines(t *testing.T) {
+	// Cross-product browser_identity coupling was a thrash path: one service
+	// breaker bounced another's egress. Each product now owns its lease/sticky key.
 	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
 	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.2:1000")}
-	hosts := []string{
-		"chatgpt.com",
-		"auth.openai.com.cdn.cloudflare.net",
-		"challenges.cloudflare.com",
-		"claude.ai",
-		"gemini.google.com",
-		"accounts.google.com",
-		"appleid.apple.com",
-		"login.microsoftonline.com",
+	cases := []struct {
+		host string
+		id   string
+	}{
+		{"chatgpt.com", "chatgpt_web"},
+		{"claude.ai", "claude"},
+		{"gemini.google.com", "gemini"},
+		{"accounts.google.com", "google_account"},
+		{"appleid.apple.com", "apple_account"},
+		{"login.microsoftonline.com", "microsoft_account"},
+		{"challenges.cloudflare.com", "cloudflare_challenge"},
+		{"api.openai.com", "openai_api"},
 	}
-	var identity SessionKey
-	services := make(map[string]struct{})
-	for index, host := range hosts {
-		resolved := resolver.Resolve(client, M.ParseSocksaddr(host+":443"), N.NetworkTCP)
-		if resolved.Mode != ModeStrictAffinity || resolved.AffinityID != "browser_identity" {
-			t.Fatalf("browser identity mismatch host=%s resolved=%+v", host, resolved)
+	sessions := make(map[string]SessionKey)
+	for _, tc := range cases {
+		resolved := resolver.Resolve(client, M.ParseSocksaddr(tc.host+":443"), N.NetworkTCP)
+		if resolved.Mode != ModeStrictAffinity || resolved.ID != tc.id || resolved.AffinityID != tc.id {
+			t.Fatalf("affinity isolation mismatch host=%s got=%+v want id/affinity=%s", tc.host, resolved, tc.id)
 		}
-		if index == 0 {
-			identity = resolved.Session
-		} else if resolved.Session != identity {
-			t.Fatalf("browser identity split at host=%s", host)
-		}
-		services[resolved.ID] = struct{}{}
+		sessions[tc.id] = resolved.Session
 	}
-	if len(services) < 7 {
-		t.Fatalf("health service IDs were incorrectly collapsed: %v", services)
+	if sessions["chatgpt_web"] == sessions["claude"] {
+		t.Fatal("chatgpt and claude must not share session/lease spine")
 	}
-	api := resolver.Resolve(client, M.ParseSocksaddr("api.openai.com:443"), N.NetworkTCP)
-	if api.Session == identity || api.AffinityID != "openai_api" {
-		t.Fatalf("OpenAI API incorrectly shared browser identity: %+v", api)
+	if sessions["chatgpt_web"] == sessions["gemini"] {
+		t.Fatal("chatgpt and gemini must not share session/lease spine")
+	}
+	if sessions["chatgpt_web"] == sessions["google_account"] {
+		t.Fatal("chatgpt and google_account must not share session/lease spine")
+	}
+	// Same product, related hosts still share spine (health service id + affinity).
+	cdn := resolver.Resolve(client, M.ParseSocksaddr("auth.openai.com.cdn.cloudflare.net:443"), N.NetworkTCP)
+	if cdn.ID != "chatgpt_web" || cdn.Session != sessions["chatgpt_web"] {
+		t.Fatalf("chatgpt CDN host lost product spine: %+v", cdn)
 	}
 }
 
@@ -145,6 +152,38 @@ func TestServiceResolverSeparatesTransportPurposeAndIPFamily(t *testing.T) {
 	}
 }
 
+func TestRefineHealthTransportFamilyPinsConcreteStack(t *testing.T) {
+	if got := refineHealthTransportFamily("tcp/any", healthFamilyIPv4); got != "tcp/ipv4" {
+		t.Fatalf("tcp/any + ipv4 => %q", got)
+	}
+	if got := refineHealthTransportFamily("tcp/any", healthFamilyIPv6); got != "tcp/ipv6" {
+		t.Fatalf("tcp/any + ipv6 => %q", got)
+	}
+	if got := refineHealthTransportFamily("tcp/ipv4", healthFamilyIPv6); got != "tcp/ipv4" {
+		t.Fatalf("concrete path must not flip family: %q", got)
+	}
+	if got := refineHealthTransportFamily(normalizeHealthTransportPath(N.NetworkTCP), healthFamilyIPv4); got != "tcp/ipv4" {
+		t.Fatalf("bare tcp + ipv4 => %q", got)
+	}
+	if got := normalizeHealthTransportPath(N.NetworkTCP); got != "tcp/any" {
+		t.Fatalf("bare tcp normalizes to tcp/any: %q", got)
+	}
+	if got := refineHealthTransportFamily("udp_dns/any", healthFamilyIPv6); got != "udp_dns/ipv6" {
+		t.Fatalf("udp_dns/any + ipv6 => %q", got)
+	}
+	service := ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 443}
+	if got := observedHealthTransport(service, M.ParseSocksaddr("example.com:443"), remote); got != "tcp/ipv4" {
+		t.Fatalf("observed from remote addr: %q", got)
+	}
+	if got := observedHealthTransport(service, M.ParseSocksaddr("2001:db8::1:443"), nil); got != "tcp/ipv6" {
+		// ParseSocksaddr with bare v6 may need brackets
+		if got2 := observedHealthTransport(service, M.ParseSocksaddr("[2001:db8::1]:443"), nil); got2 != "tcp/ipv6" {
+			t.Fatalf("observed from destination IP: %q / %q", got, got2)
+		}
+	}
+}
+
 func TestServiceResolverTemporaryOverrideExpires(t *testing.T) {
 	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
 	now := time.Unix(1_700_000_000, 0)
@@ -188,5 +227,29 @@ func TestServiceResolverSeparatesOpenAIAPIFromChatGPTWeb(t *testing.T) {
 	}
 	if api.Session == web.Session || web.Session != static.Session {
 		t.Fatal("OpenAI API and ChatGPT web lease boundaries are incorrect")
+	}
+}
+
+func TestFamilyFromIPIgnoresProxyTunnelAddresses(t *testing.T) {
+	if got := familyFromIP(net.ParseIP("10.30.0.115")); got != "" {
+		t.Fatalf("private remote must not pin dial family: %s", got)
+	}
+	if got := familyFromIP(net.ParseIP("127.0.0.1")); got != "" {
+		t.Fatalf("loopback must not pin dial family: %s", got)
+	}
+	if got := familyFromIP(net.ParseIP("198.18.0.1")); got != healthFamilyIPv4 {
+		t.Fatalf("FakeIP range must still pin: %s", got)
+	}
+	if got := familyFromIP(net.ParseIP("1.2.3.4")); got != healthFamilyIPv4 {
+		t.Fatalf("public v4: %s", got)
+	}
+}
+
+func TestObservedHealthTransportPrefersDestinationOverPrivateRemote(t *testing.T) {
+	service := ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"}
+	dest := M.ParseSocksaddr("198.18.1.2:443")
+	remote := &net.TCPAddr{IP: net.ParseIP("10.20.20.4"), Port: 12345}
+	if got := observedHealthTransport(service, dest, remote); got != "tcp/ipv4" {
+		t.Fatalf("destination FakeIP should win over private remote: %s", got)
 	}
 }

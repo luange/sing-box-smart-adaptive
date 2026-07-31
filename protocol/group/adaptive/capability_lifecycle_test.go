@@ -59,7 +59,7 @@ func TestAdaptivePoolCapabilityLifecycleUsesOwnedSchedulerAndObservationPipeline
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if pool.capabilityController == nil || pool.scheduler == nil {
+	if len(pool.capabilityControllers) == 0 || pool.scheduler == nil {
 		t.Fatal("published capability runtime was not assembled")
 	}
 	_, _, completed := pool.scheduler.Stats()
@@ -79,7 +79,7 @@ func TestAdaptivePoolCapabilityLifecycleUsesOwnedSchedulerAndObservationPipeline
 	}
 
 	pool.OnRuntimeEpochRetire()
-	if pool.capabilityController != nil || pool.scheduler != nil {
+	if len(pool.capabilityControllers) != 0 || pool.scheduler != nil {
 		t.Fatal("retired pool retained capability controller or scheduler")
 	}
 }
@@ -95,7 +95,7 @@ func TestAdaptivePoolCapabilityLifecycleIsDisabledWithoutProvider(t *testing.T) 
 	}
 	pool.OnRuntimeEpochPublishCommit()
 	defer pool.OnRuntimeEpochRetire()
-	if pool.capabilityController != nil {
+	if len(pool.capabilityControllers) != 0 {
 		t.Fatal("default pool started capability controller without a trusted provider")
 	}
 	status := pool.AdaptiveStatus()
@@ -115,25 +115,18 @@ func TestAdaptivePoolAIServiceControllersShareSchedulerAndIsolateEvidence(t *tes
 	pool.probeTimeout = time.Second
 	pool.probeRunner = func(context.Context, string, N.Dialer) (uint16, error) { return 1, nil }
 
-	provider, err := NewBuiltinAIServiceTLSTargetProvider(nil)
+	// AI service TLS provider is sealed — lifecycle must not wire it.
+	if _, err := NewBuiltinAIServiceTLSTargetProvider(nil); err == nil {
+		t.Fatal("expected sealed builtin AI service provider to be rejected")
+	}
+	// Exercise shared scheduler lifecycle with the non-AI YouTube TLS provider.
+	provider, err := NewBuiltinYouTubeTLSTargetProvider(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runner := NewCapabilityProbeRunner(nil)
 	runner.tlsProbe = func(context.Context, N.Dialer, ProbeTarget) ProbeRawResult {
 		return ProbeRawResult{TLSHandshakeOK: true}
-	}
-	runner.httpClientFactory = func(_ context.Context, _ N.Dialer, target ProbeTarget) (probeHTTPClient, error) {
-		return &probeHTTPClientFunc{do: func(*http.Request) (*http.Response, error) {
-			statusCode := http.StatusUnauthorized
-			if target.Capability == ProbeCapabilityWebWAF {
-				statusCode = http.StatusOK
-			}
-			return &http.Response{
-				StatusCode: statusCode, TLS: &tls.ConnectionState{}, Header: make(http.Header),
-				Body: io.NopCloser(bytes.NewReader([]byte(`{"error":"authentication required"}`))),
-			}, nil
-		}}, nil
 	}
 	pool.capabilityProvider = provider
 	pool.capabilityServiceIDs = provider.ServiceIDs()
@@ -148,13 +141,17 @@ func TestAdaptivePoolAIServiceControllersShareSchedulerAndIsolateEvidence(t *tes
 	}
 	pool.OnRuntimeEpochPublishCommit()
 	defer pool.OnRuntimeEpochRetire()
+	wantServices := len(provider.ServiceIDs())
+	if wantServices == 0 {
+		t.Fatal("youtube provider returned no service IDs")
+	}
 	deadline := time.Now().Add(2 * time.Second)
-	for pool.AdaptiveStatus().CapabilityCyclesCompleted < 5 && time.Now().Before(deadline) {
+	for pool.AdaptiveStatus().CapabilityCyclesCompleted < uint64(wantServices) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	status := pool.AdaptiveStatus()
-	if status.CapabilityCyclesCompleted != 5 || len(pool.capabilityControllers) != 5 || status.CapabilityInitFailures != 0 || status.CapabilitySuiteFailures != 0 {
-		t.Fatalf("multi-service capability runtime did not complete: status=%+v controllers=%d", status, len(pool.capabilityControllers))
+	if status.CapabilityCyclesCompleted != uint64(wantServices) || len(pool.capabilityControllers) != wantServices || status.CapabilityInitFailures != 0 || status.CapabilitySuiteFailures != 0 {
+		t.Fatalf("capability runtime did not complete: status=%+v controllers=%d want=%d", status, len(pool.capabilityControllers), wantServices)
 	}
 	snapshot := pool.catalog.load()
 	for _, serviceID := range provider.ServiceIDs() {

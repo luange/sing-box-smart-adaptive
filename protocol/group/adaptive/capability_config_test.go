@@ -73,7 +73,7 @@ func TestAdaptivePoolCapabilityConfigIsExplicitAndDoesNotFetchDuringNew(t *testi
 	}
 	pool := outbound.(*AdaptivePool)
 	defer pool.Close()
-	if pool.capabilityProvider == nil || pool.capabilityController != nil {
+	if pool.capabilityProvider == nil || len(pool.capabilityControllers) != 0 {
 		t.Fatal("valid capability config fetched or started before publish")
 	}
 	if pool.stateWriter != nil {
@@ -124,7 +124,7 @@ func TestAdaptivePoolBuiltinYouTubeTLSCapabilityNeedsNoManifest(t *testing.T) {
 	}
 }
 
-func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing.T) {
+func TestAdaptivePoolBuiltinAIServiceCapabilityIsSealed(t *testing.T) {
 	ctx := service.ContextWith[adapter.OutboundManager](context.Background(), &capabilityConfigOutboundManager{})
 	options := option.AdaptivePoolOutboundOptions{
 		GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"node"}},
@@ -134,18 +134,11 @@ func TestAdaptivePoolBuiltinAIServiceCapabilityConfiguresFiveServices(t *testing
 			RefreshInterval: badoption.Duration(time.Minute), Timeout: badoption.Duration(time.Second), Quorum: 1, CommonModeMinNodes: 2,
 		},
 	}
-	outbound, err := New(ctx, nil, nil, "builtin-ai", options)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := New(ctx, nil, nil, "builtin-ai", options); err == nil {
+		t.Fatal("sealed builtin_ai_service_tls was accepted")
 	}
-	pool := outbound.(*AdaptivePool)
-	defer pool.Close()
-	if len(pool.capabilityServiceIDs) != 5 {
-		t.Fatalf("unexpected capability services: %v", pool.capabilityServiceIDs)
-	}
-	options.Capability.BuiltinYouTubeTLS = true
-	if _, err = New(ctx, nil, nil, "ambiguous-ai", options); err == nil {
-		t.Fatal("overlapping builtin capability modes were accepted")
+	if _, err := NewBuiltinCapabilityTargetProvider(nil, false, true, false); err == nil {
+		t.Fatal("sealed AI builtin provider was constructed")
 	}
 }
 

@@ -14,12 +14,10 @@ type builtinServiceTarget struct {
 	capability ProbeCapability
 }
 
-var builtinAIServiceTargets = map[string]builtinServiceTarget{
+// builtinServiceTargets only lists production-allowed builtin probes.
+// AI auth_http/web_waf service tables were removed — sealed and ineffective.
+var builtinServiceTargets = map[string]builtinServiceTarget{
 	"youtube":          {url: "https://www.youtube.com/", capability: ProbeCapabilityTLS},
-	"gemini":           {url: "https://www.google.com/", capability: ProbeCapabilityTLS},
-	"openai_api":       {url: "https://api.openai.com/v1/models", capability: ProbeCapabilityAuthHTTP},
-	"chatgpt_web":      {url: "https://chatgpt.com/", capability: ProbeCapabilityWebWAF},
-	"claude":           {url: "https://api.anthropic.com/v1/models", capability: ProbeCapabilityAuthHTTP},
 	"exit_identity_v4": {url: "https://api4.ipify.org/", capability: ProbeCapabilityExitIdentity},
 	"exit_identity_v6": {url: "https://api6.ipify.org/", capability: ProbeCapabilityExitIdentity},
 }
@@ -47,28 +45,25 @@ func NewBuiltinYouTubeTLSTargetProvider(clock Clock) (*BuiltinYouTubeTLSTargetPr
 	return provider, nil
 }
 
+// NewBuiltinAIServiceTLSTargetProvider is sealed. AI service probing proved
+// ineffective; AdaptivePool.New also rejects builtin_ai_service_tls config.
 func NewBuiltinAIServiceTLSTargetProvider(clock Clock) (*BuiltinYouTubeTLSTargetProvider, error) {
-	if clock == nil {
-		clock = realClock{}
-	}
-	provider := &BuiltinYouTubeTLSTargetProvider{
-		clock: clock, services: []string{"youtube", "gemini", "openai_api", "chatgpt_web", "claude"},
-		snapshots: make(map[string]*ProbeTargetSnapshot),
-	}
-	if err := provider.Refresh(context.Background()); err != nil {
-		return nil, err
-	}
-	return provider, nil
+	_ = clock
+	return nil, errors.New("adaptive builtin AI service capability is sealed")
 }
 
 func NewBuiltinCapabilityTargetProvider(clock Clock, includeYouTube, includeAI, includeExitIdentity bool) (*BuiltinYouTubeTLSTargetProvider, error) {
 	if clock == nil {
 		clock = realClock{}
 	}
-	services := make([]string, 0, 6)
 	if includeAI {
-		services = append(services, "youtube", "gemini", "openai_api", "chatgpt_web", "claude")
-	} else if includeYouTube {
+		// Keep the parameter for API stability with tests that assert rejection
+		// at the config boundary; providers themselves must not enable AI sets
+		// for production pools.
+		return nil, errors.New("adaptive builtin AI service capability is sealed")
+	}
+	services := make([]string, 0, 6)
+	if includeYouTube {
 		services = append(services, "youtube")
 	}
 	if includeExitIdentity {
@@ -109,7 +104,7 @@ func (p *BuiltinYouTubeTLSTargetProvider) Refresh(context.Context) error {
 	expiresAt := now.Add(7 * 24 * time.Hour)
 	snapshots := make(map[string]*ProbeTargetSnapshot, len(p.services))
 	for _, serviceID := range p.services {
-		spec, loaded := builtinAIServiceTargets[serviceID]
+		spec, loaded := builtinServiceTargets[serviceID]
 		if !loaded {
 			return errors.New("adaptive builtin service target is unknown")
 		}

@@ -84,10 +84,6 @@ func (r *CapabilityProbeRunner) Run(ctx context.Context, dialer N.Dialer, target
 	}
 	request.Header.Set("Accept-Encoding", "identity")
 	request.Header.Set("User-Agent", "sing-box-adaptive-probe/1")
-	if target.Capability == ProbeCapabilityWebWAF {
-		request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		request.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-	}
 	if target.Capability == ProbeCapabilityRange && target.Range != nil {
 		request.Header.Set("Range", "bytes="+strconv.FormatInt(target.Range.Start, 10)+"-"+strconv.FormatInt(target.Range.End, 10))
 	}

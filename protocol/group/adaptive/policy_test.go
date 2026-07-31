@@ -1,6 +1,7 @@
 package adaptive
 
 import (
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -93,6 +94,35 @@ func TestStrictAffinityLeaseFailsOverOnlyAfterLeasedNodeIsUnavailable(t *testing
 	}
 }
 
+func TestStrictAffinityReplacementUsesCooldownNotPureRankThrash(t *testing.T) {
+	// After the leased identity dies, the next plan must not hop to every
+	// slightly-faster node. Cooldown keeps the remembered replacement stable.
+	health := NewHealthStore(time.Hour, 32)
+	dead := Candidate{ID: NodeID{0xd1}, Handle: NodeHandle{NodeID: NodeID{0xd1}, Slot: 1, Version: 1}, PrimaryTag: "dead"}
+	stable := Candidate{ID: NodeID{0xd2}, Handle: NodeHandle{NodeID: NodeID{0xd2}, Slot: 2, Version: 1}, PrimaryTag: "stable"}
+	faster := Candidate{ID: NodeID{0xd3}, Handle: NodeHandle{NodeID: NodeID{0xd3}, Slot: 3, Version: 1}, PrimaryTag: "faster"}
+	for range 3 {
+		health.Observe(Observation{NodeID: dead.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeFailure})
+	}
+	health.Observe(Observation{NodeID: stable.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	health.Observe(Observation{NodeID: faster.ID, NodeSlot: 3, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	engine := NewPolicyEngine(health, 3, "fallback").BindSwitchStability(0.15, time.Minute)
+	service := ServiceContext{ID: "chatgpt_web", AffinityID: "chatgpt_web", Session: SessionKey{7}, Mode: ModeStrictAffinity, Transport: N.NetworkTCP}
+	// Prior successful replacement remembered as sticky.
+	engine.RememberSelection(engine.stickyKey(service), stable.Handle, time.Now())
+	lease := &SessionLease{NodeID: dead.ID, NodeSlot: 1, NodeVersion: 1, ServiceID: service.ID, Mode: service.Mode}
+	plan, err := engine.Plan(testExecutionSnapshot(dead, faster, stable), service, lease, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidates[0].ID != stable.ID {
+		t.Fatalf("strict replacement ignored cooldown sticky: reason=%s first=%+v", plan.Reason, plan.Candidates[0])
+	}
+	if plan.Reason != ReasonSwitchCooldown && plan.Reason != ReasonStickyMargin {
+		t.Fatalf("expected sticky/cooldown reason after strict lease break, got %s", plan.Reason)
+	}
+}
+
 func TestRealTransportFailureDownranksGenericProbeWinner(t *testing.T) {
 	health := NewHealthStore(time.Hour, 32)
 	fastButBroken := Candidate{ID: NodeID{31}, Handle: NodeHandle{NodeID: NodeID{31}, Slot: 1, Version: 1}, PrimaryTag: "fast-but-broken"}
@@ -177,16 +207,34 @@ func TestPolicyUsesBoundedWarmingFallbackWhenEveryBreakerIsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Reason != ReasonWarmingFallback || len(plan.Candidates) != 2 || !plan.allowBlocked {
-		t.Fatalf("all-open startup did not receive bounded fallback: %+v", plan)
+	if plan.Reason != ReasonWarmingFallback || len(plan.Candidates) != 1 || !plan.allowBlocked || !plan.disableHedge {
+		t.Fatalf("all-open startup must be single-candidate no-hedge fallback: %+v", plan)
 	}
-	permit, allowed := plan.TryAcquireAttemptPermit(candidates[0].ID, time.Now())
+	chosen := plan.Candidates[0]
+	permit, allowed := plan.TryAcquireAttemptPermit(chosen.ID, time.Now())
 	if !allowed || permit == nil {
 		t.Fatal("last-resort candidate was not permitted")
 	}
 	permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainEndpoint: OutcomeSuccess, DomainTransport: OutcomeSuccess}, time.Now(), time.Millisecond, "recovered")
-	if status := health.EndpointHandle(candidates[0].Handle); status.Health != HealthHealthy || status.Breaker != BreakerClosed {
+	if status := health.EndpointHandle(chosen.Handle); status.Health != HealthHealthy || status.Breaker != BreakerClosed {
 		t.Fatalf("successful last-resort attempt did not recover breaker: %+v", status)
+	}
+}
+
+func TestDualStackScorePrefersHealthyFamilyDelay(t *testing.T) {
+	// v6 path is terrible; v4 is fine. tcp/any rank must not use the dead family delay.
+	health := NewHealthStore(time.Hour, 32)
+	node := Candidate{ID: NodeID{0xe1}, Handle: NodeHandle{NodeID: NodeID{0xe1}, Slot: 1, Version: 1}, PrimaryTag: "dual"}
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 40 * time.Millisecond})
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeSuccess, Delay: 50 * time.Millisecond})
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeSuccess, Delay: 800 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	score := engine.candidateScore(node, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/any"})
+	if score.ObservedDelay > 100*time.Millisecond {
+		t.Fatalf("dual-stack score used dead/slow family delay: %+v", score)
+	}
+	if score.DominantEvidence != "tcp/ipv4" && score.SmoothedDelay > 100*time.Millisecond {
+		t.Fatalf("expected v4-dominated score, got %+v", score)
 	}
 }
 
@@ -449,5 +497,111 @@ func TestEarlyFailureRemovesOnlyMatchingRecentStickySelection(t *testing.T) {
 	engine.RememberSelection(engine.stickyKey(service), handle, now)
 	if engine.ForgetSelectionAfterEarlyFailure(service, handle, now.Add(earlySwitchWindow+time.Second)) {
 		t.Fatal("old failure incorrectly removed stable sticky selection")
+	}
+}
+
+func TestPlanFilteringDoesNotMutateBreakerState(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_100_000, 0)}
+	health := NewHealthStoreWithClock(time.Hour, 32, clock, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute, JitterFraction: 0})
+	node := Candidate{ID: NodeID{3, 0, 1}, Handle: NodeHandle{NodeID: NodeID{3, 0, 1}, Slot: 1, Version: 1}, PrimaryTag: "n1"}
+	// Open breaker with cooldown still active.
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeFailure, At: clock.Now()})
+	before := health.EndpointHandle(node.Handle)
+	if before.Breaker != BreakerOpen {
+		t.Fatalf("setup expected open breaker: %+v", before)
+	}
+	engine := NewPolicyEngine(health, 2, "fallback")
+	service := ServiceContext{ID: "site", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4"}
+	// Multiple plans must not advance open -> cooldown purely by filtering.
+	for range 5 {
+		_, err := engine.Plan(testExecutionSnapshot(node), service, nil, nil)
+		if err != ErrNoEligibleCandidates && err != nil {
+			// warming fallback may succeed with allowBlocked
+		}
+		_ = err
+	}
+	after := health.EndpointHandle(node.Handle)
+	if after.Breaker != before.Breaker || after.CooldownUntil != before.CooldownUntil {
+		t.Fatalf("plan filtering mutated breaker: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestExclusionReasonsSummarizeAllBrokenPaths(t *testing.T) {
+	health := NewHealthStoreWithClock(time.Hour, 32, realClock{}, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute, JitterFraction: 0})
+	node := Candidate{ID: NodeID{3, 0, 2}, Handle: NodeHandle{NodeID: NodeID{3, 0, 2}, Slot: 1, Version: 1}, PrimaryTag: "n2"}
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "udp_dns/ipv4", Outcome: OutcomeFailure, Reason: "dns fail"})
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeFailure, Reason: "tcp6 fail"})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	reasons := engine.ExclusionReasons(node, ServiceContext{})
+	if len(reasons) < 2 {
+		t.Fatalf("expected multiple path exclusions, got %v", reasons)
+	}
+	joined := strings.Join(reasons, ",")
+	if !strings.Contains(joined, "udp_dns/ipv4") || !strings.Contains(joined, "tcp/ipv6") {
+		t.Fatalf("path labels missing from exclusions: %v", reasons)
+	}
+}
+
+func TestAffinityModeDisabledSkipsSticky(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	fast := Candidate{ID: NodeID{1, 1, 1}, Handle: NodeHandle{NodeID: NodeID{1, 1, 1}, Slot: 1, Version: 1}, PrimaryTag: "fast"}
+	slow := Candidate{ID: NodeID{2, 2, 2}, Handle: NodeHandle{NodeID: NodeID{2, 2, 2}, Slot: 2, Version: 1}, PrimaryTag: "slow"}
+	health.Observe(Observation{NodeID: fast.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeSuccess, Delay: 20 * time.Millisecond})
+	health.Observe(Observation{NodeID: slow.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeSuccess, Delay: 200 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, time.Minute).BindAffinityMode("disabled")
+	service := ServiceContext{ID: "svc", AffinityID: "svc", Mode: ModeAdaptive, Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4", Session: SessionKey{9}}
+	engine.RememberSelection(engine.stickyKey(service), slow.Handle, time.Now())
+	plan, err := engine.Plan(testExecutionSnapshot(fast, slow), service, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Candidates[0].ID != fast.ID {
+		t.Fatalf("disabled affinity still preferred sticky slow node: %+v", plan)
+	}
+}
+
+func TestRankUsesConcreteDialFamilyNotPeer(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	node := Candidate{ID: NodeID{3, 3, 3}, Handle: NodeHandle{NodeID: NodeID{3, 3, 3}, Slot: 1, Version: 1}, PrimaryTag: "n"}
+	// v4 is fast; v6 is terrible — dial family ipv4 must rank on v4 only.
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeSuccess, Delay: 15 * time.Millisecond})
+	health.Observe(Observation{NodeID: node.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv6", Outcome: OutcomeSuccess, Delay: 800 * time.Millisecond})
+	engine := NewPolicyEngine(health, 2, "fallback")
+	score := engine.candidateScore(node, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4"})
+	// Ranking delay must come from the dial family ledger (v4), not the slower v6 peer.
+	if score.ObservedDelay != 15*time.Millisecond {
+		t.Fatalf("concrete dial family rank delay mismatch: %+v", score)
+	}
+	// Dual-stack aggregate would pick min(15,800)=15 too; pin path label when transport dominates.
+	name, status := engine.transportScoreStatus(node.Handle, ServiceContext{Transport: N.NetworkTCP, HealthTransport: "tcp/ipv4"})
+	if name != "tcp/ipv4" || status.RankingDelay() != 15*time.Millisecond {
+		t.Fatalf("transportScoreStatus did not pin dial family: name=%s status=%+v", name, status)
+	}
+}
+
+func TestServiceAndTransportRecoveryIndependent(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_100_000, 0)}
+	health := NewHealthStoreWithClock(time.Hour, 32, clock, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Millisecond, MaxCooldown: time.Second, JitterFraction: 0})
+	handle := NodeHandle{NodeID: NodeID{4, 4, 4}, Slot: 1, Version: 1}
+	// Open both domains.
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: 1, NodeVersion: 1, Scope: DomainTransport, Transport: "tcp/ipv4", Outcome: OutcomeFailure, At: clock.Now()})
+	health.Observe(Observation{NodeID: handle.NodeID, NodeSlot: 1, NodeVersion: 1, Scope: DomainService, Service: "svc", Outcome: OutcomeFailure, At: clock.Now()})
+	clock.Advance(2 * time.Millisecond)
+	// Recover transport only via half-open settlement (two independent successes).
+	for i := 0; i < 2; i++ {
+		permit, ok := health.TryAcquireDomainPermitHandle(handle, DomainTransport, "tcp/ipv4", "", clock.Now())
+		if !ok {
+			t.Fatalf("transport permit %d", i)
+		}
+		permit.CompleteDomains(map[FailureDomain]ObservationOutcome{DomainTransport: OutcomeSuccess}, clock.Now(), time.Millisecond, "")
+		clock.Advance(time.Millisecond)
+	}
+	transport := health.StatusHandle(handle, DomainTransport, "tcp/ipv4", "")
+	service := health.StatusHandle(handle, DomainService, "", "svc")
+	if transport.Breaker != BreakerClosed || transport.Health != HealthHealthy {
+		t.Fatalf("transport did not recover independently: %+v", transport)
+	}
+	if service.Breaker == BreakerClosed && service.Health == HealthHealthy {
+		t.Fatalf("service recovered from transport success: %+v", service)
 	}
 }

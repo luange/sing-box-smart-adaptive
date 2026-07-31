@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +27,7 @@ type businessObservation struct {
 	evidence       ObservationEvidence
 	service        ServiceContext
 	payloadOnce    sync.Once
+	udpPathOnce    sync.Once
 	failureOnce    sync.Once
 	throughputOnce sync.Once
 	releaseOnce    sync.Once
@@ -36,11 +38,6 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 		return
 	}
 	o.failureOnce.Do(func() {
-		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, time.Now())
-		if !allowed {
-			o.pool.observationPermitBusy.Add(1)
-			return
-		}
 		evidence := o.evidence
 		evidence.Source = SourceTLS
 		evidence.Stage = StageServiceApplication
@@ -48,12 +45,24 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 		evidence.Outcome = OutcomeFailure
 		evidence.Failure = failure
 		evidence.Delay = delay
-		evidence.At = time.Now()
+		evidence.At = o.pool.health.Now()
 		evidence.Reason = reason
-		reducer := &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.pool.health.Now())
+		var reducer *HealthObservationReducer
+		if !allowed {
+			// Half-open owner busy: still record quality (non-breaker) so concurrent
+			// failures are not silently dropped — learning continues without stealing tokens.
+			o.pool.observationPermitBusy.Add(1)
+			if confidence > ConfidenceLow {
+				evidence.Confidence = ConfidenceLow
+			}
+			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		} else {
+			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
-		if publishErr == nil && disposition == IngestAccepted && confidence >= ConfidenceHigh {
+		if publishErr == nil && disposition == IngestAccepted && confidence >= ConfidenceHigh && allowed {
 			o.pool.businessTLSFailures.Add(1)
 			earlyFailure := o.pool.policy != nil && o.pool.policy.ForgetSelectionAfterEarlyFailure(o.service, o.evidence.Handle, evidence.At)
 			if earlyFailure {
@@ -84,20 +93,25 @@ func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) 
 		confidence := ConfidenceLow
 		failure := FailureConnect
 		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+			// Timeouts stay low-confidence — do not open breakers on slow DNS alone.
 			failure = FailureTimeout
-		}
-		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+			confidence = ConfidenceLow
+		} else if isNodeNetworkIOError(err) {
+			// Strong network errors (reset/unreachable/refused/…) open transport breakers.
 			confidence = ConfidenceHigh
 		}
 		evidence := o.evidence
 		evidence.Source = SourceUDP
 		evidence.Stage = StageDestinationTransport
-		evidence.NetworkPath = serviceHealthTransport(o.service)
+		evidence.NetworkPath = normalizeHealthTransportPath(serviceHealthTransport(o.service))
+		if evidence.NetworkPath == "" {
+			evidence.NetworkPath = serviceHealthTransport(o.service)
+		}
 		evidence.Confidence = confidence
 		evidence.Outcome = OutcomeFailure
 		evidence.Failure = failure
 		evidence.Delay = delay
-		evidence.At = time.Now()
+		evidence.At = o.pool.health.Now()
 		evidence.Reason = errorReason(err)
 		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
@@ -140,11 +154,9 @@ func (o *businessObservation) observePayload(source ObservationSource, delay tim
 		}
 	}()
 	o.payloadOnce.Do(func() {
-		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, time.Now())
-		if !allowed {
-			o.pool.observationPermitBusy.Add(1)
-			return
-		}
+		// Half-open owner busy: still quality-learn at low confidence so concurrent
+		// successes are not silently dropped (parity with observeTLSFailure).
+		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.pool.health.Now())
 		evidence := o.evidence
 		evidence.Source = source
 		evidence.Stage = StageServiceApplication
@@ -152,11 +164,98 @@ func (o *businessObservation) observePayload(source ObservationSource, delay tim
 		evidence.Outcome = OutcomeSuccess
 		evidence.Failure = FailureNone
 		evidence.Delay = delay
-		evidence.At = time.Now()
-		reducer := &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		evidence.At = o.pool.health.Now()
+		var reducer *HealthObservationReducer
+		if !allowed {
+			o.pool.observationPermitBusy.Add(1)
+			evidence.Confidence = ConfidenceLow
+			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		} else {
+			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
 	})
+}
+
+// observeUDPSuccess closes the passive UDP path loop:
+//  1. transport/DNS path evidence so udp_dns / udp_data ledgers can recover;
+//  2. service payload success only when the payload is admissible for that path
+//     (DNS requires a response-shaped packet — garbage must not wash service half-open).
+func (o *businessObservation) observeUDPSuccess(payload []byte, delay time.Duration) {
+	if o == nil || len(payload) == 0 {
+		return
+	}
+	pathOK := o.observeUDPPathSuccess(payload, delay)
+	class, _ := splitHealthTransport(normalizeHealthTransportPath(serviceHealthTransport(o.service)))
+	if class == healthTransportUDPDNS && !pathOK {
+		// Non-DNS bytes on a DNS path: no transport success and no service success.
+		return
+	}
+	o.observePayload(SourceUDP, delay)
+}
+
+// observeUDPPathSuccess reports whether the payload is admissible path evidence.
+// False means the payload must not count for transport or service success.
+func (o *businessObservation) observeUDPPathSuccess(payload []byte, delay time.Duration) bool {
+	if o == nil || len(payload) == 0 || o.pool == nil || o.pool.health == nil {
+		return false
+	}
+	path := normalizeHealthTransportPath(serviceHealthTransport(o.service))
+	if path == "" {
+		path = serviceHealthTransport(o.service)
+	}
+	class, _ := splitHealthTransport(path)
+	if class == healthTransportUDPDNS && !looksLikeDNSResponse(payload) {
+		// DNS success requires a response-shaped packet (QR bit). Bare noise
+		// must not wash a broken resolver path — or service half-open — clean.
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			o.pool.recordObservationPanic()
+		}
+	}()
+	o.udpPathOnce.Do(func() {
+		source := SourceUDP
+		stage := StageDestinationTransport
+		if class == healthTransportUDPDNS {
+			source = SourceDNS
+			stage = StageDNSHealth
+		}
+		evidence := o.evidence
+		evidence.Source = source
+		evidence.Stage = stage
+		evidence.NetworkPath = path
+		evidence.Confidence = ConfidenceHigh
+		evidence.Outcome = OutcomeSuccess
+		evidence.Failure = FailureNone
+		evidence.Delay = delay
+		evidence.At = o.pool.health.Now()
+		evidence.Reason = ""
+		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainTransport, path, "", o.pool.health.Now())
+		var reducer *HealthObservationReducer
+		if !allowed {
+			o.pool.observationPermitBusy.Add(1)
+			evidence.Confidence = ConfidenceLow
+			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		} else {
+			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+		}
+		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
+		o.pool.recordObservationResult(disposition, publishErr)
+	})
+	return true
+}
+
+// looksLikeDNSResponse is a minimal passive DNS QR check. It does not parse
+// questions or compare IDs (that belongs to active dns_health probes).
+func looksLikeDNSResponse(payload []byte) bool {
+	if len(payload) < 12 {
+		return false
+	}
+	// Header byte 2 bit 7 = QR (1 = response).
+	return payload[2]&0x80 != 0
 }
 
 func (o *businessObservation) observeThroughput(bytes int64, elapsed time.Duration) {
@@ -175,7 +274,7 @@ func (o *businessObservation) observeThroughput(bytes int64, elapsed time.Durati
 		evidence.Outcome = OutcomeSuccess
 		evidence.Failure = FailureNone
 		evidence.ThroughputBPS = bps
-		evidence.At = time.Now()
+		evidence.At = o.pool.health.Now()
 		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
@@ -235,17 +334,22 @@ func (c *observedConn) Read(payload []byte) (int, error) {
 }
 
 func classifyEarlyTLSFailure(err error) (FailureClass, ObservationConfidence, bool) {
-	// A zero-byte EOF is ambiguous: browsers routinely abandon speculative
-	// address/HTTP3 races and some proxy transports surface that local decision
-	// as EOF. Penalizing it caused healthy AI nodes to flap. Explicit reset,
-	// timeout, and protocol errors remain actionable evidence.
+	// EOF / local close / cancel: browsers abandon speculative races; never punish.
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return FailureNone, 0, false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+		// Timeout alone is weak for identity thrash — low confidence, no hard open
+		// until the breaker policy says so via weight (typically non-opening).
 		return FailureTimeout, ConfidenceLow, true
 	}
-	return FailureTLS, ConfidenceHigh, true
+	// Write/Read early path: only strong network I/O evidence may open service
+	// breakers and invalidate leases. Opaque framing/local errors must not.
+	// (Parity with ReadFrom's isNodeNetworkIOError gate.)
+	if isNodeNetworkIOError(err) {
+		return FailureTLS, ConfidenceHigh, true
+	}
+	return FailureNone, 0, false
 }
 
 func (c *observedConn) Close() error {
@@ -284,7 +388,9 @@ func (c *observedConn) Write(payload []byte) (int, error) {
 	if count > 0 {
 		c.writeBytes.Add(int64(count))
 	}
-	if err != nil {
+	// Same network-only attribution as ReadFrom — local/body errors must not
+	// open identity breakers via the Write path.
+	if err != nil && isNodeNetworkIOError(err) {
 		c.observeWriteFailure(err)
 	}
 	return count, err
@@ -300,7 +406,10 @@ func (c *observedConn) ReadFrom(reader io.Reader) (int64, error) {
 		if count > 0 {
 			c.writeBytes.Add(count)
 		}
-		if err != nil {
+		// ReadFrom errors may originate from the upstream reader (file/body
+		// cancel) rather than the network socket. Only attribute clear network
+		// I/O failures to node health.
+		if err != nil && isNodeNetworkIOError(err) {
 			c.observeWriteFailure(err)
 		}
 		if err == nil || errors.Is(err, io.EOF) {
@@ -313,6 +422,77 @@ func (c *observedConn) ReadFrom(reader io.Reader) (int64, error) {
 		c.observeThroughput()
 	}
 	return count, err
+}
+
+// isNodeNetworkIOError reports whether err is strong evidence of a network-path
+// problem rather than a local/upstream reader failure (request body cancel,
+// file read error, etc.).
+//
+// net.OpError is intentionally narrow: only dial/read/write/accept ops with a
+// network-class syscall or timeout count. Arbitrary OpError wrappers around
+// local failures must not mark the node unhealthy.
+func isNodeNetworkIOError(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return isNetworkOpError(opErr)
+	}
+	return isNetworkSyscallError(err)
+}
+
+func isNetworkOpError(opErr *net.OpError) bool {
+	if opErr == nil {
+		return false
+	}
+	switch opErr.Op {
+	case "dial", "read", "write", "accept", "readfrom", "writeto":
+	default:
+		// e.g. file/path ops accidentally wrapped as OpError must not count.
+		return false
+	}
+	if opErr.Timeout() {
+		return true
+	}
+	if opErr.Err == nil {
+		return false
+	}
+	if isTimeoutError(opErr.Err) || errors.Is(opErr.Err, context.DeadlineExceeded) {
+		return true
+	}
+	if isNetworkSyscallError(opErr.Err) {
+		return true
+	}
+	var syscallErr *os.SyscallError
+	if errors.As(opErr.Err, &syscallErr) {
+		return isNetworkSyscallError(syscallErr.Err)
+	}
+	return false
+}
+
+func isNetworkSyscallError(err error) bool {
+	switch {
+	case errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, syscall.ENETUNREACH),
+		errors.Is(err, syscall.EHOSTUNREACH),
+		errors.Is(err, syscall.ETIMEDOUT),
+		errors.Is(err, syscall.ECONNABORTED):
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *observedConn) WriteTo(writer io.Writer) (int64, error) {
@@ -448,15 +628,15 @@ type observedPacketConn struct {
 	closeErr    error
 }
 
-func (c *observedPacketConn) observeRead(count int) {
+func (c *observedPacketConn) observeRead(payload []byte, count int) {
 	if count > 0 {
-		c.observation.observePayload(SourceUDP, time.Since(c.startedAt))
+		c.observation.observeUDPSuccess(payload[:count], time.Since(c.startedAt))
 	}
 }
 
 func (c *observedPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 	count, source, err := c.PacketConn.ReadFrom(payload)
-	c.observeRead(count)
+	c.observeRead(payload, count)
 	if count == 0 && err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}
@@ -491,8 +671,12 @@ type observedPacketReaderConn struct {
 func (c *observedPacketReaderConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
-	c.observeRead(buffer.Len() - before)
-	if buffer.Len() == before && err != nil {
+	got := buffer.Len() - before
+	if got > 0 {
+		// ReadPacket appends into buffer; slice only the newly written bytes.
+		c.observeRead(buffer.Bytes()[before:], got)
+	}
+	if got == 0 && err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}
 	return destination, err
@@ -520,8 +704,11 @@ type observedExtendedPacketConn struct {
 func (c *observedExtendedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
-	c.observeRead(buffer.Len() - before)
-	if buffer.Len() == before && err != nil {
+	got := buffer.Len() - before
+	if got > 0 {
+		c.observeRead(buffer.Bytes()[before:], got)
+	}
+	if got == 0 && err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}
 	return destination, err

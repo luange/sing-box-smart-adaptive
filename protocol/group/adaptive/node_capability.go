@@ -23,10 +23,25 @@ type NodeCapabilityProfile struct {
 	ThroughputBPS float64 `json:"throughput_bps,omitempty"`
 }
 
+// Path capability states exposed to operators. These are intentionally finer
+// than a bare available bool so "never probed" is not shown as verified OK.
+const (
+	PathStateUnknown        = "unknown"
+	PathStateHealthy        = "healthy"
+	PathStateDegraded       = "degraded"
+	PathStateUnreachable    = "unreachable"
+	PathStateOpen           = "open"
+	PathStateCooldown       = "cooldown"
+	PathStateCooldownReady  = "cooldown_ready"
+	PathStateHalfOpen       = "half_open"
+	PathStateRecoveryPending = "recovery_pending"
+)
+
 type PathCapability struct {
 	Path                string    `json:"path,omitempty"`
 	Available           bool      `json:"available"`
 	Known               bool      `json:"known"`
+	State               string    `json:"state,omitempty"`
 	Health              string    `json:"health,omitempty"`
 	Breaker             string    `json:"breaker,omitempty"`
 	SmoothedDelayMs     uint32    `json:"smoothed_delay_ms,omitempty"`
@@ -55,9 +70,12 @@ func (s *HealthStore) BuildCapabilityProfile(handle NodeHandle, now time.Time) N
 }
 
 func (s *HealthStore) pathCapability(handle NodeHandle, path string, now time.Time) PathCapability {
-	cap := PathCapability{Path: path, Available: true}
+	cap := PathCapability{Path: path, Available: true, State: PathStateUnknown}
 	if s == nil {
 		return cap
+	}
+	if now.IsZero() && s.clock != nil {
+		now = s.clock.Now()
 	}
 	var status HealthStatus
 	if path == "" {
@@ -73,20 +91,10 @@ func (s *HealthStore) pathCapability(handle NodeHandle, path string, now time.Ti
 	cap.BackoffMs = uint32(max(0, status.Backoff.Milliseconds()))
 	cap.OpenUntil = status.CooldownUntil
 	cap.Reason = status.Reason
-	if status.Health != HealthUnknown || status.Successes > 0 || status.Failures > 0 {
+	if status.Health != HealthUnknown || status.Successes > 0 || status.Failures > 0 || status.Breaker != BreakerClosed && status.Breaker != "" {
 		cap.Known = true
 	}
-	// Mirror CanAttempt: open/cooldown are hard exclusions. Half-open after the
-	// first recovery success remains eligible so confirmation traffic and
-	// bounded production retries are not starved.
-	switch status.Breaker {
-	case BreakerOpen, BreakerCooldown:
-		cap.Available = !status.CooldownUntil.IsZero() && !now.Before(status.CooldownUntil)
-	default:
-		if status.Health == HealthUnreachable && status.Breaker != BreakerHalfOpen {
-			cap.Available = false
-		}
-	}
+	cap.State, cap.Available = classifyPathCapability(status, now)
 	if !cap.Available {
 		if status.Reason != "" {
 			cap.LastFailure = status.Reason
@@ -95,10 +103,112 @@ func (s *HealthStore) pathCapability(handle NodeHandle, path string, now time.Ti
 		} else {
 			cap.LastFailure = string(status.Health)
 		}
-	} else if status.Breaker == BreakerHalfOpen && status.RecoverySuccesses < 2 {
+	} else if cap.State == PathStateRecoveryPending {
 		cap.LastFailure = "recovery_pending"
 	}
 	return cap
+}
+
+// classifyPathCapability is read-only: it never advances breaker state.
+// Available mirrors whether a new attempt may be considered (same idea as
+// availableReadOnly for a single path record).
+func classifyPathCapability(status HealthStatus, now time.Time) (state string, available bool) {
+	switch status.Breaker {
+	case BreakerOpen:
+		if status.CooldownUntil.IsZero() || now.Before(status.CooldownUntil) {
+			return PathStateOpen, false
+		}
+		// Cooldown elapsed; dial path may half-open on acquire, but evidence is
+		// not yet re-validated.
+		return PathStateCooldownReady, true
+	case BreakerCooldown:
+		if status.CooldownUntil.IsZero() || now.Before(status.CooldownUntil) {
+			return PathStateCooldown, false
+		}
+		return PathStateCooldownReady, true
+	case BreakerHalfOpen:
+		if status.RecoverySuccesses < 2 {
+			// Token-free half-open after first success remains dialable so the
+			// confirmation attempt is not starved; surface recovery_pending.
+			return PathStateRecoveryPending, true
+		}
+		return PathStateHalfOpen, true
+	}
+	switch status.Health {
+	case HealthHealthy:
+		return PathStateHealthy, true
+	case HealthDegraded:
+		return PathStateDegraded, true
+	case HealthUnreachable:
+		return PathStateUnreachable, false
+	default:
+		return PathStateUnknown, true
+	}
+}
+
+// RequiredPathKnownBlocked reports whether the service path is known-bad under
+// dual-stack policy. Used by status/Explain; Plan uses CanAttemptHandleReadOnly
+// (same transportPathEligible rule) without rebuilding a full portrait.
+func (s *HealthStore) RequiredPathKnownBlocked(handle NodeHandle, service ServiceContext, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	if now.IsZero() && s.clock != nil {
+		now = s.clock.Now()
+	}
+	return !s.transportPathEligible(handle, RequiredPathForService(service), now)
+}
+
+// dualStackFamilyPaths returns the concrete v4/v6 ledger keys for an aggregate
+// health path. ok is false for concrete family paths and unknown keys.
+func dualStackFamilyPaths(path string) (familyA, familyB string, ok bool) {
+	switch path {
+	case N.NetworkTCP, "tcp/any": // N.NetworkTCP == "tcp"
+		return "tcp/ipv4", "tcp/ipv6", true
+	case "udp_dns/any":
+		return "udp_dns/ipv4", "udp_dns/ipv6", true
+	case N.NetworkUDP, "udp/any", "udp_data/any": // N.NetworkUDP == "udp"
+		return "udp_data/ipv4", "udp_data/ipv6", true
+	default:
+		return "", "", false
+	}
+}
+
+// transportPathEligible reports whether the transport health path may still be
+// attempted. Dual-stack aggregates follow aggregateDualStackCapability; a
+// collapsed */any ledger entry only blocks when no family is known-good.
+func (s *HealthStore) transportPathEligible(handle NodeHandle, path string, now time.Time) bool {
+	if s == nil {
+		return true
+	}
+	if now.IsZero() && s.clock != nil {
+		now = s.clock.Now()
+	}
+	if familyA, familyB, isDual := dualStackFamilyPaths(path); isDual {
+		a := s.pathCapability(handle, familyA, now)
+		b := s.pathCapability(handle, familyB, now)
+		agg := aggregateDualStackCapability(path, a, b)
+		if agg.Known && !agg.Available {
+			// Both concrete families confirmed bad.
+			return false
+		}
+		if (a.Known && a.Available) || (b.Known && b.Available) {
+			// At least one family still usable — do not let a collapsed any-key
+			// failure eliminate the node.
+			return true
+		}
+		// Both unknown, or one bad + one unknown: fall through to the aggregate
+		// ledger key so dual-stack dials that only wrote tcp/any still count.
+	}
+	cap := s.pathCapability(handle, path, now)
+	return !cap.Known || cap.Available
+}
+
+// PeekAvailable is the preferred read-only availability entry point for
+// status/plan callers. Prefer this over CanAttemptHandle, which may advance
+// breaker labels on open expiry.
+func (s *HealthStore) PeekAvailable(handle NodeHandle, service ServiceContext, now time.Time) bool {
+	return s.CanAttemptHandleReadOnly(handle, service, now)
 }
 
 // ExplainExclusion returns a stable, non-sensitive reason when a candidate is
@@ -115,19 +225,62 @@ func (s *HealthStore) ExplainExclusion(handle NodeHandle, service ServiceContext
 		if endpoint.Health == HealthUnreachable || endpoint.Breaker == BreakerOpen || endpoint.Breaker == BreakerCooldown || endpoint.Breaker == BreakerHalfOpen {
 			return exclusionLabel("endpoint", endpoint)
 		}
-		transport := s.StatusHandle(handle, DomainTransport, serviceHealthTransport(service), "")
-		if transport.Health == HealthUnreachable || transport.Breaker == BreakerOpen || transport.Breaker == BreakerCooldown || transport.Breaker == BreakerHalfOpen {
-			return exclusionLabel(serviceHealthTransport(service), transport)
-		}
 		if service.ID != "" {
 			serviceStatus := s.StatusHandle(handle, DomainService, "", service.ID)
 			if serviceStatus.Health == HealthUnreachable || serviceStatus.Breaker == BreakerOpen || serviceStatus.Breaker == BreakerCooldown || serviceStatus.Breaker == BreakerHalfOpen {
 				return exclusionLabel("service:"+service.ID, serviceStatus)
 			}
 		}
+		// Prefer dual-stack / capability reason over a single aggregate key.
+		if s.RequiredPathKnownBlocked(handle, service, now) {
+			profile := s.BuildCapabilityProfile(handle, now)
+			if ok, reason := profile.SupportsService(service); !ok && reason != "" {
+				return reason
+			}
+		}
+		path := serviceHealthTransport(service)
+		transport := s.StatusHandle(handle, DomainTransport, path, "")
+		if transport.Health == HealthUnreachable || transport.Breaker == BreakerOpen || transport.Breaker == BreakerCooldown || transport.Breaker == BreakerHalfOpen {
+			return exclusionLabel(path, transport)
+		}
 		return "path_unavailable"
 	}
 	return ""
+}
+
+// ExplainAllPathExclusions summarizes every known-bad path for status views.
+// Unknown paths are omitted (fail-open).
+func (s *HealthStore) ExplainAllPathExclusions(handle NodeHandle, now time.Time) []string {
+	if s == nil {
+		return nil
+	}
+	if now.IsZero() && s.clock != nil {
+		now = s.clock.Now()
+	}
+	profile := s.BuildCapabilityProfile(handle, now)
+	paths := []PathCapability{
+		profile.Endpoint, profile.TCP4, profile.TCP6,
+		profile.DNSUDPv4, profile.DNSUDPv6, profile.DataUDPv4, profile.DataUDPv6,
+	}
+	var reasons []string
+	for _, path := range paths {
+		if !path.Known || path.Available {
+			continue
+		}
+		label := path.Path
+		if label == "" {
+			label = "endpoint"
+		}
+		detail := path.LastFailure
+		if detail == "" {
+			detail = path.State
+		}
+		if detail == "" {
+			detail = "unavailable"
+		}
+		reasons = append(reasons, exclusionLabel(label, HealthStatus{Reason: detail, Health: HealthState(path.Health), Breaker: BreakerState(path.Breaker)}))
+	}
+	return reasons
 }
 
 func exclusionLabel(scope string, status HealthStatus) string {
@@ -165,6 +318,9 @@ func (p NodeCapabilityProfile) SupportsService(service ServiceContext) (bool, st
 		if cap.LastFailure != "" {
 			return false, path + ":" + cap.LastFailure
 		}
+		if cap.State != "" {
+			return false, path + ":" + cap.State
+		}
 		return false, path + ":unavailable"
 	}
 	if service.Mode == ModeBulk && p.ThroughputBPS > 0 && !p.ThroughputOK {
@@ -189,38 +345,45 @@ func (p NodeCapabilityProfile) capabilityForPath(path string) PathCapability {
 	case "udp_data/ipv6":
 		return p.DataUDPv6
 	case N.NetworkTCP, "tcp/any":
-		// Prefer a known-good family; if either is known-bad and the other
-		// unknown/good, still allow (destination family decides later).
-		if p.TCP4.Known && p.TCP4.Available {
-			return p.TCP4
-		}
-		if p.TCP6.Known && p.TCP6.Available {
-			return p.TCP6
-		}
-		if p.TCP4.Known && !p.TCP4.Available && p.TCP6.Known && !p.TCP6.Available {
-			return p.TCP4
-		}
-		return PathCapability{Path: path, Available: true}
+		// Dual-stack aggregate: never let one known-bad family poison an
+		// unknown peer family. Block only when BOTH families are known-bad.
+		return aggregateDualStackCapability(path, p.TCP4, p.TCP6)
 	case N.NetworkUDP, "udp/any", "udp_data/any":
-		if p.DataUDPv4.Known && p.DataUDPv4.Available {
-			return p.DataUDPv4
-		}
-		if p.DataUDPv6.Known && p.DataUDPv6.Available {
-			return p.DataUDPv6
-		}
-		if p.DataUDPv4.Known && !p.DataUDPv4.Available && p.DataUDPv6.Known && !p.DataUDPv6.Available {
-			return p.DataUDPv4
-		}
-		return PathCapability{Path: path, Available: true}
+		return aggregateDualStackCapability(path, p.DataUDPv4, p.DataUDPv6)
 	case "udp_dns/any":
-		if p.DNSUDPv4.Known && p.DNSUDPv4.Available {
-			return p.DNSUDPv4
-		}
-		if p.DNSUDPv6.Known && p.DNSUDPv6.Available {
-			return p.DNSUDPv6
-		}
-		return PathCapability{Path: path, Available: true}
+		return aggregateDualStackCapability(path, p.DNSUDPv4, p.DNSUDPv6)
 	default:
-		return PathCapability{Path: path, Available: true}
+		return PathCapability{Path: path, Available: true, State: PathStateUnknown}
 	}
+}
+
+// aggregateDualStackCapability implements fail-open dual-stack policy:
+//   - any known-good family => available
+//   - both families known-bad => unavailable
+//   - one known-bad + one unknown => available (unknown fail-open)
+//   - both unknown => available unknown
+func aggregateDualStackCapability(path string, familyA, familyB PathCapability) PathCapability {
+	if familyA.Known && familyA.Available {
+		return PathCapability{Path: path, Available: true, Known: true, State: familyA.State, SmoothedDelayMs: familyA.SmoothedDelayMs}
+	}
+	if familyB.Known && familyB.Available {
+		return PathCapability{Path: path, Available: true, Known: true, State: familyB.State, SmoothedDelayMs: familyB.SmoothedDelayMs}
+	}
+	bothKnownBad := familyA.Known && !familyA.Available && familyB.Known && !familyB.Available
+	if bothKnownBad {
+		failure := familyA.LastFailure
+		if failure == "" {
+			failure = familyB.LastFailure
+		}
+		if failure == "" {
+			failure = "all_families_unavailable"
+		}
+		return PathCapability{
+			Path: path, Available: false, Known: true,
+			State: PathStateUnreachable, LastFailure: failure,
+		}
+	}
+	// One bad + one unknown, or both unknown: keep the node eligible so the
+	// concrete destination family can still succeed.
+	return PathCapability{Path: path, Available: true, Known: false, State: PathStateUnknown}
 }

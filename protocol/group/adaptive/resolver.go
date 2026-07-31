@@ -2,6 +2,7 @@ package adaptive
 
 import (
 	"errors"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -148,13 +150,146 @@ func serviceHealthTransport(service ServiceContext) string {
 	return service.Transport
 }
 
-func serviceAffinityFamily(serviceID string) string {
-	switch serviceID {
-	case "chatgpt_web", "claude", "gemini", "google_account", "apple_account", "microsoft_account", "cloudflare_challenge":
-		return "browser_identity"
-	default:
-		return serviceID
+// refineHealthTransportFamily upgrades a collapsed */any (or bare class) path to
+// a concrete family when the actual peer address family is known. Already-concrete
+// paths are left unchanged. This is how dual-stack dials stop poisoning both
+// families after only one address family was tried.
+func refineHealthTransportFamily(path, family string) string {
+	if path == "" || family == "" || family == healthFamilyAny {
+		return path
 	}
+	if family != healthFamilyIPv4 && family != healthFamilyIPv6 {
+		return path
+	}
+	class, currentFamily := splitHealthTransport(path)
+	if class == "" {
+		return path
+	}
+	if currentFamily != "" && currentFamily != healthFamilyAny {
+		return path
+	}
+	return class + "/" + family
+}
+
+func splitHealthTransport(path string) (class, family string) {
+	// N.NetworkTCP == "tcp", N.NetworkUDP == "udp"
+	switch path {
+	case N.NetworkTCP:
+		return healthTransportTCP, ""
+	case N.NetworkUDP:
+		return healthTransportUDPData, ""
+	case healthTransportUDPDNS, healthTransportUDPData:
+		return path, ""
+	}
+	if i := strings.IndexByte(path, '/'); i > 0 {
+		return path[:i], path[i+1:]
+	}
+	return path, ""
+}
+
+func familyFromNetAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	switch typed := addr.(type) {
+	case *net.TCPAddr:
+		return familyFromIP(typed.IP)
+	case *net.UDPAddr:
+		return familyFromIP(typed.IP)
+	case *net.IPAddr:
+		return familyFromIP(typed.IP)
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			host = addr.String()
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return familyFromIP(ip)
+		}
+	}
+	return ""
+}
+
+func familyFromIP(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	// Proxy tunnel local addresses (10.x, 127.x, link-local) are not the dial
+	// destination family. Using them pinned nearly every success to tcp/ipv4 and
+	// left real destination ledgers unknown in production.
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return ""
+	}
+	if ip.To4() != nil {
+		return healthFamilyIPv4
+	}
+	return healthFamilyIPv6
+}
+
+func familyFromSocksaddr(destination M.Socksaddr) string {
+	if !destination.IsValid() {
+		return ""
+	}
+	addr := destination.Addr
+	if !addr.IsValid() {
+		return ""
+	}
+	if addr.Is4() || addr.Is4In6() {
+		return healthFamilyIPv4
+	}
+	if addr.Is6() {
+		return healthFamilyIPv6
+	}
+	return ""
+}
+
+// observedHealthTransport is the ledger key for a dial/business observation.
+// Prefer destination IP (incl. FakeIP), then a *public* remote peer address.
+// Never trust private/loopback RemoteAddr from proxy tunnels. Falls back to the
+// service path (may remain */any) which still scores via aggregate ledgers.
+func observedHealthTransport(service ServiceContext, destination M.Socksaddr, remote net.Addr) string {
+	base := normalizeHealthTransportPath(serviceHealthTransport(service))
+	if family := familyFromSocksaddr(destination); family != "" {
+		return refineHealthTransportFamily(base, family)
+	}
+	if family := familyFromNetAddr(remote); family != "" {
+		return refineHealthTransportFamily(base, family)
+	}
+	return base
+}
+
+// normalizeHealthTransportPath maps bare class names onto the qualified ledger
+// vocabulary used by observation validation and dual-stack aggregates.
+func normalizeHealthTransportPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	// N.NetworkTCP == "tcp"; N.NetworkUDP == "udp"
+	switch path {
+	case N.NetworkTCP:
+		return healthTransportTCP + "/" + healthFamilyAny
+	case N.NetworkUDP:
+		return healthTransportUDPData + "/" + healthFamilyAny
+	case healthTransportUDPDNS:
+		return healthTransportUDPDNS + "/" + healthFamilyAny
+	case healthTransportUDPData:
+		return healthTransportUDPData + "/" + healthFamilyAny
+	default:
+		return path
+	}
+}
+
+// serviceAffinityFamily keys lease + sticky memory.
+//
+// Each identity-sensitive product keeps its own spine. The old shared
+// "browser_identity" bag coupled ChatGPT/Claude/Gemini/accounts so one product
+// breaker could bounce another product's egress — that was a real thrash path,
+// not a useful cookie-world optimization.
+func serviceAffinityFamily(serviceID string) string {
+	if serviceID == "" {
+		return "unknown"
+	}
+	return serviceID
 }
 
 func (r *ServiceResolver) SetOverride(serviceID string, mode PolicyMode, ttl time.Duration, now time.Time) error {

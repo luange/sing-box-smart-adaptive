@@ -69,12 +69,19 @@ func adaptivePoolRouter(server *Server) http.Handler {
 				render.JSON(w, request, map[string]any{"revision": group.AdaptiveStatus().ControlRevision, "overrides": control.AdaptiveServiceOverrides()})
 			})
 			router.Route("/{service}", func(router chi.Router) {
-				router.Put("/", updateAdaptiveServiceOverride)
-				router.Delete("/", deleteAdaptiveServiceOverride)
+				// Control-plane is read-only for service mode overrides in production.
+				// Writes caused silent policy drift away from config; use config reload instead.
+				router.Put("/", adaptiveServiceOverrideWritesDisabled)
+				router.Delete("/", adaptiveServiceOverrideWritesDisabled)
 			})
 		})
 	})
 	return router
+}
+
+func adaptiveServiceOverrideWritesDisabled(w http.ResponseWriter, request *http.Request) {
+	render.Status(request, http.StatusMethodNotAllowed)
+	render.JSON(w, request, newError("adaptive service override writes are disabled; change config and reload"))
 }
 
 func streamAdaptivePoolEvents(writer http.ResponseWriter, request *http.Request) {
@@ -89,7 +96,8 @@ func streamAdaptivePoolEvents(writer http.ResponseWriter, request *http.Request)
 	writer.Header().Set("Cache-Control", "no-cache, no-store")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.Header().Set("X-Accel-Buffering", "no")
-	ticker := time.NewTicker(time.Second)
+	// 3s status cadence: AdaptiveStatus clones health; 1Hz was pure control-plane tax.
+	ticker := time.NewTicker(3 * time.Second)
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	defer heartbeat.Stop()

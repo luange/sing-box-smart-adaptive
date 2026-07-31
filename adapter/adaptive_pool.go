@@ -46,12 +46,27 @@ type AdaptiveCandidateStatus struct {
 	SelectionScore        uint64                    `json:"selection_score,omitempty"`
 	DominantEvidence      string                    `json:"dominant_evidence,omitempty"`
 	FilterReason          string                    `json:"filter_reason,omitempty"`
+	FilterReasons         []string                  `json:"filter_reasons,omitempty"`
 	LastFailure           string                    `json:"last_failure,omitempty"`
 	LastFailureService    string                    `json:"last_failure_service,omitempty"`
 	LastFailurePath       string                    `json:"last_failure_path,omitempty"`
 	LastSelectionReason   string                    `json:"last_selection_reason,omitempty"`
-	Capabilities          *AdaptiveNodeCapabilities `json:"capabilities,omitempty"`
-	Paths                 []AdaptivePathStatus      `json:"paths,omitempty"`
+	LastSelectionService  string                    `json:"last_selection_service,omitempty"`
+	// ServiceMemories keeps recent per-service selection/failure notes so one
+	// service cannot erase another service's last outcome in the UI.
+	ServiceMemories []AdaptiveServiceMemory   `json:"service_memories,omitempty"`
+	Capabilities    *AdaptiveNodeCapabilities `json:"capabilities,omitempty"`
+	Paths           []AdaptivePathStatus      `json:"paths,omitempty"`
+}
+
+// AdaptiveServiceMemory is a per-service selection or failure snapshot.
+type AdaptiveServiceMemory struct {
+	ServiceID        string    `json:"service_id,omitempty"`
+	Path             string    `json:"path,omitempty"`
+	SelectionReason  string    `json:"selection_reason,omitempty"`
+	Failure          string    `json:"failure,omitempty"`
+	SelectedAt       time.Time `json:"selected_at,omitempty"`
+	FailedAt         time.Time `json:"failed_at,omitempty"`
 }
 
 // AdaptiveNodeCapabilities is the partial-availability portrait used by

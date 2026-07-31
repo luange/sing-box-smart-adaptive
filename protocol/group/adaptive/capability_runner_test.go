@@ -111,7 +111,8 @@ func TestCapabilityProbeRunnerTLSAndErrorBoundaries(t *testing.T) {
 func TestCapabilityProbeRunnerDetectsWAFChallengeWithoutPersistingHeaders(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	runner := NewCapabilityProbeRunner(&fakeClock{now: now})
-	target := testProbeTarget(t, "runner-web-waf", 1, ProbeCapabilityWebWAF, now)
+	// web_waf is sealed at construct; HTTP runner still detects challenge markers.
+	target := testProbeTarget(t, "runner-http-waf", 1, ProbeCapabilityHTTP, now)
 	var userAgent string
 	runner.httpClientFactory = func(context.Context, N.Dialer, ProbeTarget) (probeHTTPClient, error) {
 		return &probeHTTPClientFunc{do: func(request *http.Request) (*http.Response, error) {
@@ -123,9 +124,10 @@ func TestCapabilityProbeRunnerDetectsWAFChallengeWithoutPersistingHeaders(t *tes
 			}, nil
 		}}, nil
 	}
-	result := runner.Run(context.Background(), newTestOutbound("runner-web-waf"), target)
-	if !result.WAFChallenge || result.StatusCode != http.StatusForbidden || !strings.Contains(userAgent, "Firefox/") {
-		t.Fatalf("WAF challenge was not detected with browser-shaped request: result=%+v ua=%q", result, userAgent)
+	result := runner.Run(context.Background(), newTestOutbound("runner-http-waf"), target)
+	// web_waf sealed → HTTP probe UA; challenge marker detection is what matters.
+	if !result.WAFChallenge || result.StatusCode != http.StatusForbidden || userAgent == "" {
+		t.Fatalf("WAF challenge was not detected: result=%+v ua=%q", result, userAgent)
 	}
 	formatted := fmt.Sprintf("%+v %#v", result, result)
 	if strings.Contains(formatted, "Set-Cookie") || strings.Contains(formatted, "must-not-escape") {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -14,11 +15,12 @@ import (
 var ErrBreakerAttemptDeferred = errors.New("adaptive attempt deferred by breaker")
 
 type DialAttemptResult struct {
-	Candidate Candidate
-	Err       error
-	Delay     time.Duration
-	Deferred  bool
-	Panic     bool
+	Candidate  Candidate
+	Err        error
+	Delay      time.Duration
+	Deferred   bool
+	Panic      bool
+	RemoteAddr net.Addr // set on successful dial so health can pin the family
 }
 
 type AttemptComplete func(DialAttemptResult)
@@ -111,7 +113,11 @@ func (r *AttemptRunner) Dial(ctx context.Context, network string, destination M.
 				results <- dialResult{candidate: candidate, err: parentCtx.Err(), deferred: true}
 				return
 			}
-			complete(DialAttemptResult{Candidate: candidate, Err: err, Delay: time.Since(startedAt)})
+			result := DialAttemptResult{Candidate: candidate, Err: err, Delay: time.Since(startedAt)}
+			if err == nil && conn != nil {
+				result.RemoteAddr = conn.RemoteAddr()
+			}
+			complete(result)
 			results <- dialResult{candidate: candidate, conn: conn, err: err, delay: time.Since(startedAt)}
 		}()
 	}
@@ -122,7 +128,9 @@ func (r *AttemptRunner) Dial(ctx context.Context, network string, destination M.
 	timer := time.NewTimer(r.hedgeDelay)
 	defer timer.Stop()
 	var timerChannel <-chan time.Time
-	if plan.Mode != ModeBulk && plan.Mode != ModeStrictAffinity && len(plan.Candidates) > 1 {
+	// No hedge on bulk/strict/warming-outage plans — parallel fan-out storms
+	// dead nodes when every candidate is already blocked.
+	if !plan.disableHedge && !plan.allowBlocked && plan.Mode != ModeBulk && plan.Mode != ModeStrictAffinity && len(plan.Candidates) > 1 {
 		timerChannel = timer.C
 	} else {
 		if !timer.Stop() {
@@ -187,5 +195,11 @@ func errorReason(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	// Collapse multi-line proxy errors (e.g. joined read destination faults) so
+	// status/filter_reasons stay single-line and bounded for operators.
+	reason := strings.Join(strings.Fields(err.Error()), " ")
+	if len(reason) > 160 {
+		reason = reason[:160]
+	}
+	return reason
 }

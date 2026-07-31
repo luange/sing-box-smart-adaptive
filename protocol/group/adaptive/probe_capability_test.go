@@ -97,12 +97,23 @@ func errorsIs(err, target error) bool {
 	return err != nil && (err == target || strings.Contains(err.Error(), target.Error()))
 }
 
+func TestSealedProbeCapabilitiesRejectedAtConstruct(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for _, capability := range []ProbeCapability{ProbeCapabilityAuthHTTP, ProbeCapabilityWebWAF} {
+		_, err := NewProbeTarget("https://sealed.example.test/", 1, capability, now.Add(-time.Minute), now.Add(time.Hour), nil, nil)
+		if err == nil {
+			t.Fatalf("expected sealed capability %q to be rejected", capability)
+		}
+		if !strings.Contains(err.Error(), "sealed") {
+			t.Fatalf("unexpected sealed rejection error for %q: %v", capability, err)
+		}
+	}
+}
+
 func TestClassifyProbeResultMatrix(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	rangeTarget := testProbeTarget(t, "range", 1, ProbeCapabilityRange, now)
 	httpTarget := testProbeTarget(t, "http", 1, ProbeCapabilityHTTP, now)
-	authTarget := testProbeTarget(t, "auth", 1, ProbeCapabilityAuthHTTP, now)
-	wafTarget := testProbeTarget(t, "web-waf", 1, ProbeCapabilityWebWAF, now)
 	tlsTarget := testProbeTarget(t, "tls", 1, ProbeCapabilityTLS, now)
 	endpointTarget := testProbeTarget(t, "endpoint", 1, ProbeCapabilityEndpoint, now)
 	validRange := ProbeRawResult{TLSHandshakeOK: true, StatusCode: http.StatusPartialContent, ContentRange: "bytes 0-15/100", ContentType: "video/mp4", BytesRead: 16, PayloadPrefix: []byte{0, 1, 2}}
@@ -125,15 +136,6 @@ func TestClassifyProbeResultMatrix(t *testing.T) {
 		{"http_410", httpTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 410}, now, ProbeSampleTargetFault, FailureProtocol},
 		{"http_429", httpTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 429}, now, ProbeSampleTargetFault, FailureProtocol},
 		{"http_503", httpTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 503}, now, ProbeSampleTargetFault, FailureProtocol},
-		{"auth_401_reachable", authTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 401}, now, ProbeSampleSuccess, FailureNone},
-		{"auth_200_reachable", authTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 200}, now, ProbeSampleSuccess, FailureNone},
-		{"auth_403_blocked", authTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 403}, now, ProbeSampleBlocked, FailureHTTPBlock},
-		{"auth_451_blocked", authTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 451}, now, ProbeSampleBlocked, FailureHTTPBlock},
-		{"auth_500_target_fault", authTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 500}, now, ProbeSampleTargetFault, FailureProtocol},
-		{"waf_200_reachable", wafTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 200}, now, ProbeSampleSuccess, FailureNone},
-		{"waf_challenge_blocked", wafTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 403, WAFChallenge: true}, now, ProbeSampleBlocked, FailureHTTPBlock},
-		{"waf_403_blocked", wafTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 403}, now, ProbeSampleBlocked, FailureHTTPBlock},
-		{"waf_503_target_fault", wafTarget, ProbeRawResult{TLSHandshakeOK: true, StatusCode: 503}, now, ProbeSampleTargetFault, FailureProtocol},
 		{"tls_failure", tlsTarget, ProbeRawResult{}, now, ProbeSampleNodeFailure, FailureTLS},
 		{"tls_success", tlsTarget, ProbeRawResult{TLSHandshakeOK: true}, now, ProbeSampleSuccess, FailureNone},
 		{"endpoint_success", endpointTarget, ProbeRawResult{EndpointHandshakeOK: true}, now, ProbeSampleSuccess, FailureNone},
@@ -304,7 +306,7 @@ func TestProbeAggregatorSuppressesCommonModeTargetFailure(t *testing.T) {
 func TestProbeAggregatorKeepsMinorityFailuresInLargePool(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	aggregator := NewProbeAggregator(ProbeAggregatorConfig{}, &fakeClock{now: now}, nil)
-	target := testProbeTarget(t, "large-pool", 7, ProbeCapabilityAuthHTTP, now).Descriptor()
+	target := testProbeTarget(t, "large-pool", 7, ProbeCapabilityHTTP, now).Descriptor()
 	nodes := make([]NodeHandle, 16)
 	for index := range nodes {
 		nodes[index] = NodeHandle{NodeID: NodeID{byte(index + 1)}, Slot: uint64(index + 1), Version: 1, BornRevision: 1}

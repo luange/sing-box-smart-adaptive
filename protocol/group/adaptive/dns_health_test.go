@@ -117,3 +117,18 @@ func TestDNSHealthUsesSecondIndependentTarget(t *testing.T) {
 		t.Fatal("two independent DNS target failures were accepted")
 	}
 }
+
+func TestProxyFramingProbeErrorClassification(t *testing.T) {
+	if !isProxyFramingProbeError(errors.New("read destination: unknown address family: 0")) {
+		t.Fatal("address family framing must match")
+	}
+	if !isProxyFramingProbeError(errors.New("unknown version: 72")) {
+		t.Fatal("version framing must match")
+	}
+	if isProxyFramingProbeError(errors.New("read destination: i/o timeout")) {
+		t.Fatal("timeout must not be classified as framing")
+	}
+	if isProxyFramingProbeError(context.DeadlineExceeded) {
+		t.Fatal("deadline must not be framing")
+	}
+}

@@ -49,6 +49,9 @@ type DecisionPlan struct {
 	health          *HealthStore
 	service         ServiceContext
 	allowBlocked    bool
+	// disableHedge turns off parallel hedge starts (used for warming/outage plans
+	// so a fully-blocked pool does not storm every leaf outbound).
+	disableHedge bool
 }
 
 func (p DecisionPlan) TryAcquireAttemptPermit(nodeID NodeID, at time.Time) (*AttemptPermit, bool) {
@@ -82,6 +85,8 @@ type PolicyEngine struct {
 	nodeWeights    *nodeweight.Matcher
 	switchMargin   float64
 	switchCooldown time.Duration
+	// affinityMode: ""/"service" = per-product sticky; "disabled" = no sticky.
+	affinityMode   string
 	stickyAccess   sync.Mutex
 	sticky         map[string]stickyPreference
 }
@@ -118,6 +123,23 @@ func (e *PolicyEngine) BindNodeWeights(weights *nodeweight.Matcher) *PolicyEngin
 	return e
 }
 
+// BindAffinityMode configures sticky spine behavior (A5).
+// "service" (default) keys sticky by AffinityID/service; "disabled" turns sticky off.
+func (e *PolicyEngine) BindAffinityMode(mode string) *PolicyEngine {
+	if e == nil {
+		return e
+	}
+	switch mode {
+	case "", "service":
+		e.affinityMode = "service"
+	case "disabled":
+		e.affinityMode = "disabled"
+	default:
+		e.affinityMode = "service"
+	}
+	return e
+}
+
 func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duration) *PolicyEngine {
 	if e == nil {
 		return e
@@ -136,6 +158,24 @@ func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duratio
 	return e
 }
 
+// importStickyFrom copies live sticky preferences into a status-time engine so
+// operator scores share the same cooldown/margin memory as dial Plan.
+func (e *PolicyEngine) importStickyFrom(src *PolicyEngine) {
+	if e == nil || src == nil {
+		return
+	}
+	src.stickyAccess.Lock()
+	defer src.stickyAccess.Unlock()
+	e.stickyAccess.Lock()
+	defer e.stickyAccess.Unlock()
+	if e.sticky == nil {
+		e.sticky = make(map[string]stickyPreference, len(src.sticky))
+	}
+	for key, pref := range src.sticky {
+		e.sticky[key] = pref
+	}
+}
+
 // Clear drops sticky selection state. Called on pool retire/reload so process
 // lifetime health conclusions and sticky maps cannot leak across epochs.
 func (e *PolicyEngine) Clear() {
@@ -150,7 +190,7 @@ func (e *PolicyEngine) Clear() {
 // RememberSelection records the live egress for a service affinity so later
 // plans can apply delay hysteresis and a short switch cooldown.
 func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time.Time) {
-	if e == nil || key == "" || handle.NodeID == (NodeID{}) {
+	if e == nil || key == "" || handle.NodeID == (NodeID{}) || e.affinityMode == "disabled" {
 		return
 	}
 	if now.IsZero() {
@@ -198,6 +238,9 @@ func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, 
 }
 
 func (e *PolicyEngine) stickyKey(service ServiceContext) string {
+	if e != nil && e.affinityMode == "disabled" {
+		return ""
+	}
 	base := service.ID
 	if service.AffinityID != "" {
 		base = service.AffinityID
@@ -287,8 +330,11 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	}
 	if len(eligible) == 0 {
 		if len(supported) > 0 && (mode == ModeAdaptive || mode == ModeLatency || mode == ModeBulk) {
-			plan := e.plan(snapshot, mode, ReasonWarmingFallback, service, limitCandidates(supported, e.maxAttempts))
+			// Cold start / total outage: one sequential probe path only — hedge would
+			// fan out concurrent dials against every broken node.
+			plan := e.plan(snapshot, mode, ReasonWarmingFallback, service, limitCandidates(supported, 1))
 			plan.allowBlocked = true
+			plan.disableHedge = true
 			return plan, nil
 		}
 		return DecisionPlan{}, ErrNoEligibleCandidates
@@ -327,7 +373,10 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	if pinned != nil {
 		reason = ReasonFallback
 	}
-	if mode == ModeAdaptive {
+	// Sticky margin/cooldown apply to adaptive browsing AND to strict identity
+	// replacement after a lease breaks. Without this, AI/account hosts (default
+	// strict-affinity) thrash egress on every recovery dial.
+	if mode == ModeAdaptive || mode == ModeStrictAffinity {
 		if stickyReason, ok := e.applyStickyStability(eligible, service, time.Now()); ok {
 			reason = stickyReason
 		}
@@ -335,20 +384,21 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	if mode == ModeStrictAffinity && lease != nil {
 		for index, candidate := range eligible {
 			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
-				// An established identity lease must not hedge or immediately fall
-				// through to another egress. Retain the leased node until its
-				// breaker excludes it; the next connection then performs bounded
-				// failover and commits one new identity.
+				// Healthy lease: single candidate, no hedge. Identity stays put
+				// until the breaker excludes this handle.
 				return e.plan(snapshot, mode, ReasonLease, service, []Candidate{eligible[index]}), nil
 			}
 		}
-		// The leased handle is no longer eligible. Start a bounded sequential
-		// failover plan; DialContext replaces the lease only after a candidate
-		// actually connects.
+		// Lease handle is gone from eligible. Prefer sticky stability (above) so
+		// the next identity is not pure rank thrash; DialContext commits only
+		// after a candidate actually connects.
 	}
 	switch mode {
 	case ModeStrictAffinity:
-		return e.plan(snapshot, mode, ReasonStrictNew, service, limitCandidates(eligible, e.maxAttempts)), nil
+		if reason == ReasonRanked {
+			reason = ReasonStrictNew
+		}
+		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeBulk:
 		sequence := e.bulkSequence.Add(1)
 		if hasTrustedBulkThroughput(e.health, eligible, service.ID) {
@@ -451,34 +501,42 @@ type CandidateScoreExplanation struct {
 }
 
 func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContext) CandidateScoreExplanation {
-	type namedStatus struct {
-		name   string
-		status HealthStatus
+	endpoint := e.health.EndpointHandle(candidate.Handle)
+	transportName, transport := e.transportScoreStatus(candidate.Handle, service)
+	var serviceStatus HealthStatus
+	if service.ID != "" {
+		serviceStatus = e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID)
 	}
-	statuses := []namedStatus{
-		{name: "endpoint", status: e.health.EndpointHandle(candidate.Handle)},
-		{name: serviceHealthTransport(service), status: e.health.StatusHandle(candidate.Handle, DomainTransport, serviceHealthTransport(service), "")},
+
+	// Health priority: worst across domains (conservative).
+	priority := healthPriority(endpoint.Health)
+	dominant := "endpoint"
+	if current := healthPriority(transport.Health); current > priority {
+		priority = current
+		dominant = transportName
 	}
 	if service.ID != "" {
-		statuses = append(statuses, namedStatus{name: "service:" + service.ID, status: e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID)})
-	}
-	priority := healthPriority(HealthHealthy)
-	var delay time.Duration
-	var smoothed time.Duration
-	dominant := "endpoint"
-	for _, item := range statuses {
-		status := item.status
-		if current := healthPriority(status.Health); current > priority {
+		if current := healthPriority(serviceStatus.Health); current > priority {
 			priority = current
-			dominant = item.name
+			dominant = "service:" + service.ID
 		}
-		ranking := status.RankingDelay()
-		if ranking > 0 && (delay == 0 || ranking > delay) {
-			delay = ranking
+	}
+
+	// Delay: dual-stack best usable family first, then worsen with endpoint/service.
+	// DominantEvidence stays health-priority based (not rewritten by delay).
+	delay := transport.RankingDelay()
+	smoothed := transport.SmoothedDelay
+	worsenDelay := func(status HealthStatus) {
+		if r := status.RankingDelay(); r > 0 && (delay == 0 || r > delay) {
+			delay = r
 		}
 		if status.SmoothedDelay > 0 && (smoothed == 0 || status.SmoothedDelay > smoothed) {
 			smoothed = status.SmoothedDelay
 		}
+	}
+	worsenDelay(endpoint)
+	if service.ID != "" {
+		worsenDelay(serviceStatus)
 	}
 	if delay == 0 {
 		delay = 10 * time.Second
@@ -506,6 +564,83 @@ func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContex
 	}
 }
 
+// transportScoreStatus picks the transport ledger used for ranking delay.
+//
+// A3: rank against the dial family when the service already carries a concrete
+// family (tcp/ipv4, udp_dns/ipv6, …). Dual-stack aggregates (*/any) use the
+// best usable family delay so a dead peer family cannot poison ranking.
+func (e *PolicyEngine) transportScoreStatus(handle NodeHandle, service ServiceContext) (string, HealthStatus) {
+	path := serviceHealthTransport(service)
+	if e == nil || e.health == nil {
+		if normalized := normalizeHealthTransportPath(path); normalized != "" {
+			return normalized, HealthStatus{Health: HealthUnknown, Breaker: BreakerClosed}
+		}
+		return path, HealthStatus{Health: HealthUnknown, Breaker: BreakerClosed}
+	}
+	normalized := normalizeHealthTransportPath(path)
+	if normalized == "" {
+		normalized = path
+	}
+	familyA, familyB, isDual := dualStackFamilyPaths(normalized)
+	if !isDual {
+		// Concrete dial family (or bare class already normalized): single ledger.
+		return normalized, e.health.StatusHandle(handle, DomainTransport, normalized, "")
+	}
+	a := e.health.StatusHandle(handle, DomainTransport, familyA, "")
+	b := e.health.StatusHandle(handle, DomainTransport, familyB, "")
+	aOK := familyUsableForScore(a)
+	bOK := familyUsableForScore(b)
+	// When neither family has samples, rank from the aggregate ledger
+	// (tcp/any etc.) so bare-class or */any observations are not invisible.
+	agg := e.health.StatusHandle(handle, DomainTransport, normalized, "")
+	switch {
+	case aOK && bOK:
+		if !familyHasEvidence(a) && !familyHasEvidence(b) && familyHasEvidence(agg) {
+			return normalized, agg
+		}
+		if preferStatusDelay(a, b) {
+			return familyA, a
+		}
+		return familyB, b
+	case aOK:
+		if !familyHasEvidence(a) && familyHasEvidence(agg) {
+			return normalized, agg
+		}
+		return familyA, a
+	case bOK:
+		if !familyHasEvidence(b) && familyHasEvidence(agg) {
+			return normalized, agg
+		}
+		return familyB, b
+	default:
+		return normalized, agg
+	}
+}
+
+func familyHasEvidence(status HealthStatus) bool {
+	return status.Successes > 0 || status.Failures > 0 || status.NonBreakerSuccesses > 0 || status.NonBreakerFailures > 0 ||
+		status.DelaySamples > 0 || status.Health == HealthDegraded || status.Health == HealthUnreachable ||
+		(status.Breaker != BreakerClosed && status.Breaker != "")
+}
+
+func familyUsableForScore(status HealthStatus) bool {
+	if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown {
+		return false
+	}
+	return status.Health != HealthUnreachable
+}
+
+func preferStatusDelay(left, right HealthStatus) bool {
+	ld, rd := left.RankingDelay(), right.RankingDelay()
+	if ld == 0 {
+		return false
+	}
+	if rd == 0 {
+		return true
+	}
+	return ld <= rd
+}
+
 func hasTrustedBulkThroughput(health *HealthStore, candidates []Candidate, serviceID string) bool {
 	if health == nil {
 		return false
@@ -526,27 +661,39 @@ func (e *PolicyEngine) candidateBlocked(candidate Candidate, service ServiceCont
 	if e == nil || e.health == nil {
 		return false
 	}
-	if !e.health.CanAttemptHandle(candidate.Handle, service, time.Time{}) {
-		return true
-	}
-	profile := e.health.BuildCapabilityProfile(candidate.Handle, time.Time{})
-	ok, _ := profile.SupportsService(service)
-	return !ok
+	// Single read-only gate: endpoint + service breakers + dual-stack transport
+	// eligibility (transportPathEligible). Do not also BuildCapabilityProfile here —
+	// that duplicated the same decision with more work and no extra user-facing
+	// outcome. Status/Explain still use RequiredPathKnownBlocked / SupportsService.
+	return !e.health.CanAttemptHandleReadOnly(candidate.Handle, service, time.Time{})
 }
 
 // ExclusionReason explains why a candidate is out of the plan for a service.
 func (e *PolicyEngine) ExclusionReason(candidate Candidate, service ServiceContext) string {
-	if e == nil || e.health == nil {
+	reasons := e.ExclusionReasons(candidate, service)
+	if len(reasons) == 0 {
 		return ""
 	}
-	if reason := e.health.ExplainExclusion(candidate.Handle, service, time.Time{}); reason != "" {
-		return reason
+	return reasons[0]
+}
+
+// ExclusionReasons returns all stable exclusion labels for status views.
+// service may be empty to summarize every known path without inventing a fake default.
+func (e *PolicyEngine) ExclusionReasons(candidate Candidate, service ServiceContext) []string {
+	if e == nil || e.health == nil {
+		return nil
 	}
-	profile := e.health.BuildCapabilityProfile(candidate.Handle, time.Time{})
-	if ok, reason := profile.SupportsService(service); !ok {
-		return reason
+	if service.Transport != "" || service.HealthTransport != "" || service.ID != "" {
+		if reason := e.health.ExplainExclusion(candidate.Handle, service, time.Time{}); reason != "" {
+			return []string{reason}
+		}
+		profile := e.health.BuildCapabilityProfile(candidate.Handle, time.Time{})
+		if ok, reason := profile.SupportsService(service); !ok && reason != "" {
+			return []string{reason}
+		}
+		return nil
 	}
-	return ""
+	return e.health.ExplainAllPathExclusions(candidate.Handle, time.Time{})
 }
 
 func candidateSupports(candidate Candidate, transport string) bool {

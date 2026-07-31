@@ -12,8 +12,12 @@ type AdaptivePoolOutboundOptions struct {
 }
 
 type AdaptivePoolCapabilityOptions struct {
-	Enabled             bool               `json:"enabled,omitempty"`
-	BuiltinYouTubeTLS   bool               `json:"builtin_youtube_tls,omitempty"`
+	Enabled           bool `json:"enabled,omitempty"`
+	BuiltinYouTubeTLS bool `json:"builtin_youtube_tls,omitempty"`
+	// BuiltinAIServiceTLS is sealed. The field remains for config parse
+	// compatibility but AdaptivePool construction rejects enabling it.
+	// AI/WebWAF/AuthHTTP service reachability is out of scope for production
+	// Smart until a trusted protocol+credential model exists.
 	BuiltinAIServiceTLS bool               `json:"builtin_ai_service_tls,omitempty"`
 	BuiltinExitIdentity bool               `json:"builtin_exit_identity,omitempty"`
 	ManifestURL         string             `json:"manifest_url,omitempty"`
@@ -33,13 +37,21 @@ type AdaptivePoolPolicyOptions struct {
 	AttemptTimeout   badoption.Duration `json:"attempt_timeout,omitempty"`
 	HedgeDelay       badoption.Duration `json:"hedge_delay,omitempty"`
 	// SwitchMargin requires a challenger to be this fraction faster (0.15 =
-	// 15%) before replacing a sticky healthy incumbent. Zero uses the default.
+	// 15%) before replacing a sticky healthy incumbent. Omit for default 0.15;
+	// set explicitly to 0 to disable margin while keeping cooldown.
 	SwitchMargin *float64 `json:"switch_margin,omitempty"`
-	// SwitchCooldown keeps the previous healthy egress preferred for this
-	// duration after a selection change. Zero uses the default; negative disables.
+	// SwitchCooldown keeps the previous healthy egress preferred after a
+	// selection change.
+	//   omit / 0  => default 2m
+	//   negative  => disabled (no cooldown window)
+	//   positive  => that duration
 	SwitchCooldown badoption.Duration `json:"switch_cooldown,omitempty"`
-	ManualFailure string             `json:"manual_failure,omitempty"`
-	AIIPv6Policy  string             `json:"ai_ipv6_policy,omitempty"`
+	// AffinityMode controls sticky spine keys used by adaptive/strict-affinity:
+	//   omit / "service" => per-product AffinityID (default; isolates products)
+	//   "disabled"       => no sticky preference (leases still apply)
+	AffinityMode  string `json:"affinity_mode,omitempty"`
+	ManualFailure string `json:"manual_failure,omitempty"`
+	AIIPv6Policy  string `json:"ai_ipv6_policy,omitempty"`
 }
 
 type AdaptivePoolProbeOptions struct {

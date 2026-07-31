@@ -141,15 +141,40 @@ func TestRuntimePublishCommitHandsProbeOwnershipToNewEpoch(t *testing.T) {
 	if status := second.health.EndpointHandle(secondSnapshot.Candidates[0].Handle); status.NonBreakerSuccesses != 1 || status.NonBreakerFailures != 0 {
 		t.Fatalf("revoked old epoch wrote probe evidence: %+v", status)
 	}
+	// Capture scheduler stats before retire/trigger so coalesce does not flake the
+	// "did it still accept work" check (submit may merge with an in-flight key).
+	if second.scheduler == nil || !second.scheduler.ActiveOwner() {
+		t.Fatal("new epoch lost scheduler ownership before old retire")
+	}
+	_, _, completedBefore := second.scheduler.Stats()
+	acceptedBefore, _, _, _ := second.scheduler.SubmissionStats()
 	first.OnRuntimeEpochRetire()
+	if second.scheduler == nil || !second.scheduler.ActiveOwner() {
+		t.Fatal("old runtime retire revoked new scheduler ownership")
+	}
 	if err := second.TriggerAdaptiveProbe(context.Background()); err != nil {
 		t.Fatalf("old runtime retire revoked new scheduler: %v", err)
 	}
-	select {
-	case <-secondRuns:
-	case <-time.After(time.Second):
-		t.Fatal("new scheduler stopped after old runtime retire")
+	// Prefer stats over channel: coalesced submits may not re-enter probeRunner.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		acceptedAfter, _, _, _ := second.scheduler.SubmissionStats()
+		_, _, completedAfter := second.scheduler.Stats()
+		if acceptedAfter > acceptedBefore || completedAfter > completedBefore {
+			break
+		}
+		select {
+		case <-secondRuns:
+			// runner fired — also success
+			goto handoffOK
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new scheduler stopped accepting work after old runtime retire")
+		}
+		time.Sleep(time.Millisecond)
 	}
+handoffOK:
 	if maximum.Load() > 1 {
 		t.Fatalf("runtime publish overlapped epoch probes: max=%d", maximum.Load())
 	}
@@ -377,7 +402,8 @@ func TestURLTestTriggerAndPeriodicShareOneScheduler(t *testing.T) {
 		t.Fatal(err)
 	}
 	accepted, coalesced, _, rejected := pool.scheduler.SubmissionStats()
-	if accepted+coalesced < 5 {
+	// URLTest + trigger(HTTP+DNS/v4) + periodic >= 4 (DNS/v6 no longer auto-fired).
+	if accepted+coalesced < 4 {
 		t.Fatalf("probe entrances did not share scheduler stats: accepted=%d coalesced=%d rejected=%d", accepted, coalesced, rejected)
 	}
 }

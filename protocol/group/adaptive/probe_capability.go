@@ -120,7 +120,12 @@ func NewProbeTarget(rawURL string, generation uint64, capability ProbeCapability
 	if generation == 0 || issuedAt.IsZero() || !expiresAt.After(issuedAt) {
 		return ProbeTarget{}, errors.New("adaptive probe target lifetime is invalid")
 	}
-	if capability != ProbeCapabilityEndpoint && capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF && capability != ProbeCapabilityHTTP && capability != ProbeCapabilityHTTP3 && capability != ProbeCapabilityRange && capability != ProbeCapabilityExitIdentity {
+	// auth_http / web_waf are sealed: reject at construct time so signed
+	// manifests cannot re-enable AI-style service probes that proved ineffective.
+	if capability == ProbeCapabilityAuthHTTP || capability == ProbeCapabilityWebWAF {
+		return ProbeTarget{}, errors.New("adaptive probe capability auth_http/web_waf is sealed and disabled")
+	}
+	if capability != ProbeCapabilityEndpoint && capability != ProbeCapabilityTLS && capability != ProbeCapabilityHTTP && capability != ProbeCapabilityHTTP3 && capability != ProbeCapabilityRange && capability != ProbeCapabilityExitIdentity {
 		return ProbeTarget{}, errors.New("adaptive probe target capability is invalid")
 	}
 	if capability == ProbeCapabilityRange && (byteRange == nil || byteRange.Len() == 0) {
@@ -132,7 +137,7 @@ func NewProbeTarget(rawURL string, generation uint64, capability ProbeCapability
 	executionHost := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	target := ProbeTarget{
 		ID: id, Generation: generation, Host: redactProbeHost(executionHost), Capability: capability,
-		RequireTLS: strings.EqualFold(parsed.Scheme, "https"), RequirePayload: capability != ProbeCapabilityTLS && capability != ProbeCapabilityAuthHTTP && capability != ProbeCapabilityWebWAF && capability != ProbeCapabilityExitIdentity,
+		RequireTLS: strings.EqualFold(parsed.Scheme, "https"), RequirePayload: capability != ProbeCapabilityTLS && capability != ProbeCapabilityExitIdentity,
 		Range: cloneProbeRange(byteRange), IssuedAt: issuedAt, ExpiresAt: expiresAt,
 		secretURL: &redactedProbeURL{value: rawURL}, secretHost: &redactedProbeURL{value: executionHost},
 	}
@@ -434,27 +439,7 @@ func ClassifyProbeResult(target ProbeTarget, raw ProbeRawResult, now time.Time) 
 		}
 		return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
 	}
-	if target.Capability == ProbeCapabilityAuthHTTP {
-		switch raw.StatusCode {
-		case http.StatusUnauthorized:
-			return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
-		case http.StatusForbidden, http.StatusUnavailableForLegalReasons:
-			return ProbeSampleClassification{Class: ProbeSampleBlocked, Failure: FailureHTTPBlock}
-		}
-		if raw.StatusCode >= 200 && raw.StatusCode < 300 {
-			return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
-		}
-		return ProbeSampleClassification{Class: ProbeSampleTargetFault, Failure: FailureProtocol}
-	}
-	if target.Capability == ProbeCapabilityWebWAF {
-		if raw.WAFChallenge || raw.StatusCode == http.StatusForbidden || raw.StatusCode == http.StatusUnavailableForLegalReasons {
-			return ProbeSampleClassification{Class: ProbeSampleBlocked, Failure: FailureHTTPBlock}
-		}
-		if raw.StatusCode >= 200 && raw.StatusCode < 300 {
-			return ProbeSampleClassification{Class: ProbeSampleSuccess, Failure: FailureNone}
-		}
-		return ProbeSampleClassification{Class: ProbeSampleTargetFault, Failure: FailureProtocol}
-	}
+	// auth_http / web_waf are sealed at NewProbeTarget; no classifier branches.
 	switch raw.StatusCode {
 	case http.StatusForbidden, http.StatusUnavailableForLegalReasons:
 		return ProbeSampleClassification{Class: ProbeSampleBlocked, Failure: FailureHTTPBlock}
@@ -1028,6 +1013,9 @@ func aggregateProbeVerdicts(run *aggregateProbeRun, now time.Time) ProbeRunResul
 				verdict.Outcome, verdict.Failure = OutcomeFailure, majorityFailure(failures[ProbeSampleNodeFailure])
 			}
 		}
+		// Below-quorum samples are dropped: soft/partial capability feedback was
+		// complex, noisy in production, and not used for selection. Authoritative
+		// quorum only.
 		result.Verdicts = append(result.Verdicts, verdict)
 	}
 	sort.Slice(result.Verdicts, func(i, j int) bool {

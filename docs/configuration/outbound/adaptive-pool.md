@@ -35,6 +35,9 @@ epoch-local outbound only at execution time.
     "max_attempts": 3,
     "attempt_timeout": "4s",
     "hedge_delay": "450ms",
+    "switch_margin": 0.15,
+    "switch_cooldown": "2m",
+    "affinity_mode": "service",
     "manual_failure": "fallback",
     "ai_ipv6_policy": "block"
   },
@@ -66,13 +69,14 @@ client/service affinity; it does not contain the source address, process,
 username, destination, token, or credential.
 
 `policy.ai_ipv6_policy` accepts `allow` (default) or `block`. `block` rejects
-IPv6 destinations classified as ChatGPT/OpenAI, Claude, Gemini, Google account,
-Apple and Microsoft OAuth domains join the same `browser_identity` lease as
-ChatGPT, Claude, Gemini, Google login, and Cloudflare challenge traffic.
-`ai_ipv6_policy: block` rejects IPv6 destinations in those identity families so
-a dual-stack client can retry through IPv4.
+IPv6 destinations classified as ChatGPT/OpenAI, Claude, Gemini, Google/Apple/
+Microsoft login, or Cloudflare challenge so a dual-stack client can retry via IPv4.
 It does not alter non-AI IPv6 traffic. This is a safety guard, not a substitute
 for routing IPv6 through the transparent proxy.
+
+Each identity product keeps its **own** lease/sticky spine (`chatgpt_web`,
+`claude`, `gemini`, account families, etc.). Products no longer share a single
+`browser_identity` bag, so one product's breaker cannot bounce another's egress.
 
 ## Rollout
 
@@ -95,20 +99,19 @@ short-lived specification with `sing-box tools adaptive-manifest serve`; the
 server reloads both files on every request, so atomic file replacement rotates
 keys without restarting it. Keep the private-key file mode at `0600`.
 
-Supported service capabilities are `tls`, `auth_http`, `http`, `http3`, and `range`.
+Supported production service capabilities are `tls`, `http`, `http3`, and `range`.
 `http3` is available only in `with_quic` builds and rejects HTTP/2 fallback.
+`auth_http` / web-WAF style AI reachability probes remain in code for sealed
+experiments only and must not be enabled in production configs.
 
 `builtin_youtube_tls` enables the fixed, credential-free YouTube TLS target.
-`builtin_ai_service_tls` replaces it with five isolated service probes:
-YouTube TLS, Google-backed Gemini TLS, unauthenticated OpenAI and Anthropic
-model-list requests, and a browser-shaped ChatGPT web/WAF request. For the
-unauthenticated probes, HTTP 401 proves that the service path is reachable.
-For the web probe, 2xx is reachable and HTTP 403/451 or `cf-mitigated:
-challenge` is blocked evidence. A strict majority of equal failures is treated
-as a common target incident instead of penalizing every node. A 5xx response is
-a target fault. No API key, cookie, response header, or query string is stored.
-Builtin modes use one target per service and therefore require `quorum: 1`.
-The two builtin modes and signed-manifest mode are mutually exclusive.
+`builtin_ai_service_tls` is **sealed**: the JSON field still parses for migration,
+but AdaptivePool construction rejects enabling it. AI ChatGPT/Claude/Gemini
+reachability is out of scope for Smart until a trusted protocol and credential
+model exists. Prefer real traffic observation, node health, leases, and
+`ai_ipv6_policy` instead.
+Builtin YouTube / exit-identity modes use one target per service and therefore
+require `quorum: 1`. Builtin modes and signed-manifest mode are mutually exclusive.
 
 `builtin_exit_identity` uses the same scheduler and observation pipeline to
 probe separate IPv4 and IPv6 identity endpoints. Raw addresses are converted
