@@ -16,7 +16,7 @@ func TestStartupProbeTasksBoundAndStaggerInitialCoverage(t *testing.T) {
 	snapshot := &ExecutionSnapshot{RuntimeEpochID: 1, CatalogRevision: 1, Generation: 1}
 	for _, value := range []byte{5, 1, 4, 2, 3} {
 		id := NodeID{value}
-		snapshot.Candidates = append(snapshot.Candidates, Candidate{ID: id, Handle: NodeHandle{NodeID: id, Slot: uint64(value), Version: 1}})
+		snapshot.Candidates = append(snapshot.Candidates, Candidate{ID: id, Handle: NodeHandle{NodeID: id, Slot: uint64(value), Version: 1}, PrimaryTag: "node-" + string(rune('a'+value))})
 	}
 
 	tasks := pool.startupProbeTasks(snapshot, now)
@@ -79,11 +79,39 @@ func TestStartupProbeTasksUseCoverageBoundForShortIntervals(t *testing.T) {
 	snapshot := &ExecutionSnapshot{RuntimeEpochID: 1, CatalogRevision: 1, Generation: 1}
 	for value := byte(1); value <= 3; value++ {
 		id := NodeID{value}
-		snapshot.Candidates = append(snapshot.Candidates, Candidate{ID: id, Handle: NodeHandle{NodeID: id, Slot: uint64(value), Version: 1}})
+		snapshot.Candidates = append(snapshot.Candidates, Candidate{ID: id, Handle: NodeHandle{NodeID: id, Slot: uint64(value), Version: 1}, PrimaryTag: "n"})
 	}
 
 	tasks := pool.startupProbeTasks(snapshot, now)
 	if got := tasks[len(tasks)-1].DueAt.Sub(now); got != 2*time.Second {
 		t.Fatalf("short coverage interval was over-delayed: %s", got)
+	}
+}
+
+func TestStartupProbeTasksSkipDNSForReplicaTags(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	pool := &AdaptivePool{probeConcurrency: 2, probeCoverage: 10 * time.Minute, probeTimeout: time.Second}
+	primary := Candidate{ID: NodeID{1}, Handle: NodeHandle{NodeID: NodeID{1}, Slot: 1, Version: 1}, PrimaryTag: "airport/hk-1", EndpointConflictCount: 2}
+	replica := Candidate{ID: NodeID{2}, Handle: NodeHandle{NodeID: NodeID{2}, Slot: 2, Version: 1}, PrimaryTag: "airport/hk-1 (2)", EndpointConflictCount: 2}
+	snapshot := &ExecutionSnapshot{RuntimeEpochID: 1, CatalogRevision: 1, Generation: 1, Candidates: []Candidate{primary, replica}}
+	tasks := pool.startupProbeTasks(snapshot, now)
+	// primary: HTTP+DNS; replica: HTTP only (delayed)
+	if len(tasks) != 3 {
+		t.Fatalf("unexpected task count: %d", len(tasks))
+	}
+	dnsCount := 0
+	for _, task := range tasks {
+		if task.Key.Suite == "dns-health" {
+			dnsCount++
+			if task.Key.NodeID == replica.ID {
+				t.Fatal("replica must not receive auto DNS health probe")
+			}
+		}
+		if task.Key.NodeID == replica.ID && !task.DueAt.After(now) {
+			t.Fatal("replica endpoint probe must be delayed behind primaries")
+		}
+	}
+	if dnsCount != 1 {
+		t.Fatalf("expected one DNS probe for primary only, got %d", dnsCount)
 	}
 }

@@ -549,6 +549,14 @@ func (e *PolicyEngine) candidateScore(candidate Candidate, service ServiceContex
 		weight = e.nodeWeights.Weight(candidate.PrimaryTag)
 	}
 	weighted := weightedDelay(smoothed, weight)
+	// Deprioritize provider replica tags ("… (2)") and endpoint-conflict
+	// secondaries so a healthy primary wins ties without waiting for the
+	// replica's TLS blackhole to exhaust retries.
+	if isProviderReplicaCandidate(candidate) {
+		weighted += 8 * time.Second
+	} else if candidate.EndpointConflictCount > 1 {
+		weighted += 2 * time.Second
+	}
 	score := uint64(priority) * 1_000_000_000_000
 	if weighted > 0 {
 		score += uint64(weighted.Microseconds())

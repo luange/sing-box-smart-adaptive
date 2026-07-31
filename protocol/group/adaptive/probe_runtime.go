@@ -88,14 +88,29 @@ func (p *AdaptivePool) startupProbeTasks(snapshot *ExecutionSnapshot, now time.T
 	if spread < 0 {
 		spread = 0
 	}
-	// One HTTP endpoint probe + one DNS/IPv4 probe per candidate. DNS/IPv6 is
-	// not auto-scheduled (passive business evidence only) — halves probe fan-out
-	// and drops the noisiest production failure class.
+	// One HTTP endpoint probe per candidate. DNS/IPv4 only for non-replica
+	// primaries — provider "(2)" siblings and endpoint-conflict secondaries are
+	// endpoint-probed later (or on demand) so large OT pools do not bury the
+	// queue under framing/TLS noise. DNS/IPv6 stays passive-only.
 	tasks := make([]ProbeTask, 0, len(candidates)*2)
+	replicaIndex := 0
 	for index, candidate := range candidates {
 		dueAt := now
 		if index >= immediate && spreadCount > 0 {
 			dueAt = now.Add(time.Duration(index-immediate+1) * spread / time.Duration(spreadCount))
+		}
+		replica := isProviderReplicaCandidate(candidate)
+		if replica {
+			// Push replica endpoint probes to the back of the stagger window so
+			// primary tags claim workers first.
+			replicaIndex++
+			extra := spread
+			if extra < 15*time.Second {
+				extra = 15 * time.Second
+			}
+			dueAt = now.Add(extra + time.Duration(replicaIndex)*time.Second)
+			tasks = append(tasks, p.probeTask(snapshot, candidate, dueAt, p.probeCoverage))
+			continue
 		}
 		tasks = append(tasks,
 			p.probeTask(snapshot, candidate, dueAt, p.probeCoverage),
@@ -103,6 +118,33 @@ func (p *AdaptivePool) startupProbeTasks(snapshot *ExecutionSnapshot, now time.T
 		)
 	}
 	return tasks
+}
+
+// isProviderReplicaCandidate reports subscription siblings such as
+// "airport/香港-… (2)" that share an endpoint identity with a primary tag.
+// These often fail TLS/framing while the primary stays healthy; auto DNS
+// probing them mostly inflates the queue without improving selection.
+func isProviderReplicaCandidate(candidate Candidate) bool {
+	return isProviderReplicaTag(candidate.PrimaryTag)
+}
+
+// isProviderReplicaTag matches provider duplicate suffixes: " (2)", " (3)", …
+func isProviderReplicaTag(tag string) bool {
+	tag = strings.TrimSpace(tag)
+	open := strings.LastIndex(tag, " (")
+	if open < 0 || !strings.HasSuffix(tag, ")") {
+		return false
+	}
+	num := tag[open+2 : len(tag)-1]
+	if num == "" || num == "1" {
+		return false
+	}
+	for _, r := range num {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate) (ProbeResult, uint16) {
@@ -226,10 +268,12 @@ func (p *AdaptivePool) completeDNSHealthProbe(attempt *observationAttempt, probe
 		evidence.Confidence = ConfidenceMedium
 	case isProxyFramingProbeError(probeErr):
 		// Trojan/VLESS "unknown address family: 0" / "unknown version" are
-		// encapsulation faults, not proof the node cannot resolve DNS. Medium
-		// quality only — do not hard-open udp_dns the way a real NXDOMAIN path would.
+		// encapsulation faults, not proof the node cannot resolve DNS.
+		// ConfidenceLow is metrics-only (weight < 0.5): never degrade/unreachable
+		// the udp_dns ledger the way a real path blackhole would. Production rc30
+		// showed Medium framing still stacking NonBreakerFailures → Unreachable.
 		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureProtocol
-		evidence.Confidence = ConfidenceMedium
+		evidence.Confidence = ConfidenceLow
 	default:
 		// Clear DNS protocol failures (bad rcode after a real response, etc.).
 		evidence.Outcome, evidence.Failure = OutcomeFailure, FailureDNS

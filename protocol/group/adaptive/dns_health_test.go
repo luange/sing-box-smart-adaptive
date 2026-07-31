@@ -132,3 +132,47 @@ func TestProxyFramingProbeErrorClassification(t *testing.T) {
 		t.Fatal("deadline must not be framing")
 	}
 }
+
+func TestProxyFramingDNSHealthDoesNotMarkUnreachable(t *testing.T) {
+	// ConfidenceLow framing must stay metrics-only even after many failures.
+	store := NewHealthStore(time.Hour, 32)
+	handle := NodeHandle{NodeID: NodeID{9}, Slot: 1, Version: 1}
+	path := "udp_dns/ipv4"
+	for range 6 {
+		evidence := ObservationEvidence{
+			Source: SourceDNS, Stage: StageDNSHealth, Transport: "udp", NetworkPath: path,
+			Handle: handle, Outcome: OutcomeFailure, Failure: FailureProtocol,
+			Confidence: ConfidenceLow, Reason: "read destination: unknown address family: 0",
+			At: store.Now(),
+		}
+		domains, err := evidence.MapDomains()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = (&HealthObservationReducer{Store: store}).Reduce(evidence, domains); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := store.StatusHandle(handle, DomainTransport, path, "")
+	if status.Health == HealthUnreachable || status.Health == HealthDegraded {
+		t.Fatalf("framing noise flipped health: %+v", status)
+	}
+	if status.Breaker != BreakerClosed && status.Breaker != "" {
+		t.Fatalf("framing noise opened breaker: %+v", status)
+	}
+}
+
+func TestProviderReplicaTagDetection(t *testing.T) {
+	if !isProviderReplicaTag("airport/香港-广东专线 NeaRoute-2 (2)") {
+		t.Fatal("expected replica tag")
+	}
+	if isProviderReplicaTag("airport/香港-广东专线 NeaRoute-2") {
+		t.Fatal("primary must not be replica")
+	}
+	if isProviderReplicaCandidate(Candidate{PrimaryTag: "node", EndpointConflictCount: 2}) {
+		t.Fatal("conflict alone without (N) suffix is not a replica")
+	}
+	if !isProviderReplicaCandidate(Candidate{PrimaryTag: "node (3)", EndpointConflictCount: 2}) {
+		t.Fatal("replica tag must match")
+	}
+}

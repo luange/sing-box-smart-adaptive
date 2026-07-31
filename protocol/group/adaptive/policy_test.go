@@ -605,3 +605,22 @@ func TestServiceAndTransportRecoveryIndependent(t *testing.T) {
 		t.Fatalf("service recovered from transport success: %+v", service)
 	}
 }
+
+func TestCandidateScoreDeprioritizesProviderReplica(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	primary := Candidate{ID: NodeID{1}, Handle: NodeHandle{NodeID: NodeID{1}, Slot: 1, Version: 1}, PrimaryTag: "airport/hk-1", EndpointConflictCount: 2}
+	replica := Candidate{ID: NodeID{2}, Handle: NodeHandle{NodeID: NodeID{2}, Slot: 2, Version: 1}, PrimaryTag: "airport/hk-1 (2)", EndpointConflictCount: 2}
+	for _, c := range []Candidate{primary, replica} {
+		health.Observe(Observation{NodeID: c.ID, NodeSlot: c.Handle.Slot, NodeVersion: c.Handle.Version, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
+	}
+	engine := NewPolicyEngine(health, 2, "fallback")
+	service := ServiceContext{ID: "site:example.com", Mode: ModeAdaptive, Transport: N.NetworkTCP}
+	primaryScore := engine.candidateScore(primary, service)
+	replicaScore := engine.candidateScore(replica, service)
+	if replicaScore.SelectionScore <= primaryScore.SelectionScore {
+		t.Fatalf("replica was not deprioritized: primary=%d replica=%d", primaryScore.SelectionScore, replicaScore.SelectionScore)
+	}
+	if replicaScore.WeightedDelay < primaryScore.WeightedDelay+7*time.Second {
+		t.Fatalf("replica delay bias missing: primary=%s replica=%s", primaryScore.WeightedDelay, replicaScore.WeightedDelay)
+	}
+}
