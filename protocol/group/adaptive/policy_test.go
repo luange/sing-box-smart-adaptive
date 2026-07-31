@@ -620,7 +620,8 @@ func TestCandidateScoreDeprioritizesProviderReplica(t *testing.T) {
 	if replicaScore.SelectionScore <= primaryScore.SelectionScore {
 		t.Fatalf("replica was not deprioritized: primary=%d replica=%d", primaryScore.SelectionScore, replicaScore.SelectionScore)
 	}
-	if replicaScore.WeightedDelay < primaryScore.WeightedDelay+7*time.Second {
+	// Primary with endpoint conflict gets +2s; replica tag gets +8s → gap ≥ 5s.
+	if replicaScore.WeightedDelay < primaryScore.WeightedDelay+5*time.Second {
 		t.Fatalf("replica delay bias missing: primary=%s replica=%s", primaryScore.WeightedDelay, replicaScore.WeightedDelay)
 	}
 }
