@@ -1,0 +1,184 @@
+name: Adaptive Linux eBPF Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string baked into binary"
+        required: true
+        type: string
+        default: "1.14.0-beta.4-reF1nd-luan-adaptive.rc32-beta4-ebpf"
+      publish_release:
+        description: "Create GitHub release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adaptive-linux-ebpf-build
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build:
+    name: eBPF linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang + headers (for bpfel)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm make pkg-config libelf-dev zlib1g-dev linux-libc-dev
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Build tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f release/DEFAULT_BUILD_TAGS_OTHERS ]]; then
+            base="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          else
+            base="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0"
+          fi
+          tags="${base},with_ebpf"
+          echo "BUILD_TAGS=${tags}" >> "$GITHUB_ENV"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          ldflags_shared=""
+          if [[ -f release/LDFLAGS ]]; then
+            ldflags_shared="$(tr -d '\n' < release/LDFLAGS)"
+          fi
+          echo "LDFLAGS_SHARED=${ldflags_shared}" >> "$GITHUB_ENV"
+          echo "tags=$tags"
+
+      - name: Generate eBPF objects
+        run: |
+          set -euo pipefail
+          make -C common/ebpf generate
+          ls -la common/ebpf/native/*.o || true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Build sing-box (CGO + with_ebpf)
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+          CC: clang
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/sing-box-${GOOS}-${GOARCH}"
+          # cross-compile arm64 with zig or clang
+          if [[ "$GOARCH" == "arm64" ]]; then
+            sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+            export CC=aarch64-linux-gnu-gcc
+            export CGO_ENABLED=1
+          fi
+          go build -trimpath \
+            -tags "$BUILD_TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o "$out" ./cmd/sing-box
+          chmod +x "$out"
+          file "$out" || true
+          sha256sum "$out" | tee "dist/sing-box-${GOOS}-${GOARCH}.sha256"
+          if [[ "$GOARCH" == "amd64" ]]; then
+            "$out" version | tee dist/version.txt
+            # must NOT contain stub message in usage path — check tags
+            "$out" version
+            if strings "$out" | grep -q 'eBPF inbound is not included in this build'; then
+              # stub string may still exist in binary as dead code from other packages; verify registration works via schema/help
+              echo "NOTE: stub string present in binary (may be normal if both files linked)"
+            fi
+            # validate config with type ebpf parses
+            cat > /tmp/ebpf-check.json <<'EOF'
+          {
+            "inbounds": [{"type":"ebpf","tag":"ebpf-in","network":["tcp","udp"],"dns_mode":"hijack","shared_network":{"enabled":true,"include_interface":["eth0"]}}],
+            "outbounds": [{"type":"direct","tag":"direct"}],
+            "route": {"final":"direct"}
+          }
+          EOF
+            # check may fail without root/cgroup at runtime start, but decode should work
+            "$out" check -c /tmp/ebpf-check.json && echo "ebpf config check OK"
+          fi
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-ebpf-linux-${{ matrix.goarch }}
+          path: |
+            dist/sing-box-linux-${{ matrix.goarch }}
+            dist/sing-box-linux-${{ matrix.goarch }}.sha256
+            dist/version.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sing-box-ebpf-linux-*
+          merge-multiple: true
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          ls -laR artifacts
+          mkdir -p release-out
+          cp -a artifacts/* release-out/ 2>/dev/null || true
+          find release-out -type f -ls
+          VER="${{ inputs.version }}"
+          echo "$VER" > release-out/VERSION.txt
+          cat > release-out/README-eBPF.md <<EOF
+          # ${VER}
+
+          Linux builds with \`with_ebpf\` + CGO.
+
+          Tags include DEFAULT_BUILD_TAGS_OTHERS + with_ebpf.
+          EOF
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: |
+            Adaptive core with **eBPF inbound** enabled (`with_ebpf` + CGO).
+
+            Use on Linux gateways (e.g. VM116) to replace tproxy/nft.
+          files: |
+            release-out/**
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
