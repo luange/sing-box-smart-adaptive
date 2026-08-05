@@ -2,10 +2,6 @@ package group
 
 import (
 	"context"
-	"encoding/json"
-	"os"
-	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 )
@@ -238,7 +234,7 @@ func TestSmartHistorySnapshotHonorsRetentionAndLimit(t *testing.T) {
 	}
 }
 
-func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
+func TestSmartWorkerStartsOnPostStart(t *testing.T) {
 	smart := &Smart{
 		ctx:               context.Background(),
 		store:             newSmartStore(time.Hour, 3, time.Minute),
@@ -247,7 +243,6 @@ func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
 		halfLife:          time.Hour,
 		breakerFailures:   3,
 		breakerCooldown:   time.Minute,
-		historyPath:       filepath.Join(t.TempDir(), "history.json"),
 		historyRetention:  time.Hour,
 		maxHistoryEntries: 100,
 	}
@@ -255,133 +250,54 @@ func TestSmartWorkerStartsOnlyAfterRuntimeEpochPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	smart.lifecycleAccess.Lock()
-	startedAfterPostStart := smart.workerStarted
+	started := smart.workerStarted
 	smart.lifecycleAccess.Unlock()
-	if startedAfterPostStart {
-		t.Fatal("unpublished Smart worker started during PREPARE")
-	}
-	publishSmartForTest(t, smart)
-	smart.lifecycleAccess.Lock()
-	startedAfterPublish := smart.workerStarted
-	smart.lifecycleAccess.Unlock()
-	if !startedAfterPublish {
-		t.Fatal("Smart worker did not start after runtime epoch publish")
+	if !started {
+		t.Fatal("smart worker did not start on PostStart")
 	}
 	if err := smart.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSmartHistoryStoreSharedAcrossPublishedGenerationsWithoutDiskPersistence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "history.json")
-	first := newSmartHistoryTestInstance(path)
-	second := newSmartHistoryTestInstance(path)
+func TestSmartHealthIsPerInstance(t *testing.T) {
+	newInstance := func() *Smart {
+		return &Smart{
+			ctx:               context.Background(),
+			store:             newSmartStore(time.Hour, 3, time.Minute),
+			control:           &smartControlState{},
+			probeInterval:     time.Hour,
+			probeTimeout:      time.Millisecond,
+			halfLife:          time.Hour,
+			breakerFailures:   3,
+			breakerCooldown:   time.Minute,
+			historyRetention:  time.Hour,
+			maxHistoryEntries: 100,
+		}
+	}
+	first := newInstance()
 	if err := first.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	publishSmartForTest(t, first)
 	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
+	first.control.pinned = "candidate-a"
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := newInstance()
 	if err := second.PostStart(); err != nil {
 		t.Fatal(err)
 	}
-	publishSmartForTest(t, second)
-	if first.store != second.store {
-		t.Fatal("published generations do not share the same history store")
+	if first.store == second.store {
+		t.Fatal("a new smart generation shares the previous health store")
 	}
-	estimate := second.store.estimate(time.Now(), "network", "", "candidate-a", "tcp", 1)
-	if estimate.State == "unknown" {
-		t.Fatal("new generation cannot see observations from the previous generation")
+	if second.control.pinned != "" {
+		t.Fatalf("a new smart generation inherited a pin: %s", second.control.pinned)
 	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
+	if estimate := second.store.estimate(time.Now(), "network", "", "candidate-a", "tcp", 1); estimate.State != "unknown" {
+		t.Fatalf("a new smart generation inherited observations: %s", estimate.State)
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("process-local Smart health was persisted: %v", err)
-	}
-}
-
-func TestSmartHistoryConcurrentFlushUsesAtomicFiles(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "history.json")
-	first := newSmartHistoryTestInstance(path)
-	second := newSmartHistoryTestInstance(path)
-	if err := first.PostStart(); err != nil {
-		t.Fatal(err)
-	}
-	publishSmartForTest(t, first)
-	if err := second.PostStart(); err != nil {
-		t.Fatal(err)
-	}
-	publishSmartForTest(t, second)
-	first.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
-	var waitGroup sync.WaitGroup
-	for range 20 {
-		waitGroup.Add(2)
-		go func() {
-			defer waitGroup.Done()
-			first.flushHistory()
-		}()
-		go func() {
-			defer waitGroup.Done()
-			second.flushHistory()
-		}()
-	}
-	waitGroup.Wait()
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var snapshot smartStoreSnapshot
-	if err = json.Unmarshal(content, &snapshot); err != nil {
-		t.Fatal(err)
-	}
-	pattern := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
-	if matches, err := filepath.Glob(pattern); err != nil {
-		t.Fatal(err)
-	} else if len(matches) != 0 {
-		t.Fatalf("temporary history files leaked: %v", matches)
-	}
-	if err = first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err = second.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestUnpublishedSmartDoesNotWriteHistory(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "history.json")
-	smart := newSmartHistoryTestInstance(path)
-	smart.store.observeDial(time.Now(), "network", "", "candidate-a", "tcp", true, time.Millisecond)
-	if err := smart.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("unpublished candidate wrote history: %v", err)
-	}
-}
-
-func newSmartHistoryTestInstance(path string) *Smart {
-	return &Smart{
-		ctx:               context.Background(),
-		store:             newSmartStore(time.Hour, 3, time.Minute),
-		probeInterval:     time.Hour,
-		probeTimeout:      time.Millisecond,
-		halfLife:          time.Hour,
-		breakerFailures:   3,
-		breakerCooldown:   time.Minute,
-		historyPath:       path,
-		historyRetention:  time.Hour,
-		maxHistoryEntries: 100,
-	}
-}
-
-func publishSmartForTest(t *testing.T, smart *Smart) {
-	t.Helper()
-	if err := smart.OnRuntimeEpochPublish(); err != nil {
-		t.Fatal(err)
-	}
-	smart.OnRuntimeEpochPublishCommit()
 }

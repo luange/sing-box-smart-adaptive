@@ -27,11 +27,27 @@ func (b *Backend) IsClosed() bool {
 	return true
 }
 
+func (b *Backend) AddBypassPrefix(netip.Prefix) error {
+	return E.New("ebpf unavailable")
+}
+
+func (b *Backend) DeleteBypassPrefix(netip.Prefix) error {
+	return E.New("ebpf unavailable")
+}
+
 func (b *Backend) UpdateBypassCIDR([]netip.Prefix) (bool, error) {
 	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
 }
 
 func (b *Backend) BypassCIDRCount() (int, int) {
+	return 0, 0
+}
+
+func (b *Backend) UpdateDNSDirectCIDR([]netip.Prefix) (bool, error) {
+	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
+}
+
+func (b *Backend) DNSDirectCIDRCount() (int, int) {
 	return 0, 0
 }
 
@@ -50,6 +66,16 @@ func (b *Backend) AttachedPrograms() []string {
 func (b *Backend) ProtectFunc() control.Func {
 	return nil
 }
+
+func (b *Backend) ProtectHits() uint64 { return 0 }
+
+func (b *Backend) RegisterSelfListenPort(uint16) error {
+	return E.New("eBPF inbound is not supported by this build: cgo is disabled")
+}
+
+func (b *Backend) OutVerdictMapFDs() (int, int, int) { return -1, -1, -1 }
+
+func (b *Backend) FlowVerdictEnabled() bool { return false }
 
 func (b *Backend) LookupOriginal(uint8, netip.AddrPort) (OriginalDestination, error) {
 	return OriginalDestination{}, E.New("eBPF inbound is not supported by this build: cgo is disabled")

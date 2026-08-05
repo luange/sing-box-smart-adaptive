@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"net"
 	"net/netip"
 
 	"github.com/sagernet/sing-box/log"
@@ -40,6 +41,32 @@ type FlowOutbound interface {
 type FlowOutboundDomainResolver interface {
 	FlowOutbound
 	FlowDomainResolveOptions() DNSQueryOptions
+}
+
+// SpliceCapableConn is an optional extension for eBPF sockmap splice.
+// Official protocol leaves need not implement it; direct/socks/http already
+// return bare post-handshake TCP that the eBPF layer can use.
+type SpliceCapableConn interface {
+	// SpliceReady returns underlying TCP after framing is done; nil = not ready.
+	SpliceReady() *net.TCPConn
+}
+
+// ConnectionSplicer is registered by eBPF inbound when outbound_offload.splice is on.
+type ConnectionSplicer interface {
+	TrySpliceTCP(
+		ctx context.Context,
+		inboundType string,
+		dialer N.Dialer,
+		local net.Conn,
+		remote net.Conn,
+		metadata InboundContext,
+		onClose N.CloseHandlerFunc,
+	) bool
+}
+
+// VerdictLearner is registered by eBPF inbound when outbound_offload.verdict.mode != off.
+type VerdictLearner interface {
+	MaybeLearnTCP(ctx context.Context, dialer N.Dialer, metadata InboundContext, remote netip.AddrPort)
 }
 
 type OutboundRegistry interface {

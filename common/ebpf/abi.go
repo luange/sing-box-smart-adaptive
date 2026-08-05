@@ -26,9 +26,10 @@ type RuntimeStats struct {
 }
 
 type OriginalDestination struct {
-	Destination  netip.AddrPort
-	ConnectedUDP bool
-	UID          uint32
+	Destination    netip.AddrPort
+	ConnectedUDP   bool
+	UID            uint32
+	IngressIfIndex uint32
 }
 
 type redirectKey struct {

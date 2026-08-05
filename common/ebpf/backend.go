@@ -10,12 +10,15 @@ package ebpf
 
 static int singbox_ebpf_inbound_prepare(
 	const char *cgroup_path,
+	bool capture_local,
 	uint16_t listen_port,
 	bool enable_tcp,
 	bool enable_udp,
 	bool enable_ipv4,
 	bool enable_bypass_cidr,
 	bool hijack_dns,
+	bool enable_flow_verdict,
+	uint32_t flow_verdict_max_entries,
 	const uint8_t *redirect_ipv4,
 	uint32_t redirect_ipv4_prefix_bits,
 	bool enable_ipv6,
@@ -27,12 +30,15 @@ static int singbox_ebpf_inbound_prepare(
 	int *saved_errno) {
 	int result = sb_ebpf_inbound_prepare(
 		cgroup_path,
+		capture_local,
 		listen_port,
 		enable_tcp,
 		enable_udp,
 		enable_ipv4,
 		enable_bypass_cidr,
 		hijack_dns,
+		enable_flow_verdict,
+		flow_verdict_max_entries,
 		redirect_ipv4,
 		redirect_ipv4_prefix_bits,
 		enable_ipv6,
@@ -96,16 +102,28 @@ type Backend struct {
 	udpTokenMap        int
 	statsMap           int
 	cookieMap          int
-	bypassIPv4CIDRMap  int
-	bypassIPv6CIDRMap  int
-	bypassIPv4CIDR     []netip.Prefix
-	bypassIPv6CIDR     []netip.Prefix
-	cgroupPath         string
+	bypassIPv4CIDRMap     int
+	bypassIPv6CIDRMap     int
+	dnsDirectIPv4CIDRMap  int
+	dnsDirectIPv6CIDRMap  int
+	outVerdictMap         int
+	outVerdictControl     int
+	outVerdictStats       int
+	selfListenPortMap     int
+	bypassIPv4CIDR        []netip.Prefix
+	bypassIPv6CIDR        []netip.Prefix
+	dnsDirectIPv4CIDR     []netip.Prefix
+	dnsDirectIPv6CIDR     []netip.Prefix
+	cgroupPath            string
 	enableUDP          bool
+	captureLocal       bool
 	hijackDNS          bool
+	enableFlowVerdict  bool
+	listenPort         uint16
 	lookupMisses       atomic.Uint64
 	tcpRedirectDeletes atomic.Uint64
 	udpRedirectDeletes atomic.Uint64
+	protectHits        atomic.Uint64 // Module C.1: ProtectFunc success counter
 }
 
 type mapElementAttr struct {
@@ -203,12 +221,15 @@ func Prepare(
 	}
 	if C.singbox_ebpf_inbound_prepare(
 		cgroupPathCString,
+		C.bool(!policy.DisableLocalCapture),
 		C.uint16_t(listenPort),
 		C.bool(enableTCP),
 		C.bool(enableUDP),
 		C.bool(redirectIPv4.IsValid()),
 		C.bool(policy.EnableBypassCIDR),
 		C.bool(policy.HijackDNS),
+		C.bool(policy.EnableFlowVerdict),
+		C.uint32_t(policy.FlowVerdictMaxEntries),
 		redirectIPv4Pointer,
 		redirectIPv4Bits,
 		C.bool(redirectIPv6.IsValid()),
@@ -234,11 +255,20 @@ func Prepare(
 		udpTokenMap:       int(runtimeState.udp_token_map_fd),
 		statsMap:          int(runtimeState.stats_map_fd),
 		cookieMap:         int(runtimeState.bypass_socket_cookie_map_fd),
-		bypassIPv4CIDRMap: int(runtimeState.bypass_ipv4_cidr_map_fd),
-		bypassIPv6CIDRMap: int(runtimeState.bypass_ipv6_cidr_map_fd),
-		cgroupPath:        cgroupPath,
-		enableUDP:         enableUDP,
-		hijackDNS:         policy.HijackDNS,
+		bypassIPv4CIDRMap:    int(runtimeState.bypass_ipv4_cidr_map_fd),
+		bypassIPv6CIDRMap:    int(runtimeState.bypass_ipv6_cidr_map_fd),
+		dnsDirectIPv4CIDRMap: int(runtimeState.dns_direct_ipv4_cidr_map_fd),
+		dnsDirectIPv6CIDRMap: int(runtimeState.dns_direct_ipv6_cidr_map_fd),
+		outVerdictMap:        int(runtimeState.out_verdict_map_fd),
+		outVerdictControl:    int(runtimeState.out_verdict_control_map_fd),
+		outVerdictStats:      int(runtimeState.out_verdict_stats_map_fd),
+		selfListenPortMap:    int(runtimeState.self_listen_port_map_fd),
+		cgroupPath:           cgroupPath,
+		enableUDP:            enableUDP,
+		captureLocal:         !policy.DisableLocalCapture,
+		hijackDNS:            policy.HijackDNS,
+		enableFlowVerdict:    policy.EnableFlowVerdict,
+		listenPort:           listenPort,
 	}
 	if err = populateUIDPolicyMap(int(runtimeState.include_uid_map_fd), includeUIDEntries); err != nil {
 		_ = backend.Close()
@@ -247,6 +277,11 @@ func Prepare(
 	if err = populateUIDPolicyMap(int(runtimeState.exclude_uid_map_fd), excludeUIDEntries); err != nil {
 		_ = backend.Close()
 		return nil, E.Cause(err, "populate exclude_uid eBPF map")
+	}
+	// Module C.1: register self listen port (host order).
+	if err = backend.RegisterSelfListenPort(listenPort); err != nil {
+		_ = backend.Close()
+		return nil, E.Cause(err, "register self listen port")
 	}
 	return backend, nil
 }
@@ -403,6 +438,9 @@ func (b *Backend) Attach() error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	if !b.captureLocal {
+		return nil
+	}
 	var savedErrno C.int
 	if C.singbox_ebpf_inbound_attach(b.runtime, &savedErrno) != 0 {
 		return eBPFOperationError("attach eBPF inbound", syscall.Errno(savedErrno))
@@ -431,6 +469,10 @@ func (b *Backend) Close() error {
 		b.cookieMap = -1
 		b.bypassIPv4CIDRMap = -1
 		b.bypassIPv6CIDRMap = -1
+		b.outVerdictMap = -1
+		b.outVerdictControl = -1
+		b.outVerdictStats = -1
+		b.selfListenPortMap = -1
 		b.bypassIPv4CIDR = nil
 		b.bypassIPv6CIDR = nil
 	}
@@ -521,6 +563,179 @@ func (b *Backend) BypassCIDRCount() (int, int) {
 	defer b.access.RUnlock()
 	return len(b.bypassIPv4CIDR), len(b.bypassIPv6CIDR)
 }
+
+const maxDNSDirectCIDREntries = 256
+
+// UpdateDNSDirectCIDR installs dns_kernel_direct.server_cidr into the :53 exception LPM
+// (shared by cgroup connect and TC shared_network). Empty clears all exceptions.
+func (b *Backend) UpdateDNSDirectCIDR(prefixes []netip.Prefix) (bool, error) {
+	if b == nil {
+		return false, osErrClosed
+	}
+	ipv4Prefixes, ipv6Prefixes, err := compileBypassCIDRPolicy(prefixes)
+	if err != nil {
+		return false, E.Cause(err, "compile dns_kernel_direct server_cidr")
+	}
+	if len(ipv4Prefixes) > maxDNSDirectCIDREntries {
+		return false, E.New("dns_kernel_direct IPv4 server_cidr has too many entries: ",
+			len(ipv4Prefixes), " > ", maxDNSDirectCIDREntries)
+	}
+	if len(ipv6Prefixes) > maxDNSDirectCIDREntries {
+		return false, E.New("dns_kernel_direct IPv6 server_cidr has too many entries: ",
+			len(ipv6Prefixes), " > ", maxDNSDirectCIDREntries)
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return false, osErrClosed
+	}
+	if b.dnsDirectIPv4CIDRMap < 0 || b.dnsDirectIPv6CIDRMap < 0 {
+		return false, E.New("dns_direct maps unavailable")
+	}
+	ipv4Changed := !slices.Equal(b.dnsDirectIPv4CIDR, ipv4Prefixes)
+	ipv6Changed := !slices.Equal(b.dnsDirectIPv6CIDR, ipv6Prefixes)
+	if !ipv4Changed && !ipv6Changed {
+		return false, nil
+	}
+	if ipv6Changed {
+		if err = replaceBypassCIDRPolicyMap(
+			b.dnsDirectIPv6CIDRMap,
+			b.dnsDirectIPv6CIDR,
+			ipv6Prefixes,
+		); err != nil {
+			return false, E.Cause(err, "update IPv6 dns_direct eBPF map")
+		}
+	}
+	if ipv4Changed {
+		if err = replaceBypassCIDRPolicyMap(
+			b.dnsDirectIPv4CIDRMap,
+			b.dnsDirectIPv4CIDR,
+			ipv4Prefixes,
+		); err != nil {
+			var rollbackErr error
+			if ipv6Changed {
+				rollbackErr = replaceBypassCIDRPolicyMap(
+					b.dnsDirectIPv6CIDRMap,
+					ipv6Prefixes,
+					b.dnsDirectIPv6CIDR,
+				)
+			}
+			updateErr := E.Cause(err, "update IPv4 dns_direct eBPF map")
+			if rollbackErr != nil {
+				updateErr = E.Errors(
+					updateErr,
+					E.Cause(rollbackErr, "rollback IPv6 dns_direct eBPF map"),
+				)
+			}
+			return false, updateErr
+		}
+	}
+	b.dnsDirectIPv4CIDR = slices.Clone(ipv4Prefixes)
+	b.dnsDirectIPv6CIDR = slices.Clone(ipv6Prefixes)
+	return true, nil
+}
+
+func (b *Backend) DNSDirectCIDRCount() (int, int) {
+	if b == nil {
+		return 0, 0
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	return len(b.dnsDirectIPv4CIDR), len(b.dnsDirectIPv6CIDR)
+}
+
+// AddBypassPrefix incrementally installs one LPM entry (learn→TC promote hot path).
+func (b *Backend) AddBypassPrefix(prefix netip.Prefix) error {
+	if b == nil {
+		return osErrClosed
+	}
+	if !prefix.IsValid() {
+		return E.New("invalid bypass prefix")
+	}
+	prefix = prefix.Masked()
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	is4 := prefix.Addr().Is4()
+	var cur []netip.Prefix
+	if is4 {
+		cur = b.bypassIPv4CIDR
+	} else {
+		cur = b.bypassIPv6CIDR
+	}
+	for _, existing := range cur {
+		if existing == prefix {
+			return nil
+		}
+	}
+	if len(cur)+1 > maxBypassCIDRPolicyEntries {
+		return E.New("bypass CIDR map full")
+	}
+	value := uint8(1)
+	mapFD := b.bypassIPv4CIDRMap
+	if !is4 {
+		mapFD = b.bypassIPv6CIDRMap
+	}
+	if err := updateBypassCIDRMapEntry(mapFD, prefix, &value, bpfNoExist); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			if is4 {
+				b.bypassIPv4CIDR = append(slices.Clone(b.bypassIPv4CIDR), prefix)
+			} else {
+				b.bypassIPv6CIDR = append(slices.Clone(b.bypassIPv6CIDR), prefix)
+			}
+			return nil
+		}
+		return E.Cause(err, "add bypass prefix")
+	}
+	if is4 {
+		b.bypassIPv4CIDR = append(slices.Clone(b.bypassIPv4CIDR), prefix)
+	} else {
+		b.bypassIPv6CIDR = append(slices.Clone(b.bypassIPv6CIDR), prefix)
+	}
+	return nil
+}
+
+// DeleteBypassPrefix removes one LPM entry (promoted TTL expiry).
+func (b *Backend) DeleteBypassPrefix(prefix netip.Prefix) error {
+	if b == nil {
+		return osErrClosed
+	}
+	if !prefix.IsValid() {
+		return E.New("invalid bypass prefix")
+	}
+	prefix = prefix.Masked()
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	is4 := prefix.Addr().Is4()
+	mapFD := b.bypassIPv4CIDRMap
+	if !is4 {
+		mapFD = b.bypassIPv6CIDRMap
+	}
+	if err := deleteBypassCIDRMapEntry(mapFD, prefix); err != nil && !errors.Is(err, unix.ENOENT) {
+		return E.Cause(err, "delete bypass prefix")
+	}
+	filter := func(list []netip.Prefix) []netip.Prefix {
+		out := make([]netip.Prefix, 0, len(list))
+		for _, existing := range list {
+			if existing != prefix {
+				out = append(out, existing)
+			}
+		}
+		return out
+	}
+	if is4 {
+		b.bypassIPv4CIDR = filter(b.bypassIPv4CIDR)
+	} else {
+		b.bypassIPv6CIDR = filter(b.bypassIPv6CIDR)
+	}
+	return nil
+}
+
 
 func replaceBypassCIDRPolicyMap(
 	mapFD int,
@@ -613,9 +828,60 @@ func (b *Backend) ProtectFunc() control.Func {
 			if err = updateMap(b.cookieMap, unsafe.Pointer(&cookie), unsafe.Pointer(&value)); err != nil {
 				return E.Cause(err, "register eBPF bypass socket")
 			}
+			// Module C.1: count successful protect registrations.
+			b.protectHits.Add(1)
 			return nil
 		})
 	}
+}
+
+// ProtectHits returns how many times ProtectFunc successfully registered a cookie.
+func (b *Backend) ProtectHits() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.protectHits.Load()
+}
+
+// RegisterSelfListenPort writes host-order listen port into the self_listen_port map (Module C.1).
+// Module C.2 (mark/bind sink via sock_create) and C.3 (UDP direct offload) are deferred —
+// ProtectFunc + cookie bypass remains the primary loop-prevention path.
+func (b *Backend) RegisterSelfListenPort(port uint16) error {
+	if b == nil {
+		return osErrClosed
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.selfListenPortMap < 0 {
+		return osErrClosed
+	}
+	if port == 0 {
+		return nil
+	}
+	key := port
+	value := uint8(1)
+	if err := updateMap(b.selfListenPortMap, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		return E.Cause(err, "register self listen port")
+	}
+	return nil
+}
+
+// OutVerdictMapFDs exposes Module A map fds after Prepare (owned by inbound runtime).
+func (b *Backend) OutVerdictMapFDs() (verdictMap, controlMap, statsMap int) {
+	if b == nil {
+		return -1, -1, -1
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	return b.outVerdictMap, b.outVerdictControl, b.outVerdictStats
+}
+
+// FlowVerdictEnabled reports whether Prepare created verdict maps.
+func (b *Backend) FlowVerdictEnabled() bool {
+	if b == nil {
+		return false
+	}
+	return b.enableFlowVerdict && b.outVerdictMap >= 0 && b.outVerdictControl >= 0 && b.outVerdictStats >= 0
 }
 
 func (b *Backend) LookupOriginal(protocol uint8, redirect netip.AddrPort) (OriginalDestination, error) {

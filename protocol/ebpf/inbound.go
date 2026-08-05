@@ -4,13 +4,16 @@ package ebpf
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,6 +76,8 @@ type Inbound struct {
 	localRoutes       []*localRoute
 	sharedOptions     option.EBPFSharedNetworkOptions
 	sharedNetwork     *sharedNetwork
+	offloadOptions    option.EBPFOutboundOffloadOptions
+	outboundCoord     *outboundCoordinator
 	backendAccess     sync.RWMutex
 	closeAccess       sync.Mutex
 	statsCancel       context.CancelFunc
@@ -82,6 +87,21 @@ type Inbound struct {
 	bypassRuleSet          []adapter.RuleSet
 	bypassRuleSetCallbacks []*list.Element[adapter.RuleSetUpdateCallback]
 	bypassRuleSetStarted   bool
+	// promotedBypass: learn→TC /32 (addr → expire). Gateway high hit-rate path.
+	promotedBypass map[netip.Addr]time.Time
+
+	// dns_kernel_direct: :53 server CIDR exceptions (empty when disabled).
+	dnsKernelDirectEnabled bool
+	dnsKernelDirectCIDRs   []netip.Prefix
+
+	// weak dns_prefill (outbound_offload.dns_prefill).
+	dnsPrefill          dnsPrefillOptions
+	dnsPrefillRouter    adapter.Router
+	dnsPrefillOutbounds adapter.OutboundManager
+	dnsPrefillClosed    atomic.Bool // set on Close; async workers check
+
+	// N8: throttle repeated "splice metrics unavailable" warns.
+	spliceStatsErrLogged bool
 
 	udpClients udpClientTable
 }
@@ -116,6 +136,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
+	offloadOptions, clampWarnings, err := normalizeOutboundOffloadOptions(options.OutboundOffload)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range clampWarnings {
+		logger.Warn(w)
+	}
+	dnsKernelEnabled, dnsKernelCIDRs, err := normalizeDNSKernelDirectOptions(options.DNSKernelDirect, dnsMode)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateLocalCaptureOptions(options, sharedOptions); err != nil {
+		return nil, err
+	}
 	network := options.Network.Build()
 	enableTCP := common.Contains(network, N.NetworkTCP)
 	enableUDP := common.Contains(network, N.NetworkUDP)
@@ -140,12 +174,24 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		dnsMode:        dnsMode,
 		redirectIPv4:   redirectIPv4,
 		redirectIPv6:   redirectIPv6,
-		sharedOptions:  sharedOptions,
+		sharedOptions:          sharedOptions,
+		offloadOptions:         offloadOptions,
+		dnsKernelDirectEnabled: dnsKernelEnabled,
+		dnsKernelDirectCIDRs:   dnsKernelCIDRs,
+		dnsPrefill:             dnsPrefillOptionsFrom(offloadOptions.DNSPrefill),
 		policy: ECommon.Policy{
-			HijackDNS:  dnsMode == dnsModeHijack,
-			IncludeUID: includeUID,
-			ExcludeUID: excludeUID,
+			DisableLocalCapture: options.CaptureLocal != nil && !*options.CaptureLocal,
+			HijackDNS:           dnsMode == dnsModeHijack,
+			IncludeUID:          includeUID,
+			ExcludeUID:          excludeUID,
 		},
+	}
+	udpTimeout := C.UDPTimeout
+	if listenOptions.UDPTimeout != 0 {
+		udpTimeout = time.Duration(listenOptions.UDPTimeout)
+	}
+	if offloadOptions.Splice.Enabled || (offloadOptions.Verdict.Mode != "" && offloadOptions.Verdict.Mode != "off") {
+		inbound.outboundCoord = newOutboundCoordinator(logger, offloadOptions, udpTimeout)
 	}
 	for _, ruleSetTag := range options.BypassRuleSet {
 		ruleSet, loaded := router.RuleSet(ruleSetTag)
@@ -153,10 +199,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.New("parse bypass_rule_set: rule-set not found: ", ruleSetTag)
 		}
 		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
-	}
-	udpTimeout := C.UDPTimeout
-	if listenOptions.UDPTimeout != 0 {
-		udpTimeout = time.Duration(listenOptions.UDPTimeout)
 	}
 	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
 	if redirectIPv4.IsValid() {
@@ -166,6 +208,23 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.listener6 = inbound.newListener(network, true)
 	}
 	return inbound, nil
+}
+
+func validateLocalCaptureOptions(
+	options option.EBPFInboundOptions,
+	sharedOptions option.EBPFSharedNetworkOptions,
+) error {
+	if options.CaptureLocal == nil || *options.CaptureLocal {
+		return nil
+	}
+	if !sharedOptions.Enabled {
+		return E.New("capture_local=false requires shared_network.enabled=true")
+	}
+	if options.CgroupPath != "" || len(options.IncludeUID) != 0 || len(options.IncludeUIDRange) != 0 ||
+		len(options.ExcludeUID) != 0 || len(options.ExcludeUIDRange) != 0 {
+		return E.New("cgroup_path and UID filters are invalid when capture_local=false")
+	}
+	return nil
 }
 
 func normalizeDNSMode(mode string) (string, error) {
@@ -307,23 +366,31 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	case adapter.StartStateInitialize:
 		policy := i.policy
 		policy.EnableBypassCIDR = true
+		// Module A: create verdict maps when mode != off (maps owned by inbound runtime).
+		if i.offloadOptions.Verdict.Mode != "" && i.offloadOptions.Verdict.Mode != "off" {
+			policy.EnableFlowVerdict = true
+			// A5: wire MaxEntries (0 → default 65536 in C).
+			policy.FlowVerdictMaxEntries = i.offloadOptions.Verdict.MaxEntries
+		}
 		backend, err := ECommon.Prepare(i.cgroupPath, i.listenPort,
 			i.enableTCP, i.enableUDP, i.redirectIPv4, i.redirectIPv6, policy)
 		if err != nil {
 			return err
 		}
 		i.setBackend(backend)
-		if err = i.networkManager.RegisterSocketProtectFunc(backend.ProtectFunc()); err != nil {
-			closeErr := backend.Close()
-			if backend.IsClosed() {
-				i.setBackend(nil)
+		if !i.policy.DisableLocalCapture {
+			if err = i.networkManager.RegisterSocketProtectFunc(backend.ProtectFunc()); err != nil {
+				closeErr := backend.Close()
+				if backend.IsClosed() {
+					i.setBackend(nil)
+				}
+				if closeErr != nil {
+					closeErr = E.Cause(closeErr, "close eBPF backend")
+				}
+				return E.Errors(err, closeErr)
 			}
-			if closeErr != nil {
-				closeErr = E.Cause(closeErr, "close eBPF backend")
-			}
-			return E.Errors(err, closeErr)
+			i.protectRegistered = true
 		}
-		i.protectRegistered = true
 		if i.sharedOptions.Enabled {
 			i.sharedNetwork = newSharedNetwork(i, i.sharedOptions)
 		}
@@ -331,6 +398,12 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 		backend := i.backendInstance()
 		if backend == nil {
 			return E.New("eBPF backend is not initialized")
+		}
+		if err := i.applyDNSKernelDirect(); err != nil {
+			return combineStartError(
+				E.Cause(err, "initialize eBPF dns_kernel_direct"),
+				i.cleanupStartFailure(),
+			)
 		}
 		if err := i.startBypassRuleSets(); err != nil {
 			return combineStartError(
@@ -355,15 +428,26 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 		if err := backend.Attach(); err != nil {
 			return combineStartError(err, i.cleanupStartFailure())
 		}
+		if err := i.startOutboundOffload(); err != nil {
+			return combineStartError(err, i.cleanupStartFailure())
+		}
+		i.wireDNSPrefill()
 		i.startRuntimeStatsMonitor(backend)
 		bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
+		dnsDirectV4, dnsDirectV6 := backend.DNSDirectCIDRCount()
 		i.logger.Info(
-			"eBPF inbound attached: cgroup=", backend.CgroupPath(),
+			"eBPF inbound attached: local_capture=", !i.policy.DisableLocalCapture,
+			", cgroup=", backend.CgroupPath(),
 			", dns_mode=", i.dnsMode,
+			", dns_kernel_direct=", i.dnsKernelDirectEnabled,
+			", dns_direct_cidr={ipv4:", dnsDirectV4, ", ipv6:", dnsDirectV6, "}",
+			", dns_prefill=", i.dnsPrefill.enabled,
 			", redirect_address=[", strings.Join(i.redirectAddressStrings(), ", "), "]",
 			", bypass_cidr={ipv4:", bypassIPv4Count, ", ipv6:", bypassIPv6Count, "}",
 			", redirect_map_capacity={tcp:", ECommon.TCPRedirectMapCapacity,
 			", udp:", ECommon.UDPRedirectMapCapacity, "}",
+			", outbound_splice=", i.offloadOptions.Splice.Enabled,
+			", outbound_verdict=", i.offloadOptions.Verdict.Mode,
 			", programs=[", strings.Join(backend.AttachedPrograms(), ", "), "]",
 		)
 	}
@@ -380,34 +464,7 @@ func combineStartError(startErr error, cleanupErr error) error {
 func (i *Inbound) Close() error {
 	i.closeAccess.Lock()
 	defer i.closeAccess.Unlock()
-	i.stopRuntimeStatsMonitor()
-	i.udpNat.Purge()
-	i.stopBypassRuleSets()
-	var sharedErr error
-	if i.sharedNetwork != nil {
-		sharedErr = i.sharedNetwork.Close()
-		if !i.sharedNetwork.IsClosed() {
-			if sharedErr == nil {
-				sharedErr = E.New("shared-network eBPF backend remained open after close")
-			}
-			return sharedErr
-		}
-		i.sharedNetwork = nil
-	}
-	backend := i.backendInstance()
-	var backendErr error
-	if backend != nil {
-		backendErr = backend.Close()
-		if !backend.IsClosed() {
-			if backendErr == nil {
-				backendErr = E.New("eBPF backend remained open after close")
-			}
-			return backendErr
-		}
-		i.setBackend(nil)
-	}
-	i.unregisterSocketProtector()
-	return E.Errors(sharedErr, backendErr, i.closeListeners(), i.removeLocalRoutes())
+	return i.closeLocked()
 }
 
 func (i *Inbound) startListeners() error {
@@ -436,10 +493,20 @@ func (i *Inbound) closeListeners() error {
 	return E.Errors(listener4Err, listener6Err)
 }
 
+// cleanupStartFailure tears down a partial Start without taking closeAccess.
+// Callers already own the inbound lifecycle; behavior matches Close body.
 func (i *Inbound) cleanupStartFailure() error {
+	return i.closeLocked()
+}
+
+// closeLocked is the shared teardown path for Close and cleanupStartFailure.
+// Must keep close order and E.Errors aggregation identical to the pre-dedup code.
+func (i *Inbound) closeLocked() error {
+	i.stopDNSPrefill()
 	i.stopRuntimeStatsMonitor()
 	i.udpNat.Purge()
 	i.stopBypassRuleSets()
+	offloadErr := i.closeOutboundOffload()
 	var sharedErr error
 	if i.sharedNetwork != nil {
 		sharedErr = i.sharedNetwork.Close()
@@ -464,7 +531,80 @@ func (i *Inbound) cleanupStartFailure() error {
 		i.setBackend(nil)
 	}
 	i.unregisterSocketProtector()
-	return E.Errors(sharedErr, backendErr, i.closeListeners(), i.removeLocalRoutes())
+	return E.Errors(offloadErr, sharedErr, backendErr, i.closeListeners(), i.removeLocalRoutes())
+}
+
+func (i *Inbound) startOutboundOffload() error {
+	if i.outboundCoord == nil {
+		return nil
+	}
+	if err := i.outboundCoord.Start(); err != nil {
+		return err
+	}
+	// Module A: wire verdict against inbound-owned maps (fail-open inside StartVerdict).
+	if i.outboundCoord.verdictEnabled() {
+		if err := i.outboundCoord.StartVerdict(i.backendInstance()); err != nil {
+			return err
+		}
+		if i.outboundCoord.Verdict() != nil {
+			service.MustRegister[adapter.VerdictLearner](i.ctx, i)
+		}
+	}
+	if i.outboundCoord != nil {
+		i.outboundCoord.SetPromoteHooks(i.promoteLearnedBypass, i.clearPromotedBypass)
+	}
+	// Register for ConnectionManager fail-open splice hooks (master §6.1).
+	if i.outboundCoord.enabled() && i.outboundCoord.Splice() != nil {
+		service.MustRegister[adapter.ConnectionSplicer](i.ctx, i)
+	}
+	return nil
+}
+
+func (i *Inbound) closeOutboundOffload() error {
+	if i.outboundCoord == nil {
+		return nil
+	}
+	// Q1: do not nil the pointer — coordinator Close() marks closed and no-ops entries.
+	// Concurrent MaybeLearnTCP/TrySpliceTCP/stats may still hold the pointer.
+	return i.outboundCoord.Close()
+}
+
+// MaybeLearnTCP implements adapter.VerdictLearner (Module A learn path).
+func (i *Inbound) MaybeLearnTCP(
+	ctx context.Context,
+	dialer N.Dialer,
+	metadata adapter.InboundContext,
+	remote netip.AddrPort,
+) {
+	if i == nil || i.outboundCoord == nil {
+		return
+	}
+	i.outboundCoord.MaybeLearnTCP(ctx, dialer, metadata, remote)
+}
+
+// TrySpliceTCP implements adapter.ConnectionSplicer.
+func (i *Inbound) TrySpliceTCP(
+	ctx context.Context,
+	inboundType string,
+	dialer N.Dialer,
+	local net.Conn,
+	remote net.Conn,
+	metadata adapter.InboundContext,
+	onClose N.CloseHandlerFunc,
+) bool {
+	if i == nil || i.outboundCoord == nil {
+		return false
+	}
+	if inboundType == "" {
+		inboundType = C.TypeEBPF
+	}
+	var track func(io.Closer)
+	if manager := service.FromContext[adapter.ConnectionManager](ctx); manager != nil {
+		track = func(c io.Closer) {
+			_ = manager.TrackCloser(c)
+		}
+	}
+	return TrySpliceTCP(ctx, i.outboundCoord, inboundType, dialer, local, remote, metadata, onClose, track)
 }
 
 func (i *Inbound) backendInstance() *ECommon.Backend {
@@ -574,6 +714,21 @@ func (i *Inbound) refreshBypassRuleSetsLocked(warnEmpty bool) (bool, error) {
 			prefixes = append(prefixes, ipSet.Prefixes()...)
 		}
 	}
+	// Merge non-expired learn→TC promotions (dae-style gateway high trigger).
+	now := time.Now()
+	if i.promotedBypass != nil {
+		for addr, exp := range i.promotedBypass {
+			if now.After(exp) {
+				delete(i.promotedBypass, addr)
+				continue
+			}
+			bits := 32
+			if !addr.Is4() {
+				bits = 128
+			}
+			prefixes = append(prefixes, netip.PrefixFrom(addr, bits))
+		}
+	}
 	backend := i.backendInstance()
 	if backend == nil {
 		return false, E.New("eBPF backend is not initialized")
@@ -610,6 +765,126 @@ func localInterfacePrefixes(interfaces []control.Interface) []netip.Prefix {
 	return prefixes
 }
 
+
+const promotedBypassMaxEntries = 8192
+
+func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) {
+	if i == nil || !addr.IsValid() {
+		return
+	}
+	addr = addr.Unmap()
+	if addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() {
+		return
+	}
+	// RFC1918 already TC builtin-bypassed; promoting is redundant noise.
+	if addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	if i.promotedBypass == nil {
+		i.promotedBypass = make(map[netip.Addr]time.Time)
+	}
+	if len(i.promotedBypass) >= promotedBypassMaxEntries {
+		if _, exists := i.promotedBypass[addr]; !exists {
+			now := time.Now()
+			dropped := false
+			for a, exp := range i.promotedBypass {
+				if now.After(exp) {
+					delete(i.promotedBypass, a)
+					dropped = true
+					break
+				}
+			}
+			if !dropped {
+				for a := range i.promotedBypass {
+					delete(i.promotedBypass, a)
+					break
+				}
+			}
+		}
+	}
+	i.promotedBypass[addr] = time.Now().Add(ttl)
+	bits := 32
+	if !addr.Is4() {
+		bits = 128
+	}
+	prefix := netip.PrefixFrom(addr, bits)
+	backend := i.backendInstance()
+	if backend != nil {
+		if err := backend.AddBypassPrefix(prefix); err != nil {
+			i.logger.Debug("promote AddBypassPrefix: ", err, " fallback full refresh")
+			if _, err2 := i.refreshBypassRuleSetsLocked(false); err2 != nil {
+				i.logger.Debug("promote learned bypass refresh: ", err2)
+				return
+			}
+		}
+		i.logger.Info("eBPF promote TC bypass /32: ", addr.String(), " ttl=", ttl, " promoted=", len(i.promotedBypass))
+		return
+	}
+	if _, err := i.refreshBypassRuleSetsLocked(false); err != nil {
+		i.logger.Debug("promote learned bypass refresh: ", err)
+	}
+}
+
+
+// gcPromotedBypass drops TTL-expired learn→TC entries from the LPM (no full rebuild).
+func (i *Inbound) gcPromotedBypass() {
+	if i == nil {
+		return
+	}
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	if len(i.promotedBypass) == 0 {
+		return
+	}
+	now := time.Now()
+	var expired []netip.Addr
+	for addr, exp := range i.promotedBypass {
+		if now.After(exp) {
+			expired = append(expired, addr)
+			delete(i.promotedBypass, addr)
+		}
+	}
+	if len(expired) == 0 {
+		return
+	}
+	backend := i.backendInstance()
+	if backend == nil {
+		return
+	}
+	for _, addr := range expired {
+		bits := 32
+		if !addr.Is4() {
+			bits = 128
+		}
+		if err := backend.DeleteBypassPrefix(netip.PrefixFrom(addr, bits)); err != nil {
+			i.logger.Debug("gc promoted bypass delete: ", addr, " ", err)
+		}
+	}
+	i.logger.Info("eBPF gc promoted TC bypass expired=", len(expired), " remain=", len(i.promotedBypass))
+}
+
+func (i *Inbound) clearPromotedBypass() {
+	if i == nil {
+		return
+	}
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	if len(i.promotedBypass) == 0 {
+		return
+	}
+	i.promotedBypass = make(map[netip.Addr]time.Time)
+	if _, err := i.refreshBypassRuleSetsLocked(false); err != nil {
+		i.logger.Debug("clear promoted bypass refresh: ", err)
+		return
+	}
+	i.logger.Info("eBPF cleared promoted TC bypass entries")
+}
+
 func (i *Inbound) logBypassCIDRUpdate() {
 	backend := i.backendInstance()
 	if backend == nil {
@@ -622,18 +897,51 @@ func (i *Inbound) logBypassCIDRUpdate() {
 func (i *Inbound) InterfaceUpdated() {
 	i.udpNat.Purge()
 	i.bypassRuleSetAccess.Lock()
+	var updated bool
+	var refreshErr error
 	if i.bypassRuleSetStarted {
-		updated, err := i.refreshBypassRuleSetsLocked(false)
-		if err != nil {
-			i.logger.Error("refresh eBPF local interface bypass: ", err)
+		updated, refreshErr = i.refreshBypassRuleSetsLocked(false)
+		if refreshErr != nil {
+			i.logger.Error("refresh eBPF local interface bypass: ", refreshErr)
 		} else if updated {
 			i.logBypassCIDRUpdate()
 		}
 	}
+	// Fingerprint local+bypass prefixes even when rule-set path is idle (Q2/N2).
+	fp := bypassFingerprint(i.localInterfacePrefixes())
+	if backend := i.backendInstance(); backend != nil {
+		v4, v6 := backend.BypassCIDRCount()
+		fp = fp + "|map=" + strconv.Itoa(v4) + "," + strconv.Itoa(v6)
+	}
 	i.bypassRuleSetAccess.Unlock()
+	// N2: force invalidate on refresh failure or rule-set content change; else fingerprint gate.
+	if i.outboundCoord != nil {
+		switch {
+		case refreshErr != nil:
+			i.outboundCoord.InvalidateVerdictNow("bypass-refresh-failed")
+		case updated:
+			i.outboundCoord.InvalidateVerdictNow("bypass-ruleset-updated")
+			i.outboundCoord.NoteBypassFingerprint(fp)
+		default:
+			i.outboundCoord.InvalidateVerdictIfNeeded(fp, "interface-updated")
+		}
+	}
 	if i.sharedNetwork != nil {
 		i.sharedNetwork.InterfaceUpdated()
 	}
+}
+
+func bypassFingerprint(prefixes []netip.Prefix) string {
+	if len(prefixes) == 0 {
+		return "empty"
+	}
+	// Sort for stability.
+	parts := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		parts = append(parts, p.String())
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

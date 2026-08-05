@@ -2,7 +2,7 @@
 
 本文对比当前项目的 eBPF 入站、[daeuniverse/dae](https://github.com/daeuniverse/dae)，以及 sing-box 的 TUN、Redirect、TProxy 入站。
 
-本文随当前项目的 eBPF 实现维护；dae 对比基于
+本文随当前项目的 eBPF 实现维护（**Linux-first / rc49+**：Q3 MatchClass + backend splice watcher；不维护 Android 为支持目标）。dae 对比基于
 [`caa6f5e9`](https://github.com/daeuniverse/dae/commit/caa6f5e91776bc86d5b0edc940bb7d264359863c)（2026-07-31 主分支）。
 
 ## 总体结论
@@ -59,8 +59,8 @@ UID 包含/排除策略、Android `dns_tether` UID 1052 排除以及 DHCP 端口
 | 网关/热点流量 | 仅开启 `shared_network` 后，在指定下游接口挂 TC ingress/egress | 直接在 LAN/WAN 接口挂 TC，是主要工作模式 |
 | 重定向原理 | 将目的地址改成 loopback/ULA “令牌地址”，由 map 保存原目标；listener 查询 map 后交给 sing-box | TC 内完成分流；代理流量经 netkit/veth 与独立 netns，使用 `bpf_sk_assign` 等交给 TProxy listener |
 | 路由决策位置 | 完整规则仍在 sing-box 用户态；内核仅支持 UID、固定绕过和纯 CIDR `bypass_rule_set` | 域名映射、IP、端口、协议、MAC、进程名等规则可下沉到 eBPF map，由 TC 直接决策 |
-| 直连流量 | 只有命中 `bypass_rule_set`/内置绕过时才完全不进用户态；普通 sing-box `direct` 仍经过用户态中继 | 分流结果为 direct 时直接走内核 L3 转发，不进入 dae 用户态 |
-| 代理流量 | 本机流量在 socket 调用处拦截，没有每包 TC/netfilter 分类；热点模式仍需每包 TC 改写 | 每包执行 TC 解析和 map 查询，再把代理流量送进控制面 |
+| 直连流量 | 命中 `bypass_rule_set`/内置绕过时完全不进用户态。另可选 `outbound_offload.verdict`（**默认 off**）：对学到的 destination 级 DIRECT 在 `connect` 时内核放行；纯 IPv6 verdict 与 UDP learn 仍未落地。普通未学到的 `direct` 仍经用户态中继（可再经 SOCKMAP splice） | 分流结果为 direct 时直接走内核 L3 转发，不进入 dae 用户态 |
+| 代理流量 | 本机流量在 socket 调用处拦截，没有每包 TC/netfilter 分类；热点模式仍需每包 TC 改写。可选 `outbound_offload.splice`（**默认 off**）对 bare TCP + 白名单出站做 SOCKMAP 中继（IPv4/IPv6 pair 均已落地；内核无 STREAM_PARSER 时 fail-open） | 每包执行 TC 解析和 map 查询，再把代理流量送进控制面 |
 | DNS | 由 sing-box DNS/路由系统处理；`dns_mode` 默认 `hijack`，本机与热点 TCP/UDP 53 优先捕获，也可设为 `off` 放行 | DNS 必须经过 dae，以建立域名到 IP 的规则映射 |
 | Android | 明确支持 root Android 原生二进制，且热点接口可动态出现/消失 | 主要面向标准 Linux 路由器/网关，不是 Android 方案 |
 | 系统侵入性 | 本机模式不使用 nftables、mark、策略路由或 TC；热点模式只操作指定下游 TC 和 `route_localnet` | 管理 LAN/WAN TC、netns、netkit/veth、sysctl、BPF map，系统拓扑改动更多 |

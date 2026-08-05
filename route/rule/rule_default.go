@@ -54,6 +54,19 @@ type RuleItem interface {
 	String() string
 }
 
+// RuleItemClass reports which condition class this item evaluates (Q3 P1).
+// Items that do not implement it contribute RouteMatchUnknown (fail-closed for verdict learn).
+type RuleItemClass interface {
+	MatchClass() adapter.RouteMatchInputs
+}
+
+func itemMatchClass(item RuleItem) adapter.RouteMatchInputs {
+	if c, ok := item.(RuleItemClass); ok {
+		return c.MatchClass()
+	}
+	return adapter.RouteMatchUnknown
+}
+
 func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options option.DefaultRule) (*DefaultRule, error) {
 	action, err := NewRuleAction(ctx, logger, options.RuleAction)
 	if err != nil {
@@ -77,6 +90,11 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 	}
 	if len(options.Inbound) > 0 {
 		item := NewInboundRule(options.Inbound)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
+	if len(options.InboundInterface) > 0 {
+		item := NewInboundInterfaceItem(options.InboundInterface)
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}

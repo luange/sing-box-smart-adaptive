@@ -127,10 +127,10 @@ int sb_ebpf_load_prog(
     return fd;
 }
 
-int sb_ebpf_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type) {
+int sb_ebpf_attach_prog(int target_fd, int prog_fd, enum bpf_attach_type attach_type) {
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.target_fd = (uint32_t)cgroup_fd;
+    attr.target_fd = (uint32_t)target_fd;
     attr.attach_bpf_fd = (uint32_t)prog_fd;
     attr.attach_type = attach_type;
 #ifdef BPF_F_ALLOW_MULTI
@@ -142,7 +142,7 @@ int sb_ebpf_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_
 #ifdef BPF_F_ALLOW_MULTI
     if (result != 0 && (errno == EINVAL || errno == EPERM || errno == ENOTSUP || errno == EOPNOTSUPP)) {
         memset(&attr, 0, sizeof(attr));
-        attr.target_fd = (uint32_t)cgroup_fd;
+        attr.target_fd = (uint32_t)target_fd;
         attr.attach_bpf_fd = (uint32_t)prog_fd;
         attr.attach_type = attach_type;
         attr.attach_flags = 0U;
@@ -152,10 +152,10 @@ int sb_ebpf_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_
     return result;
 }
 
-int sb_ebpf_detach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type) {
+int sb_ebpf_detach_prog(int target_fd, int prog_fd, enum bpf_attach_type attach_type) {
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.target_fd = (uint32_t)cgroup_fd;
+    attr.target_fd = (uint32_t)target_fd;
     if (prog_fd >= 0) {
         attr.attach_bpf_fd = (uint32_t)prog_fd;
     }

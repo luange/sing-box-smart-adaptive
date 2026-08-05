@@ -90,6 +90,9 @@ struct sb_ebpf_inbound_config {
     bool disable_ipv4;
     bool hijack_dns;
     int stats_map_fd;
+    /* dns_kernel_direct LPM fds (-1 when unused); checked on :53 before hijack. */
+    int dns_direct_ipv4_map_fd;
+    int dns_direct_ipv6_map_fd;
     uint8_t redirect_ipv4_prefix[4];
     uint32_t redirect_ipv4_prefix_bits;
     uint8_t redirect_ipv6_prefix[16];
@@ -108,6 +111,15 @@ struct sb_ebpf_inbound_runtime {
     int exclude_uid_map_fd;
     int bypass_ipv4_cidr_map_fd;
     int bypass_ipv6_cidr_map_fd;
+    /* dns_kernel_direct: :53 exceptions (owned by inbound, shared with TC). */
+    int dns_direct_ipv4_cidr_map_fd;
+    int dns_direct_ipv6_cidr_map_fd;
+    /* Module A: flow verdict offload maps (owned by inbound runtime). */
+    int out_verdict_map_fd;
+    int out_verdict_control_map_fd;
+    int out_verdict_stats_map_fd; /* ARRAY u64 × SB_OUT_VERDICT_STAT_COUNT */
+    /* Module C: self-listen port registry (host-order u16 → u8). */
+    int self_listen_port_map_fd;
     int connect4_prog_fd;
     int connect6_prog_fd;
     int connect6_v4mapped_prog_fd;
@@ -123,13 +135,18 @@ struct sb_ebpf_inbound_runtime {
 
 struct sb_ebpf_shared_network_runtime {
     int control_map_fd;
+    int interface_mac_map_fd;
     int original_to_token_map_fd;
     int token_to_original_map_fd;
     int redirect_map_fd;
+    int listener_socket_map_fd;
+    int stats_map_fd;
     int host_ipv4_map_fd;
     int host_ipv6_map_fd;
     int fallback_bypass_ipv4_map_fd;
     int fallback_bypass_ipv6_map_fd;
+    int fallback_dns_direct_ipv4_map_fd;
+    int fallback_dns_direct_ipv6_map_fd;
     int scratch_map_fd;
     int ingress_prog_fd;
     int egress_prog_fd;
@@ -137,12 +154,15 @@ struct sb_ebpf_shared_network_runtime {
 
 int sb_ebpf_inbound_prepare(
     const char *cgroup_path,
+    bool capture_local,
     uint16_t listen_port,
     bool enable_tcp,
     bool enable_udp,
     bool enable_ipv4,
     bool enable_bypass_cidr,
     bool hijack_dns,
+    bool enable_flow_verdict,
+    uint32_t flow_verdict_max_entries, /* 0 → SB_OUT_VERDICT_MAX_ENTRIES */
     const uint8_t redirect_ipv4[4],
     uint32_t redirect_ipv4_prefix_bits,
     bool enable_ipv6,
@@ -159,12 +179,16 @@ int sb_ebpf_load_shared_network_programs(
     size_t object_size,
     int bypass_ipv4_map_fd,
     int bypass_ipv6_map_fd,
+    int dns_direct_ipv4_map_fd,
+    int dns_direct_ipv6_map_fd,
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_prepare(
     const uint8_t *object,
     size_t object_size,
     int bypass_ipv4_map_fd,
     int bypass_ipv6_map_fd,
+    int dns_direct_ipv4_map_fd,
+    int dns_direct_ipv6_map_fd,
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime);
 
@@ -181,8 +205,29 @@ int sb_ebpf_load_prog(
     enum bpf_prog_type prog_type,
     enum bpf_attach_type expected_attach_type,
     bool log_error);
-int sb_ebpf_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type);
-int sb_ebpf_detach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type);
+/* target_fd is a cgroup fd for cgroup programs, or a map fd for sockmap/sk_skb. */
+int sb_ebpf_attach_prog(int target_fd, int prog_fd, enum bpf_attach_type attach_type);
+int sb_ebpf_detach_prog(int target_fd, int prog_fd, enum bpf_attach_type attach_type);
 int sb_ebpf_detach_owned_progs(int cgroup_fd);
+
+/* Generic ELF BPF object loader (parameterized prog type + map fd table). */
+struct sb_ebpf_object_map_entry {
+	const char *name;
+	int fd;
+};
+
+struct sb_ebpf_object_map_table {
+	const struct sb_ebpf_object_map_entry *entries;
+	size_t count;
+};
+
+int sb_ebpf_object_load_section(
+	const uint8_t *object,
+	size_t object_size,
+	const char *section_name,
+	const char *program_name,
+	enum bpf_prog_type prog_type,
+	enum bpf_attach_type expected_attach_type,
+	const struct sb_ebpf_object_map_table *maps);
 
 #endif

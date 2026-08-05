@@ -10,12 +10,38 @@
 #define SB_SHARED_NETWORK_MAP_ENTRIES 65536U
 #define SB_SHARED_TOKEN_ATTEMPTS 8U
 #define SB_SHARED_NETWORK_SCRATCH_SIZE 256U
+#define SB_SHARED_NETWORK_INTERFACE_ENTRIES 256U
+
+enum sb_shared_stat_index {
+    SB_SHARED_STAT_INGRESS_REDIRECTS = 0,
+    SB_SHARED_STAT_INGRESS_BYPASS,
+    SB_SHARED_STAT_INGRESS_DROPS,
+    SB_SHARED_STAT_EGRESS_RESTORES,
+    SB_SHARED_STAT_EGRESS_REVERSE_MISSES,
+    SB_SHARED_STAT_TOKEN_FAILURES,
+    SB_SHARED_STAT_REWRITE_FAILURES,
+    SB_SHARED_STAT_SOCKET_ASSIGNMENTS,
+    SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES,
+    SB_SHARED_STAT_FLOW_UPDATE_FAILURES,
+    SB_SHARED_STAT_COUNT,
+};
 
 #define SB_SHARED_FLAG_IPV4 (1U << 0)
 #define SB_SHARED_FLAG_IPV6 (1U << 1)
 #define SB_SHARED_FLAG_TCP (1U << 2)
 #define SB_SHARED_FLAG_UDP (1U << 3)
 #define SB_SHARED_FLAG_DNS_HIJACK (1U << 4)
+/* Match classic tproxy bypass: drop QUIC (UDP/443) before divert so clients fall back to TCP. */
+#define SB_SHARED_FLAG_DROP_UDP_443 (1U << 5)
+#define SB_SHARED_FLAG_SOCKET_ASSIGN (1U << 6)
+
+enum sb_shared_listener_key {
+    SB_SHARED_LISTENER_TCP4 = 0,
+    SB_SHARED_LISTENER_UDP4,
+    SB_SHARED_LISTENER_TCP6,
+    SB_SHARED_LISTENER_UDP6,
+    SB_SHARED_LISTENER_COUNT,
+};
 
 struct sb_shared_control {
     __u32 enabled;
@@ -27,6 +53,12 @@ struct sb_shared_control {
     __u8 token_ipv6_prefix_bits;
     __u8 reserved2[2];
     __u8 token_ipv6_prefix[16];
+    __u32 routing_mark;
+};
+
+struct sb_shared_interface_mac {
+    __u8 addr[6];
+    __u8 reserved[2];
 };
 
 struct sb_shared_original_key {
@@ -92,7 +124,7 @@ struct sb_shared_scratch {
     __u8 padding[56];
 };
 
-_Static_assert(sizeof(struct sb_shared_control) == 36U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_control) == 40U, "shared control ABI");
 _Static_assert(sizeof(struct sb_shared_original_key) == 44U, "shared original key ABI");
 _Static_assert(sizeof(struct sb_shared_reverse_key) == 44U, "shared reverse key ABI");
 _Static_assert(sizeof(struct sb_shared_redirect_key) == 40U, "shared redirect key ABI");

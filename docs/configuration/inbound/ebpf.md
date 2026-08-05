@@ -5,10 +5,12 @@ icon: material/lan-connect
 # eBPF
 
 The eBPF inbound intercepts locally generated TCP and UDP traffic with cgroup
-socket-address programs. The optional `shared_network` mode uses TC token
-rewrites for forwarded traffic from selected downstream interfaces. It does
-not use a TUN device, TProxy, iptables, skb marks, policy routing, loopback TC,
-socket assignment, or a SOCKS bridge.
+socket-address programs. The optional `shared_network` mode handles forwarded
+traffic from selected downstream interfaces. Its recommended `socket_assign`
+data plane preserves the original tuple at TC ingress, assigns a transparent
+listener through a SOCKMAP, and uses a dedicated mark/table only for local
+delivery. The compatibility `token` mode retains ingress/egress token rewrites.
+Neither mode uses a TUN device, iptables, loopback TC, or a SOCKS bridge.
 
 This inbound is intended for a rooted Android or Linux native sing-box binary.
 It is included only in builds made with the `with_ebpf` build tag and cgo.
@@ -25,6 +27,7 @@ It is included only in builds made with the `with_ebpf` build tag and cgo.
   "network": "",
   "dns_mode": "hijack",
   "cgroup_path": "",
+  "capture_local": true,
   "redirect_address": [
     "127.128.0.0/9",
     "fd53:696e:672d:626f::/64"
@@ -38,7 +41,21 @@ It is included only in builds made with the `with_ebpf` build tag and cgo.
   "exclude_uid_range": [],
   "shared_network": {
     "enabled": false,
-    "include_interface": []
+    "include_interface": [],
+    "data_plane": "socket_assign",
+    "routing_mark": 1396834305,
+    "routing_table": 2026
+  },
+  "outbound_offload": {
+    "splice": {
+      "enabled": false,
+      "accounting": true,
+      "half_close": "close",
+      "allow_outbound_types": ["direct"]
+    },
+    "verdict": {
+      "mode": "off"
+    }
   }
 }
 ```
@@ -112,6 +129,23 @@ intercepted. If empty, sing-box discovers the cgroup2 mount and uses its root.
 On standard Linux, place selected services in a dedicated cgroup and configure
 that path when system-wide local interception is not desired. This field does
 not restrict forwarded traffic selected by `shared_network`.
+
+#### capture_local
+
+Whether to load and attach cgroup programs for connections created by local
+processes. Defaults to `true`.
+
+Set this to `false` on a PBR/router deployment that only receives downstream
+client traffic through `shared_network`. In this mode no cgroup is opened or
+locked and no local connect/sendmsg/recvmsg program is loaded. Management
+probes, SSH, DNS, and updates remain in the control plane. The required TC
+programs are still attached to every
+`shared_network.include_interface`, so the forwarded data plane remains active.
+
+When `capture_local` is false, `shared_network` must be enabled and
+`cgroup_path`, `include_uid`, `include_uid_range`, `exclude_uid`, and
+`exclude_uid_range` must not be configured. Invalid combinations fail before
+startup.
 
 #### include_uid
 
@@ -275,12 +309,19 @@ the bridge master; the exact hook path depends on the bridge and driver. This
 mode is intended for a routed downstream whose clients use this host as their
 gateway, not for an arbitrary transparent layer-2 bridge.
 
-For every present interface, sing-box attaches an egress filter first and an
-ingress filter second, then enables the data plane. Ingress replaces the
-destination address and port of selected TCP/UDP packets with a per-flow token
-and a random sing-box listener port. Egress restores the original source on
-replies. The original-destination key includes the client address and port, so
-different hotspot clients cannot alias each other's flow state.
+`data_plane: socket_assign` is recommended. It attaches ingress only, records
+the original destination and ingress interface, assigns an IPv4/IPv6 TCP/UDP
+transparent listener with `bpf_sk_assign`, and sets a dedicated mark for a
+local routing table. The packet tuple stays unchanged and replies come from the
+kernel transparent socket, avoiding egress NAT, checksum repair, and GSO
+rewrites. Zero `routing_mark` and `routing_table` select `0x53420001` and `2026`.
+Startup preflights rule priority 9000 and the table; incompatible existing state
+causes a transactional startup failure instead of overwriting third-party state.
+
+`data_plane: token` is the compatibility mode. It attaches egress first and
+ingress second; ingress rewrites destinations to per-flow tokens and egress
+restores the original reply source. In both modes, original-destination keys
+include the client address and port, preventing cross-client aliases.
 
 DHCP ports 67, 68, 546, and 547 always bypass TC. In `dns_mode: hijack`,
 destination port 53 is captured before host, private-network, or
@@ -289,7 +330,7 @@ destination port 53 is captured before host, private-network, or
 Other host, private, link-local, multicast, and configured bypass CIDRs also
 keep their normal forwarding path.
 
-For IPv4, token addresses use the configured loopback redirect prefix.
+In `token` mode, IPv4 token addresses use the configured loopback redirect prefix.
 sing-box temporarily enables `net.ipv4.conf.<interface>.route_localnet` only
 when it was disabled, and restores it after both TC filters are detached. An
 existing enabled value is left unchanged. IPv6 uses the configured ULA token
@@ -318,6 +359,69 @@ service used while `shared_network` is disabled. XDP or hardware tethering
 offload that bypasses Linux TC cannot be proxied; verify the actual downstream
 interface and both directions on each Android kernel. On standard Linux, also
 verify the chosen bridge-port hook and any pre-existing priority `1` TC filter.
+
+#### outbound_offload
+
+Optional module B/A coordinator owned by this inbound (not a routable outbound
+type). Defaults keep every offload path **off**.
+
+##### outbound_offload.splice
+
+| Field | Default | Notes |
+|---|---|---|
+| `enabled` | `false` | SOCKMAP / `sk_skb` stream parser+verdict relay. Fail-open to userspace copy. |
+| `accounting` | `true` | PERCPU byte maps. When false, bytes map is never touched. |
+| `half_close` | `close` | `close` = both sides closed on peer FIN. `passthrough` currently **disables splice entirely** (no SOCKMAP attach); true half-close forwarding is not implemented — the enum value is reserved for a future faithful path. |
+| `allow_outbound_types` | `["direct"]` | Explicit outbound-type whitelist. Group outbounds only when listed. |
+| `max_pairs` | `65536` | Cap on concurrent pairs (`0` = default). |
+| `idle_timeout` | `10m` | Idle watchdog for spliced pairs. |
+
+**Eligibility (all required):** TCP; bare `*net.TCPConn` both ends; inbound type
+`ebpf` only (redirect/tproxy not authorized without separate lab evidence);
+outbound type in `allow_outbound_types`; no TLS fragment/spoof; kernel recvq
+empty after userspace drain (FIONREAD); capability probe OK.
+
+`bpf_sk_redirect_hash` flags are fixed to `0` (egress). IPv4 and pure IPv6 pairs
+are both supported when the kernel loads the SOCKMAP programs (fail-open if not).
+
+##### outbound_offload.verdict
+
+Flow verdict offload (Module A). Caches "this destination is direct" so later
+connects can skip userspace. **Default `off` (F-1).** Incorrect writes would
+silently leak traffic past route/log/clash-api — safety gates below are mandatory.
+
+**Granularity (A3 / F-3):** keys are **destination-level** only
+`{family, protocol, port, addr}` — not per-UID / per-flow / per-netns. One
+learned DIRECT applies to all UIDs on the cgroup capture surface for that
+destination. Suitable only for global-direct gateway profiles; keep off
+otherwise.
+
+| Field | Default | Notes |
+|---|---|---|
+| `mode` | `off` | `off` — disabled. `learn` — after a successful **eBPF-inbound** empty-direct dial, write `(dst_ip, dst_port) → DIRECT` (TTL). Values other than `off`/`learn` (including legacy `dns`) are **rejected at parse**. |
+| `ttl` | `5m` | Cache lifetime vs **`bpf_ktime_get_ns` / CLOCK_MONOTONIC** only (never wall clock; A1/F-2). |
+| `max_entries` | `65536` | LRU map capacity (wired into map create; `0` → default). |
+| `allow_with_sniff` | `false` | **Deprecated (Q3 P4).** Kept for config compat. Does **not** relax domain/protocol/process learn gates. Route `MatchInputs` is authoritative: IP/port/network-only decisions may learn even when sniff filled Protocol. Domain-class rules never learn. Softens only the legacy sniff heuristic when no rule item set MatchInputs. |
+
+**Safety gates (skip write + count skip, never error):**
+
+1. Destination port **53** is never written (DNS hijack coexistence).
+2. If sniff metadata participated and `allow_with_sniff` is false → skip.
+3. Outbound must be empty `direct` (`dialer.DirectDialer` with `IsEmpty()==true`).
+4. Process/user metadata present (`ProcessInfo` / `User`) → skip.
+5. **Only `inbound type == ebpf`** may learn (A4); mixed/socks/tun cannot poison the map.
+
+**Invalidate:** `generation++` on interface update / coordinator close; TTL expiry
+in kernel; Export of recent writes for debug.
+
+**Kernel path:** `connect4` looks up `sb_out_verdict` after dest bypass and before
+CIDR. Hit `DIRECT` + generation match + not expired → return 1 (no redirect) and
+increment kernel `hits`. Mismatch/expired increment `gen_mismatch` / `expired`.
+`udp4` has the same lookup but **no UDP learn writer as of rc45** (A7) — misses
+only. Periodic log: `eBPF outbound verdict metrics: … kernel_hits=…`.
+
+**Evidence (F-5):** claim effective verdict only with `kernel_hits>0` + app n/n +
+`InvalidateAll` stops hit growth.
 
 ## Build
 

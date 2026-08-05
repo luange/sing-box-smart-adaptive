@@ -2,15 +2,13 @@ package group
 
 import (
 	"context"
+	"math"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"hash/fnv"
 	"io"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -35,7 +33,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/filemanager"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -221,7 +218,6 @@ type Smart struct {
 	halfLife          time.Duration
 	breakerFailures   int
 	breakerCooldown   time.Duration
-	historyPath       string
 	historyRetention  time.Duration
 	maxHistoryEntries int
 	interruptGroup    *interrupt.Group
@@ -232,43 +228,9 @@ type Smart struct {
 	cancel            context.CancelFunc
 	worker            sync.WaitGroup
 	lifecycleAccess   sync.Mutex
-	published         bool
 	postStarted       bool
 	retired           bool
 	workerStarted     bool
-	historyEntry      *smartHistoryEntry
-	historyReleased   bool
-	loadedHistory     map[string]smartStoreSnapshot
-}
-
-var _ adapter.RuntimeEpochLifecycle = (*Smart)(nil)
-
-type smartHistoryEntry struct {
-	fileAccess sync.Mutex
-	stores     map[string]smartHistoryStore
-	controls   map[string]*smartControlState
-	references map[string]int
-	persisted  map[string]smartStoreSnapshot
-}
-
-type smartHistoryStore struct {
-	store      *smartStore
-	retention  time.Duration
-	maxEntries int
-}
-
-const smartHistoryFileVersion = 2
-
-type smartHistoryFile struct {
-	Version int                           `json:"version"`
-	Groups  map[string]smartStoreSnapshot `json:"groups"`
-}
-
-var smartHistoryPool = struct {
-	sync.Mutex
-	entries map[string]*smartHistoryEntry
-}{
-	entries: make(map[string]*smartHistoryEntry),
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -348,8 +310,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		maxHistoryEntries = defaultSmartMaxHistoryEntries
 	}
 	historyPath := options.HistoryPath
-	if historyPath == "" {
-		historyPath = "smart-history-" + safeSmartFileName(tag) + ".json"
+	if historyPath != "" && logger != nil {
+		// S2: field kept for config compat; no effect since rc44.
+		logger.Warn("smart history_path is deprecated since rc44, no effect (health is process-local and rebuilt after each start)")
 	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
@@ -393,7 +356,6 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		halfLife:          halfLife,
 		breakerFailures:   breakerFailures,
 		breakerCooldown:   breakerCooldown,
-		historyPath:       filemanager.BasePath(ctx, historyPath),
 		historyRetention:  historyRetention,
 		maxHistoryEntries: maxHistoryEntries,
 		interruptGroup:    interrupt.NewGroup(),
@@ -454,68 +416,6 @@ func (s *Smart) PostStart() error {
 	return nil
 }
 
-func (s *Smart) OnRuntimeEpochPublish() error {
-	return nil
-}
-
-func (s *Smart) OnRuntimeEpochPublishCommit() {
-	s.lifecycleAccess.Lock()
-	s.publishHistoryLocked()
-	s.startWorkerLocked()
-	s.lifecycleAccess.Unlock()
-}
-
-func (s *Smart) OnRuntimeEpochPublishRollback() { s.OnRuntimeEpochRetire() }
-
-func (s *Smart) OnRuntimeEpochRetire() {
-	s.stopWorker()
-}
-
-func (s *Smart) publishHistoryLocked() {
-	if s.published {
-		return
-	}
-	smartHistoryPool.Lock()
-	entry := smartHistoryPool.entries[s.historyPath]
-	if entry == nil {
-		entry = &smartHistoryEntry{
-			stores:     make(map[string]smartHistoryStore),
-			controls:   make(map[string]*smartControlState),
-			references: make(map[string]int),
-			persisted:  cloneSmartHistorySnapshots(s.loadedHistory),
-		}
-		smartHistoryPool.entries[s.historyPath] = entry
-	} else if len(s.loadedHistory) > 0 {
-		for tag, snapshot := range s.loadedHistory {
-			if _, loaded := entry.persisted[tag]; !loaded {
-				entry.persisted[tag] = snapshot
-			}
-		}
-	}
-	if historyStore, loaded := entry.stores[s.Tag()]; loaded {
-		s.store = historyStore.store
-	} else {
-		entry.stores[s.Tag()] = smartHistoryStore{store: s.store}
-	}
-	entry.stores[s.Tag()] = smartHistoryStore{
-		store:      s.store,
-		retention:  s.historyRetention,
-		maxEntries: s.maxHistoryEntries,
-	}
-	control := entry.controls[s.Tag()]
-	if control == nil {
-		control = s.control
-		entry.controls[s.Tag()] = control
-	}
-	s.control = control
-	entry.references[s.Tag()]++
-	s.store.setPolicy(s.halfLife, s.breakerFailures, s.breakerCooldown)
-	s.store.setBounds(s.historyRetention, s.maxHistoryEntries)
-	s.historyEntry = entry
-	s.published = true
-	smartHistoryPool.Unlock()
-}
-
 func (s *Smart) stopWorker() {
 	s.lifecycleAccess.Lock()
 	s.retired = true
@@ -526,7 +426,7 @@ func (s *Smart) stopWorker() {
 }
 
 func (s *Smart) startWorkerLocked() {
-	if !s.published || !s.postStarted || s.retired || s.workerStarted {
+	if !s.postStarted || s.retired || s.workerStarted {
 		return
 	}
 	workerCtx, cancel := context.WithCancel(s.ctx)
@@ -540,15 +440,9 @@ func (s *Smart) Close() error {
 	if !s.closing.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.OnRuntimeEpochRetire()
+	s.stopWorker()
 	s.unregisterProviderCallbacks()
 	s.worker.Wait()
-	s.lifecycleAccess.Lock()
-	published := s.published
-	s.lifecycleAccess.Unlock()
-	if published {
-		s.releaseHistory()
-	}
 	return nil
 }
 
@@ -1184,13 +1078,45 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	}
 	if pinned != "" {
 		if index := smartRankIndex(ranks, pinned); index >= 0 && ranks[index].status.State != "open" {
-			ranks[index].eligible = true
-			ranks[index].status.Reason = "manual pin"
-			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
-			return ranking, networkKey, siteKey, siteDisplay
+			// S1: bypass pin when half-dead — enough samples and score much worse
+			// than best other (lower score is better).
+			pinRank := ranks[index]
+			bestOther := math.Inf(1)
+			for i, r := range ranks {
+				if i == index || r.status.State == "open" {
+					continue
+				}
+				if r.status.Score < bestOther {
+					bestOther = r.status.Score
+				}
+			}
+			bypassPin := false
+			if !math.IsInf(bestOther, 1) && pinRank.status.Samples >= float64(s.minSamples) {
+				threshold := bestOther
+				if s.switchMargin < 1 {
+					// pin worse than bestOther by more than switch_margin relative gap
+					threshold = bestOther / (1 - s.switchMargin)
+				}
+				if pinRank.status.Score > threshold {
+					bypassPin = true
+				}
+			}
+			if !bypassPin {
+				ranks[index].eligible = true
+				ranks[index].status.Reason = "manual pin"
+				moveSmartRankFirst(ranks, index)
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
+				return ranking, networkKey, siteKey, siteDisplay
+			}
+			manualPinUnavailable = true
+			if s.logger != nil {
+				s.logger.Info("smart pin bypassed: score pin=", pinRank.status.Score,
+					" best_other=", bestOther, " samples=", pinRank.status.Samples,
+					" tag=", pinned)
+			}
+		} else {
+			manualPinUnavailable = true
 		}
-		manualPinUnavailable = true
 	}
 	if !hasEligibleSmartRank(ranks) {
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
@@ -1569,130 +1495,6 @@ func smartNetworkFingerprint(networkInterface *adapter.NetworkInterface, wifi ad
 	return "network-" + hashSmartIdentity(identity.String())
 }
 
-func (s *Smart) loadHistory() {
-	content, err := os.ReadFile(s.historyPath)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			s.logger.Warn("load smart history: ", err)
-		}
-		return
-	}
-	var header struct {
-		Version int `json:"version"`
-	}
-	if err = json.Unmarshal(content, &header); err != nil {
-		s.logger.Warn("decode smart history: ", err)
-		return
-	}
-	var snapshot smartStoreSnapshot
-	if header.Version == smartHistoryFileVersion {
-		var historyFile smartHistoryFile
-		if err = json.Unmarshal(content, &historyFile); err != nil {
-			s.logger.Warn("decode smart history: ", err)
-			return
-		}
-		s.loadedHistory = cloneSmartHistorySnapshots(historyFile.Groups)
-		snapshot = historyFile.Groups[s.Tag()]
-	} else if err = json.Unmarshal(content, &snapshot); err != nil {
-		s.logger.Warn("decode smart history: ", err)
-		return
-	}
-	s.store.restore(snapshot)
-}
-
-func (s *Smart) flushHistory() {
-	s.lifecycleAccess.Lock()
-	entry := s.historyEntry
-	released := s.historyReleased
-	s.lifecycleAccess.Unlock()
-	if s.historyPath == "" || entry == nil || released {
-		return
-	}
-	entry.fileAccess.Lock()
-	defer entry.fileAccess.Unlock()
-	smartHistoryPool.Lock()
-	stores := make(map[string]smartHistoryStore, len(entry.stores))
-	for tag, historyStore := range entry.stores {
-		stores[tag] = historyStore
-	}
-	groups := cloneSmartHistorySnapshots(entry.persisted)
-	smartHistoryPool.Unlock()
-	for tag, historyStore := range stores {
-		snapshot := historyStore.store.snapshot(time.Now(), historyStore.retention, historyStore.maxEntries)
-		groups[tag] = snapshot
-	}
-	content, err := json.Marshal(smartHistoryFile{
-		Version: smartHistoryFileVersion,
-		Groups:  groups,
-	})
-	if err != nil {
-		s.logger.Warn("encode smart history: ", err)
-		return
-	}
-	if err = os.MkdirAll(filepath.Dir(s.historyPath), 0o755); err != nil {
-		s.logger.Warn("create smart history directory: ", err)
-		return
-	}
-	temporaryFile, err := os.CreateTemp(filepath.Dir(s.historyPath), "."+filepath.Base(s.historyPath)+".*.tmp")
-	if err != nil {
-		s.logger.Warn("create smart history temporary file: ", err)
-		return
-	}
-	temporaryPath := temporaryFile.Name()
-	defer os.Remove(temporaryPath)
-	if err = temporaryFile.Chmod(0o600); err == nil {
-		_, err = temporaryFile.Write(content)
-	}
-	if closeErr := temporaryFile.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		s.logger.Warn("write smart history: ", err)
-		return
-	}
-	if err = os.Rename(temporaryPath, s.historyPath); err != nil {
-		s.logger.Warn("publish smart history: ", err)
-		return
-	}
-	smartHistoryPool.Lock()
-	if smartHistoryPool.entries[s.historyPath] == entry {
-		entry.persisted = groups
-	}
-	smartHistoryPool.Unlock()
-}
-
-func (s *Smart) releaseHistory() {
-	s.lifecycleAccess.Lock()
-	if s.historyReleased || s.historyEntry == nil {
-		s.lifecycleAccess.Unlock()
-		return
-	}
-	entry := s.historyEntry
-	s.historyReleased = true
-	s.lifecycleAccess.Unlock()
-	smartHistoryPool.Lock()
-	tag := s.Tag()
-	entry.references[tag]--
-	if entry.references[tag] <= 0 {
-		delete(entry.references, tag)
-		delete(entry.stores, tag)
-		delete(entry.controls, tag)
-	}
-	if len(entry.references) == 0 && smartHistoryPool.entries[s.historyPath] == entry {
-		delete(smartHistoryPool.entries, s.historyPath)
-	}
-	smartHistoryPool.Unlock()
-}
-
-func cloneSmartHistorySnapshots(source map[string]smartStoreSnapshot) map[string]smartStoreSnapshot {
-	result := make(map[string]smartStoreSnapshot, len(source))
-	for tag, snapshot := range source {
-		snapshot.Metrics = append([]smartMetric(nil), snapshot.Metrics...)
-		result[tag] = snapshot
-	}
-	return result
-}
-
 func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr) (string, string) {
 	host := ""
 	if metadata != nil {
@@ -1764,28 +1566,6 @@ func hashSmartIdentity(value string) string {
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(value))
 	return hex.EncodeToString(hash.Sum(nil))
-}
-
-func safeSmartFileName(value string) string {
-	if value == "" {
-		return "default"
-	}
-	var builder strings.Builder
-	for _, character := range value {
-		switch {
-		case character >= 'a' && character <= 'z':
-			builder.WriteRune(character)
-		case character >= 'A' && character <= 'Z':
-			builder.WriteRune(character)
-		case character >= '0' && character <= '9':
-			builder.WriteRune(character)
-		case character == '-' || character == '_':
-			builder.WriteRune(character)
-		default:
-			builder.WriteByte('_')
-		}
-	}
-	return builder.String()
 }
 
 func itoaSmall(value int) string {

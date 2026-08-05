@@ -136,6 +136,7 @@ func (m DNSRuleMatchResponse) DescribeSchema(builder schema.Builder) (*schema.No
 
 type RawDefaultDNSRule struct {
 	Inbound                  badoption.Listable[string]                                                  `json:"inbound,omitempty" reference:"inbound"`
+	InboundInterface         badoption.Listable[string]                                                  `json:"inbound_interface,omitempty"`
 	IPVersion                int                                                                         `json:"ip_version,omitempty" enum:"4,6"`
 	QueryType                badoption.Listable[DNSQueryType]                                            `json:"query_type,omitempty"`
 	Network                  badoption.Listable[string]                                                  `json:"network,omitempty" enum:"tcp,udp"`

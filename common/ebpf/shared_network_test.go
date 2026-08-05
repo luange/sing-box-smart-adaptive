@@ -9,7 +9,7 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 36 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 40 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkRedirectKey{}); size != 40 {
@@ -17,6 +17,12 @@ func TestSharedNetworkABI(t *testing.T) {
 	}
 	if sharedNetworkFlagDNSHijack != 1<<4 {
 		t.Fatalf("unexpected shared-network DNS flag: %#x", sharedNetworkFlagDNSHijack)
+	}
+	if sharedNetworkFlagDropUDP443 != 1<<5 {
+		t.Fatalf("unexpected shared-network drop UDP/443 flag: %#x", sharedNetworkFlagDropUDP443)
+	}
+	if sharedNetworkFlagSocketAssign != 1<<6 {
+		t.Fatalf("unexpected shared-network socket-assign flag: %#x", sharedNetworkFlagSocketAssign)
 	}
 }
 

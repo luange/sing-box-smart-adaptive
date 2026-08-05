@@ -48,6 +48,8 @@ int sb_ebpf_shared_network_prepare(
     size_t object_size,
     int bypass_ipv4_map_fd,
     int bypass_ipv6_map_fd,
+    int dns_direct_ipv4_map_fd,
+    int dns_direct_ipv6_map_fd,
     struct sb_ebpf_shared_network_runtime *runtime) {
     if (object == NULL || object_size == 0U || runtime == NULL) {
         errno = EINVAL;
@@ -60,6 +62,13 @@ int sb_ebpf_shared_network_prepare(
         sizeof(uint32_t),
         sizeof(struct sb_shared_control),
         1U,
+        0U);
+    stage = "create interface MAC map";
+    runtime->interface_mac_map_fd = sb_ebpf_create_map(
+        BPF_MAP_TYPE_HASH,
+        sizeof(uint32_t),
+        sizeof(struct sb_shared_interface_mac),
+        SB_SHARED_NETWORK_INTERFACE_ENTRIES,
         0U);
     stage = "create original-to-token map";
     runtime->original_to_token_map_fd = sb_ebpf_create_map(
@@ -82,6 +91,20 @@ int sb_ebpf_shared_network_prepare(
         sizeof(struct sb_shared_original_dst),
         SB_SHARED_NETWORK_MAP_ENTRIES,
         0U);
+    stage = "create listener socket map";
+    runtime->listener_socket_map_fd = sb_ebpf_create_map(
+        BPF_MAP_TYPE_SOCKMAP,
+        sizeof(uint32_t),
+        sizeof(uint64_t),
+        SB_SHARED_LISTENER_COUNT,
+        0U);
+    stage = "create stats map";
+    runtime->stats_map_fd = sb_ebpf_create_map(
+        BPF_MAP_TYPE_ARRAY,
+        sizeof(uint32_t),
+        sizeof(uint64_t),
+        SB_SHARED_STAT_COUNT,
+        0U);
     stage = "create host maps";
     runtime->host_ipv4_map_fd = shared_network_create_lpm4();
     runtime->host_ipv6_map_fd = shared_network_create_lpm6();
@@ -93,9 +116,12 @@ int sb_ebpf_shared_network_prepare(
         1U,
         0U);
     if (runtime->control_map_fd < 0 ||
+        runtime->interface_mac_map_fd < 0 ||
         runtime->original_to_token_map_fd < 0 ||
         runtime->token_to_original_map_fd < 0 ||
         runtime->redirect_map_fd < 0 ||
+        runtime->listener_socket_map_fd < 0 ||
+        runtime->stats_map_fd < 0 ||
         runtime->host_ipv4_map_fd < 0 ||
         runtime->host_ipv6_map_fd < 0 ||
         runtime->scratch_map_fd < 0) {
@@ -113,12 +139,26 @@ int sb_ebpf_shared_network_prepare(
         if (runtime->fallback_bypass_ipv6_map_fd < 0) goto fail;
         bypass_ipv6_map_fd = runtime->fallback_bypass_ipv6_map_fd;
     }
+    if (dns_direct_ipv4_map_fd < 0) {
+        stage = "create fallback IPv4 dns_direct map";
+        runtime->fallback_dns_direct_ipv4_map_fd = shared_network_create_lpm4();
+        if (runtime->fallback_dns_direct_ipv4_map_fd < 0) goto fail;
+        dns_direct_ipv4_map_fd = runtime->fallback_dns_direct_ipv4_map_fd;
+    }
+    if (dns_direct_ipv6_map_fd < 0) {
+        stage = "create fallback IPv6 dns_direct map";
+        runtime->fallback_dns_direct_ipv6_map_fd = shared_network_create_lpm6();
+        if (runtime->fallback_dns_direct_ipv6_map_fd < 0) goto fail;
+        dns_direct_ipv6_map_fd = runtime->fallback_dns_direct_ipv6_map_fd;
+    }
     stage = "load shared-network programs";
     if (sb_ebpf_load_shared_network_programs(
             object,
             object_size,
             bypass_ipv4_map_fd,
             bypass_ipv6_map_fd,
+            dns_direct_ipv4_map_fd,
+            dns_direct_ipv6_map_fd,
             runtime) != 0) {
         goto fail;
     }
@@ -143,13 +183,18 @@ int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime)
     CLOSE_SHARED_FD(runtime->egress_prog_fd);
     CLOSE_SHARED_FD(runtime->ingress_prog_fd);
     CLOSE_SHARED_FD(runtime->scratch_map_fd);
+    CLOSE_SHARED_FD(runtime->fallback_dns_direct_ipv6_map_fd);
+    CLOSE_SHARED_FD(runtime->fallback_dns_direct_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->fallback_bypass_ipv6_map_fd);
     CLOSE_SHARED_FD(runtime->fallback_bypass_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->host_ipv6_map_fd);
     CLOSE_SHARED_FD(runtime->host_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->redirect_map_fd);
+    CLOSE_SHARED_FD(runtime->listener_socket_map_fd);
+    CLOSE_SHARED_FD(runtime->stats_map_fd);
     CLOSE_SHARED_FD(runtime->token_to_original_map_fd);
     CLOSE_SHARED_FD(runtime->original_to_token_map_fd);
+    CLOSE_SHARED_FD(runtime->interface_mac_map_fd);
     CLOSE_SHARED_FD(runtime->control_map_fd);
 #undef CLOSE_SHARED_FD
     return result;

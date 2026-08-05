@@ -99,6 +99,7 @@ func OutboundRegistry() *outbound.Registry {
 
 	direct.RegisterOutbound(registry)
 	bridge.RegisterOutbound(registry)
+	registerEBPFOutbound(registry)
 
 	pass.RegisterOutbound(registry)
 	block.RegisterOutbound(registry)

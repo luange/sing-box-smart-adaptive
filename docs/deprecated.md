@@ -6,6 +6,12 @@ icon: material/delete-alert
 
 ## 1.14.0
 
+#### Smart `history_path` (rc44+)
+
+`outbounds[].history_path` on `type: "smart"` is **deprecated since rc44** and
+has no effect. Health is process-local and rebuilt after each start. The field
+remains accepted so existing configs keep parsing; remove it when convenient.
+
 #### Legacy `download_detour` remote rule-set option
 
 Legacy `download_detour` remote rule-set option is deprecated,

@@ -126,6 +126,23 @@ func TestNormalizeCgroupPathRejectsRelativePath(t *testing.T) {
 	}
 }
 
+func TestValidateLocalCaptureOptions(t *testing.T) {
+	disabled := false
+	shared := option.EBPFSharedNetworkOptions{Enabled: true}
+	if err := validateLocalCaptureOptions(option.EBPFInboundOptions{CaptureLocal: &disabled}, shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLocalCaptureOptions(option.EBPFInboundOptions{CaptureLocal: &disabled}, option.EBPFSharedNetworkOptions{}); err == nil {
+		t.Fatal("expected shared_network to be required")
+	}
+	if err := validateLocalCaptureOptions(option.EBPFInboundOptions{
+		CaptureLocal: &disabled,
+		ExcludeUID:   []uint32{0},
+	}, shared); err == nil {
+		t.Fatal("expected UID filters to be rejected when local capture is disabled")
+	}
+}
+
 func TestNormalizeDNSMode(t *testing.T) {
 	for _, test := range []struct {
 		input  string

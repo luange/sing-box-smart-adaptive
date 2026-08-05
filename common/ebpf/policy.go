@@ -17,10 +17,16 @@ const (
 )
 
 type Policy struct {
-	EnableBypassCIDR bool
-	HijackDNS        bool
-	IncludeUID       []UIDRange
-	ExcludeUID       []UIDRange
+	DisableLocalCapture bool
+	EnableBypassCIDR    bool
+	HijackDNS           bool
+	// EnableFlowVerdict creates Module A verdict maps and wires connect4/udp4 lookup.
+	// Default false (off). Contract: master §6.2 / plan §4 / F-1.
+	EnableFlowVerdict bool
+	// FlowVerdictMaxEntries sizes the LRU verdict map; 0 → 65536 (A5).
+	FlowVerdictMaxEntries uint32
+	IncludeUID            []UIDRange
+	ExcludeUID            []UIDRange
 }
 
 type UIDRange struct {

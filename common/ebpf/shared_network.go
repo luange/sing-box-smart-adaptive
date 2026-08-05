@@ -13,6 +13,8 @@ static int singbox_ebpf_shared_network_prepare(
 	size_t object_size,
 	int bypass_ipv4_map_fd,
 	int bypass_ipv6_map_fd,
+	int dns_direct_ipv4_map_fd,
+	int dns_direct_ipv6_map_fd,
 	struct sb_ebpf_shared_network_runtime *runtime,
 	int *saved_errno) {
 	int result = sb_ebpf_shared_network_prepare(
@@ -20,6 +22,8 @@ static int singbox_ebpf_shared_network_prepare(
 		object_size,
 		bypass_ipv4_map_fd,
 		bypass_ipv6_map_fd,
+		dns_direct_ipv4_map_fd,
+		dns_direct_ipv6_map_fd,
 		runtime);
 	if (result != 0) *saved_errno = errno;
 	return result;
@@ -51,6 +55,33 @@ import (
 
 const SharedNetworkMapCapacity = 65536
 
+const (
+	sharedStatIngressRedirects uint32 = iota
+	sharedStatIngressBypass
+	sharedStatIngressDrops
+	sharedStatEgressRestores
+	sharedStatEgressReverseMisses
+	sharedStatTokenFailures
+	sharedStatRewriteFailures
+	sharedStatSocketAssignments
+	sharedStatSocketAssignFailures
+	sharedStatFlowUpdateFailures
+	sharedStatCount
+)
+
+type SharedNetworkRuntimeStats struct {
+	IngressRedirects     uint64
+	IngressBypass        uint64
+	IngressDrops         uint64
+	EgressRestores       uint64
+	EgressReverseMisses  uint64
+	TokenFailures        uint64
+	RewriteFailures      uint64
+	SocketAssignments    uint64
+	SocketAssignFailures uint64
+	FlowUpdateFailures   uint64
+}
+
 //go:embed native/shared_network.bpf.o
 var sharedNetworkObject []byte
 
@@ -64,6 +95,7 @@ type sharedNetworkControl struct {
 	IPv6PrefixBits uint8
 	Reserved2      [2]byte
 	IPv6Prefix     [16]byte
+	RoutingMark    uint32
 }
 
 type sharedNetworkRedirectKey struct {
@@ -76,12 +108,19 @@ type sharedNetworkRedirectKey struct {
 	ClientAddr   [16]byte
 }
 
+type sharedNetworkInterfaceMAC struct {
+	Addr     [6]byte
+	Reserved [2]byte
+}
+
 const (
 	sharedNetworkFlagIPv4 = 1 << iota
 	sharedNetworkFlagIPv6
 	sharedNetworkFlagTCP
 	sharedNetworkFlagUDP
 	sharedNetworkFlagDNSHijack
+	sharedNetworkFlagDropUDP443
+	sharedNetworkFlagSocketAssign
 )
 
 type SharedNetworkBackend struct {
@@ -99,6 +138,9 @@ func PrepareSharedNetwork(
 	enableUDP bool,
 	redirectIPv4 netip.Prefix,
 	redirectIPv6 netip.Prefix,
+	dropUDP443 bool,
+	socketAssign bool,
+	routingMark uint32,
 ) (*SharedNetworkBackend, error) {
 	if parent == nil {
 		return nil, osErrClosed
@@ -139,12 +181,16 @@ func PrepareSharedNetwork(
 		return nil, osErrClosed
 	}
 	hijackDNS := parent.hijackDNS
+	dnsDirect4 := parent.dnsDirectIPv4CIDRMap
+	dnsDirect6 := parent.dnsDirectIPv6CIDRMap
 	var savedErrno C.int
 	result := C.singbox_ebpf_shared_network_prepare(
 		(*C.uint8_t)(unsafe.Pointer(&sharedNetworkObject[0])),
 		C.size_t(len(sharedNetworkObject)),
 		C.int(parent.bypassIPv4CIDRMap),
 		C.int(parent.bypassIPv6CIDRMap),
+		C.int(dnsDirect4),
+		C.int(dnsDirect6),
 		runtimeState,
 		&savedErrno,
 	)
@@ -168,6 +214,17 @@ func PrepareSharedNetwork(
 	if hijackDNS {
 		backend.control.Flags |= sharedNetworkFlagDNSHijack
 	}
+	if dropUDP443 {
+		backend.control.Flags |= sharedNetworkFlagDropUDP443
+	}
+	if socketAssign {
+		if routingMark == 0 {
+			_ = backend.Close()
+			return nil, E.New("missing shared-network socket-assignment routing mark")
+		}
+		backend.control.Flags |= sharedNetworkFlagSocketAssign
+		backend.control.RoutingMark = routingMark
+	}
 	if redirectIPv4.IsValid() {
 		backend.control.Flags |= sharedNetworkFlagIPv4
 		backend.control.IPv4Prefix = redirectIPv4.Addr().As4()
@@ -185,20 +242,43 @@ func PrepareSharedNetwork(
 	return backend, nil
 }
 
+func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error {
+	if b == nil || key >= 4 || fd < 0 {
+		return E.New("invalid shared-network listener socket")
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	value := uint64(fd)
+	return updateMapWithFlags(
+		int(b.runtime.listener_socket_map_fd),
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&value),
+		0,
+	)
+}
+
 func (b *SharedNetworkBackend) updateControl(enabled bool) error {
 	if b == nil || b.runtime == nil {
 		return osErrClosed
 	}
 	control := b.control
+	control.Enabled = 0
 	if enabled {
 		control.Enabled = 1
 	}
 	key := uint32(0)
-	return updateMap(
+	if err := updateMap(
 		int(b.runtime.control_map_fd),
 		unsafe.Pointer(&key),
 		unsafe.Pointer(&control),
-	)
+	); err != nil {
+		return err
+	}
+	b.control.Enabled = control.Enabled
+	return nil
 }
 
 func (b *SharedNetworkBackend) Enable() error {
@@ -208,6 +288,36 @@ func (b *SharedNetworkBackend) Enable() error {
 	b.access.Lock()
 	defer b.access.Unlock()
 	return b.updateControl(true)
+}
+
+func (b *SharedNetworkBackend) UpdateInterfaceMAC(ifIndex uint32, hardwareAddress []byte) error {
+	if b == nil || len(hardwareAddress) != 6 {
+		return E.New("invalid shared-network interface MAC")
+	}
+	var value sharedNetworkInterfaceMAC
+	copy(value.Addr[:], hardwareAddress)
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	return updateMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex), unsafe.Pointer(&value))
+}
+
+func (b *SharedNetworkBackend) DeleteInterfaceMAC(ifIndex uint32) error {
+	if b == nil {
+		return osErrClosed
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	err := deleteMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex))
+	if errors.Is(err, syscall.ENOENT) {
+		return nil
+	}
+	return err
 }
 
 func (b *SharedNetworkBackend) Disable() error {
@@ -246,6 +356,39 @@ func (b *SharedNetworkBackend) EgressProgramFD() int {
 	return int(b.runtime.egress_prog_fd)
 }
 
+func (b *SharedNetworkBackend) RuntimeStats() (SharedNetworkRuntimeStats, error) {
+	if b == nil {
+		return SharedNetworkRuntimeStats{}, osErrClosed
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return SharedNetworkRuntimeStats{}, osErrClosed
+	}
+	var values [sharedStatCount]uint64
+	for key := uint32(0); key < sharedStatCount; key++ {
+		if err := lookupMap(
+			int(b.runtime.stats_map_fd),
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&values[key]),
+		); err != nil {
+			return SharedNetworkRuntimeStats{}, err
+		}
+	}
+	return SharedNetworkRuntimeStats{
+		IngressRedirects:     values[sharedStatIngressRedirects],
+		IngressBypass:        values[sharedStatIngressBypass],
+		IngressDrops:         values[sharedStatIngressDrops],
+		EgressRestores:       values[sharedStatEgressRestores],
+		EgressReverseMisses:  values[sharedStatEgressReverseMisses],
+		TokenFailures:        values[sharedStatTokenFailures],
+		RewriteFailures:      values[sharedStatRewriteFailures],
+		SocketAssignments:    values[sharedStatSocketAssignments],
+		SocketAssignFailures: values[sharedStatSocketAssignFailures],
+		FlowUpdateFailures:   values[sharedStatFlowUpdateFailures],
+	}, nil
+}
+
 func (b *SharedNetworkBackend) LookupOriginal(
 	protocol uint8,
 	client netip.AddrPort,
@@ -276,7 +419,8 @@ func (b *SharedNetworkBackend) LookupOriginal(
 		return OriginalDestination{}, err
 	}
 	return OriginalDestination{
-		Destination: netip.AddrPortFrom(address, original.Port),
+		Destination:    netip.AddrPortFrom(address, original.Port),
+		IngressIfIndex: uint32(original.SocketCookie),
 	}, nil
 }
 

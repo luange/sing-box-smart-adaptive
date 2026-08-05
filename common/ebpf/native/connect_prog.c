@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "singbox_ebpf.h"
+#include "singbox_ebpf_out.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -65,6 +66,10 @@ enum {
     STACK_UID_KEY = -240,
     STACK_BYPASS_CIDR_KEY = -272,
     STACK_STATS_KEY = -280,
+    /* Module A: sb_out_verdict_key (24B) below existing slots; no clobber of active keys. */
+    STACK_VERDICT_KEY = -304,
+    /* Scratch for control.generation / expire_ns during verdict lookup. */
+    STACK_VERDICT_SCRATCH = -312,
 };
 
 struct bpf_builder {
@@ -238,7 +243,7 @@ static void emit_dns_hijack_jumps(
 
 static int create_redirect_map(uint32_t max_entries) {
     return sb_ebpf_create_map(
-        (enum bpf_map_type)SB_EBPF_HASH_MAP_TYPE,
+        (enum bpf_map_type)SB_EBPF_LRU_HASH_MAP_TYPE,
         sizeof(struct sb_ebpf_redirect_key),
         sizeof(struct sb_ebpf_original_dst),
         max_entries,
@@ -301,6 +306,58 @@ static int create_bypass_cidr_map(bool enabled, uint32_t key_size) {
         BPF_F_NO_PREALLOC);
 }
 
+/* Always created (small): empty map ⇒ no :53 kernel exceptions. */
+static int create_dns_direct_cidr_map(uint32_t key_size) {
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_LPM_TRIE_MAP_TYPE,
+        key_size,
+        sizeof(uint8_t),
+        256U,
+        BPF_F_NO_PREALLOC);
+}
+
+static int create_out_verdict_map(bool enabled, uint32_t max_entries) {
+    if (!enabled) return -1;
+    if (max_entries == 0U) max_entries = SB_OUT_VERDICT_MAX_ENTRIES;
+    if (max_entries < 16U) max_entries = 16U;
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_LRU_HASH_MAP_TYPE,
+        sizeof(struct sb_out_verdict_key),
+        sizeof(struct sb_out_verdict_value),
+        max_entries,
+        0U);
+}
+
+static int create_out_verdict_control_map(bool enabled) {
+    if (!enabled) return -1;
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_ARRAY_MAP_TYPE,
+        sizeof(uint32_t),
+        sizeof(struct sb_out_verdict_control),
+        1U,
+        0U);
+}
+
+static int create_out_verdict_stats_map(bool enabled) {
+    if (!enabled) return -1;
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_ARRAY_MAP_TYPE,
+        sizeof(uint32_t),
+        sizeof(uint64_t),
+        (uint32_t)SB_OUT_VERDICT_STAT_COUNT,
+        0U);
+}
+
+static int create_self_listen_port_map(void) {
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_HASH_MAP_TYPE,
+        sizeof(uint16_t),
+        sizeof(uint8_t),
+        SB_OUT_SELF_LISTEN_MAX_ENTRIES,
+        0U);
+}
+/* control/stats/self_listen_port seeded from Go after prepare. */
+
 static void emit_zero_region(struct bpf_builder *builder, int base_off, size_t size) {
     for (size_t off = 0; off < size; off += sizeof(uint32_t)) {
         emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, (int16_t)(base_off + (int)off), 0));
@@ -314,6 +371,23 @@ static void emit_stat_increment(
     if (config->stats_map_fd < 0) return;
     emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_STATS_KEY, index));
     emit_ld_map_fd(builder, BPF_REG_1, config->stats_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_STATS_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t missing = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit(builder, BPF_MOV64_IMM(BPF_REG_1, 1));
+    emit(builder, BPF_STX_XADD(BPF_DW, BPF_REG_0, BPF_REG_1, 0));
+    patch_jump(builder, missing, builder->count);
+}
+
+/* Module A stats ARRAY (separate from inbound redirect stats). Clobbers R0-R2. */
+static void emit_verdict_stat_increment(
+    struct bpf_builder *builder,
+    int verdict_stats_map_fd,
+    enum sb_out_verdict_stat_index index) {
+    if (verdict_stats_map_fd < 0) return;
+    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_STATS_KEY, (int)index));
+    emit_ld_map_fd(builder, BPF_REG_1, verdict_stats_map_fd);
     emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
     emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_STATS_KEY));
     emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
@@ -718,6 +792,275 @@ static void emit_socket_cookie_bypass(
     bypass_jumps[(*bypass_jump_count)++] =
         emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
     patch_jump(builder, no_cookie, builder->count);
+}
+
+/*
+ * Module A: flow verdict offload. After user_ip/port loaded; before CIDR bypass.
+ * On DIRECT hit with matching generation and unexpired TTL → join bypass_jumps
+ * (return 1, no redirect). Miss / mismatch / expired → fall through.
+ *
+ * Preconditions for IPv4: R6=ctx, R7=user_ip4 (network), R8=user_port (network).
+ * Clobbers R0-R5; preserves R6-R9. Restores nothing else.
+ */
+static void emit_flow_verdict_bypass_v4(
+    struct bpf_builder *builder,
+    int verdict_map_fd,
+    int control_map_fd,
+    int verdict_stats_map_fd,
+    uint8_t protocol,
+    bool protocol_from_context,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (verdict_map_fd < 0 || control_map_fd < 0) return;
+
+    /* control[0]: skip if missing or disabled */
+    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_STATS_KEY, 0));
+    emit_ld_map_fd(builder, BPF_REG_1, control_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_STATS_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t no_control = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_control, enabled)));
+    size_t disabled = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_1, 0, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_control, generation)));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, STACK_VERDICT_SCRATCH));
+
+    /* Build sb_out_verdict_key (24B). Port stored host-order; exact match only. */
+    emit_zero_region(builder, STACK_VERDICT_KEY, sizeof(struct sb_out_verdict_key));
+    emit(builder, BPF_ST_MEM(
+        BPF_B, BPF_REG_10,
+        STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, family),
+        AF_INET));
+    if (protocol_from_context) {
+        emit(builder, BPF_LDX_MEM(
+            BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, protocol)));
+        emit(builder, BPF_STX_MEM(
+            BPF_B, BPF_REG_10, BPF_REG_1,
+            STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, protocol)));
+    } else {
+        emit(builder, BPF_ST_MEM(
+            BPF_B, BPF_REG_10,
+            STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, protocol),
+            protocol));
+    }
+    /* R8 = user_port network order → host order via BPF_TO_BE (endian swap on LE). */
+    emit(builder, BPF_MOV32_REG(BPF_REG_1, BPF_REG_8));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_1, 16));
+    emit(builder, BPF_STX_MEM(
+        BPF_H, BPF_REG_10, BPF_REG_1,
+        STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, port)));
+    /* Address: network-order memcpy (R7 holds user_ip4). */
+    emit(builder, BPF_STX_MEM(
+        BPF_W, BPF_REG_10, BPF_REG_7,
+        STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, addr)));
+
+    emit_ld_map_fd(builder, BPF_REG_1, verdict_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_VERDICT_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t miss = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+
+    /* R0 = &sb_out_verdict_value. Spill fields we need before clobbering R0. */
+    emit(builder, BPF_LDX_MEM(
+        BPF_B, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, verdict)));
+    size_t not_direct = emit_jump(
+        builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_1, (int)SB_OUT_VERDICT_DIRECT, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, generation)));
+    emit(builder, BPF_LDX_MEM(
+        BPF_DW, BPF_REG_3, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, expire_ns)));
+    /* R1=gen, R3=expire_ns; compare gen to control gen on stack */
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, STACK_VERDICT_SCRATCH));
+    size_t gen_ok = emit_jump(builder, BPF_JMP_REG_OP(BPF_JEQ, BPF_REG_1, BPF_REG_2, 0));
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_GEN_MISMATCH);
+    size_t gen_mismatch_done = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+    patch_jump(builder, gen_ok, builder->count);
+    /* expire still in R3 */
+    emit(builder, BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_3, STACK_VERDICT_SCRATCH));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_ktime_get_ns));
+    emit(builder, BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, STACK_VERDICT_SCRATCH));
+    size_t not_expired = emit_jump(builder, BPF_JMP_REG_OP(BPF_JLT, BPF_REG_0, BPF_REG_1, 0));
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_EXPIRED);
+    size_t expired_done = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+    patch_jump(builder, not_expired, builder->count);
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_HITS);
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+
+    size_t cont = builder->count;
+    patch_jump(builder, no_control, cont);
+    patch_jump(builder, disabled, cont);
+    patch_jump(builder, miss, cont);
+    patch_jump(builder, not_direct, cont);
+    patch_jump(builder, gen_mismatch_done, cont);
+    patch_jump(builder, expired_done, cont);
+}
+
+/*
+ * W1: pure IPv6 flow-verdict lookup. Same map/ABI as v4; family=AF_INET6.
+ * Register layout on the pure-v6 path (see build_ipv6_program):
+ *   R7/R8/R9/R4 = user_ip6 words 0..3, R5 = user_port (network order).
+ * Helpers clobber R0-R5, so R4/R5 must be reloaded from ctx (R6) before return.
+ * Do not touch emit_ipv4_* (G-2).
+ */
+static void emit_flow_verdict_bypass_v6(
+    struct bpf_builder *builder,
+    int verdict_map_fd,
+    int control_map_fd,
+    int verdict_stats_map_fd,
+    uint8_t protocol,
+    bool protocol_from_context,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (verdict_map_fd < 0 || control_map_fd < 0) return;
+
+    /* control[0]: skip if missing or disabled */
+    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_STATS_KEY, 0));
+    emit_ld_map_fd(builder, BPF_REG_1, control_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_STATS_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t no_control = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_control, enabled)));
+    size_t disabled = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_1, 0, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_control, generation)));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, STACK_VERDICT_SCRATCH));
+
+    emit_zero_region(builder, STACK_VERDICT_KEY, sizeof(struct sb_out_verdict_key));
+    emit(builder, BPF_ST_MEM(
+        BPF_B, BPF_REG_10,
+        STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, family),
+        AF_INET6));
+    if (protocol_from_context) {
+        emit(builder, BPF_LDX_MEM(
+            BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, protocol)));
+        emit(builder, BPF_STX_MEM(
+            BPF_B, BPF_REG_10, BPF_REG_1,
+            STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, protocol)));
+    } else {
+        emit(builder, BPF_ST_MEM(
+            BPF_B, BPF_REG_10,
+            STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, protocol),
+            protocol));
+    }
+    /*
+     * Port + full address MUST be reloaded from ctx (R6) after any helper call.
+     * Control-map lookup clobbers R1-R5; never trust R4/R5 from the entry path.
+     * Reload all four ip6 words too so key bytes match Go putAddress As16 layout.
+     */
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_1, 16));
+    emit(builder, BPF_STX_MEM(
+        BPF_H, BPF_REG_10, BPF_REG_1,
+        STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, port)));
+    int addr_off = STACK_VERDICT_KEY + (int)offsetof(struct sb_out_verdict_key, addr);
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 0));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, addr_off + 0));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 4));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, addr_off + 4));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, addr_off + 8));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, addr_off + 12));
+
+    emit_ld_map_fd(builder, BPF_REG_1, verdict_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_VERDICT_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t miss = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+
+    emit(builder, BPF_LDX_MEM(
+        BPF_B, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, verdict)));
+    size_t not_direct = emit_jump(
+        builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_1, (int)SB_OUT_VERDICT_DIRECT, 0));
+    emit(builder, BPF_LDX_MEM(
+        BPF_W, BPF_REG_1, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, generation)));
+    emit(builder, BPF_LDX_MEM(
+        BPF_DW, BPF_REG_3, BPF_REG_0,
+        (int)offsetof(struct sb_out_verdict_value, expire_ns)));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, STACK_VERDICT_SCRATCH));
+    size_t gen_ok = emit_jump(builder, BPF_JMP_REG_OP(BPF_JEQ, BPF_REG_1, BPF_REG_2, 0));
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_GEN_MISMATCH);
+    size_t gen_mismatch_done = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+    patch_jump(builder, gen_ok, builder->count);
+    emit(builder, BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_3, STACK_VERDICT_SCRATCH));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_ktime_get_ns));
+    emit(builder, BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, STACK_VERDICT_SCRATCH));
+    size_t not_expired = emit_jump(builder, BPF_JMP_REG_OP(BPF_JLT, BPF_REG_0, BPF_REG_1, 0));
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_EXPIRED);
+    size_t expired_done = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+    patch_jump(builder, not_expired, builder->count);
+    emit_verdict_stat_increment(builder, verdict_stats_map_fd, SB_OUT_VERDICT_STAT_HITS);
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+
+    size_t cont = builder->count;
+    patch_jump(builder, no_control, cont);
+    patch_jump(builder, disabled, cont);
+    patch_jump(builder, miss, cont);
+    patch_jump(builder, not_direct, cont);
+    patch_jump(builder, gen_mismatch_done, cont);
+    patch_jump(builder, expired_done, cont);
+    /* Critical: restore R4 (ip6[3]) and R5 (port) for downstream IPv6 emitters. */
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+}
+
+/*
+ * Module C.1: if destination port is a registered self listen port AND
+ * destination IPv4 is inside the redirect token prefix, bypass capture.
+ * Prevents double-redirect when cookie protect misses on a token-address dial
+ * back to our own listener. UDP: no learn writer as of rc45 (A7) — verdict path
+ * on udp4 is lookup-only.
+ */
+static void emit_self_listen_redirect_bypass_v4(
+    struct bpf_builder *builder,
+    const struct sb_ebpf_inbound_config *config,
+    int self_listen_map_fd,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (self_listen_map_fd < 0 || config == NULL || config->disable_ipv4) return;
+
+    /* host-order port key from R8 (network) */
+    emit(builder, BPF_MOV32_REG(BPF_REG_1, BPF_REG_8));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_1, 16));
+    emit(builder, BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_1, STACK_VERDICT_SCRATCH));
+    emit_ld_map_fd(builder, BPF_REG_1, self_listen_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_VERDICT_SCRATCH));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t miss = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+
+    /* R7 = user_ip4 network → host, mask with redirect prefix */
+    uint32_t redirect_prefix = ipv4_redirect_prefix(
+        config->redirect_ipv4_prefix, config->redirect_ipv4_prefix_bits);
+    uint32_t redirect_host_mask = ipv4_redirect_host_mask(config->redirect_ipv4_prefix_bits);
+    emit(builder, BPF_MOV32_REG(BPF_REG_1, BPF_REG_7));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_1, 32));
+    if (redirect_host_mask != 0U) {
+        emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_1, (int)~redirect_host_mask));
+    }
+    size_t not_prefix = emit_jump(
+        builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_1, (int)redirect_prefix, 0));
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+
+    size_t cont = builder->count;
+    patch_jump(builder, miss, cont);
+    patch_jump(builder, not_prefix, cont);
 }
 
 static void emit_uid_policy_filter(
@@ -1560,6 +1903,10 @@ static void emit_ipv4_mapped_redirect_from_regs(
     int udp_redirect_map_fd,
     int udp_token_map_fd,
     int bypass_ipv4_cidr_map_fd,
+    int out_verdict_map_fd,
+    int out_verdict_control_map_fd,
+    int out_verdict_stats_map_fd,
+    int self_listen_port_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -1580,11 +1927,31 @@ static void emit_ipv4_mapped_redirect_from_regs(
         dns_hijack_jumps,
         &dns_hijack_jump_count);
     emit_ipv4_destination_bypass(builder, bypass_jumps, bypass_jump_count);
+    /* Module A: verdict after destination checks, before CIDR bypass. */
+    emit_flow_verdict_bypass_v4(
+        builder,
+        out_verdict_map_fd,
+        out_verdict_control_map_fd,
+        out_verdict_stats_map_fd,
+        protocol,
+        protocol_from_context,
+        bypass_jumps,
+        bypass_jump_count);
+    /* Module C.1: self-listen + redirect-prefix anti double-capture */
+    emit_self_listen_redirect_bypass_v4(
+        builder,
+        config,
+        self_listen_port_map_fd,
+        bypass_jumps,
+        bypass_jump_count);
     emit_ipv4_cidr_bypass(
         builder, bypass_ipv4_cidr_map_fd, BPF_REG_7, bypass_jumps, bypass_jump_count);
     for (size_t i = 0; i < dns_hijack_jump_count; ++i) {
         patch_jump(builder, dns_hijack_jumps[i], builder->count);
     }
+    /* dns_kernel_direct: :53 destinations in dns_direct LPM stay kernel (allow). */
+    emit_ipv4_cidr_bypass(
+        builder, config->dns_direct_ipv4_map_fd, BPF_REG_7, bypass_jumps, bypass_jump_count);
     emit_ipv4_mapped_redirect_update_and_rewrite_by_protocol(
         builder,
         config,
@@ -1607,6 +1974,10 @@ static bool emit_ipv4_mapped_ipv6_branch(
     int udp_token_map_fd,
     int udp_peer_map_fd,
     int bypass_ipv4_cidr_map_fd,
+    int out_verdict_map_fd,
+    int out_verdict_control_map_fd,
+    int out_verdict_stats_map_fd,
+    int self_listen_port_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -1672,6 +2043,10 @@ static bool emit_ipv4_mapped_ipv6_branch(
         udp_redirect_map_fd,
         udp_token_map_fd,
         bypass_ipv4_cidr_map_fd,
+        out_verdict_map_fd,
+        out_verdict_control_map_fd,
+        out_verdict_stats_map_fd,
+        self_listen_port_map_fd,
         protocol,
         protocol_from_context,
         listen_port,
@@ -1698,6 +2073,10 @@ static int build_ipv4_sock_addr_prog(
     int udp_peer_map_fd,
     int bypass_socket_cookie_map_fd,
     int bypass_ipv4_cidr_map_fd,
+    int out_verdict_map_fd,
+    int out_verdict_control_map_fd,
+    int out_verdict_stats_map_fd,
+    int self_listen_port_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -1747,11 +2126,31 @@ static int build_ipv4_sock_addr_prog(
         &b, config, protocol, protocol_from_context, BPF_REG_8,
         dns_hijack_jumps, &dns_hijack_jump_count);
     emit_ipv4_destination_bypass(&b, bypass_jumps, &bypass_jump_count);
+    /* Module A: after user_ip/port + dest bypass; before CIDR (cookie protect earlier). */
+    emit_flow_verdict_bypass_v4(
+        &b,
+        out_verdict_map_fd,
+        out_verdict_control_map_fd,
+        out_verdict_stats_map_fd,
+        protocol,
+        protocol_from_context,
+        bypass_jumps,
+        &bypass_jump_count);
+    /* Module C.1: self-listen + redirect-prefix anti double-capture */
+    emit_self_listen_redirect_bypass_v4(
+        &b,
+        config,
+        self_listen_port_map_fd,
+        bypass_jumps,
+        &bypass_jump_count);
     emit_ipv4_cidr_bypass(
         &b, bypass_ipv4_cidr_map_fd, BPF_REG_7, bypass_jumps, &bypass_jump_count);
     for (size_t i = 0; i < dns_hijack_jump_count; ++i) {
         patch_jump(&b, dns_hijack_jumps[i], b.count);
     }
+    /* dns_kernel_direct: :53 destinations in dns_direct LPM stay kernel (allow). */
+    emit_ipv4_cidr_bypass(
+        &b, config->dns_direct_ipv4_map_fd, BPF_REG_7, bypass_jumps, &bypass_jump_count);
     emit_redirect_update_and_rewrite_by_protocol(
         &b,
         config,
@@ -1800,6 +2199,10 @@ static int build_ipv6_sock_addr_prog(
     int bypass_socket_cookie_map_fd,
     int bypass_ipv4_cidr_map_fd,
     int bypass_ipv6_cidr_map_fd,
+    int out_verdict_map_fd,
+    int out_verdict_control_map_fd,
+    int out_verdict_stats_map_fd,
+    int self_listen_port_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -1851,6 +2254,10 @@ static int build_ipv6_sock_addr_prog(
             udp_token_map_fd,
             udp_peer_map_fd,
             bypass_ipv4_cidr_map_fd,
+            out_verdict_map_fd,
+            out_verdict_control_map_fd,
+            out_verdict_stats_map_fd,
+            self_listen_port_map_fd,
             protocol,
             protocol_from_context,
             listen_port,
@@ -1897,11 +2304,24 @@ static int build_ipv6_sock_addr_prog(
         &b, config, protocol, protocol_from_context, BPF_REG_5,
         dns_hijack_jumps, &dns_hijack_jump_count);
     emit_ipv6_destination_bypass(&b, bypass_jumps, &bypass_jump_count);
+    /* W1: verdict after destination bypass, before CIDR — same order as v4 path. */
+    emit_flow_verdict_bypass_v6(
+        &b,
+        out_verdict_map_fd,
+        out_verdict_control_map_fd,
+        out_verdict_stats_map_fd,
+        protocol,
+        protocol_from_context,
+        bypass_jumps,
+        &bypass_jump_count);
     emit_ipv6_cidr_bypass(
         &b, bypass_ipv6_cidr_map_fd, bypass_jumps, &bypass_jump_count);
     for (size_t i = 0; i < dns_hijack_jump_count; ++i) {
         patch_jump(&b, dns_hijack_jumps[i], b.count);
     }
+    /* dns_kernel_direct: :53 destinations in dns_direct LPM stay kernel (allow). */
+    emit_ipv6_cidr_bypass(
+        &b, config->dns_direct_ipv6_map_fd, bypass_jumps, &bypass_jump_count);
     emit_redirect_update_and_rewrite_v6_by_protocol(
         &b,
         config,
@@ -1949,6 +2369,10 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
     int udp_peer_map_fd,
     int bypass_socket_cookie_map_fd,
     int bypass_ipv4_cidr_map_fd,
+    int out_verdict_map_fd,
+    int out_verdict_control_map_fd,
+    int out_verdict_stats_map_fd,
+    int self_listen_port_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -1990,6 +2414,10 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
         udp_token_map_fd,
         udp_peer_map_fd,
         bypass_ipv4_cidr_map_fd,
+        out_verdict_map_fd,
+        out_verdict_control_map_fd,
+        out_verdict_stats_map_fd,
+        self_listen_port_map_fd,
         protocol,
         protocol_from_context,
         listen_port,
@@ -2256,12 +2684,15 @@ static int open_cgroup_path(const char *path) {
 
 int sb_ebpf_inbound_prepare(
 	const char *cgroup_path,
+	bool capture_local,
 	uint16_t listen_port,
 	bool enable_tcp,
 	bool enable_udp,
 	bool enable_ipv4,
 	bool enable_bypass_cidr,
 	bool hijack_dns,
+	bool enable_flow_verdict,
+	uint32_t flow_verdict_max_entries,
 	const uint8_t redirect_ipv4[4],
 	uint32_t redirect_ipv4_prefix_bits,
 	bool enable_ipv6,
@@ -2320,16 +2751,38 @@ int sb_ebpf_inbound_prepare(
         enable_bypass_cidr, sizeof(struct sb_ebpf_ipv4_cidr_lpm_key));
     runtime->bypass_ipv6_cidr_map_fd = create_bypass_cidr_map(
         enable_bypass_cidr, sizeof(struct sb_ebpf_ipv6_cidr_lpm_key));
+    runtime->dns_direct_ipv4_cidr_map_fd =
+        create_dns_direct_cidr_map(sizeof(struct sb_ebpf_ipv4_cidr_lpm_key));
+    runtime->dns_direct_ipv6_cidr_map_fd =
+        create_dns_direct_cidr_map(sizeof(struct sb_ebpf_ipv6_cidr_lpm_key));
+    config.dns_direct_ipv4_map_fd = runtime->dns_direct_ipv4_cidr_map_fd;
+    config.dns_direct_ipv6_map_fd = runtime->dns_direct_ipv6_cidr_map_fd;
+    /* Module A: verdict maps when explicitly enabled (default off). */
+    runtime->out_verdict_map_fd = create_out_verdict_map(enable_flow_verdict, flow_verdict_max_entries);
+    runtime->out_verdict_control_map_fd = create_out_verdict_control_map(enable_flow_verdict);
+    runtime->out_verdict_stats_map_fd = create_out_verdict_stats_map(enable_flow_verdict);
+    /* Module C.1: always create self-listen registry; Go seeds listen_port. */
+    runtime->self_listen_port_map_fd = create_self_listen_port_map();
     if ((enable_tcp && runtime->tcp_redirect_map_fd < 0) ||
         (enable_udp && runtime->udp_redirect_map_fd < 0) ||
         (enable_udp && (runtime->udp_token_map_fd < 0 || runtime->udp_peer_map_fd < 0)) ||
         runtime->stats_map_fd < 0 ||
         runtime->bypass_socket_cookie_map_fd < 0 ||
+        runtime->self_listen_port_map_fd < 0 ||
+        (enable_flow_verdict &&
+         (runtime->out_verdict_map_fd < 0 || runtime->out_verdict_control_map_fd < 0 ||
+          runtime->out_verdict_stats_map_fd < 0)) ||
         (include_uid_entries > 0U && runtime->include_uid_map_fd < 0) ||
         (exclude_uid_entries > 0U && runtime->exclude_uid_map_fd < 0) ||
         (enable_bypass_cidr &&
-         (runtime->bypass_ipv4_cidr_map_fd < 0 || runtime->bypass_ipv6_cidr_map_fd < 0))) {
+         (runtime->bypass_ipv4_cidr_map_fd < 0 || runtime->bypass_ipv6_cidr_map_fd < 0)) ||
+        runtime->dns_direct_ipv4_cidr_map_fd < 0 ||
+        runtime->dns_direct_ipv6_cidr_map_fd < 0) {
         goto fail;
+    }
+
+    if (!capture_local) {
+        return 0;
     }
 
     runtime->cgroup_fd = open_cgroup_path(cgroup_path);
@@ -2356,12 +2809,19 @@ int sb_ebpf_inbound_prepare(
             runtime->udp_peer_map_fd,
             runtime->bypass_socket_cookie_map_fd,
             runtime->bypass_ipv4_cidr_map_fd,
+            runtime->out_verdict_map_fd,
+            runtime->out_verdict_control_map_fd,
+            runtime->out_verdict_stats_map_fd,
+            runtime->self_listen_port_map_fd,
             SB_EBPF_PROTO_TCP,
             true,
             listen_port,
             BPF_CGROUP_INET4_CONNECT,
             "sb_ebpf_conn4");
         if (enable_udp) {
+            /* A7: UDP verdict lookup is wired, but learn only writes TCP
+             * (MaybeLearnTCP). UDP entries are never produced as of rc45-ac2;
+             * table miss is the expected steady state for udp4. */
             runtime->udp4_sendmsg_prog_fd = build_ipv4_sock_addr_prog(
                 &config,
                 runtime->include_uid_map_fd, runtime->exclude_uid_map_fd,
@@ -2371,6 +2831,10 @@ int sb_ebpf_inbound_prepare(
                 runtime->udp_peer_map_fd,
                 runtime->bypass_socket_cookie_map_fd,
                 runtime->bypass_ipv4_cidr_map_fd,
+                runtime->out_verdict_map_fd,
+                runtime->out_verdict_control_map_fd,
+                runtime->out_verdict_stats_map_fd,
+                runtime->self_listen_port_map_fd,
                 SB_EBPF_PROTO_UDP,
                 false,
                 listen_port,
@@ -2393,6 +2857,10 @@ int sb_ebpf_inbound_prepare(
             runtime->bypass_socket_cookie_map_fd,
             runtime->bypass_ipv4_cidr_map_fd,
             runtime->bypass_ipv6_cidr_map_fd,
+            runtime->out_verdict_map_fd,
+            runtime->out_verdict_control_map_fd,
+            runtime->out_verdict_stats_map_fd,
+            runtime->self_listen_port_map_fd,
             SB_EBPF_PROTO_TCP,
             true,
             listen_port,
@@ -2409,6 +2877,10 @@ int sb_ebpf_inbound_prepare(
                 runtime->bypass_socket_cookie_map_fd,
                 runtime->bypass_ipv4_cidr_map_fd,
                 runtime->bypass_ipv6_cidr_map_fd,
+                runtime->out_verdict_map_fd,
+                runtime->out_verdict_control_map_fd,
+                runtime->out_verdict_stats_map_fd,
+                runtime->self_listen_port_map_fd,
                 SB_EBPF_PROTO_UDP,
                 false,
                 listen_port,
@@ -2429,6 +2901,10 @@ int sb_ebpf_inbound_prepare(
             runtime->udp_peer_map_fd,
             runtime->bypass_socket_cookie_map_fd,
             runtime->bypass_ipv4_cidr_map_fd,
+            runtime->out_verdict_map_fd,
+            runtime->out_verdict_control_map_fd,
+            runtime->out_verdict_stats_map_fd,
+            runtime->self_listen_port_map_fd,
             SB_EBPF_PROTO_TCP,
             true,
             listen_port,
@@ -2444,6 +2920,10 @@ int sb_ebpf_inbound_prepare(
                 runtime->udp_peer_map_fd,
                 runtime->bypass_socket_cookie_map_fd,
                 runtime->bypass_ipv4_cidr_map_fd,
+                runtime->out_verdict_map_fd,
+                runtime->out_verdict_control_map_fd,
+                runtime->out_verdict_stats_map_fd,
+                runtime->self_listen_port_map_fd,
                 SB_EBPF_PROTO_UDP,
                 false,
                 listen_port,
@@ -2611,8 +3091,14 @@ int sb_ebpf_inbound_close(struct sb_ebpf_inbound_runtime *runtime) {
     close_runtime_fd(&runtime->connect4_prog_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->exclude_uid_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->include_uid_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->dns_direct_ipv6_cidr_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->dns_direct_ipv4_cidr_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_ipv6_cidr_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_ipv4_cidr_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->self_listen_port_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->out_verdict_stats_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->out_verdict_control_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->out_verdict_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_socket_cookie_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->udp_peer_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->udp_token_map_fd, &result, &saved_errno);

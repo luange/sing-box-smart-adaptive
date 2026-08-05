@@ -31,15 +31,26 @@ an Android or Linux native object. The corresponding GPL source is
 The regular cgo compiler cannot create this object as part of its Android or
 Linux C compilation: cgo produces native machine code, while a TC program must
 be compiled separately with `-target bpfel`. When `TAGS` contains `with_ebpf`,
-the root `make build` target performs that generation automatically. Generate
-it explicitly before direct `go build` or `go test` commands:
+the root `make build` target performs that generation automatically.
+
+**Build host (hard boundary G):** run `make generate` / `make check` /
+`with_ebpf`+cgo builds **only on PVE-side Linux** (lab: `adaptive-vm112`,
+jump `adaptive-pve`). **Do not** generate `.bpf.o` on macOS (no reliable
+`linux/types.h`) or via local Docker/Colima on the Mac. See
+`docs/framework-requirements-boundaries-20260804.md` §边界 G.
+
+On the PVE host, generate before direct `go build` / `go test`:
 
 ```sh
-ANDROID_NDK_HOME=/usr/share/android-ndk-r25c make ebpf_generate
+# on adaptive-vm112 (or equivalent Linux lab), not on macOS
+make -C common/ebpf generate
+make -C common/ebpf check
+# or from repo root:
+make ebpf_generate && make ebpf_check
 ```
 
-The generated object remains ignored by Git. `make ebpf_check` is available
-for local reproducibility checks after generation.
+The generated object remains ignored by Git. If a Mac accidentally creates
+`native/*.bpf.o`, run `make -C common/ebpf clean` and discard those files.
 
 ## Testing
 

@@ -1124,7 +1124,45 @@ func (r *Router) recordReverseMapping(message *mDNS.Msg, response *mDNS.Msg, tra
 			}
 		}
 	}
+
+	r.notifyDNSAnswerObservers(message, response, transport)
 }
+
+// notifyDNSAnswerObservers delivers A/AAAA to optional DNSAnswerObserver.
+// Fail-open; cheap no-op when no observer (prefill off).
+func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
+	if response == nil || len(response.Answer) == 0 || len(message.Question) == 0 {
+		return
+	}
+	// Lookup first — avoid parsing RRs when feature is off.
+	observer := service.FromContext[adapter.DNSAnswerObserver](r.ctx)
+	if observer == nil {
+		return
+	}
+	fromFakeIP := transport != nil && transport.Type() == C.DNSTypeFakeIP
+	if fromFakeIP {
+		// Current sole consumer (dns_prefill) skips fakeip — avoid RR walk.
+		return
+	}
+	addresses := make([]netip.Addr, 0, 4)
+	for _, answer := range response.Answer {
+		switch record := answer.(type) {
+		case *mDNS.A:
+			if addr := M.AddrFromIP(record.A); addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		case *mDNS.AAAA:
+			if addr := M.AddrFromIP(record.AAAA); addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		}
+	}
+	if len(addresses) == 0 {
+		return
+	}
+	observer.OnDNSAnswer(FqdnToDomain(message.Question[0].Name), addresses, false)
+}
+
 
 func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeContext, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, adapter.DNSTransport, error) {
 	var (

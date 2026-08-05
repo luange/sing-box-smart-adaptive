@@ -59,7 +59,20 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		}
 	}
 	if l.listenOptions.TCPMultiPath {
-		listenConfig.SetMultipathTCP(true)
+		if l.forceNoMPTCP {
+			// E5: do not silently enable then override — warn and keep plain TCP.
+			if l.logger != nil {
+				l.logger.Warn("tcp_multi_path ignored: SOCKMAP/bpf_sk_assign reject MPTCP (force_no_mptcp)")
+			}
+			listenConfig.SetMultipathTCP(false)
+		} else {
+			listenConfig.SetMultipathTCP(true)
+		}
+	}
+	// E5: only force plain TCP when caller opts in (eBPF socket_assign / SOCKMAP).
+	// Classic tproxy without ForceNoMPTCP keeps Go default / user tcp_multi_path.
+	if l.forceNoMPTCP {
+		listenConfig.SetMultipathTCP(false)
 	}
 	if l.tproxy {
 		listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {

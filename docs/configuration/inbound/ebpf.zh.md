@@ -5,9 +5,11 @@ icon: material/lan-connect
 # eBPF
 
 eBPF 入站通过 cgroup socket-address 程序拦截本机产生的 TCP 和 UDP 流量。
-可选的 `shared_network` 模式使用 TC 令牌改写代理来自指定下游接口的转发流量；
-不使用 TUN、TProxy、iptables、skb mark、策略路由、loopback TC、socket assignment
-或 SOCKS 中间层。
+可选的 `shared_network` 模式代理来自指定下游接口的转发流量。推荐的
+`socket_assign` 数据面在 TC ingress 保留原始五元组，通过 SOCKMAP 把流量交给透明
+listener，并只用独立 mark/路由表完成本机投递；不挂 TC egress，也不改写回包。
+兼容的 `token` 数据面仍使用 ingress/egress 令牌改写。两种模式都不使用 TUN、
+iptables、loopback TC 或 SOCKS 中间层。
 
 此入站用于以 root 权限直接运行 Android 或 Linux 原生 sing-box 二进制的场景。
 构建时必须启用 cgo 和 `with_ebpf` 构建标签。
@@ -24,6 +26,7 @@ eBPF 入站通过 cgroup socket-address 程序拦截本机产生的 TCP 和 UDP 
   "network": "",
   "dns_mode": "hijack",
   "cgroup_path": "",
+  "capture_local": true,
   "redirect_address": [
     "127.128.0.0/9",
     "fd53:696e:672d:626f::/64"
@@ -37,7 +40,18 @@ eBPF 入站通过 cgroup socket-address 程序拦截本机产生的 TCP 和 UDP 
   "exclude_uid_range": [],
   "shared_network": {
     "enabled": false,
-    "include_interface": []
+    "include_interface": [],
+    "data_plane": "socket_assign",
+    "routing_mark": 1396834305,
+    "routing_table": 2026
+  },
+  "outbound_offload": {
+    "splice": {
+      "enabled": false
+    },
+    "verdict": {
+      "mode": "off"
+    }
   }
 }
 ```
@@ -106,6 +120,19 @@ DNS 处理模式。可选值：
 cgroup2 挂载点并使用其根层级。在标准 Linux 上，如不希望拦截系统全部本机流量，
 可把指定服务放入专用 cgroup 并配置此路径。此字段不限制 `shared_network`
 选中的转发流量。
+
+#### capture_local
+
+是否加载并挂载 cgroup 程序以截获本机进程产生的连接。默认值为 `true`。
+
+仅把 sing-box 用作 PBR/旁路由、并通过 `shared_network` 接收下游客户端流量时，
+建议设为 `false`。此时不会打开或锁定 cgroup，也不会加载本机 connect/sendmsg/
+recvmsg 程序；管理探测、SSH、DNS 和升级流量保持在控制面。TC ingress/egress
+程序仍会挂载到 `shared_network.include_interface`，转发数据面不受影响。
+
+`capture_local` 为 `false` 时必须启用 `shared_network`，且不得配置
+`cgroup_path`、`include_uid`、`include_uid_range`、`exclude_uid` 或
+`exclude_uid_range`；无效组合会在启动前报错。
 
 #### include_uid
 
@@ -230,17 +257,23 @@ sing-box 会卸载其状态，同时保持本机 eBPF 入站运行；同名接�
 路径取决于 bridge 和驱动。此模式面向客户端以本机为网关的路由下游网络，并非任意的
 二层透明网桥。
 
-对于每个已出现的接口，sing-box 先挂载 egress filter，再挂载 ingress filter，全部
-就绪后才启用数据面。Ingress 把选中的 TCP/UDP 数据包目标地址和端口改写为逐流令牌
-及随机 sing-box listener 端口，egress 则在回包上恢复原始源地址。原目标查询键包含
-客户端地址和端口，不同热点客户端不会错误共享流状态。
+`data_plane: socket_assign` 是推荐模式。它只挂 TC ingress：先保存原目标和入口接口，
+再用 `bpf_sk_assign` 交给 IPv4/IPv6 TCP/UDP 透明 listener，并设置专用 mark 进入独立
+local 路由表。数据包五元组保持不变，回包直接由内核透明 socket 产生，因此没有
+egress NAT、校验和重算或 GSO 改写。`routing_mark` 和 `routing_table` 为零时分别使用
+`0x53420001` 和 `2026`；启动会预检优先级 9000 的规则及路由表占用，发现不兼容状态
+会拒绝启动且回收本进程已创建的项目，不会覆盖第三方规则。
+
+`data_plane: token` 是兼容模式：先挂 egress 再挂 ingress，ingress 将目标改写为逐流
+令牌和随机 listener 端口，egress 在回包恢复原始源地址。两种模式的原目标查询键均
+包含客户端地址和端口，不同下游客户端不会错误共享状态。
 
 DHCP 端口 67、68、546 和 547 始终绕过 TC。`dns_mode: hijack` 下，目标端口 53
 会在本机地址、私网及 `bypass_rule_set` 判断之前被捕获，包括发给热点网关的 DNS
 查询；`dns_mode: off` 下，目标端口 53 始终走普通转发路径。其他本机、私网、链路
 本地、多播和已配置绕过 CIDR 也仍走普通转发路径。
 
-IPv4 令牌使用配置的回环重定向前缀。仅当
+`token` 模式的 IPv4 令牌使用配置的回环重定向前缀。仅当
 `net.ipv4.conf.<interface>.route_localnet` 原值为关闭时，sing-box 才会临时启用，
 并在 ingress、egress filter 都卸载后恢复；原本已启用的值不会被修改。IPv6 使用
 配置的 ULA 令牌前缀及此入站管理的本地路由。只有 `redirect_address` 显式包含 IPv6
@@ -261,6 +294,65 @@ sing-box 排在其后，公网 IPv6 会先被直接重定向到上游。发给�
 `shared_network` 关闭时使用的 DNS 服务。绕过 Linux TC 的 XDP 或硬件热点卸载无法
 代理；应在每种 Android 内核上验证实际下游接口及双向流量。在标准 Linux 上还应验证
 所选 bridge port 的 hook 路径，以及是否已有优先级 `1` 的 TC filter。
+
+#### outbound_offload
+
+可选的模块 B/A 协调器，挂在本入站下（**不是**可路由的出站类型）。默认所有 offload
+路径均为 **关闭**。
+
+##### outbound_offload.splice
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | SOCKMAP / `sk_skb` stream parser+verdict 中继。失败 fail-open 到用户态 copy。 |
+| `accounting` | `true` | PERCPU 字节 map。为 false 时永不触碰 bytes map。 |
+| `half_close` | `close` | `close` = 对端 FIN 时两侧一并关闭。`passthrough` **当前等价于完全不启用 splice**（不 attach SOCKMAP）；真半关转发尚未实现，枚举值仅为将来保留。 |
+| `allow_outbound_types` | `["direct"]` | 显式出站类型白名单。组出站仅在列表中时才放行。 |
+| `max_pairs` | `65536` | 并发 pair 上限（`0` = 默认）。 |
+| `idle_timeout` | `10m` | 已 splice pair 的空闲 watchdog。 |
+
+**准入条件（全部满足）：** TCP；两端均为裸 `*net.TCPConn`；入站类型仅 `ebpf`
+（redirect/tproxy 未授权，除非另有 lab 证据）；出站类型在 `allow_outbound_types` 内；
+无 TLS fragment/spoof；用户态 drain 后内核 recvq 为空（FIONREAD）；能力探测 OK。
+
+`bpf_sk_redirect_hash` 的 flags 固定为 `0`（egress）。IPv4 与纯 IPv6 pair 在内核
+成功加载 SOCKMAP 程序时均可用（加载失败 fail-open）。
+
+##### outbound_offload.verdict
+
+流级 verdict 卸载（模块 A）。缓存“该目的地为 direct”，使后续 connect 可跳过用户态。
+**默认 `off`（F-1）。** 错误写入会让流量静默绕过 route/log/clash-api —— 下列安全门
+为强制要求。
+
+**粒度（A3 / F-3）：** key 仅为 **destination 级** `{family, protocol, port, addr}`，
+不是 per-UID / per-flow / per-netns。学到一条 DIRECT 后，该 cgroup 捕获面上所有到
+该目的地的流都会跳过捕获。仅适合全局直连网关画像；否则保持 off。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `mode` | `off` | `off` — 关闭。`learn` — 在 **eBPF 入站**、空 direct 拨号成功后写入 `(dst_ip, dst_port) → DIRECT`（TTL）。除 `off`/`learn` 外的值（含历史 `dns`）在解析阶段 **直接拒绝**。 |
+| `ttl` | `5m` | 相对 **`bpf_ktime_get_ns` / CLOCK_MONOTONIC** 的生命周期（禁止 wall clock；A1/F-2）。 |
+| `max_entries` | `65536` | LRU map 容量（接入 map create；`0` → 默认）。 |
+| `allow_with_sniff` | `false` | **已弃用（Q3 P4）**。保留字段兼容旧配置。**不再**放宽域名/协议/进程类 learn 门。路由 `MatchInputs` 为准：仅 IP/端口/网络类决策可学；域名类永不学。仅在没有任何规则 item 写入 MatchInputs 时，软化旧的 sniff 元数据启发式。 |
+
+**安全门（跳过写入并计 skip，永不报错）：**
+
+1. 目的端口 **53** 永不写入（与 DNS hijack 共存）。
+2. 若 sniff 元数据参与且 `allow_with_sniff` 为 false → skip。
+3. 出站必须是空 `direct`（`dialer.DirectDialer` 且 `IsEmpty()==true`，含 stock DIRECT）。
+4. 存在进程/用户元数据（`ProcessInfo` / `User`）→ skip。
+5. **仅 `inbound type == ebpf`** 可 learn（A4）；mixed/socks/tun 不能污染 map。
+
+**失效：** 接口更新 / coordinator close 时 `generation++`；内核 TTL 过期；调试用
+Export 最近写入。
+
+**内核路径：** `connect4` 在 dest bypass 之后、CIDR 之前查 `sb_out_verdict`。命中
+`DIRECT` 且 generation 匹配且未过期 → return 1（不捕获）并递增内核 `hits`。
+不匹配/过期递增 `gen_mismatch` / `expired`。`udp4` 有同样查表但 **截至 rc45 无 UDP
+learn 写入者**（A7）——仅 miss。周期日志：`eBPF outbound verdict metrics: … kernel_hits=…`。
+
+**证据（F-5）：** 声明 verdict 有效必须附 `kernel_hits>0` + 应用层 n/n +
+`InvalidateAll` 后 hits 停止增长。示例配置中 **禁止** 写 `"mode": "learn"`（默认 off）。
 
 ## 构建
 

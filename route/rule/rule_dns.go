@@ -115,6 +115,11 @@ func NewDefaultDNSRule(ctx context.Context, logger log.ContextLogger, options op
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}
+	if len(options.InboundInterface) > 0 {
+		item := NewInboundInterfaceItem(options.InboundInterface)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
 	router := service.FromContext[adapter.Router](ctx)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	if options.IPVersion > 0 {

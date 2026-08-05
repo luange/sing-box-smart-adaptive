@@ -26,6 +26,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
+	"github.com/sagernet/sing/service"
 )
 
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
@@ -92,6 +93,22 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 	}
 }
 
+// TrackCloser registers an arbitrary closer (e.g. eBPF splice pair) so CloseAll
+// releases it. Returns a wrapper that unregisters on Close.
+func (m *ConnectionManager) TrackCloser(closer io.Closer) io.Closer {
+	if closer == nil {
+		return nil
+	}
+	m.access.Lock()
+	element := m.connections.PushBack(closer)
+	m.access.Unlock()
+	return &trackedCloser{
+		Closer:  closer,
+		manager: m,
+		element: element,
+	}
+}
+
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
@@ -130,6 +147,14 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
+	// Module A: learn path after dial success (first connection still userspace). Fail-open.
+	// A4: only eBPF inbound may contribute (learner also gates InboundType).
+	if metadata.InboundType == C.TypeEBPF {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := M.AddrPortFromNet(remoteConn.RemoteAddr())
+			learner.MaybeLearnTCP(ctx, this, metadata, remoteAP)
+		}
+	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
 	}
@@ -151,6 +176,13 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	}
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
+	}
+	// Module B: eBPF sockmap splice (opt-in, fail-open). Master §6.1.
+	if splicer := service.FromContext[adapter.ConnectionSplicer](ctx); splicer != nil {
+		if splicer.TrySpliceTCP(ctx, metadata.InboundType, this, conn, remoteConn, metadata, onClose) {
+			m.logger.DebugContext(ctx, "connection handed to eBPF splice")
+			return
+		}
 	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
@@ -399,6 +431,19 @@ func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.P
 		}
 	}
 	common.Close(source, destination)
+}
+
+type trackedCloser struct {
+	io.Closer
+	manager *ConnectionManager
+	element *list.Element[io.Closer]
+}
+
+func (c *trackedCloser) Close() error {
+	c.manager.access.Lock()
+	c.manager.connections.Remove(c.element)
+	c.manager.access.Unlock()
+	return c.Closer.Close()
 }
 
 type trackedConn struct {

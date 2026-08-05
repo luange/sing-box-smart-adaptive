@@ -6380,6 +6380,12 @@
             },
             "shared_network": {
               "$ref": "#/$defs/EBPFSharedNetworkOptions"
+            },
+            "capture_local": {
+              "type": "boolean"
+            },
+            "outbound_offload": {
+              "$ref": "#/$defs/EBPFOutboundOffloadOptions"
             }
           },
           "required": [
@@ -19657,6 +19663,82 @@
               }
             }
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EBPFOutboundOffloadOptions": {
+      "type": "object",
+      "properties": {
+        "splice": {
+          "$ref": "#/$defs/EBPFSpliceOptions"
+        },
+        "verdict": {
+          "$ref": "#/$defs/EBPFVerdictOptions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EBPFSpliceOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_pairs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "accounting": {
+          "type": "boolean"
+        },
+        "half_close": {
+          "type": "string",
+          "enum": [
+            "close",
+            "passthrough"
+          ]
+        },
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "allow_outbound_types": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EBPFVerdictOptions": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "learn"
+          ]
+        },
+        "ttl": {
+          "$ref": "#/$defs/Duration"
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "allow_with_sniff": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

@@ -11,17 +11,20 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/sing-box/adapter"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/redir"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -34,31 +37,76 @@ import (
 )
 
 const (
-	sharedNetworkRefresh = 3 * time.Second
-	// Run before Android tethering offload (IPv6 priority 2, IPv4 priority 3).
-	sharedNetworkTCPriority   = 1
-	sharedIngressFilterHandle = 0x5342
-	sharedEgressFilterHandle  = 0x5343
+	sharedNetworkRefresh               = 3 * time.Second
+	sharedNetworkDataPlaneToken        = "token"
+	sharedNetworkDataPlaneSocketAssign = "socket_assign"
+	sharedNetworkRoutingMarkDefault    = 0x53420001
+	sharedNetworkRoutingTableDefault   = 2026
+	// Default TC priority: run before Android tethering offload (IPv6 prio 2, IPv4 prio 3).
+	// Lower value runs earlier. Override via shared_network.tc_priority.
+	sharedNetworkTCPriorityDefault = 1
+	sharedIngressFilterHandle      = 0x5342
+	sharedEgressFilterHandle       = 0x5343
 )
 
 type sharedNetwork struct {
-	parent      *Inbound
-	interfaces  []string
-	backend     *ECommon.SharedNetworkBackend
-	tc          *sharedTCManager
-	tcp4        *listener.Listener
-	tcp6        *listener.Listener
-	udp4        *listener.Listener
-	udp6        *listener.Listener
-	udpNat      *udpnat.Service
-	udpClients  udpClientTable
-	listenPort  uint16
-	closeAccess sync.Mutex
+	parent       *Inbound
+	interfaces   []string
+	tcPriority   uint16
+	dropUDP443   bool
+	dataPlane    string
+	routingMark  uint32
+	routingTable uint32
+	backend      *ECommon.SharedNetworkBackend
+	policyRoute  *sharedNetworkPolicyRoute
+	tc           *sharedTCManager
+	tcp4         *listener.Listener
+	tcp6         *listener.Listener
+	udp4         *listener.Listener
+	udp6         *listener.Listener
+	udpNat       *udpnat.Service
+	udpClients   udpClientTable
+	listenPort   uint16
+	closeAccess  sync.Mutex
+}
+
+type sharedNetworkIngressInterfaceKey struct{}
+
+func sharedNetworkIngressInterface(ifIndex uint32) string {
+	if ifIndex == 0 {
+		return ""
+	}
+	device, err := net.InterfaceByIndex(int(ifIndex))
+	if err != nil {
+		return ""
+	}
+	return device.Name
 }
 
 func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (option.EBPFSharedNetworkOptions, error) {
 	if !options.Enabled {
 		return option.EBPFSharedNetworkOptions{}, nil
+	}
+	switch options.DataPlane {
+	case "", sharedNetworkDataPlaneToken:
+		options.DataPlane = sharedNetworkDataPlaneToken
+	case sharedNetworkDataPlaneSocketAssign:
+	default:
+		return option.EBPFSharedNetworkOptions{}, E.New("unknown shared_network.data_plane: ", options.DataPlane)
+	}
+	if options.DataPlane == sharedNetworkDataPlaneToken && (options.RoutingMark != 0 || options.RoutingTable != 0) {
+		return option.EBPFSharedNetworkOptions{}, E.New("shared_network routing_mark/routing_table require data_plane=socket_assign")
+	}
+	if options.DataPlane == sharedNetworkDataPlaneSocketAssign {
+		if options.RoutingMark == 0 {
+			options.RoutingMark = sharedNetworkRoutingMarkDefault
+		}
+		if options.RoutingTable == 0 {
+			options.RoutingTable = sharedNetworkRoutingTableDefault
+		}
+		if options.RoutingTable > 0xffffffff {
+			return option.EBPFSharedNetworkOptions{}, E.New("invalid shared_network.routing_table")
+		}
 	}
 	if len(options.IncludeInterface) == 0 {
 		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.include_interface must not be empty")
@@ -90,10 +138,29 @@ func validateSharedNetworkProtocols(options option.EBPFSharedNetworkOptions, ena
 	return nil
 }
 
+func sharedNetworkDropUDP443(options option.EBPFSharedNetworkOptions) bool {
+	if options.DropUDP443 == nil {
+		return true
+	}
+	return *options.DropUDP443
+}
+
+func sharedNetworkResolveTCPriority(options option.EBPFSharedNetworkOptions) uint16 {
+	if options.TCPriority == 0 {
+		return sharedNetworkTCPriorityDefault
+	}
+	return options.TCPriority
+}
+
 func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) *sharedNetwork {
 	shared := &sharedNetwork{
-		parent:     parent,
-		interfaces: append([]string(nil), options.IncludeInterface...),
+		parent:       parent,
+		interfaces:   append([]string(nil), options.IncludeInterface...),
+		tcPriority:   sharedNetworkResolveTCPriority(options),
+		dropUDP443:   sharedNetworkDropUDP443(options),
+		dataPlane:    options.DataPlane,
+		routingMark:  options.RoutingMark,
+		routingTable: options.RoutingTable,
 	}
 	udpTimeout := C.UDPTimeout
 	if parent.listenOptions.UDPTimeout != 0 {
@@ -114,28 +181,52 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 		s.parent.enableUDP,
 		s.parent.redirectIPv4,
 		s.parent.redirectIPv6,
+		s.dropUDP443,
+		s.dataPlane == sharedNetworkDataPlaneSocketAssign,
+		s.routingMark,
 	)
 	if err != nil {
 		return E.Errors(err, s.closeListeners())
 	}
 	s.backend = backend
+	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
+		if err = s.registerListenerSockets(); err != nil {
+			return E.Errors(E.Cause(err, "register shared-network transparent listeners"), s.Close())
+		}
+		s.policyRoute, err = installSharedNetworkPolicyRoute(
+			s.routingMark,
+			s.routingTable,
+			s.parent.redirectIPv4.IsValid(),
+			s.parent.redirectIPv6.IsValid(),
+		)
+		if err != nil {
+			return E.Errors(err, s.Close())
+		}
+	}
 	s.tc = &sharedTCManager{
-		backend:     backend,
-		logger:      s.parent.logger,
-		interfaces:  s.interfaces,
-		enableIPv4:  s.parent.redirectIPv4.IsValid(),
-		attachments: make(map[string]*sharedTCAttachment),
+		backend:      backend,
+		logger:       s.parent.logger,
+		interfaces:   s.interfaces,
+		priority:     s.tcPriority,
+		enableIPv4:   s.parent.redirectIPv4.IsValid(),
+		attachEgress: s.dataPlane != sharedNetworkDataPlaneSocketAssign,
+		attachments:  make(map[string]*sharedTCAttachment),
 	}
 	if err = s.tc.Start(); err != nil {
 		return E.Errors(err, s.Close())
+	}
+	programs := "tc/ingress,tc/egress"
+	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
+		programs = "tc/ingress+socket-assign"
 	}
 	s.parent.logger.Info(
 		"eBPF shared-network ready: interfaces=[", s.tc.InterfaceString(),
 		"], listen_port=", s.listenPort,
 		", dns_mode=", s.parent.dnsMode,
-		", tc_priority=", sharedNetworkTCPriority,
-		", token_map_capacity=", ECommon.SharedNetworkMapCapacity,
-		", programs=[tc/ingress, tc/egress]",
+		", tc_priority=", s.tcPriority,
+		", drop_udp_443=", s.dropUDP443,
+		", data_plane=", s.dataPlane,
+		", programs=[", programs, "]",
 	)
 	return nil
 }
@@ -197,6 +288,7 @@ func (s *sharedNetwork) newListener(network string, ipv6Listener bool, port uint
 	listenOptions.Listen = common.Ptr(badoption.Addr(listenAddress))
 	listenOptions.ListenPort = port
 	listenOptions.BindInterface = ""
+	socketAssign := s.dataPlane == sharedNetworkDataPlaneSocketAssign
 	return listener.New(listener.Options{
 		Context:             s.parent.ctx,
 		Logger:              s.parent.logger,
@@ -205,8 +297,55 @@ func (s *sharedNetwork) newListener(network string, ipv6Listener bool, port uint
 		ConnectionHandler:   s,
 		OOBPacketHandler:    s,
 		DisablePacketOutput: true,
-		SocketControl:       s.parent.socketControl(ipv6Listener),
+		TProxy:              socketAssign,
+		// E5: MPTCP forced off only for socket_assign (SOCKMAP/sk_assign).
+		ForceNoMPTCP:  socketAssign,
+		SocketControl: s.parent.socketControl(ipv6Listener),
 	})
+}
+
+func (s *sharedNetwork) registerListenerSockets() error {
+	type registration struct {
+		key      uint32
+		listener syscall.Conn
+	}
+	var registrations []registration
+	if s.tcp4 != nil {
+		conn, ok := s.tcp4.TCPListener().(syscall.Conn)
+		if !ok {
+			return E.New("IPv4 TCP listener does not expose syscall connection")
+		}
+		registrations = append(registrations, registration{0, conn})
+	}
+	if s.udp4 != nil {
+		registrations = append(registrations, registration{1, s.udp4.UDPConn()})
+	}
+	if s.tcp6 != nil {
+		conn, ok := s.tcp6.TCPListener().(syscall.Conn)
+		if !ok {
+			return E.New("IPv6 TCP listener does not expose syscall connection")
+		}
+		registrations = append(registrations, registration{2, conn})
+	}
+	if s.udp6 != nil {
+		registrations = append(registrations, registration{3, s.udp6.UDPConn()})
+	}
+	for _, registration := range registrations {
+		raw, err := registration.listener.SyscallConn()
+		if err != nil {
+			return err
+		}
+		var registerErr error
+		if err = raw.Control(func(fd uintptr) {
+			registerErr = s.backend.RegisterListenerSocket(registration.key, int(fd))
+		}); err != nil {
+			return err
+		}
+		if registerErr != nil {
+			return registerErr
+		}
+	}
+	return nil
 }
 
 func (s *sharedNetwork) InterfaceUpdated() {
@@ -229,6 +368,13 @@ func (s *sharedNetwork) Close() error {
 		}
 		s.tc = nil
 	}
+	var routeErr error
+	if s.policyRoute != nil {
+		routeErr = s.policyRoute.Close()
+		if routeErr == nil {
+			s.policyRoute = nil
+		}
+	}
 	var backendErr error
 	if s.backend != nil {
 		backendErr = s.backend.Close()
@@ -236,7 +382,7 @@ func (s *sharedNetwork) Close() error {
 			s.backend = nil
 		}
 	}
-	return E.Errors(backendErr, s.closeListeners())
+	return E.Errors(routeErr, backendErr, s.closeListeners())
 }
 
 func (s *sharedNetwork) closeListeners() error {
@@ -261,7 +407,7 @@ func (s *sharedNetwork) IsClosed() bool {
 	}
 	s.closeAccess.Lock()
 	defer s.closeAccess.Unlock()
-	return s.tc == nil && s.backend == nil &&
+	return s.tc == nil && s.policyRoute == nil && s.backend == nil &&
 		s.tcp4 == nil && s.tcp6 == nil && s.udp4 == nil && s.udp6 == nil
 }
 
@@ -280,6 +426,7 @@ func (s *sharedNetwork) NewConnection(ctx context.Context, conn net.Conn, metada
 	}
 	metadata.Inbound = s.parent.Tag()
 	metadata.InboundType = s.parent.Type()
+	metadata.InboundInterface = sharedNetworkIngressInterface(original.IngressIfIndex)
 	metadata.Source = M.SocksaddrFromNetIP(client)
 	metadata.Destination = M.SocksaddrFromNetIP(original.Destination)
 	s.parent.logger.InfoContext(ctx, "shared-network inbound connection to ", metadata.Destination)
@@ -290,21 +437,31 @@ func (s *sharedNetwork) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 	if s.backend == nil {
 		return
 	}
-	redirectAddress, err := redirectAddressFromOOB(oob)
-	if err != nil {
-		s.parent.logger.Warn("read shared-network UDP token address: ", err)
-		return
-	}
 	client := source.AddrPort()
-	redirect := netip.AddrPortFrom(redirectAddress, s.listenPort)
+	var redirect netip.AddrPort
+	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
+		var err error
+		redirect, err = redir.GetOriginalDestinationFromOOB(oob)
+		if err != nil {
+			s.parent.logger.Warn("read shared-network UDP original destination: ", err)
+			return
+		}
+	} else {
+		redirectAddress, err := redirectAddressFromOOB(oob)
+		if err != nil {
+			s.parent.logger.Warn("read shared-network UDP token address: ", err)
+			return
+		}
+		redirect = netip.AddrPortFrom(redirectAddress, s.listenPort)
+	}
 	original, err := s.backend.LookupOriginal(ECommon.ProtocolUDP, client, redirect)
 	if err != nil {
 		s.parent.logger.Warn("lookup shared-network UDP original destination: ", err)
 		return
 	}
-	released := s.udpClients.setBinding(client, original.Destination, redirectAddress, false)
+	released := s.udpClients.setBinding(client, original.Destination, redirect.Addr(), false)
 	s.deleteUDPRedirects(client, released)
-	s.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), nil)
+	s.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
 }
 
 func (s *sharedNetwork) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -314,14 +471,20 @@ func (s *sharedNetwork) NewPacketConnectionEx(ctx context.Context, conn N.Packet
 		Source:      source,
 		Destination: destination,
 	}
+	if interfaceName, loaded := ctx.Value(sharedNetworkIngressInterfaceKey{}).(string); loaded {
+		metadata.InboundInterface = interfaceName
+	}
 	//nolint:staticcheck
 	metadata.InboundDetour = s.parent.listenOptions.Detour
 	s.parent.logger.InfoContext(ctx, "shared-network inbound packet connection to ", destination)
 	s.parent.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, _ any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 	ctx := log.ContextWithNewID(s.parent.ctx)
+	if ifIndex, loaded := userData.(uint32); loaded {
+		ctx = context.WithValue(ctx, sharedNetworkIngressInterfaceKey{}, sharedNetworkIngressInterface(ifIndex))
+	}
 	client := source.AddrPort()
 	clientState := s.udpClients.loadOrCreate(client)
 	writer := &sharedPacketWriter{
@@ -330,12 +493,13 @@ func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination 
 		clientState: clientState,
 	}
 	return true, ctx, writer, func(error) {
+		common.Close(common.PtrOrNil(writer.conn))
 		s.deleteUDPRedirects(client, s.udpClients.delete(client, clientState))
 	}
 }
 
 func (s *sharedNetwork) deleteUDPRedirects(client netip.AddrPort, redirects []netip.Addr) {
-	if s.backend == nil {
+	if s.backend == nil || s.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		return
 	}
 	for _, address := range redirects {
@@ -350,10 +514,15 @@ type sharedPacketWriter struct {
 	shared      *sharedNetwork
 	client      netip.AddrPort
 	clientState *udpClientState
+	conn        *net.UDPConn
+	bound       M.Socksaddr
 }
 
 func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
+	if w.shared.dataPlane == sharedNetworkDataPlaneSocketAssign {
+		return w.writeTransparent(buffer, destination)
+	}
 	redirectAddress, loaded := w.clientState.redirectAddress(destination.AddrPort())
 	if !loaded {
 		return E.New("missing shared-network UDP token for ", destination)
@@ -377,17 +546,52 @@ func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 	return err
 }
 
+func (w *sharedPacketWriter) writeTransparent(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if w.conn != nil && w.bound == destination {
+		_, err := w.conn.WriteToUDPAddrPort(buffer.Bytes(), w.client)
+		if err == nil {
+			return nil
+		}
+		_ = w.conn.Close()
+		w.conn = nil
+	}
+	current := w.shared.udp4
+	if destination.Addr.Is6() {
+		current = w.shared.udp6
+	}
+	if current == nil {
+		return E.New("shared-network transparent UDP listener is unavailable")
+	}
+	var listenConfig net.ListenConfig
+	listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
+	listenConfig.Control = control.Append(listenConfig.Control, redir.TProxyWriteBack())
+	packetConn, err := current.ListenPacket(listenConfig, w.shared.parent.ctx, "udp", destination.String())
+	if err != nil {
+		return err
+	}
+	udpConn := packetConn.(*net.UDPConn)
+	if _, err = udpConn.WriteToUDPAddrPort(buffer.Bytes(), w.client); err != nil {
+		udpConn.Close()
+		return err
+	}
+	w.conn = udpConn
+	w.bound = destination
+	return nil
+}
+
 type sharedTCManager struct {
-	backend     *ECommon.SharedNetworkBackend
-	logger      interfaceLogger
-	interfaces  []string
-	enableIPv4  bool
-	access      sync.Mutex
-	attachments map[string]*sharedTCAttachment
-	enabled     bool
-	cancel      context.CancelFunc
-	done        chan struct{}
-	wake        chan struct{}
+	backend      *ECommon.SharedNetworkBackend
+	logger       interfaceLogger
+	interfaces   []string
+	priority     uint16
+	enableIPv4   bool
+	attachEgress bool
+	access       sync.Mutex
+	attachments  map[string]*sharedTCAttachment
+	enabled      bool
+	cancel       context.CancelFunc
+	done         chan struct{}
+	wake         chan struct{}
 }
 
 type interfaceLogger interface {
@@ -464,7 +668,6 @@ func (m *sharedTCManager) reconcile() error {
 		}
 		desired[interfaceName] = link
 	}
-
 	m.access.Lock()
 	defer m.access.Unlock()
 	for interfaceName, attachment := range m.attachments {
@@ -475,6 +678,9 @@ func (m *sharedTCManager) reconcile() error {
 		if err = m.detachLocked(attachment); err != nil {
 			return E.Cause(err, "detach stale shared-network interface ", interfaceName)
 		}
+		if err = m.backend.DeleteInterfaceMAC(uint32(attachment.ifindex)); err != nil {
+			return E.Cause(err, "delete stale shared-network interface MAC ", interfaceName)
+		}
 		delete(m.attachments, interfaceName)
 		m.logger.Info("eBPF shared-network detached from ", interfaceName)
 	}
@@ -482,8 +688,12 @@ func (m *sharedTCManager) reconcile() error {
 		if _, loaded := m.attachments[interfaceName]; loaded {
 			continue
 		}
-		attachment, attachErr := attachSharedTC(link, m.backend, m.enableIPv4)
+		if err = m.backend.UpdateInterfaceMAC(uint32(link.Attrs().Index), link.Attrs().HardwareAddr); err != nil {
+			return E.Cause(err, "register shared-network interface MAC ", interfaceName)
+		}
+		attachment, attachErr := attachSharedTC(link, m.backend, m.enableIPv4, m.attachEgress, m.priority)
 		if attachErr != nil {
+			_ = m.backend.DeleteInterfaceMAC(uint32(link.Attrs().Index))
 			return E.Cause(attachErr, "attach eBPF shared-network to ", interfaceName)
 		}
 		m.attachments[interfaceName] = attachment
@@ -578,14 +788,20 @@ func (m *sharedTCManager) closeAttachments() error {
 			closeErr = E.Errors(closeErr, E.Cause(err, "detach shared-network interface ", name))
 			continue
 		}
+		if err := m.backend.DeleteInterfaceMAC(uint32(attachment.ifindex)); err != nil {
+			closeErr = E.Errors(closeErr, E.Cause(err, "delete shared-network interface MAC ", name))
+		}
 		delete(m.attachments, name)
 	}
 	return closeErr
 }
 
-func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool) (*sharedTCAttachment, error) {
+func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool, attachEgress bool, priority uint16) (*sharedTCAttachment, error) {
+	if priority == 0 {
+		priority = sharedNetworkTCPriorityDefault
+	}
 	restoreRouteLocalnet := false
-	if enableIPv4 {
+	if enableIPv4 && attachEgress {
 		var err error
 		restoreRouteLocalnet, err = enableSharedRouteLocalnet(link.Attrs().Name)
 		if err != nil {
@@ -598,18 +814,31 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		}
 		return nil, err
 	}
-	egress, err := attachSharedTCFilter(
+	var egress *netlink.BpfFilter
+	var err error
+	if attachEgress {
+		egress, err = attachSharedTCFilter(
+			link,
+			netlink.HANDLE_MIN_EGRESS,
+			backend.EgressProgramFD(),
+			"sb_share_out",
+			sharedEgressFilterHandle,
+			priority,
+		)
+		if err != nil {
+			if restoreRouteLocalnet {
+				_ = restoreSharedRouteLocalnet(link.Attrs().Name)
+			}
+			return nil, err
+		}
+	} else if err = removeOwnedSharedTCFilter(
 		link,
 		netlink.HANDLE_MIN_EGRESS,
-		backend.EgressProgramFD(),
 		"sb_share_out",
 		sharedEgressFilterHandle,
-	)
-	if err != nil {
-		if restoreRouteLocalnet {
-			_ = restoreSharedRouteLocalnet(link.Attrs().Name)
-		}
-		return nil, err
+		priority,
+	); err != nil {
+		return nil, E.Cause(err, "remove stale shared-network egress filter")
 	}
 	ingress, err := attachSharedTCFilter(
 		link,
@@ -617,6 +846,7 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		backend.IngressProgramFD(),
 		"sb_share_in",
 		sharedIngressFilterHandle,
+		priority,
 	)
 	if err != nil {
 		var routeErr error
@@ -674,9 +904,12 @@ func restoreSharedRouteLocalnet(interfaceName string) error {
 	return nil
 }
 
-func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16) (*netlink.BpfFilter, error) {
+func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16, priority uint16) (*netlink.BpfFilter, error) {
 	if programFD < 0 {
 		return nil, E.New("shared-network eBPF program is unavailable")
+	}
+	if priority == 0 {
+		priority = sharedNetworkTCPriorityDefault
 	}
 	filters, err := netlink.FilterList(link, parent)
 	if err != nil {
@@ -686,6 +919,9 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 	for _, existing := range filters {
 		bpfFilter, isBPF := existing.(*netlink.BpfFilter)
 		if isBPF && bpfFilter.Name == programName {
+			if existing.Attrs().Handle != filterHandle || existing.Attrs().Priority != priority {
+				return nil, E.New("TC filter ownership conflict on ", link.Attrs().Name, " for ", programName)
+			}
 			if err = netlink.FilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
 				return nil, err
 			}
@@ -700,7 +936,7 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 			LinkIndex: link.Attrs().Index,
 			Parent:    parent,
 			Handle:    filterHandle,
-			Priority:  sharedNetworkTCPriority,
+			Priority:  priority,
 			Protocol:  unix.ETH_P_ALL,
 		},
 		Fd:           programFD,
@@ -711,6 +947,30 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 		return nil, err
 	}
 	return filter, nil
+}
+
+func removeOwnedSharedTCFilter(link netlink.Link, parent uint32, programName string, handle uint16, priority uint16) error {
+	filters, err := netlink.FilterList(link, parent)
+	if err != nil {
+		return err
+	}
+	filterHandle := netlink.MakeHandle(0, handle)
+	for _, existing := range filters {
+		bpfFilter, isBPF := existing.(*netlink.BpfFilter)
+		if isBPF && bpfFilter.Name == programName {
+			if existing.Attrs().Handle != filterHandle || existing.Attrs().Priority != priority {
+				return E.New("TC filter ownership conflict on ", link.Attrs().Name, " for ", programName)
+			}
+			if err = netlink.FilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
+				return err
+			}
+			continue
+		}
+		if existing.Attrs().Handle == filterHandle {
+			return E.New("TC filter handle conflict on ", link.Attrs().Name)
+		}
+	}
+	return nil
 }
 
 func detachSharedTCFilter(filter *netlink.BpfFilter) error {
