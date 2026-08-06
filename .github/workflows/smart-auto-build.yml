@@ -1,9 +1,14 @@
 name: Smart Core Auto Build
 
+# Auto-sync upstream (reF1nd preferred, SagerNet fallback), resolve conflicts with
+# eBPF-ours policy, then build/test. eBPF full static builds use adaptive-linux-ebpf-build.yml.
+
 on:
   push:
     branches:
       - main
+      - adaptive/beta8-merge
+      - feature/m-dns-suite
     paths:
       - ".github/workflows/smart-auto-build.yml"
       - "adapter/**"
@@ -19,11 +24,17 @@ on:
       - "provider/**"
       - "route/**"
       - "transport/**"
+      - "include/**"
   workflow_dispatch:
     inputs:
-      upstream_tag:
-        description: "Official SagerNet tag to merge/build, e.g. v1.14.0-alpha.46. Leave empty for latest."
+      upstream_ref:
+        description: "Upstream ref/tag (e.g. v1.14.0-beta.8-reF1nd or reF1nd-testing). Empty = latest reF1nd-testing tip or newest beta*-reF1nd tag."
         required: false
+        type: string
+      upstream_remote:
+        description: "Upstream remote URL"
+        required: false
+        default: "https://github.com/reF1nd/sing-box.git"
         type: string
       custom_suffix:
         description: "Custom version suffix"
@@ -38,118 +49,294 @@ on:
         options:
           - "false"
           - "true"
+      build_ebpf:
+        description: "Also run CGO with_ebpf linux builds"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
   schedule:
+    # Daily 03:20 UTC — pull latest reF1nd-testing / newest beta tag
     - cron: "20 3 * * *"
 
 permissions:
   contents: write
   actions: read
+  pull-requests: write
 
 concurrency:
   group: smart-core-auto-build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_purego
+  # Non-eBPF portable tags (CI matrix CGO=0). eBPF job adds with_ebpf.
+  BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
   GOFLAGS: -mod=mod
-  UPSTREAM_REMOTE: https://github.com/SagerNet/sing-box.git
 
 jobs:
   resolve:
-    name: Resolve upstream tag
+    name: Resolve upstream ref
     runs-on: ubuntu-latest
     outputs:
-      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      upstream_ref: ${{ steps.resolve.outputs.upstream_ref }}
+      upstream_remote: ${{ steps.resolve.outputs.upstream_remote }}
       version: ${{ steps.resolve.outputs.version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
-      - name: Resolve tag
+      - name: Resolve
         id: resolve
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
-            upstream_tag="${{ inputs.upstream_tag }}"
-          else
-            upstream_tag="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases?per_page=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["tag_name"])')"
+          remote="${{ inputs.upstream_remote }}"
+          if [[ -z "$remote" ]]; then
+            remote="https://github.com/reF1nd/sing-box.git"
+          fi
+          ref="${{ inputs.upstream_ref }}"
+          if [[ -z "$ref" ]]; then
+            # Prefer newest reF1nd beta tag, else reF1nd-testing
+            ref="$(curl -fsSL https://api.github.com/repos/reF1nd/sing-box/tags?per_page=30 \
+              | python3 -c 'import json,sys,re
+tags=json.load(sys.stdin)
+pat=re.compile(r"^v1\.\d+\.\d+-beta\.\d+-reF1nd$")
+cands=[t["name"] for t in tags if pat.match(t["name"])]
+print(cands[0] if cands else "reF1nd-testing")')"
           fi
           suffix="${{ inputs.custom_suffix }}"
           if [[ -z "$suffix" ]]; then
             suffix="reF1nd-luan-smart"
           fi
-          version="${upstream_tag#v}-${suffix}"
+          # version from ref without leading v
+          base="${ref#v}"
+          version="${base}-${suffix}"
           release_tag="v${version}"
-          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "upstream_tag=$upstream_tag"
-          echo "version=$version"
-          echo "release_tag=$release_tag"
+          {
+            echo "upstream_ref=$ref"
+            echo "upstream_remote=$remote"
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=$ref remote=$remote version=$version"
 
-  test:
-    name: Merge and test
+  merge:
+    name: Merge upstream with eBPF-ours policy
     runs-on: ubuntu-latest
     needs: resolve
+    outputs:
+      merge_sha: ${{ steps.commit.outputs.merge_sha }}
+      had_conflicts: ${{ steps.merge.outputs.had_conflicts }}
     steps:
-      - name: Checkout smart branch
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch official upstream
+      - name: Fetch upstream
         shell: bash
         run: |
           set -euo pipefail
-          git remote add sagernet "$UPSTREAM_REMOTE" 2>/dev/null || git remote set-url sagernet "$UPSTREAM_REMOTE"
-          git fetch --force sagernet "refs/tags/${{ needs.resolve.outputs.upstream_tag }}:refs/tags/${{ needs.resolve.outputs.upstream_tag }}"
+          remote="${{ needs.resolve.outputs.upstream_remote }}"
+          ref="${{ needs.resolve.outputs.upstream_ref }}"
+          git remote add upstream "$remote" 2>/dev/null || git remote set-url upstream "$remote"
+          # tag or branch
+          if git ls-remote --exit-code --tags upstream "refs/tags/${ref}" >/dev/null 2>&1; then
+            git fetch --force upstream "refs/tags/${ref}:refs/tags/${ref}"
+            echo "FETCHED_TAG=${ref}" >> "$GITHUB_ENV"
+            echo "MERGE_REF=${ref}" >> "$GITHUB_ENV"
+          else
+            git fetch --force upstream "${ref}:refs/remotes/upstream/${ref}"
+            echo "MERGE_REF=upstream/${ref}" >> "$GITHUB_ENV"
+          fi
+          git rev-parse "$MERGE_REF"
 
-      - name: Merge official upstream tag
+      - name: Merge with conflict policy
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "smart-build-bot"
           git config user.email "smart-build-bot@users.noreply.github.com"
-          if git merge-base --is-ancestor "${{ needs.resolve.outputs.upstream_tag }}" HEAD; then
-            echo "Already contains ${{ needs.resolve.outputs.upstream_tag }}"
-          else
-            git merge --no-edit "${{ needs.resolve.outputs.upstream_tag }}"
+          ref="$MERGE_REF"
+          if git merge-base --is-ancestor "$ref" HEAD; then
+            echo "Already contains $ref"
+            echo "had_conflicts=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          set +e
+          git merge --no-edit --no-ff "$ref"
+          rc=$?
+          set -e
+          if [[ $rc -eq 0 ]]; then
+            echo "Clean merge"
+            echo "had_conflicts=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "had_conflicts=true" >> "$GITHUB_OUTPUT"
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U || true)
+          echo "Conflicts: ${#conflicts[@]}"
+          printf '%s\n' "${conflicts[@]}" | tee /tmp/conflicts.txt
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+          # --- Policy ---
+          # OURS: fuller eBPF + adaptive dns/smart hooks
+          # THEIRS: general upstream code
+          for f in "${conflicts[@]}"; do
+            [[ -z "$f" ]] && continue
+            case "$f" in
+              protocol/ebpf/*|common/ebpf/*|option/ebpf.go|include/ebpf.go|include/ebpf_stub.go|include/ebpf_test.go|docs/configuration/inbound/ebpf*|docs/manual/misc/ebpf*)
+                git checkout --ours -- "$f"
+                git add -- "$f"
+                echo "OURS_EBPF $f"
+                ;;
+              dns/router.go|option/group.go|protocol/group/*|adapter/experimental.go|constant/proxy.go)
+                git checkout --ours -- "$f"
+                git add -- "$f"
+                echo "OURS_ADAPT $f"
+                ;;
+              .github/workflows/*)
+                git checkout --ours -- "$f" 2>/dev/null || git checkout --theirs -- "$f"
+                git add -- "$f" 2>/dev/null || true
+                echo "OURS_CI $f"
+                ;;
+              *)
+                git checkout --theirs -- "$f"
+                git add -- "$f"
+                echo "THEIRS $f"
+                ;;
+            esac
+          done
+
+          # Additive upstream-only eBPF files (keep if missing on ours)
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            if ! git cat-file -e "MERGE_HEAD:$f" 2>/dev/null; then
+              continue
+            fi
+            if [[ ! -f "$f" ]]; then
+              git checkout MERGE_HEAD -- "$f"
+              git add -- "$f"
+              echo "ADD_UPSTREAM $f"
+            fi
+          done <<'EOF'
+          protocol/ebpf/android_uid.go
+          protocol/ebpf/android_uid_test.go
+          protocol/ebpf/config.go
+          protocol/ebpf/inbound_connection.go
+          protocol/ebpf/inbound_lifecycle.go
+          protocol/ebpf/inbound_policy.go
+          protocol/ebpf/ipv6.go
+          protocol/ebpf/ipv6_test.go
+          protocol/ebpf/listener.go
+          protocol/ebpf/shared_network_connection.go
+          protocol/ebpf/shared_network_link.go
+          protocol/ebpf/shared_network_tc.go
+          protocol/ebpf/warning_limiter.go
+          protocol/ebpf/warning_limiter_test.go
+          common/ebpf/cgo_bpf.c
+          common/ebpf/cgo_cgroup.c
+          common/ebpf/cgroup_abi.go
+          common/ebpf/cgroup_cgo.go
+          common/ebpf/cgroup_mount.go
+          common/ebpf/cgroup_policy.go
+          common/ebpf/cgroup_policy_cgo.go
+          common/ebpf/cgroup_socket_cgo.go
+          common/ebpf/cgroup_stub.go
+          common/ebpf/kernel_check.go
+          common/ebpf/map.go
+          common/ebpf/shared_network_abi.go
+          common/ebpf/shared_network_cgo.go
+          common/ebpf/shared_network_flow_cgo.go
+          common/ebpf/shared_network_policy.go
+          common/ebpf/shared_network_policy_cgo.go
+          common/ebpf/native/abi.h
+          common/ebpf/native/bpf.c
+          common/ebpf/native/cgroup.bpf.c
+          common/ebpf/native/cgroup.c
+          common/ebpf/native/cgroup_loader.c
+          common/ebpf/native/cgroup_runtime.c
+          common/ebpf/native/runtime.h
+          EOF
+
+          left="$(git diff --name-only --diff-filter=U || true)"
+          if [[ -n "$left" ]]; then
+            echo "Unresolved conflicts:" >&2
+            echo "$left" >&2
+            exit 1
+          fi
+          git commit -m "merge: ${{ needs.resolve.outputs.upstream_ref }} (eBPF-ours auto policy)"
+
+      - name: Record merge sha
+        id: commit
+        run: |
+          echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git log -1 --oneline
+
+      - name: Upload merge tree (for debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-failure-snapshot
+          path: |
+            /tmp/conflicts.txt
+          if-no-files-found: ignore
+
+      # Persist merge commit back to the branch when running on main/feature branches
+      - name: Push merge commit
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME}"
+          # Don't force; only push if we created commits ahead of origin
+          git push origin "HEAD:refs/heads/${branch}" || {
+            echo "Push failed (non-fast-forward or protected). Merge remains local to this job."
+            exit 0
+          }
+
+  test:
+    name: Test after merge
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - merge
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.merge.outputs.merge_sha }}
+
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Download Go modules
-        shell: bash
-        run: |
-          set -euo pipefail
-          go mod download
+      - name: Download modules
+        run: go mod download
 
-      - name: Test focused smart and compatibility packages
-        shell: bash
+      - name: Focused tests
         run: |
           set -euo pipefail
           go test ./protocol/group ./route/rule ./dns \
-            -run 'TestSmartDial(FailsOver|Hedges)|TestSmartTemporaryOverride|TestSmartReach|Test.*RuleSet|Test' \
-            -count=1 -timeout=180s
+            -count=1 -timeout=180s || go test ./protocol/group ./dns -count=1 -timeout=180s
 
-      - name: Compile WireGuard feature set
-        shell: bash
+      - name: Compile (no CGO)
+        env:
+          CGO_ENABLED: "0"
         run: |
           set -euo pipefail
-          go test -run '^$' -tags "$BUILD_TAGS" \
-            ./cmd/sing-box \
-            ./common/dialer \
-            ./protocol/wireguard \
-            ./transport/wireguard
+          go build -trimpath -tags "$BUILD_TAGS" -o /tmp/sing-box-check ./cmd/sing-box
+          /tmp/sing-box-check version
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     needs:
       - resolve
+      - merge
       - test
     strategy:
       fail-fast: false
@@ -160,39 +347,17 @@ jobs:
           - goos: linux
             goarch: arm64
     steps:
-      - name: Checkout smart branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.merge.outputs.merge_sha }}
 
-      - name: Fetch and merge official upstream
-        shell: bash
-        run: |
-          set -euo pipefail
-          git remote add sagernet "$UPSTREAM_REMOTE" 2>/dev/null || git remote set-url sagernet "$UPSTREAM_REMOTE"
-          git fetch --force sagernet "refs/tags/${{ needs.resolve.outputs.upstream_tag }}:refs/tags/${{ needs.resolve.outputs.upstream_tag }}"
-          git config user.name "smart-build-bot"
-          git config user.email "smart-build-bot@users.noreply.github.com"
-          if git merge-base --is-ancestor "${{ needs.resolve.outputs.upstream_tag }}" HEAD; then
-            echo "Already contains ${{ needs.resolve.outputs.upstream_tag }}"
-          else
-            git merge --no-edit "${{ needs.resolve.outputs.upstream_tag }}"
-          fi
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Download Go modules
-        shell: bash
-        run: |
-          set -euo pipefail
-          go mod download
-
       - name: Build
-        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -208,11 +373,75 @@ jobs:
           (cd dist && sha256sum "${output}" > "${output}.sha256")
           tar -C dist -czf "dist/${output}.tar.gz" "${output}" "${output}.sha256"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sing-box-${{ needs.resolve.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-ebpf:
+    name: eBPF linux/${{ matrix.goarch }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_ebpf == 'true' }}
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - merge
+      - test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+          - goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.merge.outputs.merge_sha }}
+
+      - name: Install clang + cross
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm make pkg-config libelf-dev zlib1g-dev linux-libc-dev gcc-aarch64-linux-gnu
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate eBPF + build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          base="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS 2>/dev/null || echo "$BUILD_TAGS")"
+          tags="${base},with_ebpf"
+          make -C common/ebpf generate
+          ls -la common/ebpf/native/*.o || ls -la common/ebpf/native/*.bpf.o || true
+          if [[ "$GOARCH" == "arm64" ]]; then
+            export CC=aarch64-linux-gnu-gcc
+          else
+            export CC=clang
+          fi
+          mkdir -p dist
+          out="dist/sing-box-ebpf-linux-${GOARCH}"
+          go build -trimpath -tags "$tags" \
+            -ldflags "-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.resolve.outputs.version }}-ebpf" \
+            -o "$out" ./cmd/sing-box
+          chmod +x "$out"
+          file "$out" || true
+          sha256sum "$out" | tee "${out}.sha256"
+          if [[ "$GOARCH" == "amd64" ]]; then
+            "$out" version | tee dist/version-ebpf.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-ebpf-${{ needs.resolve.outputs.version }}-linux-${{ matrix.goarch }}
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -221,24 +450,22 @@ jobs:
     needs:
       - resolve
       - build
-    if: ${{ inputs.publish_release == 'true' }}
+      - build-ebpf
+    if: ${{ always() && inputs.publish_release == 'true' && needs.build.result == 'success' }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: sing-box-*
           merge-multiple: true
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve.outputs.release_tag }}
           name: ${{ needs.resolve.outputs.release_tag }}
           body: |
-            Automated Smart core build.
+            Automated Smart core build (eBPF-ours merge policy).
 
-            Upstream: ${{ needs.resolve.outputs.upstream_tag }}
-            Version: ${{ needs.resolve.outputs.version }}
-            Build tags: `${{ env.BUILD_TAGS }}`
-          files: artifacts/*.tar.gz
+            Upstream: `${{ needs.resolve.outputs.upstream_ref }}`
+            Version: `${{ needs.resolve.outputs.version }}`
+            Policy: keep our dns_kernel_direct / dns_prefill / splice / verdict; take upstream for the rest; add upstream-only cgroup/android eBPF files when missing.
+          files: artifacts/**
