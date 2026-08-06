@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,7 +32,14 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-var _ adapter.NetworkManager = (*NetworkManager)(nil)
+var (
+	_ adapter.NetworkManager       = (*NetworkManager)(nil)
+	_ adapter.SocketProtectManager = (*NetworkManager)(nil)
+)
+
+type socketProtectState struct {
+	protectFunc control.Func
+}
 
 type NetworkManager struct {
 	ctx                    context.Context
@@ -56,8 +64,7 @@ type NetworkManager struct {
 	wifiMonitor            settings.WIFIMonitor
 	wifiState              adapter.WIFIState
 	wifiStateMutex         sync.RWMutex
-	socketProtectAccess    sync.RWMutex
-	socketProtectFunc      control.Func
+	socketProtectState     atomic.Pointer[socketProtectState]
 	started                bool
 }
 
@@ -387,30 +394,23 @@ func (r *NetworkManager) RegisterSocketProtectFunc(protectFunc control.Func) err
 	if protectFunc == nil {
 		return E.New("socket protect function is nil")
 	}
-	r.socketProtectAccess.Lock()
-	defer r.socketProtectAccess.Unlock()
-	if r.socketProtectFunc != nil {
+	if !r.socketProtectState.CompareAndSwap(nil, &socketProtectState{protectFunc: protectFunc}) {
 		return E.New("a socket protect function is already registered")
 	}
-	r.socketProtectFunc = protectFunc
 	return nil
 }
 
 func (r *NetworkManager) UnregisterSocketProtectFunc() {
-	r.socketProtectAccess.Lock()
-	r.socketProtectFunc = nil
-	r.socketProtectAccess.Unlock()
+	r.socketProtectState.Store(nil)
 }
 
 func (r *NetworkManager) SocketProtectFunc() control.Func {
 	return func(network string, address string, conn syscall.RawConn) error {
-		r.socketProtectAccess.RLock()
-		defer r.socketProtectAccess.RUnlock()
-		protectFunc := r.socketProtectFunc
-		if protectFunc == nil {
+		state := r.socketProtectState.Load()
+		if state == nil {
 			return nil
 		}
-		return protectFunc(network, address, conn)
+		return state.protectFunc(network, address, conn)
 	}
 }
 

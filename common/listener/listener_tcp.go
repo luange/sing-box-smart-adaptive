@@ -25,9 +25,6 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
-	if networkManager := service.FromContext[adapter.NetworkManager](l.ctx); networkManager != nil {
-		listenConfig.Control = control.Append(listenConfig.Control, networkManager.SocketProtectFunc())
-	}
 	listenConfig.Control = control.Append(listenConfig.Control, l.socketControl)
 	if l.listenOptions.BindInterface != "" {
 		listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
@@ -59,20 +56,7 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		}
 	}
 	if l.listenOptions.TCPMultiPath {
-		if l.forceNoMPTCP {
-			// E5: do not silently enable then override — warn and keep plain TCP.
-			if l.logger != nil {
-				l.logger.Warn("tcp_multi_path ignored: SOCKMAP/bpf_sk_assign reject MPTCP (force_no_mptcp)")
-			}
-			listenConfig.SetMultipathTCP(false)
-		} else {
-			listenConfig.SetMultipathTCP(true)
-		}
-	}
-	// E5: only force plain TCP when caller opts in (eBPF socket_assign / SOCKMAP).
-	// Classic tproxy without ForceNoMPTCP keeps Go default / user tcp_multi_path.
-	if l.forceNoMPTCP {
-		listenConfig.SetMultipathTCP(false)
+		listenConfig.SetMultipathTCP(true)
 	}
 	if l.tproxy {
 		listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
@@ -96,7 +80,9 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	if l.listenOptions.ProxyProtocol {
 		tcpListener = &proxyproto.Listener{Listener: tcpListener, AcceptNoHeader: l.listenOptions.ProxyProtocolAcceptNoHeader}
 	}
-	l.logger.Info("tcp server started at ", tcpListener.Addr())
+	if !l.disableListenerLog {
+		l.logger.Info("tcp server started at ", tcpListener.Addr())
+	}
 	l.tcpListener = tcpListener
 	return tcpListener, err
 }
@@ -124,7 +110,9 @@ func (l *Listener) loopTCPIn() {
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
 		ctx := log.ContextWithNewID(l.ctx)
-		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+		if !l.disableConnectionLog {
+			l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+		}
 		go l.connHandler.NewConnection(ctx, conn, metadata, nil)
 	}
 }

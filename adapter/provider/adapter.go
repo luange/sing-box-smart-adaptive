@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"reflect"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,17 +30,13 @@ type Adapter struct {
 	outboundsAccess sync.RWMutex
 	outbounds       []adapter.Outbound
 	outboundsByTag  map[string]adapter.Outbound
-	outboundOptions map[string]option.Outbound
 	endpoints       []adapter.Outbound
 	endpointsByTag  map[string]adapter.Outbound
-	endpointOptions map[string]option.Endpoint
 	ticker          *time.Ticker
 	checking        atomic.Bool
 	history         *urltest.HistoryStorage
 	callbackAccess  sync.Mutex
 	callbacks       list.List[adapter.ProviderUpdateCallback]
-	deltaRevision   uint64
-	deltaHistory    []adapter.ProviderDelta
 
 	link     string
 	enabled  bool
@@ -117,27 +112,9 @@ func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
 	return detour, ok
 }
 
-func (a *Adapter) OutboundOptions() map[string]option.Outbound {
-	a.outboundsAccess.RLock()
-	defer a.outboundsAccess.RUnlock()
-	options := make(map[string]option.Outbound, len(a.outboundOptions))
-	for tag, outboundOptions := range a.outboundOptions {
-		options[tag] = outboundOptions
-	}
-	return options
-}
-
-func (a *Adapter) OutboundOption(tag string) (option.Outbound, bool) {
-	a.outboundsAccess.RLock()
-	outboundOptions, loaded := a.outboundOptions[tag]
-	a.outboundsAccess.RUnlock()
-	return outboundOptions, loaded
-}
-
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 	tags := make([]string, len(newOpts))
 	seen := make(map[string]bool)
-	duplicateCount := 0
 	for i, opt := range newOpts {
 		var baseTag string
 		if opt.Tag != "" {
@@ -150,33 +127,20 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 			tag = F.ToString(baseTag, " (", n, ")")
 		}
 		if tag != baseTag {
-			duplicateCount++
-			if a.logger != nil {
-				a.logger.Debug("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
-			}
+			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
 		}
 		seen[tag] = true
 		tags[i] = tag
-	}
-	if duplicateCount > 0 && a.logger != nil {
-		a.logger.Warn("provider ", a.providerTag, ": renamed ", duplicateCount, " duplicate outbound tags")
 	}
 	return tags
 }
 
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
 	newTags := a.resolveOutboundTags(newOpts)
-	a.outboundsAccess.RLock()
-	previousOptions := make(map[string]option.Outbound, len(a.outboundOptions))
-	for tag, outboundOptions := range a.outboundOptions {
-		previousOptions[tag] = outboundOptions
-	}
-	a.outboundsAccess.RUnlock()
 	var (
-		oldOptByTag     = make(map[string]option.Outbound)
-		outbounds       = make([]adapter.Outbound, 0, len(newOpts))
-		outboundsByTag  = make(map[string]adapter.Outbound)
-		outboundOptions = make(map[string]option.Outbound)
+		oldOptByTag    = make(map[string]option.Outbound)
+		outbounds      = make([]adapter.Outbound, 0, len(newOpts))
+		outboundsByTag = make(map[string]adapter.Outbound)
 	)
 	for _, opt := range oldOpts {
 		oldOptByTag[opt.Tag] = opt
@@ -211,87 +175,14 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 		}
 		outbounds = append(outbounds, outbound)
 		outboundsByTag[tag] = outbound
-		outboundOptions[tag] = opt
 	}
 	a.outboundsAccess.Lock()
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
-	a.outboundOptions = outboundOptions
-	upserts := make([]string, 0)
-	removes := make([]string, 0)
-	for tag, outboundOptions := range outboundOptions {
-		if previous, loaded := previousOptions[tag]; !loaded || !reflect.DeepEqual(previous, outboundOptions) {
-			upserts = append(upserts, tag)
-		}
-	}
-	for tag := range previousOptions {
-		if _, loaded := outboundOptions[tag]; !loaded {
-			removes = append(removes, tag)
-		}
-	}
-	a.appendOutboundDeltaLocked(upserts, removes)
 	a.outboundsAccess.Unlock()
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)
 	}
-}
-
-func (a *Adapter) appendOutboundDeltaLocked(upserts, removes []string) {
-	if len(upserts) == 0 && len(removes) == 0 {
-		return
-	}
-	sort.Strings(upserts)
-	sort.Strings(removes)
-	baseRevision := a.deltaRevision
-	a.deltaRevision++
-	a.deltaHistory = append(a.deltaHistory, adapter.ProviderDelta{BaseRevision: baseRevision, Revision: a.deltaRevision, Upserts: upserts, Removes: removes})
-	if len(a.deltaHistory) > 64 {
-		copy(a.deltaHistory, a.deltaHistory[len(a.deltaHistory)-64:])
-		a.deltaHistory = a.deltaHistory[:64]
-	}
-}
-
-func (a *Adapter) OutboundDeltaRevision() uint64 {
-	a.outboundsAccess.RLock()
-	revision := a.deltaRevision
-	a.outboundsAccess.RUnlock()
-	return revision
-}
-
-func (a *Adapter) OutboundDelta(afterRevision uint64) (adapter.ProviderDelta, bool) {
-	a.outboundsAccess.RLock()
-	defer a.outboundsAccess.RUnlock()
-	if afterRevision == a.deltaRevision {
-		return adapter.ProviderDelta{BaseRevision: afterRevision, Revision: afterRevision}, true
-	}
-	if afterRevision > a.deltaRevision || len(a.deltaHistory) == 0 || afterRevision < a.deltaHistory[0].BaseRevision {
-		return adapter.ProviderDelta{}, false
-	}
-	combined := adapter.ProviderDelta{BaseRevision: afterRevision, Revision: a.deltaRevision}
-	upserts := make(map[string]struct{})
-	removes := make(map[string]struct{})
-	for _, delta := range a.deltaHistory {
-		if delta.Revision <= afterRevision {
-			continue
-		}
-		for _, tag := range delta.Removes {
-			delete(upserts, tag)
-			removes[tag] = struct{}{}
-		}
-		for _, tag := range delta.Upserts {
-			delete(removes, tag)
-			upserts[tag] = struct{}{}
-		}
-	}
-	for tag := range upserts {
-		combined.Upserts = append(combined.Upserts, tag)
-	}
-	for tag := range removes {
-		combined.Removes = append(combined.Removes, tag)
-	}
-	sort.Strings(combined.Upserts)
-	sort.Strings(combined.Removes)
-	return combined, true
 }
 
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
@@ -334,10 +225,8 @@ func (a *Adapter) Close() error {
 	endpoints := a.endpoints
 	a.outbounds = nil
 	a.outboundsByTag = nil
-	a.outboundOptions = nil
 	a.endpoints = nil
 	a.endpointsByTag = nil
-	a.endpointOptions = nil
 	a.outboundsAccess.Unlock()
 	var err error
 	for _, ob := range outbounds {
@@ -484,17 +373,10 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
 	newTags := a.resolveEndpointTags(newOpts)
-	a.outboundsAccess.RLock()
-	previousOptions := make(map[string]option.Endpoint, len(a.endpointOptions))
-	for tag, endpointOptions := range a.endpointOptions {
-		previousOptions[tag] = endpointOptions
-	}
-	a.outboundsAccess.RUnlock()
 	var (
-		oldOptByTag     = make(map[string]option.Endpoint)
-		endpoints       []adapter.Outbound
-		endpointsByTag  = make(map[string]adapter.Outbound)
-		endpointOptions = make(map[string]option.Endpoint)
+		oldOptByTag    = make(map[string]option.Endpoint)
+		endpoints      []adapter.Outbound
+		endpointsByTag = make(map[string]adapter.Outbound)
 	)
 	for _, opt := range oldOpts {
 		oldOptByTag[opt.Tag] = opt
@@ -529,25 +411,10 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 		}
 		endpoints = append(endpoints, ep)
 		endpointsByTag[tag] = ep
-		endpointOptions[tag] = opt
 	}
 	a.outboundsAccess.Lock()
 	a.endpoints = endpoints
 	a.endpointsByTag = endpointsByTag
-	a.endpointOptions = endpointOptions
-	upserts := make([]string, 0)
-	removes := make([]string, 0)
-	for tag, endpointOptions := range endpointOptions {
-		if previous, loaded := previousOptions[tag]; !loaded || !reflect.DeepEqual(previous, endpointOptions) {
-			upserts = append(upserts, tag)
-		}
-	}
-	for tag := range previousOptions {
-		if _, loaded := endpointOptions[tag]; !loaded {
-			removes = append(removes, tag)
-		}
-	}
-	a.appendOutboundDeltaLocked(upserts, removes)
 	a.outboundsAccess.Unlock()
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)

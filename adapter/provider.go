@@ -20,31 +20,6 @@ type Provider interface {
 	UnregisterCallback(element *list.Element[ProviderUpdateCallback])
 }
 
-// ProviderOutboundOptions exposes the structured source options used to build
-// provider outbounds. Consumers must treat the returned map as immutable.
-type ProviderOutboundOptions interface {
-	OutboundOptions() map[string]option.Outbound
-}
-
-type ProviderOutboundOptionLookup interface {
-	OutboundOption(tag string) (option.Outbound, bool)
-}
-
-// ProviderOutboundDelta is an optional append-only change cursor. Consumers
-// must fall back to Outbounds when the requested cursor is no longer retained.
-// It intentionally exposes tags only; runtime outbound objects stay provider-local.
-type ProviderOutboundDelta interface {
-	OutboundDeltaRevision() uint64
-	OutboundDelta(afterRevision uint64) (ProviderDelta, bool)
-}
-
-type ProviderDelta struct {
-	BaseRevision uint64
-	Revision     uint64
-	Upserts      []string
-	Removes      []string
-}
-
 type ProviderUpdater interface {
 	Update() error
 }

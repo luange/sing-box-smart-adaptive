@@ -32,10 +32,11 @@ type Listener struct {
 	oobPacketHandler         adapter.OOBPacketHandler
 	threadUnsafePacketWriter bool
 	disablePacketOutput      bool
+	disableConnectionLog     bool
+	disableListenerLog       bool
 	setSystemProxy           bool
 	systemProxySOCKS         bool
 	tproxy                   bool
-	forceNoMPTCP             bool // E5: SOCKMAP / bpf_sk_assign reject MPTCP
 	socketControl            control.Func
 
 	tcpListener          net.Listener
@@ -57,13 +58,12 @@ type Options struct {
 	OOBPacketHandler         adapter.OOBPacketHandler
 	ThreadUnsafePacketWriter bool
 	DisablePacketOutput      bool
+	DisableConnectionLog     bool
+	DisableListenerLog       bool
 	SetSystemProxy           bool
 	SystemProxySOCKS         bool
 	TProxy                   bool
-	// ForceNoMPTCP forces plain TCP (E5). Only for eBPF socket_assign / SOCKMAP.
-	// Classic tproxy must not silently ignore tcp_multi_path.
-	ForceNoMPTCP  bool
-	SocketControl control.Func
+	SocketControl            control.Func
 }
 
 func New(
@@ -79,10 +79,11 @@ func New(
 		oobPacketHandler:         options.OOBPacketHandler,
 		threadUnsafePacketWriter: options.ThreadUnsafePacketWriter,
 		disablePacketOutput:      options.DisablePacketOutput,
+		disableConnectionLog:     options.DisableConnectionLog,
+		disableListenerLog:       options.DisableListenerLog,
 		setSystemProxy:           options.SetSystemProxy,
 		systemProxySOCKS:         options.SystemProxySOCKS,
 		tproxy:                   options.TProxy,
-		forceNoMPTCP:             options.ForceNoMPTCP,
 		socketControl:            options.SocketControl,
 	}
 }

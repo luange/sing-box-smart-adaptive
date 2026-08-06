@@ -45,15 +45,14 @@ type InboundManager interface {
 }
 
 type InboundContext struct {
-	Inbound          string
-	InboundType      string
-	InboundInterface string
-	IPVersion        uint8
-	Network          string
-	Source           M.Socksaddr
-	Destination      M.Socksaddr
-	User             string
-	Outbound         string
+	Inbound     string
+	InboundType string
+	IPVersion   uint8
+	Network     string
+	Source      M.Socksaddr
+	Destination M.Socksaddr
+	User        string
+	Outbound    string
 
 	// sniffer
 
@@ -114,34 +113,9 @@ type InboundContext struct {
 	DidMatch                     bool
 	IgnoreDestinationIPCIDRMatch bool
 
-	// MatchInputs accumulates condition classes evaluated during routing (Q3).
-	// Used by eBPF verdict learn: only IP-only decisions may cache DIRECT.
-	// Zero means "no rule item evaluated" (default outbound path may learn);
-	// RouteMatchUnknown means fail-closed (must not learn).
-	MatchInputs RouteMatchInputs
-
 	// extended metadata
 	Extended *InboundContextExtended
 }
-
-// RouteMatchInputs is a bitset of rule condition classes evaluated for a flow (Q3).
-type RouteMatchInputs uint32
-
-const (
-	RouteMatchIP       RouteMatchInputs = 1 << iota // ip_cidr / geoip / ip_is_private / ip_version
-	RouteMatchPort                                  // port / port_range
-	RouteMatchNetwork                               // network / inbound / inbound_interface / ...
-	RouteMatchDomain                                // domain* / geosite / rule_set(domain)
-	RouteMatchProtocol                              // sniffed protocol
-	RouteMatchClient                                // sniffed client
-	RouteMatchProcess                               // process_name/path/package
-	RouteMatchUser                                  // auth_user / user_id
-	RouteMatchOther                                 // clash_mode / preferred_by / ...
-	RouteMatchUnknown                               // unimplemented item class → fail-closed
-)
-
-// RouteMatchIPOnly is the whitelist for destination-level DIRECT learn.
-const RouteMatchIPOnly = RouteMatchIP | RouteMatchPort | RouteMatchNetwork
 
 type InboundContextExtended struct {
 	RealOutboundChain []string

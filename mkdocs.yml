@@ -78,6 +78,9 @@ nav:
           - Hysteria 2: manual/proxy-protocol/hysteria2.md
       - Misc:
           - TunnelVision: manual/misc/tunnelvision.md
+          - AnyTLS client metadata: manual/misc/anytls-client-metadata.md
+          - eBPF inbound comparison: manual/misc/ebpf-inbound-comparison.md
+          - Transparent inbound benchmark: manual/misc/interception-benchmark.md
   - Configuration:
       - configuration/index.md
       - JSON Schema: configuration/schema.md
@@ -204,11 +207,11 @@ nav:
           - DNS: configuration/outbound/dns.md
           - Selector: configuration/outbound/selector.md
           - URLTest: configuration/outbound/urltest.md
-          - AdaptivePool: configuration/outbound/adaptive-pool.md
       - Provider:
           - configuration/provider/index.md
           - Dialer Fields Override: configuration/provider/override_dialer.md
           - TLS Fields Override: configuration/provider/override_tls.md
+          - AnyTLS Fields Override: configuration/provider/override_anytls.md
       - Service:
           - configuration/service/index.md
           - sing-box API: configuration/service/api.md
@@ -326,6 +329,7 @@ plugins:
             Certificate Provider: 证书提供者
             Dialer Fields Override: 拨号字段覆写
             TLS Fields Override: TLS 字段覆写
+            AnyTLS Fields Override: AnyTLS 字段覆写
 
             Manual: 手册
       reconfigure_material: true

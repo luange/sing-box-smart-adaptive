@@ -30,6 +30,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 	}
 }
 
+var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	ctx           context.Context
@@ -39,6 +41,7 @@ type Outbound struct {
 	clientOptions anytls.ClientConfig
 	client        *anytls.Client
 	uotClient     *uot.Client
+	disableReuse  bool
 	logger        log.ContextLogger
 }
 
@@ -46,10 +49,11 @@ var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSOutboundOptions) (adapter.Outbound, error) {
 	outbound := &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeAnyTLS, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		ctx:     ctx,
-		server:  options.ServerOptions.Build(),
-		logger:  logger,
+		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeAnyTLS, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		ctx:          ctx,
+		server:       options.ServerOptions.Build(),
+		disableReuse: options.DisableReuse,
+		logger:       logger,
 	}
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
@@ -74,7 +78,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	outbound.clientOptions = anytls.ClientConfig{
 		Password:                 options.Password,
-		ClientName:               options.ClientName,
+		ClientMetadata:           clientMetadataOrDefault(options.ClientMetadata),
 		IdleSessionCheckInterval: options.IdleSessionCheckInterval.Build(),
 		IdleSessionTimeout:       options.IdleSessionTimeout.Build(),
 		MinIdleSession:           options.MinIdleSession,
@@ -101,6 +105,13 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+func clientMetadataOrDefault(clientMetadata *string) string {
+	if clientMetadata == nil {
+		return util.Version
+	}
+	return *clientMetadata
+}
+
 type anytlsDialer func(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
 
 func (d anytlsDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -113,6 +124,10 @@ func (d anytlsDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 
 func (h *Outbound) dialOut(ctx context.Context) (net.Conn, error) {
 	return h.dialer.DialTLSContext(ctx, h.server)
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return !h.disableReuse
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

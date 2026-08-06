@@ -4,11 +4,13 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+
+	"github.com/sagernet/sing-box/adapter"
 )
 
 func TestDynamicSocketProtectFunc(t *testing.T) {
 	manager := new(NetworkManager)
-	protect := manager.SocketProtectFunc()
+	protect := adapter.SocketProtectFunc(manager)
 	if err := protect("tcp4", "example.com:443", nil); err != nil {
 		t.Fatal(err)
 	}
