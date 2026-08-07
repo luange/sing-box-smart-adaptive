@@ -92,11 +92,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          remote="${{ inputs.upstream_remote }}"
+          remote="${{ github.event.inputs.upstream_remote }}"
           if [[ -z "$remote" ]]; then
             remote="https://github.com/reF1nd/sing-box.git"
           fi
-          ref="${{ inputs.upstream_ref }}"
+          ref="${{ github.event.inputs.upstream_ref }}"
           if [[ -z "$ref" ]]; then
             # Prefer newest reF1nd beta tag, else reF1nd-testing
             ref="$(curl -fsSL https://api.github.com/repos/reF1nd/sing-box/tags?per_page=30 \
@@ -106,7 +106,7 @@ pat=re.compile(r"^v1\.\d+\.\d+-beta\.\d+-reF1nd$")
 cands=[t["name"] for t in tags if pat.match(t["name"])]
 print(cands[0] if cands else "reF1nd-testing")')"
           fi
-          suffix="${{ inputs.custom_suffix }}"
+          suffix="${{ github.event.inputs.custom_suffix }}"
           if [[ -z "$suffix" ]]; then
             suffix="reF1nd-luan-smart"
           fi
@@ -381,7 +381,7 @@ print(cands[0] if cands else "reF1nd-testing")')"
 
   build-ebpf:
     name: eBPF linux/${{ matrix.goarch }}
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_ebpf == 'true' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_ebpf != 'false' }}
     runs-on: ubuntu-latest
     needs:
       - resolve
@@ -451,7 +451,7 @@ print(cands[0] if cands else "reF1nd-testing")')"
       - resolve
       - build
       - build-ebpf
-    if: ${{ always() && inputs.publish_release == 'true' && needs.build.result == 'success' }}
+    if: ${{ always() && github.event.inputs.publish_release == 'true' && needs.build.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
