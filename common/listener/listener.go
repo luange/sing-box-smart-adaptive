@@ -37,6 +37,7 @@ type Listener struct {
 	setSystemProxy           bool
 	systemProxySOCKS         bool
 	tproxy                   bool
+	forceNoMPTCP             bool // E5: SOCKMAP / bpf_sk_assign reject MPTCP
 	socketControl            control.Func
 
 	tcpListener          net.Listener
@@ -63,7 +64,10 @@ type Options struct {
 	SetSystemProxy           bool
 	SystemProxySOCKS         bool
 	TProxy                   bool
-	SocketControl            control.Func
+	// ForceNoMPTCP forces plain TCP (E5). Only for eBPF socket_assign / SOCKMAP.
+	// Classic tproxy must not silently ignore tcp_multi_path.
+	ForceNoMPTCP  bool
+	SocketControl control.Func
 }
 
 func New(
@@ -84,6 +88,7 @@ func New(
 		setSystemProxy:           options.SetSystemProxy,
 		systemProxySOCKS:         options.SystemProxySOCKS,
 		tproxy:                   options.TProxy,
+		forceNoMPTCP:             options.ForceNoMPTCP,
 		socketControl:            options.SocketControl,
 	}
 }
