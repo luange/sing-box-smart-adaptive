@@ -27,13 +27,6 @@ type DNSRouter interface {
 	ResetNetwork()
 }
 
-// DNSAnswerObserver is an optional service hook after a successful userspace DNS
-// A/AAAA answer (e.g. eBPF weak dns_prefill → TC promote). Fail-open: never
-// blocks the DNS path. Registered via service.MustRegister when enabled.
-type DNSAnswerObserver interface {
-	OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool)
-}
-
 type DNSClient interface {
 	Start()
 	Exchange(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error)
