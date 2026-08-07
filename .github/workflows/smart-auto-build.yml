@@ -188,7 +188,7 @@ jobs:
                 git add -- "$f"
                 echo "OURS_EBPF $f"
                 ;;
-              dns/router.go|option/group.go|protocol/group/*|adapter/experimental.go|constant/proxy.go)
+              option/group.go|protocol/group/*|adapter/experimental.go|constant/proxy.go|adapter/provider.go|adapter/inbound.go|adapter/outbound.go|option/rule.go|option/rule_dns.go|route/rule/rule_default.go|route/rule/rule_abstract.go|route/rule/rule_item_match_class.go)
                 git checkout --ours -- "$f"
                 git add -- "$f"
                 echo "OURS_ADAPT $f"
