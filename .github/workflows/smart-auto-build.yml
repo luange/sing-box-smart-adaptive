@@ -208,7 +208,10 @@ jobs:
 
           # Additive upstream-only eBPF files (keep if missing on ours)
           additive_files=(
-            # intentionally empty: do not mix upstream cgroup/shared_network cgo with our eBPF stack
+            # safe upstream-only helpers (not cgroup/shared_network cgo stack)
+            common/ebpf/kernel_check.go
+            common/ebpf/check-kernel.sh
+            cmd/sing-box/cmd_tools_ebpf.go
           )
           for f in "${additive_files[@]}"; do
             if ! git cat-file -e "MERGE_HEAD:$f" 2>/dev/null; then
