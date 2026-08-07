@@ -99,12 +99,7 @@ jobs:
           ref="${{ github.event.inputs.upstream_ref }}"
           if [[ -z "$ref" ]]; then
             # Prefer newest reF1nd beta tag, else reF1nd-testing
-            ref="$(curl -fsSL https://api.github.com/repos/reF1nd/sing-box/tags?per_page=30 \
-              | python3 -c 'import json,sys,re
-tags=json.load(sys.stdin)
-pat=re.compile(r"^v1\.\d+\.\d+-beta\.\d+-reF1nd$")
-cands=[t["name"] for t in tags if pat.match(t["name"])]
-print(cands[0] if cands else "reF1nd-testing")')"
+            ref="$(curl -fsSL https://api.github.com/repos/reF1nd/sing-box/tags?per_page=30 | python3 -c "import json,sys,re; tags=json.load(sys.stdin); pat=re.compile(r'^v1\.\d+\.\d+-beta\.\d+-reF1nd$'); cands=[t['name'] for t in tags if pat.match(t['name'])]; print(cands[0] if cands else 'reF1nd-testing')")"
           fi
           suffix="${{ github.event.inputs.custom_suffix }}"
           if [[ -z "$suffix" ]]; then
@@ -211,8 +206,46 @@ print(cands[0] if cands else "reF1nd-testing")')"
           done
 
           # Additive upstream-only eBPF files (keep if missing on ours)
-          while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
+          additive_files=(
+            protocol/ebpf/android_uid.go
+            protocol/ebpf/android_uid_test.go
+            protocol/ebpf/config.go
+            protocol/ebpf/inbound_connection.go
+            protocol/ebpf/inbound_lifecycle.go
+            protocol/ebpf/inbound_policy.go
+            protocol/ebpf/ipv6.go
+            protocol/ebpf/ipv6_test.go
+            protocol/ebpf/listener.go
+            protocol/ebpf/shared_network_connection.go
+            protocol/ebpf/shared_network_link.go
+            protocol/ebpf/shared_network_tc.go
+            protocol/ebpf/warning_limiter.go
+            protocol/ebpf/warning_limiter_test.go
+            common/ebpf/cgo_bpf.c
+            common/ebpf/cgo_cgroup.c
+            common/ebpf/cgroup_abi.go
+            common/ebpf/cgroup_cgo.go
+            common/ebpf/cgroup_mount.go
+            common/ebpf/cgroup_policy.go
+            common/ebpf/cgroup_policy_cgo.go
+            common/ebpf/cgroup_socket_cgo.go
+            common/ebpf/cgroup_stub.go
+            common/ebpf/kernel_check.go
+            common/ebpf/map.go
+            common/ebpf/shared_network_abi.go
+            common/ebpf/shared_network_cgo.go
+            common/ebpf/shared_network_flow_cgo.go
+            common/ebpf/shared_network_policy.go
+            common/ebpf/shared_network_policy_cgo.go
+            common/ebpf/native/abi.h
+            common/ebpf/native/bpf.c
+            common/ebpf/native/cgroup.bpf.c
+            common/ebpf/native/cgroup.c
+            common/ebpf/native/cgroup_loader.c
+            common/ebpf/native/cgroup_runtime.c
+            common/ebpf/native/runtime.h
+          )
+          for f in "${additive_files[@]}"; do
             if ! git cat-file -e "MERGE_HEAD:$f" 2>/dev/null; then
               continue
             fi
@@ -221,45 +254,7 @@ print(cands[0] if cands else "reF1nd-testing")')"
               git add -- "$f"
               echo "ADD_UPSTREAM $f"
             fi
-          done <<'EOF'
-          protocol/ebpf/android_uid.go
-          protocol/ebpf/android_uid_test.go
-          protocol/ebpf/config.go
-          protocol/ebpf/inbound_connection.go
-          protocol/ebpf/inbound_lifecycle.go
-          protocol/ebpf/inbound_policy.go
-          protocol/ebpf/ipv6.go
-          protocol/ebpf/ipv6_test.go
-          protocol/ebpf/listener.go
-          protocol/ebpf/shared_network_connection.go
-          protocol/ebpf/shared_network_link.go
-          protocol/ebpf/shared_network_tc.go
-          protocol/ebpf/warning_limiter.go
-          protocol/ebpf/warning_limiter_test.go
-          common/ebpf/cgo_bpf.c
-          common/ebpf/cgo_cgroup.c
-          common/ebpf/cgroup_abi.go
-          common/ebpf/cgroup_cgo.go
-          common/ebpf/cgroup_mount.go
-          common/ebpf/cgroup_policy.go
-          common/ebpf/cgroup_policy_cgo.go
-          common/ebpf/cgroup_socket_cgo.go
-          common/ebpf/cgroup_stub.go
-          common/ebpf/kernel_check.go
-          common/ebpf/map.go
-          common/ebpf/shared_network_abi.go
-          common/ebpf/shared_network_cgo.go
-          common/ebpf/shared_network_flow_cgo.go
-          common/ebpf/shared_network_policy.go
-          common/ebpf/shared_network_policy_cgo.go
-          common/ebpf/native/abi.h
-          common/ebpf/native/bpf.c
-          common/ebpf/native/cgroup.bpf.c
-          common/ebpf/native/cgroup.c
-          common/ebpf/native/cgroup_loader.c
-          common/ebpf/native/cgroup_runtime.c
-          common/ebpf/native/runtime.h
-          EOF
+          done
 
           left="$(git diff --name-only --diff-filter=U || true)"
           if [[ -n "$left" ]]; then
