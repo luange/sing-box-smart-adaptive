@@ -233,11 +233,6 @@ jobs:
             common/ebpf/cgroup_stub.go
             common/ebpf/kernel_check.go
             common/ebpf/map.go
-            common/ebpf/shared_network_abi.go
-            common/ebpf/shared_network_cgo.go
-            common/ebpf/shared_network_flow_cgo.go
-            common/ebpf/shared_network_policy.go
-            common/ebpf/shared_network_policy_cgo.go
             common/ebpf/native/abi.h
             common/ebpf/native/bpf.c
             common/ebpf/native/cgroup.bpf.c
