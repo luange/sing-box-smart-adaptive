@@ -25,6 +25,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/bridge"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/protocol/group/adaptive"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/naive"
@@ -97,6 +98,7 @@ func OutboundRegistry() *outbound.Registry {
 
 	direct.RegisterOutbound(registry)
 	bridge.RegisterOutbound(registry)
+	registerEBPFOutbound(registry)
 
 	pass.RegisterOutbound(registry)
 	block.RegisterOutbound(registry)
@@ -104,6 +106,8 @@ func OutboundRegistry() *outbound.Registry {
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
 	group.RegisterLoadBalance(registry)
+	group.RegisterSmart(registry)
+	adaptive.Register(registry)
 
 	socks.RegisterOutbound(registry)
 	http.RegisterOutbound(registry)
