@@ -53,7 +53,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const SharedNetworkMapCapacity = 65536
+const SharedNetworkMapCapacity = 16384
 
 const (
 	sharedStatIngressRedirects uint32 = iota

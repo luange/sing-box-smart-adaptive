@@ -136,8 +136,8 @@ struct bpf_map_def SEC("maps") shared_stats = {
 };
 EXTERNAL_MAP(shared_host_ipv4, struct sb_lpm4_key, __u8, 256U);
 EXTERNAL_MAP(shared_host_ipv6, struct sb_lpm6_key, __u8, 256U);
-EXTERNAL_MAP(shared_bypass_ipv4, struct sb_lpm4_key, __u8, 65536U);
-EXTERNAL_MAP(shared_bypass_ipv6, struct sb_lpm6_key, __u8, 65536U);
+EXTERNAL_MAP(shared_bypass_ipv4, struct sb_lpm4_key, __u8, 16384U);
+EXTERNAL_MAP(shared_bypass_ipv6, struct sb_lpm6_key, __u8, 16384U);
 /* dns_kernel_direct: :53 to these destinations stays kernel when hijack is on. */
 EXTERNAL_MAP(shared_dns_direct_ipv4, struct sb_lpm4_key, __u8, 256U);
 EXTERNAL_MAP(shared_dns_direct_ipv6, struct sb_lpm6_key, __u8, 256U);

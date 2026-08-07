@@ -53,8 +53,10 @@ const (
 	defaultSmartBreakerFailures   = 3
 	defaultSmartBreakerCooldown   = 2 * time.Minute
 	defaultSmartHalfLife          = 30 * time.Minute
-	defaultSmartHistoryRetention  = 7 * 24 * time.Hour
-	defaultSmartMaxHistoryEntries = 50000
+	// Homelab/router default: 48h + 4k is enough for site stickiness without
+	// multi-hundred-MB metric maps (5 groups × 50k was a common RSS blow-up).
+	defaultSmartHistoryRetention  = 48 * time.Hour
+	defaultSmartMaxHistoryEntries = 4096
 	smartStatusCandidateLimit     = 32
 	smartNetworkFingerprintTTL    = 2 * time.Second
 )

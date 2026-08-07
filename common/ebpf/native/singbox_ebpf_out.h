@@ -8,12 +8,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SB_SPLICE_MAX_ENTRIES 65536U
+/* Router-scale defaults: 8k pairs/flows. Override via config max_pairs/max_entries. */
+#define SB_SPLICE_MAX_ENTRIES 8192U
 
 /* ── Module A: flow verdict offload (OUT-A) ─────────────────────────── */
 #define SB_OUT_VERDICT_DIRECT 1U
 #define SB_OUT_VERDICT_PROXY  2U
-#define SB_OUT_VERDICT_MAX_ENTRIES 65536U
+#define SB_OUT_VERDICT_MAX_ENTRIES 8192U
 
 struct sb_out_verdict_key {
 	uint8_t family;

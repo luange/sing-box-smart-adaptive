@@ -9,7 +9,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-const SharedNetworkMapCapacity = 65536
+const SharedNetworkMapCapacity = 16384
 
 type SharedNetworkBackend struct{}
 

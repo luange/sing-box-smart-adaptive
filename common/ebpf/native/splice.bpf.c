@@ -10,7 +10,7 @@
 #define SEC(name) __attribute__((section(name), used))
 #define INLINE static __attribute__((always_inline))
 
-#define SB_SPLICE_MAX_ENTRIES 65536U
+#define SB_SPLICE_MAX_ENTRIES 8192U
 
 enum sb_splice_stat_index {
 	/* 0/1 reserved: pair created/released are maintained in Go atomics only.

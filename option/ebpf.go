@@ -85,7 +85,7 @@ type EBPFDNSPrefillOptions struct {
 
 type EBPFSpliceOptions struct {
 	Enabled     bool               `json:"enabled,omitempty"`
-	MaxPairs    uint32             `json:"max_pairs,omitempty"`                           // 0 → 65536
+	MaxPairs    uint32             `json:"max_pairs,omitempty"`                           // 0 → 8192
 	Accounting  *bool              `json:"accounting,omitempty"`                          // default true
 	HalfClose   string             `json:"half_close,omitempty" enum:"close,passthrough"` // default close
 	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`                        // 0 → 2×UDPTimeout
@@ -99,7 +99,7 @@ type EBPFSpliceOptions struct {
 type EBPFVerdictOptions struct {
 	Mode           string             `json:"mode,omitempty" enum:"off,learn"` // default off; "dns" removed (never implemented)
 	TTL            badoption.Duration `json:"ttl,omitempty"`                   // 0 → 5m
-	MaxEntries     uint32             `json:"max_entries,omitempty"`           // 0 → 65536
+	MaxEntries     uint32             `json:"max_entries,omitempty"`           // 0 → 8192
 	AllowWithSniff bool               `json:"allow_with_sniff,omitempty"`      // default false
 	// PromoteBypass installs learned DIRECT IPs as /32 into TC bypass LPM (dae-style high hit-rate).
 	// nil → true when mode=learn. Set false to keep port-level userspace only (connect4 verdict).

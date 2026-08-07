@@ -13,7 +13,7 @@ import (
 
 const (
 	maxUIDPolicyEntries        = 4096
-	maxBypassCIDRPolicyEntries = 65536
+	maxBypassCIDRPolicyEntries = 16384
 )
 
 type Policy struct {
@@ -23,7 +23,7 @@ type Policy struct {
 	// EnableFlowVerdict creates Module A verdict maps and wires connect4/udp4 lookup.
 	// Default false (off). Contract: master §6.2 / plan §4 / F-1.
 	EnableFlowVerdict bool
-	// FlowVerdictMaxEntries sizes the LRU verdict map; 0 → 65536 (A5).
+	// FlowVerdictMaxEntries sizes the LRU verdict map; 0 → 8192 (A5).
 	FlowVerdictMaxEntries uint32
 	IncludeUID            []UIDRange
 	ExcludeUID            []UIDRange

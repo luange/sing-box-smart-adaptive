@@ -9,8 +9,8 @@ import (
 const (
 	ProtocolTCP            = 6
 	ProtocolUDP            = 17
-	TCPRedirectMapCapacity = 65536
-	UDPRedirectMapCapacity = 65536
+	TCPRedirectMapCapacity = 16384
+	UDPRedirectMapCapacity = 16384
 
 	addressFamilyIPv4 = 2
 	addressFamilyIPv6 = 10

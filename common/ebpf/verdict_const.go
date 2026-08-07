@@ -13,5 +13,6 @@ const (
 	outVerdictStatCount       = 3
 
 	// Default map capacity when option MaxEntries is 0.
-	OutVerdictDefaultMaxEntries = 65536
+	// 8k covers heavy LAN concurrent flows; 64k pre-charges ~tens of MiB RLIMIT_MEMLOCK.
+	OutVerdictDefaultMaxEntries = 8192
 )
