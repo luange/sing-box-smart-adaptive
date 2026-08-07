@@ -208,38 +208,7 @@ jobs:
 
           # Additive upstream-only eBPF files (keep if missing on ours)
           additive_files=(
-            protocol/ebpf/android_uid.go
-            protocol/ebpf/android_uid_test.go
-            protocol/ebpf/config.go
-            protocol/ebpf/inbound_connection.go
-            protocol/ebpf/inbound_lifecycle.go
-            protocol/ebpf/inbound_policy.go
-            protocol/ebpf/ipv6.go
-            protocol/ebpf/ipv6_test.go
-            protocol/ebpf/listener.go
-            protocol/ebpf/shared_network_connection.go
-            protocol/ebpf/shared_network_link.go
-            protocol/ebpf/shared_network_tc.go
-            protocol/ebpf/warning_limiter.go
-            protocol/ebpf/warning_limiter_test.go
-            common/ebpf/cgo_bpf.c
-            common/ebpf/cgo_cgroup.c
-            common/ebpf/cgroup_abi.go
-            common/ebpf/cgroup_cgo.go
-            common/ebpf/cgroup_mount.go
-            common/ebpf/cgroup_policy.go
-            common/ebpf/cgroup_policy_cgo.go
-            common/ebpf/cgroup_socket_cgo.go
-            common/ebpf/cgroup_stub.go
-            common/ebpf/kernel_check.go
-            common/ebpf/map.go
-            common/ebpf/native/abi.h
-            common/ebpf/native/bpf.c
-            common/ebpf/native/cgroup.bpf.c
-            common/ebpf/native/cgroup.c
-            common/ebpf/native/cgroup_loader.c
-            common/ebpf/native/cgroup_runtime.c
-            common/ebpf/native/runtime.h
+            # intentionally empty: do not mix upstream cgroup/shared_network cgo with our eBPF stack
           )
           for f in "${additive_files[@]}"; do
             if ! git cat-file -e "MERGE_HEAD:$f" 2>/dev/null; then
