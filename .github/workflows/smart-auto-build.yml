@@ -138,16 +138,17 @@ jobs:
           remote="${{ needs.resolve.outputs.upstream_remote }}"
           ref="${{ needs.resolve.outputs.upstream_ref }}"
           git remote add upstream "$remote" 2>/dev/null || git remote set-url upstream "$remote"
-          # tag or branch
+          # tag or branch — set MERGE_REF in this shell (GITHUB_ENV is next-step only)
           if git ls-remote --exit-code --tags upstream "refs/tags/${ref}" >/dev/null 2>&1; then
-            git fetch --force upstream "refs/tags/${ref}:refs/tags/${ref}"
-            echo "FETCHED_TAG=${ref}" >> "$GITHUB_ENV"
-            echo "MERGE_REF=${ref}" >> "$GITHUB_ENV"
+            git fetch --no-tags --force upstream "refs/tags/${ref}:refs/tags/${ref}"
+            MERGE_REF="${ref}"
           else
-            git fetch --force upstream "${ref}:refs/remotes/upstream/${ref}"
-            echo "MERGE_REF=upstream/${ref}" >> "$GITHUB_ENV"
+            git fetch --no-tags --force upstream "${ref}:refs/remotes/upstream/${ref}"
+            MERGE_REF="upstream/${ref}"
           fi
-          git rev-parse "$MERGE_REF"
+          echo "MERGE_REF=${MERGE_REF}" >> "$GITHUB_ENV"
+          git rev-parse "${MERGE_REF}"
+          echo "Fetched upstream ref ${MERGE_REF}"
 
       - name: Merge with conflict policy
         id: merge
