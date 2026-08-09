@@ -67,6 +67,18 @@ type smartStore struct {
 	maxEntries      int
 }
 
+func (s *smartStore) clear() {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	clear(s.metrics)
+	// A real connection may finish after the group is retired. Keep a small,
+	// writable map for that late observation while releasing the old buckets.
+	s.metrics = make(map[smartMetricKey]*smartMetric)
+	s.access.Unlock()
+}
+
 func newSmartStore(halfLife time.Duration, breakerFailures int, breakerCooldown time.Duration) *smartStore {
 	if halfLife <= 0 {
 		halfLife = 30 * time.Minute

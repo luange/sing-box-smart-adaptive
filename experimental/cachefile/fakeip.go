@@ -59,6 +59,8 @@ func (c *CacheFile) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
 }
 
 func (c *CacheFile) FakeIPSaveMetadataAsync(metadata *adapter.FakeIPMetadata) {
+	c.saveMetadataAccess.Lock()
+	defer c.saveMetadataAccess.Unlock()
 	if c.saveMetadataTimer == nil {
 		c.saveMetadataTimer = time.AfterFunc(C.FakeIPMetadataSaveInterval, func() {
 			_ = c.FakeIPSaveMetadata(metadata)

@@ -2,11 +2,11 @@ package group
 
 import (
 	"context"
-	"math"
 	"encoding/hex"
 	"errors"
 	"hash/fnv"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"regexp"
@@ -187,16 +187,17 @@ type Smart struct {
 	nodeWeights     *nodeweight.Matcher
 	useAllProviders bool
 
-	access          sync.RWMutex
-	candidates      []adapter.Outbound
-	candidateByTag  map[string]adapter.Outbound
-	control         *smartControlState
-	lastSelected    map[string]string
-	affinity        map[string]smartAffinity
-	halfOpen        map[string]struct{}
-	latest          common.TypedValue[adapter.Outbound]
-	fingerprint     atomic.Pointer[smartFingerprintCache]
-	fingerprintLock sync.Mutex
+	access            sync.RWMutex
+	candidates        []adapter.Outbound
+	candidateByTag    map[string]adapter.Outbound
+	candidateProbeKey map[string]string
+	control           *smartControlState
+	lastSelected      map[string]string
+	affinity          map[string]smartAffinity
+	halfOpen          map[string]struct{}
+	latest            common.TypedValue[adapter.Outbound]
+	fingerprint       atomic.Pointer[smartFingerprintCache]
+	fingerprintLock   sync.Mutex
 
 	statusAccess sync.RWMutex
 	status       adapter.SmartGroupStatus
@@ -206,33 +207,35 @@ type Smart struct {
 	reachLastRun map[string]time.Time
 	reachForce   atomic.Bool
 
-	store             *smartStore
-	probeURL          string
-	probeInterval     time.Duration
-	probeCycleTimeout time.Duration
-	probeTimeout      time.Duration
-	maxAttempts       int
-	attemptTimeout    time.Duration
-	siteStickiness    time.Duration
-	switchMargin      float64
-	exploration       float64
-	minSamples        int
-	halfLife          time.Duration
-	breakerFailures   int
-	breakerCooldown   time.Duration
-	historyRetention  time.Duration
-	maxHistoryEntries int
-	interruptGroup    *interrupt.Group
-	interruptExternal bool
-	probing           atomic.Bool
-	probeCursor       atomic.Uint64
-	closing           atomic.Bool
-	cancel            context.CancelFunc
-	worker            sync.WaitGroup
-	lifecycleAccess   sync.Mutex
-	postStarted       bool
-	retired           bool
-	workerStarted     bool
+	store                *smartStore
+	probeURL             string
+	probeInterval        time.Duration
+	probeCycleTimeout    time.Duration
+	probeTimeout         time.Duration
+	maxAttempts          int
+	attemptTimeout       time.Duration
+	siteStickiness       time.Duration
+	switchMargin         float64
+	exploration          float64
+	minSamples           int
+	halfLife             time.Duration
+	breakerFailures      int
+	breakerCooldown      time.Duration
+	historyRetention     time.Duration
+	maxHistoryEntries    int
+	interruptGroup       *interrupt.Group
+	interruptExternal    bool
+	probing              atomic.Bool
+	probeCursor          atomic.Uint64
+	closing              atomic.Bool
+	cancel               context.CancelFunc
+	worker               sync.WaitGroup
+	lifecycleAccess      sync.Mutex
+	postStarted          bool
+	retired              bool
+	workerStarted        bool
+	probeRegistry        *smartProbeRegistry
+	releaseProbeRegistry func()
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -318,6 +321,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
+	probeRegistry, releaseProbeRegistry := acquireSmartProbeRegistry(ctx)
 	smart := &Smart{
 		Adapter:    outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:        ctx,
@@ -338,33 +342,36 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		nodeWeights:     nodeWeights,
 		useAllProviders: options.UseAllProviders,
 
-		candidateByTag: make(map[string]adapter.Outbound),
-		control:        &smartControlState{},
-		lastSelected:   make(map[string]string),
-		affinity:       make(map[string]smartAffinity),
-		halfOpen:       make(map[string]struct{}),
-		store:          store,
+		candidateByTag:    make(map[string]adapter.Outbound),
+		candidateProbeKey: make(map[string]string),
+		control:           &smartControlState{},
+		lastSelected:      make(map[string]string),
+		affinity:          make(map[string]smartAffinity),
+		halfOpen:          make(map[string]struct{}),
+		store:             store,
 
-		probeURL:          options.URL,
-		probeInterval:     probeInterval,
-		probeCycleTimeout: probeCycleTimeout,
-		probeTimeout:      probeTimeout,
-		maxAttempts:       maxAttempts,
-		attemptTimeout:    attemptTimeout,
-		siteStickiness:    siteStickiness,
-		switchMargin:      switchMargin,
-		exploration:       exploration,
-		minSamples:        minSamples,
-		halfLife:          halfLife,
-		breakerFailures:   breakerFailures,
-		breakerCooldown:   breakerCooldown,
-		historyRetention:  historyRetention,
-		maxHistoryEntries: maxHistoryEntries,
-		interruptGroup:    interrupt.NewGroup(),
-		interruptExternal: options.InterruptConnections,
-		reachTests:        reachTests,
-		reachResults:      make(map[string]map[string]adapter.SmartReachCandidateStatus),
-		reachLastRun:      make(map[string]time.Time),
+		probeURL:             options.URL,
+		probeInterval:        probeInterval,
+		probeCycleTimeout:    probeCycleTimeout,
+		probeTimeout:         probeTimeout,
+		maxAttempts:          maxAttempts,
+		attemptTimeout:       attemptTimeout,
+		siteStickiness:       siteStickiness,
+		switchMargin:         switchMargin,
+		exploration:          exploration,
+		minSamples:           minSamples,
+		halfLife:             halfLife,
+		breakerFailures:      breakerFailures,
+		breakerCooldown:      breakerCooldown,
+		historyRetention:     historyRetention,
+		maxHistoryEntries:    maxHistoryEntries,
+		interruptGroup:       interrupt.NewGroup(),
+		interruptExternal:    options.InterruptConnections,
+		reachTests:           reachTests,
+		reachResults:         make(map[string]map[string]adapter.SmartReachCandidateStatus),
+		reachLastRun:         make(map[string]time.Time),
+		probeRegistry:        probeRegistry,
+		releaseProbeRegistry: releaseProbeRegistry,
 	}
 	return smart, nil
 }
@@ -445,6 +452,37 @@ func (s *Smart) Close() error {
 	s.stopWorker()
 	s.unregisterProviderCallbacks()
 	s.worker.Wait()
+	s.access.Lock()
+	clear(s.candidateByTag)
+	clear(s.lastSelected)
+	clear(s.affinity)
+	clear(s.halfOpen)
+	s.candidates = nil
+	s.candidateByTag = make(map[string]adapter.Outbound)
+	s.candidateProbeKey = make(map[string]string)
+	s.lastSelected = make(map[string]string)
+	s.affinity = make(map[string]smartAffinity)
+	s.halfOpen = make(map[string]struct{})
+	s.access.Unlock()
+	s.providerAccess.Lock()
+	clear(s.providers)
+	clear(s.outboundsCache)
+	s.providers = make(map[string]adapter.Provider)
+	s.outboundsCache = make(map[string][]adapter.Outbound)
+	s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
+	s.providerAccess.Unlock()
+	s.reachAccess.Lock()
+	clear(s.reachResults)
+	clear(s.reachLastRun)
+	s.reachTests = nil
+	s.reachResults = make(map[string]map[string]adapter.SmartReachCandidateStatus)
+	s.reachLastRun = make(map[string]time.Time)
+	s.reachAccess.Unlock()
+	s.store.clear()
+	if s.releaseProbeRegistry != nil {
+		s.releaseProbeRegistry()
+		s.releaseProbeRegistry = nil
+	}
 	return nil
 }
 
@@ -912,6 +950,10 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	defer s.probing.Store(false)
 	s.access.RLock()
 	candidates := append([]adapter.Outbound(nil), s.candidates...)
+	probeKeys := make(map[string]string, len(s.candidateProbeKey))
+	for tag, key := range s.candidateProbeKey {
+		probeKeys[tag] = key
+	}
 	s.access.RUnlock()
 	if len(candidates) > 1 {
 		start := int(s.probeCursor.Add(1)-1) % len(candidates)
@@ -933,7 +975,17 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 			defer waitGroup.Done()
 			for candidate := range jobs {
 				testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
-				delay, err := urltest.URLTest(testCtx, s.probeURL, candidate)
+				identity := probeKeys[candidate.Tag()]
+				key := smartProbeKey(identity, s.probeURL, s.probeTimeout)
+				var delay uint16
+				var err error
+				if s.probeRegistry != nil {
+					delay, err = s.probeRegistry.run(testCtx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
+				} else {
+					// Test/embedded constructors created before the shared registry
+					// contract retain the stock direct probe path.
+					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
+				}
 				penalize := err != nil && ctx.Err() == nil
 				cancel()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
@@ -1374,12 +1426,15 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 		return errSmartNoCandidates
 	}
 	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
+	candidateProbeKey := make(map[string]string, len(candidates))
 	for _, candidate := range candidates {
 		candidateByTag[candidate.Tag()] = candidate
+		candidateProbeKey[candidate.Tag()] = s.probeIdentityLocked(candidate)
 	}
 	s.access.Lock()
 	s.candidates = candidates
 	s.candidateByTag = candidateByTag
+	s.candidateProbeKey = candidateProbeKey
 	s.access.Unlock()
 	if latest := s.latest.Load(); latest != nil && candidateByTag[latest.Tag()] == nil {
 		s.latest.Store(nil)
@@ -1391,6 +1446,13 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.control.access.Unlock()
 	s.setCandidatesReadyStatus(candidates)
 	return nil
+}
+
+func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
+	// Provider runtime tags are unique within one Box and the same outbound
+	// object/tag is shared by every Smart group subscribing to that provider.
+	// Credential variants receive distinct provider tags and must not share.
+	return candidate.Type() + "\x00" + candidate.Tag()
 }
 
 func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {

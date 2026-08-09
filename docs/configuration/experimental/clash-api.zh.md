@@ -30,6 +30,15 @@
       "default_mode": "",
       "access_control_allow_origin": [],
       "access_control_allow_private_network": false,
+      "memory_reclaim": {
+        "enabled": false,
+        "check_interval": "1m",
+        "cooldown": "5m",
+        "minimum_process_age": "5m",
+        "minimum_idle": "32MB",
+        "maximum_heap_alloc": "0B",
+        "consecutive_eligible": 2
+      },
       
       // Deprecated
 
@@ -134,6 +143,14 @@ Clash 中的默认模式，默认使用 `Rule`。
 允许从私有网络访问。
 
 要从公共网站访问私有网络上的 Clash API，必须启用 `access_control_allow_private_network`。
+
+#### memory_reclaim
+
+可选地在空闲量、进程存活时间及冷却门禁满足后，将未使用的 Go 堆页归还给操作系统；
+不会删除存活连接或 Smart 健康状态。默认关闭。`maximum_heap_alloc` 可省略，`0B`
+表示不设置活跃堆上限。`GET /memory/details` 查看堆分解与回收次数；
+`GET /memory/heap` 与 `GET /memory/goroutines` 只输出聚合后的函数名和计数，不输出
+内存值内容。认证方式均与 Clash API 相同。
 
 #### store_mode
 

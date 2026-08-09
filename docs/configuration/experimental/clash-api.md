@@ -30,6 +30,15 @@
       "default_mode": "",
       "access_control_allow_origin": [],
       "access_control_allow_private_network": false,
+      "memory_reclaim": {
+        "enabled": false,
+        "check_interval": "1m",
+        "cooldown": "5m",
+        "minimum_process_age": "5m",
+        "minimum_idle": "32MB",
+        "maximum_heap_alloc": "0B",
+        "consecutive_eligible": 2
+      },
       
       // Deprecated
 
@@ -136,6 +145,16 @@ To access the Clash API on a private network from a public website, you must exp
 Allow access from private network.
 
 To access the Clash API on a private network from a public website, `access_control_allow_private_network` must be enabled.
+
+#### memory_reclaim
+
+Optionally returns unused Go heap pages to the operating system after a
+conservative idle/cooldown gate. It never removes live connections or Smart
+health state. Disabled by default. `maximum_heap_alloc` is optional; `0B` means
+no live-heap ceiling. Runtime diagnostics are available at
+`GET /memory/details`; aggregated, value-free heap and goroutine sources are
+available at `GET /memory/heap` and `GET /memory/goroutines`. All use the same
+Clash API authentication.
 
 #### store_mode
 
