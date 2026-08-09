@@ -83,9 +83,9 @@ require (
 )
 
 replace (
-	github.com/anytls/sing-anytls => github.com/reF1nd/sing-anytls v0.0.14-0.20260803151749-763fb5bccb9d
-	github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20260808134633-c120d40d0d5b
-	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.8.12-0.20260805152848-9833946bd00a
+	github.com/anytls/sing-anytls => github.com/darkright1/sing-anytls v0.0.14-0.20260803151749-763fb5bccb9d
+	github.com/sagernet/sing-snell => github.com/darkright1/sing-snell v0.0.0-20260808134633-c120d40d0d5b
+	github.com/sagernet/sing-tun => github.com/darkright1/sing-tun v0.8.12-0.20260805152848-9833946bd00a
 )
 
 require (
@@ -205,4 +205,4 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing => github.com/luange/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda
+replace github.com/sagernet/sing => github.com/darkright1/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda
