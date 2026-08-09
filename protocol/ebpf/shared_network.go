@@ -65,6 +65,7 @@ type sharedNetwork struct {
 	udp4         *listener.Listener
 	udp6         *listener.Listener
 	udpNat       *udpnat.Service
+	dnsUDPNat    *udpnat.Service
 	udpClients   udpClientTable
 	udpWarnings  udpWarningLimiters
 	listenPort   uint16
@@ -168,6 +169,7 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		udpTimeout = time.Duration(parent.listenOptions.UDPTimeout)
 	}
 	shared.udpNat = udpnat.New(shared, shared.preparePacketConnection, udpTimeout, false)
+	shared.dnsUDPNat = udpnat.New(shared, shared.preparePacketConnection, min(udpTimeout, C.DNSTimeout), false)
 	return shared
 }
 
@@ -351,6 +353,7 @@ func (s *sharedNetwork) registerListenerSockets() error {
 
 func (s *sharedNetwork) InterfaceUpdated() {
 	s.udpNat.Purge()
+	s.dnsUDPNat.Purge()
 	if s.tc != nil {
 		s.tc.Wake()
 	}
@@ -462,7 +465,11 @@ func (s *sharedNetwork) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 	}
 	released := s.udpClients.setBinding(client, original.Destination, redirect.Addr(), false)
 	s.deleteUDPRedirects(client, released)
-	s.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
+	natService := s.udpNat
+	if original.Destination.Port() == 53 {
+		natService = s.dnsUDPNat
+	}
+	natService.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
 }
 
 func (s *sharedNetwork) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -491,7 +498,7 @@ func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination 
 		ctx = context.WithValue(ctx, sharedNetworkIngressInterfaceKey{}, sharedNetworkIngressInterface(ifIndex))
 	}
 	client := source.AddrPort()
-	clientState := s.udpClients.loadOrCreate(client)
+	clientState := s.udpClients.retain(client)
 	writer := &sharedPacketWriter{
 		shared:      s,
 		client:      client,

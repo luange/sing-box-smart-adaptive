@@ -64,6 +64,7 @@ type Inbound struct {
 	listener4          *listener.Listener
 	listener6          *listener.Listener
 	udpNat             *udpnat.Service
+	dnsUDPNat          *udpnat.Service
 	backend            *ECommon.Backend
 	protectRegistered  bool
 	listenPort         uint16
@@ -205,6 +206,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
 	}
 	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	inbound.dnsUDPNat = udpnat.New(inbound, inbound.preparePacketConnection, min(udpTimeout, C.DNSTimeout), false)
 	inbound.udpCleanupInterval = udpNATCleanupInterval(udpTimeout)
 	if redirectIPv4.IsValid() {
 		inbound.listener4 = inbound.newListener(network, false)
@@ -512,6 +514,7 @@ func (i *Inbound) closeLocked() error {
 	i.stopRuntimeStatsMonitor()
 	i.stopUDPNATCleanup()
 	i.udpNat.Purge()
+	i.dnsUDPNat.Purge()
 	i.stopBypassRuleSets()
 	offloadErr := i.closeOutboundOffload()
 	var sharedErr error
@@ -570,8 +573,10 @@ func (i *Inbound) startUDPNATCleanup() {
 				return
 			case <-ticker.C:
 				i.udpNat.PurgeExpired()
+				i.dnsUDPNat.PurgeExpired()
 				if i.sharedNetwork != nil {
 					i.sharedNetwork.udpNat.PurgeExpired()
+					i.sharedNetwork.dnsUDPNat.PurgeExpired()
 				}
 			}
 		}
@@ -1047,7 +1052,11 @@ func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) 
 	)
 	i.udpClients.setUID(client, original.UID)
 	i.deleteUDPRedirects(releasedRedirects)
-	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
+	natService := i.udpNat
+	if original.Destination.Port() == 53 {
+		natService = i.dnsUDPNat
+	}
+	natService.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
 }
 
 func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -1076,7 +1085,7 @@ func (i *Inbound) preparePacketConnection(source M.Socksaddr, destination M.Sock
 	connectedUDP, _ := userData.(bool)
 	ctx := log.ContextWithNewID(i.ctx)
 	client := source.AddrPort()
-	clientState := i.udpClients.loadOrCreate(client)
+	clientState := i.udpClients.retain(client)
 	clientState.setConnected(connectedUDP)
 	writer := &udpPacketWriter{
 		inbound:     i,

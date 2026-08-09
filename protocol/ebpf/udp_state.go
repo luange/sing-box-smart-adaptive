@@ -15,10 +15,11 @@ type udpClientTable struct {
 }
 
 type udpClientState struct {
-	access    sync.RWMutex
-	connected bool
-	uid       uint32
-	bindings  map[netip.AddrPort]udpRedirectBinding
+	access     sync.RWMutex
+	connected  bool
+	uid        uint32
+	references uint32
+	bindings   map[netip.AddrPort]udpRedirectBinding
 }
 
 func (t *udpClientTable) setUID(client netip.AddrPort, uid uint32) {
@@ -47,6 +48,14 @@ func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
 	t.access.Lock()
 	defer t.access.Unlock()
 	return t.loadOrCreateLocked(client)
+}
+
+func (t *udpClientTable) retain(client netip.AddrPort) *udpClientState {
+	t.access.Lock()
+	clientState := t.loadOrCreateLocked(client)
+	clientState.references++
+	t.access.Unlock()
+	return clientState
 }
 
 func (t *udpClientTable) loadOrCreateLocked(client netip.AddrPort) *udpClientState {
@@ -124,6 +133,11 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 	if t.clients[client] != expected {
 		return nil
 	}
+	if expected.references > 1 {
+		expected.references--
+		return nil
+	}
+	expected.references = 0
 	delete(t.clients, client)
 
 	expected.access.Lock()

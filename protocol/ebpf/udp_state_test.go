@@ -44,6 +44,33 @@ func TestUDPClientTableDeleteChecksGeneration(t *testing.T) {
 	}
 }
 
+func TestUDPClientTableRetainsStateAcrossNATPools(t *testing.T) {
+	var table udpClientTable
+	client := netip.MustParseAddrPort("127.0.0.1:2345")
+	destination := netip.MustParseAddrPort("8.8.8.8:53")
+	redirectAddress := netip.MustParseAddr("127.128.0.9")
+
+	first := table.retain(client)
+	second := table.retain(client)
+	if first != second {
+		t.Fatal("NAT pools did not share the UDP client state")
+	}
+	table.setBinding(client, destination, redirectAddress, false)
+	if released := table.delete(client, first); len(released) != 0 {
+		t.Fatalf("first NAT pool released a shared redirect: %v", released)
+	}
+	if actual, loaded := table.load(client); !loaded || actual != first {
+		t.Fatal("first NAT pool removed state still owned by another pool")
+	}
+	released := table.delete(client, second)
+	if len(released) != 1 || released[0] != redirectAddress {
+		t.Fatalf("last NAT pool did not release the redirect: %v", released)
+	}
+	if _, loaded := table.load(client); loaded {
+		t.Fatal("last NAT pool did not remove the UDP client state")
+	}
+}
+
 func TestUDPClientTableConcurrentBindings(t *testing.T) {
 	var table udpClientTable
 	client := netip.MustParseAddrPort("127.0.0.1:4321")
