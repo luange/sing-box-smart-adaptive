@@ -55,33 +55,36 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	ctx               context.Context
-	router            adapter.ConnectionRouterEx
-	logger            log.ContextLogger
-	networkManager    adapter.NetworkManager
-	listenOptions     option.ListenOptions
-	cgroupPath        string
-	listener4         *listener.Listener
-	listener6         *listener.Listener
-	udpNat            *udpnat.Service
-	backend           *ECommon.Backend
-	protectRegistered bool
-	listenPort        uint16
-	enableTCP         bool
-	enableUDP         bool
-	dnsMode           string
-	redirectIPv4      netip.Prefix
-	redirectIPv6      netip.Prefix
-	policy            ECommon.Policy
-	localRoutes       []*localRoute
-	sharedOptions     option.EBPFSharedNetworkOptions
-	sharedNetwork     *sharedNetwork
-	offloadOptions    option.EBPFOutboundOffloadOptions
-	outboundCoord     *outboundCoordinator
-	backendAccess     sync.RWMutex
-	closeAccess       sync.Mutex
-	statsCancel       context.CancelFunc
-	statsDone         chan struct{}
+	ctx                context.Context
+	router             adapter.ConnectionRouterEx
+	logger             log.ContextLogger
+	networkManager     adapter.NetworkManager
+	listenOptions      option.ListenOptions
+	cgroupPath         string
+	listener4          *listener.Listener
+	listener6          *listener.Listener
+	udpNat             *udpnat.Service
+	backend            *ECommon.Backend
+	protectRegistered  bool
+	listenPort         uint16
+	enableTCP          bool
+	enableUDP          bool
+	dnsMode            string
+	redirectIPv4       netip.Prefix
+	redirectIPv6       netip.Prefix
+	policy             ECommon.Policy
+	localRoutes        []*localRoute
+	sharedOptions      option.EBPFSharedNetworkOptions
+	sharedNetwork      *sharedNetwork
+	offloadOptions     option.EBPFOutboundOffloadOptions
+	outboundCoord      *outboundCoordinator
+	backendAccess      sync.RWMutex
+	closeAccess        sync.Mutex
+	statsCancel        context.CancelFunc
+	statsDone          chan struct{}
+	udpCleanupInterval time.Duration
+	udpCleanupCancel   context.CancelFunc
+	udpCleanupDone     chan struct{}
 
 	bypassRuleSetAccess    sync.Mutex
 	bypassRuleSet          []adapter.RuleSet
@@ -202,6 +205,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
 	}
 	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	inbound.udpCleanupInterval = udpNATCleanupInterval(udpTimeout)
 	if redirectIPv4.IsValid() {
 		inbound.listener4 = inbound.newListener(network, false)
 	}
@@ -434,6 +438,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 		}
 		i.wireDNSPrefill()
 		i.startRuntimeStatsMonitor(backend)
+		i.startUDPNATCleanup()
 		bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
 		dnsDirectV4, dnsDirectV6 := backend.DNSDirectCIDRCount()
 		i.logger.Info(
@@ -505,6 +510,7 @@ func (i *Inbound) cleanupStartFailure() error {
 func (i *Inbound) closeLocked() error {
 	i.stopDNSPrefill()
 	i.stopRuntimeStatsMonitor()
+	i.stopUDPNATCleanup()
 	i.udpNat.Purge()
 	i.stopBypassRuleSets()
 	offloadErr := i.closeOutboundOffload()
@@ -533,6 +539,53 @@ func (i *Inbound) closeLocked() error {
 	}
 	i.unregisterSocketProtector()
 	return E.Errors(offloadErr, sharedErr, backendErr, i.closeListeners(), i.removeLocalRoutes())
+}
+
+func udpNATCleanupInterval(timeout time.Duration) time.Duration {
+	interval := timeout / 2
+	if interval < 5*time.Second {
+		return 5 * time.Second
+	}
+	if interval > time.Minute {
+		return time.Minute
+	}
+	return interval
+}
+
+func (i *Inbound) startUDPNATCleanup() {
+	if i.udpCleanupCancel != nil || i.udpCleanupInterval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(i.ctx)
+	done := make(chan struct{})
+	i.udpCleanupCancel = cancel
+	i.udpCleanupDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(i.udpCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				i.udpNat.PurgeExpired()
+				if i.sharedNetwork != nil {
+					i.sharedNetwork.udpNat.PurgeExpired()
+				}
+			}
+		}
+	}()
+}
+
+func (i *Inbound) stopUDPNATCleanup() {
+	if i.udpCleanupCancel == nil {
+		return
+	}
+	i.udpCleanupCancel()
+	<-i.udpCleanupDone
+	i.udpCleanupCancel = nil
+	i.udpCleanupDone = nil
 }
 
 func (i *Inbound) startOutboundOffload() error {
