@@ -476,7 +476,11 @@ func (s *sharedNetwork) NewPacketConnectionEx(ctx context.Context, conn N.Packet
 	}
 	//nolint:staticcheck
 	metadata.InboundDetour = s.parent.listenOptions.Detour
-	s.parent.logger.InfoContext(ctx, "shared-network inbound packet connection to ", destination)
+	// Packet connections include short-lived DNS/QUIC flows and can be created
+	// thousands of times per second on a gateway.  Logging every flow at info
+	// level causes allocation pressure and can grow the log by hundreds of MiB.
+	// Keep the diagnostic available without enabling it in normal operation.
+	s.parent.logger.DebugContext(ctx, "shared-network inbound packet connection to ", destination)
 	s.parent.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 

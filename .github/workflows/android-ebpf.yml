@@ -6,6 +6,19 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: arm64
+            compiler: aarch64-linux-android35-clang
+          - goarch: arm
+            goarm: "7"
+            compiler: armv7a-linux-androideabi35-clang
+          - goarch: amd64
+            compiler: x86_64-linux-android35-clang
+          - goarch: "386"
+            compiler: i686-linux-android35-clang
     env:
       TAGS: with_gvisor,with_quic,with_dhcp,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0,with_provider,with_ebpf
     steps:
@@ -23,20 +36,22 @@ jobs:
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25c
+          ndk-version: r29
 
       - name: Build
         env:
           CGO_ENABLED: "1"
           GOOS: android
-          GOARCH: arm64
-          CC: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
-          BPF_CLANG: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CC: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.compiler }}
+          BPF_CLANG: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
         run: |
           make build
 
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: sing-box-android-arm64-with-ebpf
+          name: sing-box-android-${{ matrix.goarch }}-with-ebpf
           path: sing-box

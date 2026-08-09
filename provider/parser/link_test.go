@@ -18,11 +18,12 @@ func TestParseVMessLinkSNI(t *testing.T) {
 	require.Equal(t, "example.com", options.TLS.ServerName)
 }
 
-func TestParseHysteria2LinkTLSOptions(t *testing.T) {
-	outbound, err := ParseSubscriptionLink("hysteria2://password@192.0.2.1:443?sni=example.com&pinSHA256=AA:BB")
+func TestParseHysteria2LinkOptions(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("hysteria2://password@192.0.2.1:443?sni=example.com&pinSHA256=AA:BB&mport=40000-50000")
 	require.NoError(t, err)
 
 	options := outbound.Options.(*option.Hysteria2OutboundOptions)
+	require.Equal(t, []string{"40000:50000"}, []string(options.ServerPorts))
 	require.Equal(t, "example.com", options.TLS.ServerName)
 	require.Equal(t, "AA:BB", options.TLS.CertificatePinSHA256)
 }

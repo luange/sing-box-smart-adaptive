@@ -644,6 +644,8 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 			options.UpMbps, _ = strconv.Atoi(value)
 		case "down":
 			options.DownMbps, _ = strconv.Atoi(value)
+		case "mport":
+			options.ServerPorts = clashPorts(value)
 		case "obfs":
 			if value == "salamander" {
 				Obfs.Type = "salamander"
