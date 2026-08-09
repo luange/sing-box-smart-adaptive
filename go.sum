@@ -193,6 +193,8 @@ github.com/logrusorgru/aurora v2.0.3+incompatible h1:tOpm7WcpBTn4fjmVfgpQq0EfczG
 github.com/logrusorgru/aurora v2.0.3+incompatible/go.mod h1:7rIyQOR62GCctdiQpZ/zOJlFyk6y+94wXzv6RNZgaR4=
 github.com/luange/sing v0.8.0-beta.11.0.20260809091550-2a7137bfa3fe h1:kzJtQLOwUXoeKwTn0SFn/FvCUJ5jfHZqnGBl6n5gSco=
 github.com/luange/sing v0.8.0-beta.11.0.20260809091550-2a7137bfa3fe/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/luange/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda h1:AkKxs80ayNXX6djgjtBEMdHV+AH/X36cYBojtvHEzSs=
+github.com/luange/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/mdlayher/netlink v1.11.2 h1:HKh2jqe+omdSWcQ88nrT7INE61B0NXfiSPFdgL4YbNI=
 github.com/mdlayher/netlink v1.11.2/go.mod h1:uT2Yc/QLaZubzDpZIBi9d4GoeLwtp3x1AMeqSRrK2sA=
 github.com/mdlayher/socket v0.6.0 h1:ScZPaAGyO1icQnbFrhPM8mnXyMu9qukC1K4ZoM2IQKU=
