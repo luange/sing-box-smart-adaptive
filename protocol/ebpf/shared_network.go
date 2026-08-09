@@ -66,6 +66,7 @@ type sharedNetwork struct {
 	udp6         *listener.Listener
 	udpNat       *udpnat.Service
 	udpClients   udpClientTable
+	udpWarnings  udpWarningLimiters
 	listenPort   uint16
 	closeAccess  sync.Mutex
 }
@@ -443,20 +444,20 @@ func (s *sharedNetwork) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		var err error
 		redirect, err = redir.GetOriginalDestinationFromOOB(oob)
 		if err != nil {
-			s.parent.logger.Warn("read shared-network UDP original destination: ", err)
+			s.udpWarnings.packetInfo.warnError(s.parent.logger, "read shared-network UDP original destination: ", err)
 			return
 		}
 	} else {
 		redirectAddress, err := redirectAddressFromOOB(oob)
 		if err != nil {
-			s.parent.logger.Warn("read shared-network UDP token address: ", err)
+			s.udpWarnings.packetInfo.warnError(s.parent.logger, "read shared-network UDP token address: ", err)
 			return
 		}
 		redirect = netip.AddrPortFrom(redirectAddress, s.listenPort)
 	}
 	original, err := s.backend.LookupOriginal(ECommon.ProtocolUDP, client, redirect)
 	if err != nil {
-		s.parent.logger.Warn("lookup shared-network UDP original destination: ", err)
+		s.udpWarnings.originalDestination.warnError(s.parent.logger, "lookup shared-network UDP original destination: ", err)
 		return
 	}
 	released := s.udpClients.setBinding(client, original.Destination, redirect.Addr(), false)
@@ -509,7 +510,7 @@ func (s *sharedNetwork) deleteUDPRedirects(client netip.AddrPort, redirects []ne
 	for _, address := range redirects {
 		redirect := netip.AddrPortFrom(address, s.listenPort)
 		if err := s.backend.DeleteRedirect(ECommon.ProtocolUDP, client, redirect); err != nil {
-			s.parent.logger.Warn("delete shared-network UDP redirect mapping for ", redirect, ": ", err)
+			s.udpWarnings.cleanup.warnValueError(s.parent.logger, "delete shared-network UDP redirect mapping for ", redirect, ": ", err)
 		}
 	}
 }

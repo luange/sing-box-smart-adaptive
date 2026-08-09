@@ -103,7 +103,8 @@ type Inbound struct {
 	// N8: throttle repeated "splice metrics unavailable" warns.
 	spliceStatsErrLogged bool
 
-	udpClients udpClientTable
+	udpClients  udpClientTable
+	udpWarnings udpWarningLimiters
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.EBPFInboundOptions) (adapter.Inbound, error) {
@@ -161,19 +162,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, E.New("missing network manager")
 	}
 	inbound := &Inbound{
-		Adapter:        inbound.NewAdapter(C.TypeEBPF, tag),
-		ctx:            ctx,
-		router:         router,
-		logger:         logger,
-		networkManager: networkManager,
-		listenOptions:  listenOptions,
-		cgroupPath:     cgroupPath,
-		listenPort:     listenOptions.ListenPort,
-		enableTCP:      enableTCP,
-		enableUDP:      enableUDP,
-		dnsMode:        dnsMode,
-		redirectIPv4:   redirectIPv4,
-		redirectIPv6:   redirectIPv6,
+		Adapter:                inbound.NewAdapter(C.TypeEBPF, tag),
+		ctx:                    ctx,
+		router:                 router,
+		logger:                 logger,
+		networkManager:         networkManager,
+		listenOptions:          listenOptions,
+		cgroupPath:             cgroupPath,
+		listenPort:             listenOptions.ListenPort,
+		enableTCP:              enableTCP,
+		enableUDP:              enableUDP,
+		dnsMode:                dnsMode,
+		redirectIPv4:           redirectIPv4,
+		redirectIPv6:           redirectIPv6,
 		sharedOptions:          sharedOptions,
 		offloadOptions:         offloadOptions,
 		dnsKernelDirectEnabled: dnsKernelEnabled,
@@ -765,7 +766,6 @@ func localInterfacePrefixes(interfaces []control.Interface) []netip.Prefix {
 	return prefixes
 }
 
-
 const promotedBypassMaxEntries = 8192
 
 func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) {
@@ -829,7 +829,6 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) {
 		i.logger.Debug("promote learned bypass refresh: ", err)
 	}
 }
-
 
 // gcPromotedBypass drops TTL-expired learn→TC entries from the LPM (no full rebuild).
 func (i *Inbound) gcPromotedBypass() {
@@ -977,14 +976,14 @@ func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) 
 	}
 	redirectAddress, err := redirectAddressFromOOB(oob)
 	if err != nil {
-		i.logger.Warn("read UDP redirect address: ", err)
+		i.udpWarnings.packetInfo.warnError(i.logger, "read UDP redirect address: ", err)
 		return
 	}
 	client := source.AddrPort()
 	redirectDestination := netip.AddrPortFrom(redirectAddress, i.listenPort)
 	original, err := backend.LookupOriginal(ECommon.ProtocolUDP, redirectDestination)
 	if err != nil {
-		i.logger.Warn("lookup UDP original destination: ", err)
+		i.udpWarnings.originalDestination.warnError(i.logger, "lookup UDP original destination: ", err)
 		return
 	}
 	releasedRedirects := i.udpClients.setBinding(
@@ -1047,7 +1046,7 @@ func (i *Inbound) deleteUDPRedirects(redirectAddresses []netip.Addr) {
 	for _, redirectAddress := range redirectAddresses {
 		redirect := netip.AddrPortFrom(redirectAddress, i.listenPort)
 		if err := backend.DeleteRedirect(ECommon.ProtocolUDP, redirect); err != nil {
-			i.logger.Warn("delete UDP redirect mapping for ", redirect, ": ", err)
+			i.udpWarnings.cleanup.warnValueError(i.logger, "delete UDP redirect mapping for ", redirect, ": ", err)
 		}
 	}
 }
