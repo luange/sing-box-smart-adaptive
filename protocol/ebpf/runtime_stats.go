@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"runtime"
 	"time"
 
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
@@ -58,6 +59,7 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 			i.logSharedRuntimeStats("final", false)
 			i.logSpliceRuntimeStats("final", false)
 			i.logVerdictRuntimeStats("final", false)
+			i.logUDPNATMemoryStats("final")
 			return
 		case <-timer.C:
 			reason := "periodic"
@@ -119,9 +121,38 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 					haveVerdictSample = true
 				}
 			}
+			i.logUDPNATMemoryStats(reason)
 			timer.Reset(runtimeStatsInterval)
 		}
 	}
+}
+
+func (i *Inbound) logUDPNATMemoryStats(reason string) {
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	dataSessions, dnsSessions := 0, 0
+	sharedDataSessions, sharedDNSSessions := 0, 0
+	if i.udpNat != nil {
+		dataSessions = i.udpNat.Len()
+	}
+	if i.dnsUDPNat != nil {
+		dnsSessions = i.dnsUDPNat.Len()
+	}
+	if i.sharedNetwork != nil {
+		if i.sharedNetwork.udpNat != nil {
+			sharedDataSessions = i.sharedNetwork.udpNat.Len()
+		}
+		if i.sharedNetwork.dnsUDPNat != nil {
+			sharedDNSSessions = i.sharedNetwork.dnsUDPNat.Len()
+		}
+	}
+	i.logger.Info("eBPF userspace metrics: reason=", reason,
+		", udp_sessions={data:", dataSessions,
+		", dns:", dnsSessions,
+		", shared_data:", sharedDataSessions,
+		", shared_dns:", sharedDNSSessions,
+		"}, goroutines=", runtime.NumGoroutine(),
+		", heap_alloc=", memory.HeapAlloc)
 }
 
 func (i *Inbound) verdictRuntimeStats() (ECommon.VerdictStats, bool) {

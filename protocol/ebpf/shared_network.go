@@ -168,8 +168,16 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 	if parent.listenOptions.UDPTimeout != 0 {
 		udpTimeout = time.Duration(parent.listenOptions.UDPTimeout)
 	}
-	shared.udpNat = udpnat.New(shared, shared.preparePacketConnection, udpTimeout, false)
-	shared.dnsUDPNat = udpnat.New(shared, shared.preparePacketConnection, min(udpTimeout, C.DNSTimeout), false)
+	shared.udpNat = udpnat.NewWithOptions(shared, shared.preparePacketConnection, udpnat.Options{
+		Timeout:    udpTimeout,
+		Capacity:   parent.udpSessionCapacity,
+		QueueDepth: 8,
+	})
+	shared.dnsUDPNat = udpnat.NewWithOptions(shared, shared.preparePacketConnection, udpnat.Options{
+		Timeout:    min(udpTimeout, C.DNSTimeout),
+		Capacity:   parent.dnsSessionCapacity,
+		QueueDepth: 4,
+	})
 	return shared
 }
 

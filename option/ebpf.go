@@ -12,13 +12,13 @@ type EBPFInboundOptions struct {
 	// CaptureLocal controls cgroup interception for processes running on this host.
 	// It defaults to true. Router deployments using only shared_network can set it
 	// to false to keep management traffic out of the proxy data path.
-	CaptureLocal    *bool                            `json:"capture_local,omitempty"`
-	Network         NetworkList                      `json:"network,omitempty"`
-	DNSMode         string                           `json:"dns_mode,omitempty" enum:"hijack,off"`
+	CaptureLocal *bool       `json:"capture_local,omitempty"`
+	Network      NetworkList `json:"network,omitempty"`
+	DNSMode      string      `json:"dns_mode,omitempty" enum:"hijack,off"`
 	// DNSKernelDirect (module M-dns-kernel-direct): selected DNS server CIDRs keep
 	// the kernel path when dns_mode=hijack. All other :53 still hijacked.
 	// Default off. Independent of dns_prefill. See docs/ebpf-feature-modules-20260805.md.
-	DNSKernelDirect EBPFDNSKernelDirectOptions `json:"dns_kernel_direct,omitempty"`
+	DNSKernelDirect EBPFDNSKernelDirectOptions       `json:"dns_kernel_direct,omitempty"`
 	RedirectAddress badoption.Listable[netip.Prefix] `json:"redirect_address,omitempty" examples:"127.128.0.0/9,fd53:696e:672d:626f::/64"`
 	BypassRuleSet   badoption.Listable[string]       `json:"bypass_rule_set,omitempty" reference:"rule_set"`
 	IncludeUID      badoption.Listable[uint32]       `json:"include_uid,omitempty"`
@@ -30,6 +30,9 @@ type EBPFInboundOptions struct {
 	// Not a routable outbound type. Defaults all-off.
 	// Contract: docs/ebpf-in-out-framework-master-20260803.md §7 / plan §6.
 	OutboundOffload EBPFOutboundOffloadOptions `json:"outbound_offload,omitempty"`
+	// Zero selects conservative defaults: 512 data sessions and 128 DNS sessions.
+	UDPSessionCapacity uint32 `json:"udp_session_capacity,omitempty"`
+	DNSSessionCapacity uint32 `json:"dns_session_capacity,omitempty"`
 }
 
 // EBPFDNSKernelDirectOptions splits the DNS path under dns_mode=hijack:
@@ -78,7 +81,7 @@ type EBPFOutboundOffloadOptions struct {
 
 // EBPFDNSPrefillOptions configures weak DNS answer → TC bypass promote.
 type EBPFDNSPrefillOptions struct {
-	Enabled bool               `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
 	// TTL for promoted /32 entries. 0 → 60s (intentionally shorter than verdict learn).
 	TTL badoption.Duration `json:"ttl,omitempty"`
 }

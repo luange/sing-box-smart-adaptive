@@ -86,6 +86,8 @@ type Inbound struct {
 	udpCleanupInterval time.Duration
 	udpCleanupCancel   context.CancelFunc
 	udpCleanupDone     chan struct{}
+	udpSessionCapacity uint32
+	dnsSessionCapacity uint32
 
 	bypassRuleSetAccess    sync.Mutex
 	bypassRuleSet          []adapter.RuleSet
@@ -161,6 +163,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err = validateSharedNetworkProtocols(sharedOptions, enableUDP, dnsMode); err != nil {
 		return nil, err
 	}
+	udpSessionCapacity, dnsSessionCapacity, capacityWarnings := normalizeUDPNATCapacities(
+		options.UDPSessionCapacity,
+		options.DNSSessionCapacity,
+	)
+	for _, warning := range capacityWarnings {
+		logger.Warn(warning)
+	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	if networkManager == nil {
 		return nil, E.New("missing network manager")
@@ -190,6 +199,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			IncludeUID:          includeUID,
 			ExcludeUID:          excludeUID,
 		},
+		udpSessionCapacity: udpSessionCapacity,
+		dnsSessionCapacity: dnsSessionCapacity,
 	}
 	udpTimeout := C.UDPTimeout
 	if listenOptions.UDPTimeout != 0 {
@@ -205,8 +216,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
 	}
-	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
-	inbound.dnsUDPNat = udpnat.New(inbound, inbound.preparePacketConnection, min(udpTimeout, C.DNSTimeout), false)
+	inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
+		Timeout:    udpTimeout,
+		Capacity:   udpSessionCapacity,
+		QueueDepth: 8,
+	})
+	inbound.dnsUDPNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
+		Timeout:    min(udpTimeout, C.DNSTimeout),
+		Capacity:   dnsSessionCapacity,
+		QueueDepth: 4,
+	})
 	inbound.udpCleanupInterval = udpNATCleanupInterval(udpTimeout)
 	if redirectIPv4.IsValid() {
 		inbound.listener4 = inbound.newListener(network, false)
@@ -215,6 +234,33 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.listener6 = inbound.newListener(network, true)
 	}
 	return inbound, nil
+}
+
+func normalizeUDPNATCapacities(dataCapacity, dnsCapacity uint32) (uint32, uint32, []string) {
+	const (
+		defaultDataCapacity = 512
+		defaultDNSCapacity  = 128
+		minimumDataCapacity = 64
+		minimumDNSCapacity  = 16
+		maximumCapacity     = 8192
+	)
+	var warnings []string
+	normalize := func(value, defaultValue, minimum uint32, name string) uint32 {
+		if value == 0 {
+			return defaultValue
+		}
+		if value < minimum {
+			warnings = append(warnings, name+" clamped to minimum")
+			return minimum
+		}
+		if value > maximumCapacity {
+			warnings = append(warnings, name+" clamped to maximum")
+			return maximumCapacity
+		}
+		return value
+	}
+	return normalize(dataCapacity, defaultDataCapacity, minimumDataCapacity, "udp_session_capacity"),
+		normalize(dnsCapacity, defaultDNSCapacity, minimumDNSCapacity, "dns_session_capacity"), warnings
 }
 
 func validateLocalCaptureOptions(
