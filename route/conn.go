@@ -266,6 +266,19 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		m.logger.ErrorContext(ctx, "report handshake success: ", err)
 		return
 	}
+	// DAE-style UDP fast path: let an eBPF inbound publish an exact direct
+	// flow verdict after the first userspace route succeeds. Proxy-backed UDP
+	// is rejected by the learner, so this remains fail-open and cannot bypass
+	// a proxy policy accidentally.
+	if metadata.InboundType == C.TypeEBPF {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := metadata.Destination.AddrPort()
+			if destinationAddress.IsValid() {
+				remoteAP = netip.AddrPortFrom(destinationAddress, metadata.Destination.Port)
+			}
+			learner.MaybeLearnUDP(ctx, this, metadata, remoteAP)
+		}
+	}
 	if destinationAddress.IsValid() {
 		var originDestination M.Socksaddr
 		if metadata.RouteOriginalDestination.IsValid() {

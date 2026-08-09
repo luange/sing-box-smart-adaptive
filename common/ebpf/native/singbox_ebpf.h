@@ -139,6 +139,7 @@ struct sb_ebpf_shared_network_runtime {
     int original_to_token_map_fd;
     int token_to_original_map_fd;
     int redirect_map_fd;
+    int flow_direct_map_fd;
     int listener_socket_map_fd;
     int stats_map_fd;
     int host_ipv4_map_fd;

@@ -23,17 +23,18 @@ static void shared_network_fill_map_table(
 	entries[2] = (struct sb_ebpf_object_map_entry){"shared_original_to_token", runtime->original_to_token_map_fd};
 	entries[3] = (struct sb_ebpf_object_map_entry){"shared_token_to_original", runtime->token_to_original_map_fd};
 	entries[4] = (struct sb_ebpf_object_map_entry){"shared_redirect", runtime->redirect_map_fd};
-	entries[5] = (struct sb_ebpf_object_map_entry){"shared_listener_sockets", runtime->listener_socket_map_fd};
-	entries[6] = (struct sb_ebpf_object_map_entry){"shared_stats", runtime->stats_map_fd};
-	entries[7] = (struct sb_ebpf_object_map_entry){"shared_host_ipv4", runtime->host_ipv4_map_fd};
-	entries[8] = (struct sb_ebpf_object_map_entry){"shared_host_ipv6", runtime->host_ipv6_map_fd};
-	entries[9] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv4", bypass_ipv4_map_fd};
-	entries[10] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv6", bypass_ipv6_map_fd};
-	entries[11] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv4", dns_direct_ipv4_map_fd};
-	entries[12] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv6", dns_direct_ipv6_map_fd};
-	entries[13] = (struct sb_ebpf_object_map_entry){"shared_scratch", runtime->scratch_map_fd};
+	entries[5] = (struct sb_ebpf_object_map_entry){"shared_flow_direct", runtime->flow_direct_map_fd};
+	entries[6] = (struct sb_ebpf_object_map_entry){"shared_listener_sockets", runtime->listener_socket_map_fd};
+	entries[7] = (struct sb_ebpf_object_map_entry){"shared_stats", runtime->stats_map_fd};
+	entries[8] = (struct sb_ebpf_object_map_entry){"shared_host_ipv4", runtime->host_ipv4_map_fd};
+	entries[9] = (struct sb_ebpf_object_map_entry){"shared_host_ipv6", runtime->host_ipv6_map_fd};
+	entries[10] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv4", bypass_ipv4_map_fd};
+	entries[11] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv6", bypass_ipv6_map_fd};
+	entries[12] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv4", dns_direct_ipv4_map_fd};
+	entries[13] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv6", dns_direct_ipv6_map_fd};
+	entries[14] = (struct sb_ebpf_object_map_entry){"shared_scratch", runtime->scratch_map_fd};
 	table->entries = entries;
-	table->count = 14U;
+	table->count = 15U;
 }
 
 int sb_ebpf_load_shared_network_programs(
@@ -51,7 +52,7 @@ int sb_ebpf_load_shared_network_programs(
 		return -1;
 	}
 
-	struct sb_ebpf_object_map_entry entries[14];
+	struct sb_ebpf_object_map_entry entries[15];
 	struct sb_ebpf_object_map_table maps;
 	shared_network_fill_map_table(
 		bypass_ipv4_map_fd,

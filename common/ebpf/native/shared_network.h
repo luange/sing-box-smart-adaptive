@@ -34,6 +34,7 @@ enum sb_shared_stat_index {
 /* Match classic tproxy bypass: drop QUIC (UDP/443) before divert so clients fall back to TCP. */
 #define SB_SHARED_FLAG_DROP_UDP_443 (1U << 5)
 #define SB_SHARED_FLAG_SOCKET_ASSIGN (1U << 6)
+#define SB_SHARED_FLAG_FLOW_DIRECT (1U << 7)
 
 enum sb_shared_listener_key {
     SB_SHARED_LISTENER_TCP4 = 0,
@@ -54,6 +55,27 @@ struct sb_shared_control {
     __u8 reserved2[2];
     __u8 token_ipv6_prefix[16];
     __u32 routing_mark;
+    /* Generation invalidates learned direct flow entries on policy change. */
+    __u32 flow_generation;
+};
+
+/* Exact five-tuple key used by the dae-style direct fast path.  This is kept
+ * separate from the token key because token allocation also includes ifindex,
+ * while a learned policy must survive a reply arriving through a parent link. */
+struct sb_shared_flow_key {
+    __u8 family;
+    __u8 protocol;
+    __u16 client_port;
+    __u16 original_port;
+    __u16 reserved;
+    __u8 client_addr[16];
+    __u8 original_addr[16];
+};
+
+struct sb_shared_flow_value {
+    __u32 generation;
+    __u32 reserved;
+    __u64 expires_ns;
 };
 
 struct sb_shared_interface_mac {
@@ -124,7 +146,9 @@ struct sb_shared_scratch {
     __u8 padding[56];
 };
 
-_Static_assert(sizeof(struct sb_shared_control) == 40U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_control) == 44U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_flow_key) == 40U, "shared flow key ABI");
+_Static_assert(sizeof(struct sb_shared_flow_value) == 16U, "shared flow value ABI");
 _Static_assert(sizeof(struct sb_shared_original_key) == 44U, "shared original key ABI");
 _Static_assert(sizeof(struct sb_shared_reverse_key) == 44U, "shared reverse key ABI");
 _Static_assert(sizeof(struct sb_shared_redirect_key) == 40U, "shared redirect key ABI");

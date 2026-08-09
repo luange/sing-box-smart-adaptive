@@ -46,6 +46,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -96,6 +97,23 @@ type sharedNetworkControl struct {
 	Reserved2      [2]byte
 	IPv6Prefix     [16]byte
 	RoutingMark    uint32
+	FlowGeneration uint32
+}
+
+type sharedNetworkFlowKey struct {
+	Family       uint8
+	Protocol     uint8
+	ClientPort   uint16
+	OriginalPort uint16
+	Reserved     uint16
+	ClientAddr   [16]byte
+	OriginalAddr [16]byte
+}
+
+type sharedNetworkFlowValue struct {
+	Generation uint32
+	Reserved   uint32
+	ExpiresNs  uint64
 }
 
 type sharedNetworkRedirectKey struct {
@@ -121,6 +139,7 @@ const (
 	sharedNetworkFlagDNSHijack
 	sharedNetworkFlagDropUDP443
 	sharedNetworkFlagSocketAssign
+	sharedNetworkFlagFlowDirect
 )
 
 type SharedNetworkBackend struct {
@@ -258,6 +277,98 @@ func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error 
 		unsafe.Pointer(&value),
 		0,
 	)
+}
+
+// SetFlowDirect enables the dae-style exact-flow direct fast path. It is kept
+// off unless the caller explicitly selects socket_assign, because token mode
+// cannot guarantee that a direct flow preserves the original routing tuple.
+func (b *SharedNetworkBackend) SetFlowDirect(enabled bool) error {
+	if b == nil {
+		return osErrClosed
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	if b.control.FlowGeneration == 0 {
+		b.control.FlowGeneration = 1
+	}
+	if enabled {
+		b.control.Flags |= 1 << 7
+	} else {
+		b.control.Flags &^= 1 << 7
+	}
+	return b.updateControl(b.control.Enabled != 0)
+}
+
+func makeSharedNetworkFlowKey(protocol uint8, source, destination netip.AddrPort) (sharedNetworkFlowKey, error) {
+	if !source.IsValid() || !destination.IsValid() || source.Port() == 0 || destination.Port() == 0 {
+		return sharedNetworkFlowKey{}, E.New("invalid shared-network direct flow tuple")
+	}
+	var key sharedNetworkFlowKey
+	key.Protocol = protocol
+	key.ClientPort = source.Port()
+	key.OriginalPort = destination.Port()
+	if err := putAddress(&key.Family, &key.ClientAddr, source.Addr()); err != nil {
+		return sharedNetworkFlowKey{}, E.Cause(err, "invalid shared-network flow source")
+	}
+	var family uint8
+	if err := putAddress(&family, &key.OriginalAddr, destination.Addr()); err != nil {
+		return sharedNetworkFlowKey{}, E.Cause(err, "invalid shared-network flow destination")
+	}
+	if family != key.Family {
+		return sharedNetworkFlowKey{}, E.New("shared-network flow tuple families do not match")
+	}
+	return key, nil
+}
+
+// PutDirectFlow publishes one exact source/destination flow after userspace
+// routing has proven the outbound is truly direct. The deadline uses the same
+// CLOCK_MONOTONIC base as bpf_ktime_get_ns.
+func (b *SharedNetworkBackend) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
+	if b == nil {
+		return osErrClosed
+	}
+	if ttl <= 0 {
+		ttl = 45 * time.Second
+	}
+	key, err := makeSharedNetworkFlowKey(protocol, source, destination)
+	if err != nil {
+		return err
+	}
+	expires, err := monotonicExpireNs(ttl)
+	if err != nil {
+		return err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.control.Flags&(1<<7) == 0 {
+		return osErrClosed
+	}
+	value := sharedNetworkFlowValue{Generation: b.control.FlowGeneration, ExpiresNs: expires}
+	if err = updateMap(int(b.runtime.flow_direct_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		return E.Cause(err, "update shared-network direct flow map")
+	}
+	return nil
+}
+
+// InvalidateFlowDirect advances the policy generation. Stale entries remain
+// bounded in the kernel map and are ignored/deleted lazily by TC.
+func (b *SharedNetworkBackend) InvalidateFlowDirect() error {
+	if b == nil {
+		return osErrClosed
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	b.control.FlowGeneration++
+	if b.control.FlowGeneration == 0 {
+		b.control.FlowGeneration = 1
+	}
+	return b.updateControl(b.control.Enabled != 0)
 }
 
 func (b *SharedNetworkBackend) updateControl(enabled bool) error {

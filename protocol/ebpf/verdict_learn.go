@@ -276,6 +276,54 @@ func (c *outboundCoordinator) MaybeLearnTCP(
 	}
 }
 
+// MaybeLearnUDP mirrors the TCP learner for the local cgroup capture surface.
+// The shared-network exact-flow map is published by Inbound.MaybeLearnUDP;
+// keeping this destination-level learner here preserves existing cgroup
+// verdict behavior without sharing state between the two capture surfaces.
+func (c *outboundCoordinator) MaybeLearnUDP(
+	ctx context.Context,
+	outboundDialer N.Dialer,
+	metadata adapter.InboundContext,
+	remote netip.AddrPort,
+) {
+	if c == nil || metadata.InboundType != C.TypeEBPF {
+		return
+	}
+	c.access.RLock()
+	backend := c.verdict
+	opts := c.verdictLearn
+	c.access.RUnlock()
+	if backend == nil || opts.mode != "learn" || c.isClosed() {
+		return
+	}
+	if !verdictIsEmptyDirect(outboundDialer) {
+		backend.Skip()
+		c.noteSkipReason(verdictSkipNonDirect)
+		return
+	}
+	dest, resolveReason := resolveLearnDestination(metadata, remote)
+	if resolveReason != verdictSkipNone || !dest.IsValid() || dest.Port() == 53 {
+		backend.Skip()
+		if resolveReason != verdictSkipNone {
+			c.noteSkipReason(resolveReason)
+		}
+		return
+	}
+	ok, reason := evaluateVerdictLearn(opts, outboundDialer, metadata, dest)
+	if !ok {
+		backend.Skip()
+		c.noteSkipReason(reason)
+		return
+	}
+	if err := backend.PutDIRECT(ECommon.ProtocolUDP, dest, opts.ttl); err != nil {
+		c.warn("eBPF UDP verdict learn write failed (ignored): ", err)
+		return
+	}
+	if opts.promoteBypass {
+		c.promoteLearnedBypass(dest.Addr(), opts.ttl)
+	}
+}
+
 func (c *outboundCoordinator) debug(args ...any) {
 	if c == nil || c.logger == nil {
 		return

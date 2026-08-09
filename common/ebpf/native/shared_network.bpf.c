@@ -122,6 +122,10 @@ EXTERNAL_MAP(shared_interface_mac, __u32, struct sb_shared_interface_mac, SB_SHA
 EXTERNAL_MAP(shared_original_to_token, struct sb_shared_original_key, struct sb_shared_token_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 EXTERNAL_MAP(shared_token_to_original, struct sb_shared_reverse_key, struct sb_shared_reverse_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 EXTERNAL_MAP(shared_redirect, struct sb_shared_redirect_key, struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES);
+/* DAE-style exact-flow direct verdicts.  A HASH (not LRU) is intentional:
+ * policy entries expire by timestamp/generation and must never evict a live
+ * flow behind the userspace session's back. */
+EXTERNAL_MAP(shared_flow_direct, struct sb_shared_flow_key, struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") shared_listener_sockets = {
     .type = BPF_MAP_TYPE_SOCKMAP,
     .key_size = sizeof(__u32),
@@ -152,6 +156,7 @@ static void *(*map_lookup)(void *map, const void *key) = (void *)BPF_FUNC_map_lo
 static long (*map_update)(void *map, const void *key, const void *value, __u64 flags) =
     (void *)BPF_FUNC_map_update_elem;
 static long (*map_delete)(void *map, const void *key) = (void *)BPF_FUNC_map_delete_elem;
+static __u64 (*ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static long (*skb_pull_data)(struct __sk_buff *skb, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
 static long (*skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 length, __u64 flags) =
     (void *)BPF_FUNC_skb_store_bytes;
@@ -230,6 +235,37 @@ INLINE bool ipv4_builtin_bypass(const __u8 address[4]) {
 INLINE bool ipv6_builtin_bypass(const __u8 address[16]) {
     if (address[0] == 0xffU || (address[0] & 0xfeU) == 0xfcU) return true;
     return address[0] == 0xfeU && (address[1] & 0xc0U) == 0x80U;
+}
+
+INLINE void fill_flow_key(
+    struct sb_shared_flow_key *key,
+    __u8 family,
+    __u8 protocol,
+    __u16 source_port,
+    __u16 destination_port,
+    const __u8 source[16],
+    const __u8 destination[16]) {
+    __builtin_memset(key, 0, sizeof(*key));
+    key->family = family;
+    key->protocol = protocol;
+    key->client_port = source_port;
+    key->original_port = destination_port;
+    copy_address(key->client_addr, source, family == AF_INET6_VALUE ? 16U : 4U);
+    copy_address(key->original_addr, destination, family == AF_INET6_VALUE ? 16U : 4U);
+}
+
+INLINE bool direct_flow_hit(
+    const struct sb_shared_control *control,
+    const struct sb_shared_flow_key *key) {
+    if ((control->flags & SB_SHARED_FLAG_FLOW_DIRECT) == 0U) return false;
+    struct sb_shared_flow_value *value = map_lookup(&shared_flow_direct, key);
+    if (value == 0) return false;
+    __u64 now = ktime_get_ns();
+    if (value->generation != control->flow_generation || value->expires_ns <= now) {
+        map_delete(&shared_flow_direct, key);
+        return false;
+    }
+    return true;
 }
 
 NOINLINE bool proxy_ipv4(
@@ -573,6 +609,10 @@ NOINLINE int ingress_ipv4(
     if ((swap16(ip->fragment_offset) & IP_FRAGMENT_MASK) != 0U) return TC_ACT_PIPE;
     __u16 source_port = swap16(ports->source);
     __u16 destination_port = swap16(ports->destination);
+    struct sb_shared_flow_key flow_key;
+    fill_flow_key(&flow_key, AF_INET_VALUE, ip->protocol, source_port, destination_port,
+        (const __u8 *)&ip->source, (const __u8 *)&ip->destination);
+    if (direct_flow_hit(control, &flow_key)) return TC_ACT_PIPE;
     /* Drop QUIC before divert (same intent as nft "udp dport 443 drop" on tproxy). */
     if ((control->flags & SB_SHARED_FLAG_DROP_UDP_443) != 0U &&
         ip->protocol == IPPROTO_UDP_VALUE &&
@@ -746,6 +786,10 @@ NOINLINE int ingress_ipv6(
     if ((void *)(ports + 1) > data_end) return TC_ACT_PIPE;
     __u16 source_port = swap16(ports->source);
     __u16 destination_port = swap16(ports->destination);
+    struct sb_shared_flow_key flow_key;
+    fill_flow_key(&flow_key, AF_INET6_VALUE, protocol, source_port, destination_port,
+        ip->source, ip->destination);
+    if (direct_flow_hit(control, &flow_key)) return TC_ACT_PIPE;
     if ((control->flags & SB_SHARED_FLAG_DROP_UDP_443) != 0U &&
         protocol == IPPROTO_UDP_VALUE &&
         destination_port == 443U) {

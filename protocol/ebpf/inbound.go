@@ -147,6 +147,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
+	if sharedOptions.FlowVerdict && offloadOptions.Verdict.Mode != "learn" {
+		return nil, E.New("shared_network.flow_verdict requires outbound_offload.verdict.mode=learn")
+	}
 	for _, w := range clampWarnings {
 		logger.Warn(w)
 	}
@@ -685,6 +688,65 @@ func (i *Inbound) MaybeLearnTCP(
 		return
 	}
 	i.outboundCoord.MaybeLearnTCP(ctx, dialer, metadata, remote)
+	// Publish the same exact-flow verdict used by UDP after the first
+	// userspace connection is proven DIRECT. The existing destination-level
+	// learner remains the compatibility path; this tuple path is opt-in through
+	// shared_network.flow_verdict and cannot bypass a proxy dialer.
+	if i.sharedNetwork == nil || !i.sharedNetwork.flowVerdict ||
+		metadata.InboundType != C.TypeEBPF || !verdictIsEmptyDirect(dialer) || !remote.IsValid() {
+		return
+	}
+	opts := i.outboundCoord.verdictLearn
+	dest, reason := resolveLearnDestination(metadata, remote)
+	if reason != verdictSkipNone || !dest.IsValid() || opts.mode != "learn" {
+		return
+	}
+	ok, _ := evaluateVerdictLearn(opts, dialer, metadata, dest)
+	if !ok {
+		return
+	}
+	source := metadata.Source.AddrPort()
+	if !source.IsValid() || source.Port() == 0 {
+		return
+	}
+	if err := i.sharedNetwork.backend.PutDirectFlow(ECommon.ProtocolTCP, source, dest, opts.ttl); err != nil {
+		i.logger.Debug("eBPF shared-network direct TCP learn skipped: ", err)
+	}
+}
+
+// MaybeLearnUDP publishes only a proven DIRECT UDP flow. The shared-network
+// backend uses the exact client/destination tuple, so a direct verdict cannot
+// affect another client, region, or Smart policy group.
+func (i *Inbound) MaybeLearnUDP(
+	ctx context.Context,
+	dialer N.Dialer,
+	metadata adapter.InboundContext,
+	remote netip.AddrPort,
+) {
+	if i == nil || metadata.InboundType != C.TypeEBPF {
+		return
+	}
+	if i.outboundCoord != nil {
+		i.outboundCoord.MaybeLearnUDP(ctx, dialer, metadata, remote)
+	}
+	if i.sharedNetwork == nil || !i.sharedNetwork.flowVerdict || i.outboundCoord == nil {
+		return
+	}
+	if !verdictIsEmptyDirect(dialer) || !remote.IsValid() || remote.Port() == 53 {
+		return
+	}
+	opts := i.outboundCoord.verdictLearn
+	ok, _ := evaluateVerdictLearn(opts, dialer, metadata, remote)
+	if opts.mode != "learn" || !ok {
+		return
+	}
+	source := metadata.Source.AddrPort()
+	if !source.IsValid() || source.Port() == 0 {
+		return
+	}
+	if err := i.sharedNetwork.backend.PutDirectFlow(ECommon.ProtocolUDP, source, remote, opts.ttl); err != nil {
+		i.logger.Debug("eBPF shared-network direct UDP learn skipped: ", err)
+	}
 }
 
 // TrySpliceTCP implements adapter.ConnectionSplicer.

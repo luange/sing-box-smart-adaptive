@@ -55,6 +55,7 @@ type sharedNetwork struct {
 	tcPriority   uint16
 	dropUDP443   bool
 	dataPlane    string
+	flowVerdict  bool
 	routingMark  uint32
 	routingTable uint32
 	backend      *ECommon.SharedNetworkBackend
@@ -98,6 +99,9 @@ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (opt
 	}
 	if options.DataPlane == sharedNetworkDataPlaneToken && (options.RoutingMark != 0 || options.RoutingTable != 0) {
 		return option.EBPFSharedNetworkOptions{}, E.New("shared_network routing_mark/routing_table require data_plane=socket_assign")
+	}
+	if options.FlowVerdict && options.DataPlane != sharedNetworkDataPlaneSocketAssign {
+		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.flow_verdict requires data_plane=socket_assign")
 	}
 	if options.DataPlane == sharedNetworkDataPlaneSocketAssign {
 		if options.RoutingMark == 0 {
@@ -161,6 +165,7 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		tcPriority:   sharedNetworkResolveTCPriority(options),
 		dropUDP443:   sharedNetworkDropUDP443(options),
 		dataPlane:    options.DataPlane,
+		flowVerdict:  options.FlowVerdict,
 		routingMark:  options.RoutingMark,
 		routingTable: options.RoutingTable,
 	}
@@ -200,6 +205,9 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 		return E.Errors(err, s.closeListeners())
 	}
 	s.backend = backend
+	if err = backend.SetFlowDirect(s.flowVerdict); err != nil {
+		return E.Errors(E.Cause(err, "configure shared-network flow verdict"), s.Close())
+	}
 	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		if err = s.registerListenerSockets(); err != nil {
 			return E.Errors(E.Cause(err, "register shared-network transparent listeners"), s.Close())
@@ -362,6 +370,11 @@ func (s *sharedNetwork) registerListenerSockets() error {
 func (s *sharedNetwork) InterfaceUpdated() {
 	s.udpNat.Purge()
 	s.dnsUDPNat.Purge()
+	if s.flowVerdict && s.backend != nil {
+		if err := s.backend.InvalidateFlowDirect(); err != nil {
+			s.parent.logger.Debug("invalidate shared-network direct flow verdicts: ", err)
+		}
+	}
 	if s.tc != nil {
 		s.tc.Wake()
 	}

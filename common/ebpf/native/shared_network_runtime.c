@@ -91,6 +91,13 @@ int sb_ebpf_shared_network_prepare(
         sizeof(struct sb_shared_original_dst),
         SB_SHARED_NETWORK_MAP_ENTRIES,
         0U);
+    stage = "create direct flow verdict map";
+    runtime->flow_direct_map_fd = sb_ebpf_create_map(
+        BPF_MAP_TYPE_HASH,
+        sizeof(struct sb_shared_flow_key),
+        sizeof(struct sb_shared_flow_value),
+        SB_SHARED_NETWORK_MAP_ENTRIES,
+        BPF_F_NO_PREALLOC);
     stage = "create listener socket map";
     runtime->listener_socket_map_fd = sb_ebpf_create_map(
         BPF_MAP_TYPE_SOCKMAP,
@@ -120,6 +127,7 @@ int sb_ebpf_shared_network_prepare(
         runtime->original_to_token_map_fd < 0 ||
         runtime->token_to_original_map_fd < 0 ||
         runtime->redirect_map_fd < 0 ||
+        runtime->flow_direct_map_fd < 0 ||
         runtime->listener_socket_map_fd < 0 ||
         runtime->stats_map_fd < 0 ||
         runtime->host_ipv4_map_fd < 0 ||
@@ -190,6 +198,7 @@ int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime)
     CLOSE_SHARED_FD(runtime->host_ipv6_map_fd);
     CLOSE_SHARED_FD(runtime->host_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->redirect_map_fd);
+    CLOSE_SHARED_FD(runtime->flow_direct_map_fd);
     CLOSE_SHARED_FD(runtime->listener_socket_map_fd);
     CLOSE_SHARED_FD(runtime->stats_map_fd);
     CLOSE_SHARED_FD(runtime->token_to_original_map_fd);

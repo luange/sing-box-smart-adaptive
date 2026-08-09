@@ -67,6 +67,7 @@ type ConnectionSplicer interface {
 // VerdictLearner is registered by eBPF inbound when outbound_offload.verdict.mode != off.
 type VerdictLearner interface {
 	MaybeLearnTCP(ctx context.Context, dialer N.Dialer, metadata InboundContext, remote netip.AddrPort)
+	MaybeLearnUDP(ctx context.Context, dialer N.Dialer, metadata InboundContext, remote netip.AddrPort)
 }
 
 type OutboundRegistry interface {

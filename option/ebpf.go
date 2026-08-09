@@ -66,6 +66,12 @@ type EBPFSharedNetworkOptions struct {
 	// tproxy nft bypass ("udp dport 443 drop") so clients fall back to TCP. Default true when omitted.
 	// Set to false to allow UDP/443 through shared_network (experimental).
 	DropUDP443 *bool `json:"drop_udp_443,omitempty"`
+	// FlowVerdict enables the dae-style exact-flow direct fast path. After a
+	// userspace route proves a flow is DIRECT, subsequent packets bypass the
+	// transparent listener in TC until the TTL or policy generation expires.
+	// It is valid only with data_plane=socket_assign because token mode cannot
+	// safely preserve the original route semantics for direct forwarding.
+	FlowVerdict bool `json:"flow_verdict,omitempty"`
 }
 
 // EBPFOutboundOffloadOptions is the inbound-attached outbound offload block.

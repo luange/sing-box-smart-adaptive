@@ -411,8 +411,6 @@ func (c *outboundCoordinator) SpliceWatcher() *spliceWatcher {
 	}
 	return c.spliceWatch
 }
-
-
 func (c *outboundCoordinator) IdleTimeout() time.Duration {
 	if c == nil {
 		return 0

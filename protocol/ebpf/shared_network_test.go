@@ -58,6 +58,29 @@ func TestNormalizeSharedNetworkOptionsRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestNormalizeSharedNetworkOptionsFlowVerdictRequiresSocketAssign(t *testing.T) {
+	_, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
+		Enabled:          true,
+		IncludeInterface: []string{"eth0"},
+		FlowVerdict:      true,
+	})
+	if err == nil {
+		t.Fatal("expected flow_verdict token-mode rejection")
+	}
+	got, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
+		Enabled:          true,
+		IncludeInterface: []string{"eth0"},
+		DataPlane:        "socket_assign",
+		FlowVerdict:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FlowVerdict {
+		t.Fatal("flow_verdict was lost during normalization")
+	}
+}
+
 func TestValidateSharedNetworkProtocols(t *testing.T) {
 	if err := validateSharedNetworkProtocols(option.EBPFSharedNetworkOptions{}, false, dnsModeHijack); err != nil {
 		t.Fatal(err)
