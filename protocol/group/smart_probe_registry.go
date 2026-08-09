@@ -103,6 +103,22 @@ func smartProbeKey(identity, probeURL string, timeout time.Duration) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
+// failed reports a recent shared probe failure for a candidate. Probe
+// outcomes are process-wide, so every Smart group avoids the same failed node
+// until the shared TTL expires instead of rediscovering the failure itself.
+func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	r.access.Lock()
+	defer r.access.Unlock()
+	entry := r.entries[key]
+	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.completedAt.IsZero() && time.Since(entry.result.completedAt) < ttl
+}
+
 func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error) {
 	if ttl <= 0 {
 		ttl = time.Minute

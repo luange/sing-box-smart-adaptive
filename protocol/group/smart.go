@@ -1064,6 +1064,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			continue
 		}
 		estimate := s.store.estimate(now, networkKey, siteKey, candidate.Tag(), transport, s.minSamples)
+		sharedProbeFailed := false
+		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
+			s.access.RLock()
+			identity := s.candidateProbeKey[candidate.Tag()]
+			s.access.RUnlock()
+			sharedProbeFailed = s.probeRegistry.failed(smartProbeKey(identity, s.probeURL, s.probeTimeout), s.probeInterval)
+		}
+		if sharedProbeFailed {
+			estimate.State = "open"
+		}
 		totalSamples += estimate.Samples
 		profileThroughputSamples := estimate.ThroughputSamples
 		if siteKey != "" {

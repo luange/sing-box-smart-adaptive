@@ -67,6 +67,8 @@ func TestSmartProbeRegistryFailureIsOpaqueAndBounded(t *testing.T) {
 		require.NotContains(t, storedKey, "token")
 		require.NotContains(t, storedKey, "secret")
 	}
+	require.True(t, registry.failed(key, time.Minute), "a recent failure must be visible to every Smart group")
+	require.False(t, registry.failed(key, time.Nanosecond), "expired failures must not permanently suppress a node")
 }
 
 func TestSmartProbeRegistryProcessLifetime(t *testing.T) {
