@@ -988,20 +988,24 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 		go func() {
 			defer waitGroup.Done()
 			for candidate := range jobs {
-				testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
 				identity := probeKeys[candidate.Tag()]
 				key := smartProbeKey(identity, s.probeURL, s.probeTimeout)
 				var delay uint16
 				var err error
 				if s.probeRegistry != nil {
-					delay, err = s.probeRegistry.run(testCtx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
+					// Admission is process-wide and may legitimately wait behind
+					// another group. Apply the per-node timeout only after a slot is
+					// acquired inside the registry; otherwise a healthy node can be
+					// mislabeled merely because the shared queue took five seconds.
+					delay, err = s.probeRegistry.run(ctx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
 				} else {
 					// Test/embedded constructors created before the shared registry
 					// contract retain the stock direct probe path.
+					testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
 					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
+					cancel()
 				}
 				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil
-				cancel()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
 			}
 		}()

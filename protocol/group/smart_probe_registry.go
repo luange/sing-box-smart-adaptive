@@ -224,7 +224,7 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		return 0, errSharedSmartProbeDeferred
 	}
 
-	probeCtx, cancel := context.WithTimeout(r.ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
 	// Probe transports and protocol stacks are intentionally short-lived. A
