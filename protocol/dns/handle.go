@@ -155,10 +155,11 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 	// Bound outstanding exchanges per client UDP flow. A DNS source port is a
 	// small request/response lane, not a bulk transport: keeping 64 concurrent
 	// queries for every NAT entry multiplies the session budget into thousands
-	// of contexts, timers and response buffers. Four still permits pipelined
-	// stub resolvers while the independent session pool provides concurrency
-	// across clients.
-	const maxConcurrentDNSQueries = 4
+	// of contexts, timers and response buffers. UDP DNS transaction IDs still
+	// allow clients to pipeline, but serializing each source-port lane preserves
+	// ordering and bounds memory; the independent session pool provides
+	// concurrency across clients.
+	const maxConcurrentDNSQueries = 1
 	querySlots := make(chan struct{}, maxConcurrentDNSQueries)
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
