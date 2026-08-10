@@ -10,7 +10,7 @@ BPF_INCLUDE_FLAGS += -I$(BPF_MULTIARCH_INCLUDE)
 endif
 
 # Luan fuller eBPF stack (shared_network + splice). Upstream cgroup not mixed.
-SOURCES := native/shared_network.bpf.c native/splice.bpf.c
+SOURCES := native/shared_network.bpf.c native/shared_network_v2.bpf.c native/splice.bpf.c
 OBJECTS := $(SOURCES:.c=.o)
 
 .PHONY: generate check clean

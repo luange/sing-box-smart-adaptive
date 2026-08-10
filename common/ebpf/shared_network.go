@@ -83,7 +83,7 @@ type SharedNetworkRuntimeStats struct {
 	FlowUpdateFailures   uint64
 }
 
-//go:embed native/shared_network.bpf.o
+//go:embed native/shared_network_v2.bpf.o
 var sharedNetworkObject []byte
 
 type sharedNetworkControl struct {
