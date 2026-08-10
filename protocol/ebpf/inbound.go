@@ -768,6 +768,13 @@ func (i *Inbound) TrySpliceTCP(
 	if inboundType == "" {
 		inboundType = C.TypeEBPF
 	}
+	// Shared-network socket_assign preserves the original tuple while the
+	// ingress metadata may still be reported as mixed by the transparent
+	// listener. Treat that path as an eBPF inbound for splice eligibility;
+	// outbound type allow-listing remains the final safety gate.
+	if inboundType == C.TypeMixed && i.sharedOptions.DataPlane == sharedNetworkDataPlaneSocketAssign {
+		inboundType = C.TypeEBPF
+	}
 	var track func(io.Closer)
 	if manager := service.FromContext[adapter.ConnectionManager](ctx); manager != nil {
 		track = func(c io.Closer) {
