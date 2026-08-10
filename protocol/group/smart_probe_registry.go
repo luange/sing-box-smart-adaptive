@@ -94,7 +94,7 @@ func newSmartProbeRegistry(parent context.Context) *smartProbeRegistry {
 		ctx:     ctx,
 		cancel:  cancel,
 		entries: make(map[string]*smartProbeEntry),
-		slots:   make(chan struct{}, 2),
+		slots:   make(chan struct{}, 4),
 		probe: func(ctx context.Context, link string, outbound adapter.Outbound) (uint16, error) {
 			return urltest.URLTest(ctx, link, outbound)
 		},

@@ -503,7 +503,10 @@ func (s *Smart) run(ctx context.Context) {
 	reachTicker := time.NewTicker(30 * time.Second)
 	defer probeTicker.Stop()
 	defer reachTicker.Stop()
-	probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
+	// Cold start builds process-local endpoint profiles only once. Give the
+	// shared bounded scheduler enough time to cover large provider catalogs;
+	// steady-state cycles retain the configured shorter deadline below.
+	probeCtx, cancel := context.WithTimeout(ctx, max(s.probeCycleTimeout, 2*time.Minute))
 	_, _ = s.probe(probeCtx)
 	cancel()
 	s.runDueReachTests(ctx, true)

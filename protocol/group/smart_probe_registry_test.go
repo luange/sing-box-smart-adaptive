@@ -130,9 +130,11 @@ func TestSmartProbeRegistryBoundsProcessWideConcurrency(t *testing.T) {
 	}
 	<-started
 	<-started
-	require.Equal(t, int32(2), active.Load())
-	require.Equal(t, int32(2), maximum.Load())
+	<-started
+	<-started
+	require.Equal(t, int32(4), active.Load())
+	require.Equal(t, int32(4), maximum.Load())
 	close(release)
 	workers.Wait()
-	require.Equal(t, int32(2), maximum.Load())
+	require.Equal(t, int32(4), maximum.Load())
 }
