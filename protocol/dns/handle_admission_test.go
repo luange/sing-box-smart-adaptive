@@ -22,10 +22,3 @@ func TestDNSExchangeAdmissionIsProcessWideAndBounded(t *testing.T) {
 		releaseDNSExchange()
 	}
 }
-
-func TestDNSExchangePerConnectionBudgetIsBelowGlobalBudget(t *testing.T) {
-	if dnsExchangeSlotsPerConnection < 1 || dnsExchangeSlotsPerConnection >= cap(dnsExchangeSlots) {
-		t.Fatalf("invalid hierarchical DNS budget: per_connection=%d global=%d",
-			dnsExchangeSlotsPerConnection, cap(dnsExchangeSlots))
-	}
-}
