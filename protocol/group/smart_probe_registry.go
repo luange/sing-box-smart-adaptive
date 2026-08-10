@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -34,12 +36,13 @@ type smartProbeEntry struct {
 }
 
 type smartProbeRegistry struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	access  sync.Mutex
-	entries map[string]*smartProbeEntry
-	probe   func(context.Context, string, adapter.Outbound) (uint16, error)
-	slots   chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	access    sync.Mutex
+	entries   map[string]*smartProbeEntry
+	probe     func(context.Context, string, adapter.Outbound) (uint16, error)
+	slots     chan struct{}
+	completed atomic.Uint64
 }
 
 type smartProbeRegistryReference struct {
@@ -216,6 +219,13 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	probeCtx, cancel := context.WithTimeout(r.ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
+	// Probe transports and protocol stacks are intentionally short-lived. A
+	// large catalog can otherwise accumulate their dead buffers until the
+	// process-wide heap goal is reached. Collect at a bounded unit of completed
+	// probe work instead of using a periodic unconditional memory purge.
+	if r.completed.Add(1)%8 == 0 {
+		runtime.GC()
+	}
 	<-r.slots
 	completedAt := time.Now()
 	r.access.Lock()
