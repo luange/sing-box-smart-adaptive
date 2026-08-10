@@ -19,6 +19,24 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
+// dnsExchangeSlots is deliberately process-wide. A per-connection semaphore
+// multiplies the budget by the number of UDP NAT clients (for example,
+// 16 sessions * 64 slots) and recreates thousands of goroutines, contexts and
+// timers under a TC/eBPF gateway workload. One shared admission budget keeps
+// memory bounded regardless of how traffic entered the DNS handler.
+var dnsExchangeSlots = make(chan struct{}, 64)
+
+func acquireDNSExchange(ctx context.Context) bool {
+	select {
+	case dnsExchangeSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseDNSExchange() { <-dnsExchangeSlots }
+
 func HandleStreamDNSRequest(ctx context.Context, router adapter.DNSRouter, conn net.Conn, metadata adapter.InboundContext) error {
 	var queryLength uint16
 	err := binary.Read(conn, binary.BigEndian, &queryLength)
@@ -40,7 +58,11 @@ func HandleStreamDNSRequest(ctx context.Context, router adapter.DNSRouter, conn 
 		return err
 	}
 	metadataInQuery := metadata
+	if !acquireDNSExchange(ctx) {
+		return ctx.Err()
+	}
 	router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+		releaseDNSExchange()
 		if err != nil {
 			conn.Close()
 			return
@@ -127,7 +149,11 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
+			if !acquireDNSExchange(fastClose) {
+				return fastClose.Err()
+			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+				releaseDNSExchange()
 				if err != nil {
 					cancel(err)
 					return
@@ -152,13 +178,6 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 }
 
 func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn N.PacketConn, readWaiter N.PacketReadWaiter, readCounters []N.CountFunc, cached []*N.PacketBuffer, metadata adapter.InboundContext) error {
-	// Bound outstanding DNS exchanges. ExchangeAsync intentionally decouples
-	// request intake from response delivery, but an unbounded intake loop can
-	// otherwise retain one goroutine, context chain and timer per client query
-	// during an upstream stall. Backpressure here keeps DNS memory proportional
-	// to a fixed concurrency budget while preserving normal UDP reuse.
-	const maxConcurrentDNSQueries = 64
-	querySlots := make(chan struct{}, maxConcurrentDNSQueries)
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
 	fastClose, cancel := context.WithCancelCause(ctx)
@@ -204,13 +223,11 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
-			select {
-			case querySlots <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
+			if !acquireDNSExchange(fastClose) {
+				return fastClose.Err()
 			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
-				<-querySlots
+				releaseDNSExchange()
 				if err != nil {
 					cancel(err)
 					return
