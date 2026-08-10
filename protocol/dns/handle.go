@@ -24,7 +24,9 @@ import (
 // 16 sessions * 64 slots) and recreates thousands of goroutines, contexts and
 // timers under a TC/eBPF gateway workload. One shared admission budget keeps
 // memory bounded regardless of how traffic entered the DNS handler.
-var dnsExchangeSlots = make(chan struct{}, 64)
+var dnsExchangeSlots = make(chan struct{}, 256)
+
+const dnsExchangeSlotsPerConnection = 16
 
 func acquireDNSExchange(ctx context.Context) bool {
 	select {
@@ -109,6 +111,7 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 		break
 	}
 	fastClose, cancel := context.WithCancelCause(ctx)
+	connectionSlots := make(chan struct{}, dnsExchangeSlotsPerConnection)
 	timeout := canceler.New(fastClose, cancel, C.DNSTimeout)
 	var group task.Group
 	group.Append0(func(_ context.Context) error {
@@ -149,11 +152,18 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
+			select {
+			case connectionSlots <- struct{}{}:
+			case <-fastClose.Done():
+				return fastClose.Err()
+			}
 			if !acquireDNSExchange(fastClose) {
+				<-connectionSlots
 				return fastClose.Err()
 			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
 				releaseDNSExchange()
+				<-connectionSlots
 				if err != nil {
 					cancel(err)
 					return
@@ -181,6 +191,7 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
 	fastClose, cancel := context.WithCancelCause(ctx)
+	connectionSlots := make(chan struct{}, dnsExchangeSlotsPerConnection)
 	timeout := canceler.New(fastClose, cancel, C.DNSTimeout)
 	var group task.Group
 	group.Append0(func(_ context.Context) error {
@@ -223,11 +234,18 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
+			select {
+			case connectionSlots <- struct{}{}:
+			case <-fastClose.Done():
+				return fastClose.Err()
+			}
 			if !acquireDNSExchange(fastClose) {
+				<-connectionSlots
 				return fastClose.Err()
 			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
 				releaseDNSExchange()
+				<-connectionSlots
 				if err != nil {
 					cancel(err)
 					return
