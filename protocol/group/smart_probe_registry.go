@@ -20,6 +20,9 @@ type smartProbeResult struct {
 	delay       uint16
 	success     bool
 	completedAt time.Time
+	nextProbeAt time.Time
+	successes   uint8
+	failures    uint8
 }
 
 type smartProbeEntry struct {
@@ -116,7 +119,28 @@ func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
 	r.access.Lock()
 	defer r.access.Unlock()
 	entry := r.entries[key]
-	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.completedAt.IsZero() && time.Since(entry.result.completedAt) < ttl
+	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.nextProbeAt.IsZero() && time.Now().Before(entry.result.nextProbeAt)
+}
+
+func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
+	if success {
+		switch successes {
+		case 0, 1:
+			return 5 * time.Minute
+		case 2:
+			return 15 * time.Minute
+		default:
+			return 30 * time.Minute
+		}
+	}
+	switch failures {
+	case 0, 1:
+		return 30 * time.Second
+	case 2:
+		return time.Minute
+	default:
+		return 5 * time.Minute
+	}
 }
 
 func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error) {
@@ -126,7 +150,7 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	now := time.Now()
 	r.access.Lock()
 	entry := r.entries[key]
-	if entry != nil && !entry.inflight && now.Sub(entry.result.completedAt) < ttl {
+	if entry != nil && !entry.inflight && now.Before(entry.result.nextProbeAt) {
 		result := entry.result
 		r.access.Unlock()
 		if result.success {
@@ -170,8 +194,20 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	probeCtx, cancel := context.WithTimeout(r.ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
-	result := smartProbeResult{delay: delay, success: err == nil, completedAt: time.Now()}
+	completedAt := time.Now()
 	r.access.Lock()
+	previous := entry.result
+	var successes, failures uint8
+	if err == nil {
+		successes = min(previous.successes+1, uint8(3))
+	} else {
+		failures = min(previous.failures+1, uint8(3))
+	}
+	result := smartProbeResult{
+		delay: delay, success: err == nil, completedAt: completedAt,
+		nextProbeAt: completedAt.Add(smartProbeCadence(err == nil, successes, failures)),
+		successes:   successes, failures: failures,
+	}
 	entry.result = result
 	entry.inflight = false
 	close(entry.done)

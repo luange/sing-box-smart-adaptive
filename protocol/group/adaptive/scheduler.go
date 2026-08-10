@@ -62,6 +62,7 @@ type ProbeTask struct {
 	Interval          time.Duration
 	FailureInterval   time.Duration
 	FailureStreak     uint8
+	SuccessStreak     uint8
 	Timeout           time.Duration
 	FreshAfterCurrent bool
 	Run               func(context.Context) ProbeResult
@@ -616,8 +617,12 @@ func (s *ProbeScheduler) runDispatcher() {
 					if periodic.FailureStreak < 3 {
 						periodic.FailureStreak++
 					}
-				} else {
+					periodic.SuccessStreak = 0
+				} else if completion.result.Outcome == OutcomeSuccess {
 					periodic.FailureStreak = 0
+					if periodic.SuccessStreak < 3 {
+						periodic.SuccessStreak++
+					}
 				}
 				periodic.DueAt = time.Now().Add(nextInterval)
 				periodic.SubmittedAt = time.Now()
@@ -641,14 +646,24 @@ func (s *ProbeScheduler) runDispatcher() {
 }
 
 func nextPeriodicProbeInterval(task ProbeTask, result ProbeResult) time.Duration {
-	if result.Outcome == OutcomeFailure && task.FailureInterval > 0 && task.FailureInterval < task.Interval {
+	if result.Outcome == OutcomeFailure {
 		switch task.FailureStreak {
 		case 0:
-			return task.FailureInterval
+			return 30 * time.Second
 		case 1:
-			return min(task.Interval, 5*task.FailureInterval)
+			return time.Minute
 		default:
-			return task.Interval
+			return 5 * time.Minute
+		}
+	}
+	if result.Outcome == OutcomeSuccess {
+		switch task.SuccessStreak {
+		case 0:
+			return 5 * time.Minute
+		case 1:
+			return 15 * time.Minute
+		default:
+			return 30 * time.Minute
 		}
 	}
 	return task.Interval

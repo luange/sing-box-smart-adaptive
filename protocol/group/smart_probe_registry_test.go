@@ -68,7 +68,19 @@ func TestSmartProbeRegistryFailureIsOpaqueAndBounded(t *testing.T) {
 		require.NotContains(t, storedKey, "secret")
 	}
 	require.True(t, registry.failed(key, time.Minute), "a recent failure must be visible to every Smart group")
+	registry.access.Lock()
+	registry.entries[key].result.nextProbeAt = time.Now().Add(-time.Second)
+	registry.access.Unlock()
 	require.False(t, registry.failed(key, time.Nanosecond), "expired failures must not permanently suppress a node")
+}
+
+func TestSmartProbeCadence(t *testing.T) {
+	require.Equal(t, 5*time.Minute, smartProbeCadence(true, 1, 0))
+	require.Equal(t, 15*time.Minute, smartProbeCadence(true, 2, 0))
+	require.Equal(t, 30*time.Minute, smartProbeCadence(true, 3, 0))
+	require.Equal(t, 30*time.Second, smartProbeCadence(false, 0, 1))
+	require.Equal(t, time.Minute, smartProbeCadence(false, 0, 2))
+	require.Equal(t, 5*time.Minute, smartProbeCadence(false, 0, 3))
 }
 
 func TestSmartProbeRegistryProcessLifetime(t *testing.T) {

@@ -523,6 +523,12 @@ func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination 
 		ctx = context.WithValue(ctx, sharedNetworkIngressInterfaceKey{}, sharedNetworkIngressInterface(ifIndex))
 	}
 	client := source.AddrPort()
+	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
+		writer := &sharedPacketWriter{shared: s, client: client}
+		return true, ctx, writer, func(error) {
+			common.Close(common.PtrOrNil(writer.conn))
+		}
+	}
 	clientState := s.udpClients.retain(client)
 	writer := &sharedPacketWriter{
 		shared:      s,

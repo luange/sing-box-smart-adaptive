@@ -55,19 +55,30 @@ func TestStartupProbeTasksBoundAndStaggerInitialCoverage(t *testing.T) {
 
 func TestPeriodicProbeFailureUsesFastRecoveryThenReturnsToCoverage(t *testing.T) {
 	task := ProbeTask{Interval: 10 * time.Minute, FailureInterval: time.Minute}
-	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != time.Minute {
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 30*time.Second {
 		t.Fatalf("failure did not select recovery interval: %s", got)
 	}
 	task.FailureStreak = 1
-	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 5*time.Minute {
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != time.Minute {
 		t.Fatalf("second failure did not back off to five minutes: %s", got)
 	}
 	task.FailureStreak = 2
-	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 10*time.Minute {
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeFailure}); got != 5*time.Minute {
 		t.Fatalf("persistent failure did not return to coverage interval: %s", got)
 	}
-	for _, outcome := range []ObservationOutcome{OutcomeSuccess, OutcomeDeferred, OutcomeBlocked} {
-		if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: outcome}); got != 10*time.Minute {
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeSuccess}); got != 5*time.Minute {
+		t.Fatalf("first success cadence: %s", got)
+	}
+	task.SuccessStreak = 1
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeSuccess}); got != 15*time.Minute {
+		t.Fatalf("second success cadence: %s", got)
+	}
+	task.SuccessStreak = 2
+	if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: OutcomeSuccess}); got != 30*time.Minute {
+		t.Fatalf("stable success cadence: %s", got)
+	}
+	for _, outcome := range []ObservationOutcome{OutcomeDeferred, OutcomeBlocked} {
+		if got := nextPeriodicProbeInterval(task, ProbeResult{Outcome: outcome}); got != task.Interval {
 			t.Fatalf("%s unexpectedly changed normal coverage: %s", outcome, got)
 		}
 	}

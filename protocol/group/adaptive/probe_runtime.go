@@ -339,11 +339,12 @@ func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidat
 		FailureInterval: failureInterval,
 		Timeout:         p.probeTimeout,
 		Run: func(ctx context.Context) ProbeResult {
-			if !globalEndpointProfiles.TryAcquire(candidate.EndpointID) {
-				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint probe already in flight"}
+			if !globalEndpointProfiles.Acquire(ctx, candidate.EndpointID, TrackTCP4) {
+				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint probe wait canceled"}
 			}
-			defer globalEndpointProfiles.Release(candidate.EndpointID)
+			defer globalEndpointProfiles.Release(candidate.EndpointID, TrackTCP4)
 			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
+			globalEndpointProfiles.Record(candidate.EndpointID, TrackTCP4, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
 			return result
 		},
 	}
@@ -369,7 +370,19 @@ func (p *AdaptivePool) dnsHealthProbeTask(snapshot *ExecutionSnapshot, candidate
 		},
 		Source: firstOrDefault(candidate.Sources, "static"), Priority: priority, DueAt: dueAt,
 		Interval: interval, FailureInterval: failureInterval, Timeout: max(p.probeTimeout, 5*time.Second),
-		Run: func(ctx context.Context) ProbeResult { return p.runDNSHealthProbe(ctx, snapshot, candidate, family) },
+		Run: func(ctx context.Context) ProbeResult {
+			track := TrackDNSUDP4
+			if family == "ipv6" {
+				track = TrackDNSUDP6
+			}
+			if !globalEndpointProfiles.Acquire(ctx, candidate.EndpointID, track) {
+				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint DNS probe wait canceled"}
+			}
+			defer globalEndpointProfiles.Release(candidate.EndpointID, track)
+			result := p.runDNSHealthProbe(ctx, snapshot, candidate, family)
+			globalEndpointProfiles.Record(candidate.EndpointID, track, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
+			return result
+		},
 	}
 }
 
