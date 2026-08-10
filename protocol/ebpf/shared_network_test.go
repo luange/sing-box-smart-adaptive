@@ -27,6 +27,9 @@ func TestNormalizeSharedNetworkOptions(t *testing.T) {
 		options.IncludeInterface[1] != "wlan1" {
 		t.Fatalf("unexpected interfaces: %v", options.IncludeInterface)
 	}
+	if options.DataPlane != sharedNetworkDataPlaneSocketAssign {
+		t.Fatalf("expected socket_assign default, got %q", options.DataPlane)
+	}
 }
 
 func TestNormalizeSharedNetworkOptionsDisabled(t *testing.T) {
@@ -62,6 +65,7 @@ func TestNormalizeSharedNetworkOptionsFlowVerdictRequiresSocketAssign(t *testing
 	_, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
 		Enabled:          true,
 		IncludeInterface: []string{"eth0"},
+		DataPlane:        sharedNetworkDataPlaneToken,
 		FlowVerdict:      true,
 	})
 	if err == nil {

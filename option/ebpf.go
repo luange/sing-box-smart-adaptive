@@ -51,8 +51,9 @@ type EBPFSharedNetworkOptions struct {
 	Enabled          bool                       `json:"enabled,omitempty"`
 	IncludeInterface badoption.Listable[string] `json:"include_interface,omitempty"`
 	// DataPlane selects how packets from shared interfaces reach the transparent
-	// listener. "token" is the compatibility implementation. "socket_assign"
-	// preserves the original tuple and uses TC socket assignment plus policy routing.
+	// listener. Empty defaults to "socket_assign", which preserves the original
+	// tuple and uses TC socket assignment plus policy routing. "token" is kept
+	// as an explicit compatibility mode for legacy deployments.
 	DataPlane string `json:"data_plane,omitempty" enum:"token,socket_assign"`
 	// RoutingMark and RoutingTable are used only by socket_assign. Zero selects
 	// process-owned defaults.

@@ -91,8 +91,12 @@ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (opt
 		return option.EBPFSharedNetworkOptions{}, nil
 	}
 	switch options.DataPlane {
-	case "", sharedNetworkDataPlaneToken:
-		options.DataPlane = sharedNetworkDataPlaneToken
+	case "":
+		// socket_assign is the safe default: it preserves the original tuple
+		// and avoids the per-flow token/session state retained by compatibility
+		// mode. Set data_plane="token" explicitly only for legacy deployments.
+		options.DataPlane = sharedNetworkDataPlaneSocketAssign
+	case sharedNetworkDataPlaneToken:
 	case sharedNetworkDataPlaneSocketAssign:
 	default:
 		return option.EBPFSharedNetworkOptions{}, E.New("unknown shared_network.data_plane: ", options.DataPlane)
