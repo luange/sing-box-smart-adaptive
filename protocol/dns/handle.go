@@ -152,12 +152,13 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 }
 
 func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn N.PacketConn, readWaiter N.PacketReadWaiter, readCounters []N.CountFunc, cached []*N.PacketBuffer, metadata adapter.InboundContext) error {
-	// Bound outstanding DNS exchanges. ExchangeAsync intentionally decouples
-	// request intake from response delivery, but an unbounded intake loop can
-	// otherwise retain one goroutine, context chain and timer per client query
-	// during an upstream stall. Backpressure here keeps DNS memory proportional
-	// to a fixed concurrency budget while preserving normal UDP reuse.
-	const maxConcurrentDNSQueries = 64
+	// Bound outstanding exchanges per client UDP flow. A DNS source port is a
+	// small request/response lane, not a bulk transport: keeping 64 concurrent
+	// queries for every NAT entry multiplies the session budget into thousands
+	// of contexts, timers and response buffers. Four still permits pipelined
+	// stub resolvers while the independent session pool provides concurrency
+	// across clients.
+	const maxConcurrentDNSQueries = 4
 	querySlots := make(chan struct{}, maxConcurrentDNSQueries)
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
