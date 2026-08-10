@@ -236,6 +236,7 @@ type Smart struct {
 	workerStarted        bool
 	probeRegistry        *smartProbeRegistry
 	releaseProbeRegistry func()
+	probeStartupDelay    time.Duration
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -372,6 +373,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		reachLastRun:         make(map[string]time.Time),
 		probeRegistry:        probeRegistry,
 		releaseProbeRegistry: releaseProbeRegistry,
+		probeStartupDelay:    probeRegistry.startupDelay(),
 	}
 	return smart, nil
 }
@@ -503,6 +505,15 @@ func (s *Smart) run(ctx context.Context) {
 	reachTicker := time.NewTicker(30 * time.Second)
 	defer probeTicker.Stop()
 	defer reachTicker.Stop()
+	if s.probeStartupDelay > 0 {
+		timer := time.NewTimer(s.probeStartupDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 	// Cold start builds process-local endpoint profiles only once. Give the
 	// shared bounded scheduler enough time to cover large provider catalogs;
 	// steady-state cycles retain the configured shorter deadline below.

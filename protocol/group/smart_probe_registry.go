@@ -7,6 +7,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -41,6 +42,15 @@ type smartProbeRegistry struct {
 	entries map[string]*smartProbeEntry
 	probe   func(context.Context, string, adapter.Outbound) (uint16, error)
 	slots   chan struct{}
+	groups  atomic.Uint32
+}
+
+func (r *smartProbeRegistry) startupDelay() time.Duration {
+	if r == nil {
+		return 0
+	}
+	order := r.groups.Add(1) - 1
+	return time.Duration(min(order, uint32(4))) * 15 * time.Second
 }
 
 type smartProbeRegistryReference struct {

@@ -83,6 +83,17 @@ func TestSmartProbeCadence(t *testing.T) {
 	require.Equal(t, 5*time.Minute, smartProbeCadence(false, 0, 3))
 }
 
+func TestSmartProbeStartupDelay(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	require.Equal(t, time.Duration(0), registry.startupDelay())
+	require.Equal(t, 15*time.Second, registry.startupDelay())
+	require.Equal(t, 30*time.Second, registry.startupDelay())
+	require.Equal(t, 45*time.Second, registry.startupDelay())
+	require.Equal(t, time.Minute, registry.startupDelay())
+	require.Equal(t, time.Minute, registry.startupDelay())
+}
+
 func TestSmartProbeRegistryProcessLifetime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	registryA, releaseA := acquireSmartProbeRegistry(ctx)
