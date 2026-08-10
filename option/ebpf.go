@@ -30,7 +30,9 @@ type EBPFInboundOptions struct {
 	// Not a routable outbound type. Defaults all-off.
 	// Contract: docs/ebpf-in-out-framework-master-20260803.md §7 / plan §6.
 	OutboundOffload EBPFOutboundOffloadOptions `json:"outbound_offload,omitempty"`
-	// Zero selects conservative defaults: 512 data sessions and 128 DNS sessions.
+	// Zero selects bounded defaults: 512 data sessions and 16 DNS sessions.
+	// DNS is intentionally kept separate from the data budget because DNS
+	// requests are short-lived and do not need a large long-lived pool.
 	UDPSessionCapacity uint32 `json:"udp_session_capacity,omitempty"`
 	DNSSessionCapacity uint32 `json:"dns_session_capacity,omitempty"`
 }

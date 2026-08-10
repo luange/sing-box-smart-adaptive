@@ -242,7 +242,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 func normalizeUDPNATCapacities(dataCapacity, dnsCapacity uint32) (uint32, uint32, []string) {
 	const (
 		defaultDataCapacity = 512
-		defaultDNSCapacity  = 128
+		// DNS is request-oriented and should not consume the same budget as
+		// long-lived data UDP. Keep a small bounded pool by default; deployments
+		// with unusually high concurrent DNS fan-out can override it explicitly.
+		defaultDNSCapacity  = 16
 		minimumDataCapacity = 64
 		minimumDNSCapacity  = 16
 		maximumCapacity     = 8192
