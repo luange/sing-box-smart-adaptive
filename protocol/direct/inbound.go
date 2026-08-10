@@ -58,7 +58,21 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	// A direct DNS listener sees a new client source port for almost every query.
+	// Keeping the generic 1024-session/64-packet defaults here retains a large
+	// amount of memory without improving DNS correctness: request/response DNS
+	// exchanges neither need a deep per-client queue nor a thousand live NAT
+	// entries. Keep the generic defaults for data UDP, and use a bounded service
+	// for a port-53 listener. The timeout remains configurable by the user.
+	if options.ListenPort == 53 {
+		inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
+			Timeout:    udpTimeout,
+			Capacity:   128,
+			QueueDepth: 4,
+		})
+	} else {
+		inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
