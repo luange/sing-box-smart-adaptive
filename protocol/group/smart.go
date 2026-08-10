@@ -986,7 +986,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					// contract retain the stock direct probe path.
 					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
 				}
-				penalize := err != nil && ctx.Err() == nil
+				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil
 				cancel()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
 			}

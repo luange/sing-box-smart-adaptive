@@ -15,6 +15,7 @@ import (
 const smartProbeRegistryLimit = 8192
 
 var errSharedSmartProbeFailed = errors.New("shared smart probe failed")
+var errSharedSmartProbeDeferred = errors.New("shared smart probe deferred")
 
 type smartProbeResult struct {
 	delay       uint16
@@ -23,6 +24,7 @@ type smartProbeResult struct {
 	nextProbeAt time.Time
 	successes   uint8
 	failures    uint8
+	deferred    bool
 }
 
 type smartProbeEntry struct {
@@ -37,6 +39,7 @@ type smartProbeRegistry struct {
 	access  sync.Mutex
 	entries map[string]*smartProbeEntry
 	probe   func(context.Context, string, adapter.Outbound) (uint16, error)
+	slots   chan struct{}
 }
 
 type smartProbeRegistryReference struct {
@@ -90,6 +93,7 @@ func newSmartProbeRegistry(parent context.Context) *smartProbeRegistry {
 		ctx:     ctx,
 		cancel:  cancel,
 		entries: make(map[string]*smartProbeEntry),
+		slots:   make(chan struct{}, 2),
 		probe: func(ctx context.Context, link string, outbound adapter.Outbound) (uint16, error) {
 			return urltest.URLTest(ctx, link, outbound)
 		},
@@ -156,6 +160,9 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		if result.success {
 			return result.delay, nil
 		}
+		if result.deferred {
+			return 0, errSharedSmartProbeDeferred
+		}
 		return 0, errSharedSmartProbeFailed
 	}
 	if entry != nil && entry.inflight {
@@ -171,6 +178,9 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		r.access.Unlock()
 		if result.success {
 			return result.delay, nil
+		}
+		if result.deferred {
+			return 0, errSharedSmartProbeDeferred
 		}
 		return 0, errSharedSmartProbeFailed
 	}
@@ -191,9 +201,22 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	r.entries[key] = entry
 	r.access.Unlock()
 
+	select {
+	case r.slots <- struct{}{}:
+	case <-ctx.Done():
+		r.access.Lock()
+		entry.result = smartProbeResult{completedAt: time.Now(), nextProbeAt: time.Now(), deferred: true}
+		entry.inflight = false
+		close(entry.done)
+		entry.done = nil
+		r.access.Unlock()
+		return 0, errSharedSmartProbeDeferred
+	}
+
 	probeCtx, cancel := context.WithTimeout(r.ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
+	<-r.slots
 	completedAt := time.Now()
 	r.access.Lock()
 	previous := entry.result

@@ -97,3 +97,42 @@ func TestSmartProbeRegistryProcessLifetime(t *testing.T) {
 	releaseC()
 	cancel()
 }
+
+func TestSmartProbeRegistryBoundsProcessWideConcurrency(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	var active atomic.Int32
+	var maximum atomic.Int32
+	release := make(chan struct{})
+	started := make(chan struct{}, 5)
+	registry.probe = func(context.Context, string, adapter.Outbound) (uint16, error) {
+		current := active.Add(1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		active.Add(-1)
+		return 10, nil
+	}
+	var workers sync.WaitGroup
+	for index := range 5 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			key := smartProbeKey(string(rune('a'+index)), "https://probe.invalid/", time.Second)
+			_, err := registry.run(context.Background(), key, "https://probe.invalid/", time.Second, time.Minute, nil)
+			require.NoError(t, err)
+		}()
+	}
+	<-started
+	<-started
+	require.Equal(t, int32(2), active.Load())
+	require.Equal(t, int32(2), maximum.Load())
+	close(release)
+	workers.Wait()
+	require.Equal(t, int32(2), maximum.Load())
+}
