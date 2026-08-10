@@ -152,6 +152,13 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 }
 
 func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn N.PacketConn, readWaiter N.PacketReadWaiter, readCounters []N.CountFunc, cached []*N.PacketBuffer, metadata adapter.InboundContext) error {
+	// Bound outstanding DNS exchanges. ExchangeAsync intentionally decouples
+	// request intake from response delivery, but an unbounded intake loop can
+	// otherwise retain one goroutine, context chain and timer per client query
+	// during an upstream stall. Backpressure here keeps DNS memory proportional
+	// to a fixed concurrency budget while preserving normal UDP reuse.
+	const maxConcurrentDNSQueries = 64
+	querySlots := make(chan struct{}, maxConcurrentDNSQueries)
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
 	fastClose, cancel := context.WithCancelCause(ctx)
@@ -197,7 +204,13 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
+			select {
+			case querySlots <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
+				<-querySlots
 				if err != nil {
 					cancel(err)
 					return
