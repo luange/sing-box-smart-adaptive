@@ -339,6 +339,10 @@ func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidat
 		FailureInterval: failureInterval,
 		Timeout:         p.probeTimeout,
 		Run: func(ctx context.Context) ProbeResult {
+			if !globalEndpointProfiles.TryAcquire(candidate.EndpointID) {
+				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint probe already in flight"}
+			}
+			defer globalEndpointProfiles.Release(candidate.EndpointID)
 			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
 			return result
 		},
