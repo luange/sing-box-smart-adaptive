@@ -67,7 +67,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.ListenPort == 53 {
 		inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
 			Timeout:    udpTimeout,
-			Capacity:   128,
+			Capacity:   64,
 			QueueDepth: 4,
 		})
 	} else {
