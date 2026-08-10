@@ -9,9 +9,11 @@ import (
 
 type DirectInboundOptions struct {
 	ListenOptions
-	Network         NetworkList `json:"network,omitempty"`
-	OverrideAddress string      `json:"override_address,omitempty"`
-	OverridePort    uint16      `json:"override_port,omitempty"`
+	Network            NetworkList `json:"network,omitempty"`
+	OverrideAddress    string      `json:"override_address,omitempty"`
+	OverridePort       uint16      `json:"override_port,omitempty"`
+	UDPSessionCapacity uint32      `json:"udp_session_capacity,omitempty"`
+	UDPQueueDepth      int         `json:"udp_queue_depth,omitempty"`
 }
 
 type _DirectOutboundOptions struct {

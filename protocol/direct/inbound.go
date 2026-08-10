@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/udpnat2"
@@ -58,21 +59,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	// A direct DNS listener sees a new client source port for almost every query.
-	// Keeping the generic 1024-session/64-packet defaults here retains a large
-	// amount of memory without improving DNS correctness: request/response DNS
-	// exchanges neither need a deep per-client queue nor a thousand live NAT
-	// entries. Keep the generic defaults for data UDP, and use a bounded service
-	// for a port-53 listener. The timeout remains configurable by the user.
-	if options.ListenPort == 53 {
-		inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
-			Timeout:    udpTimeout,
-			Capacity:   16,
-			QueueDepth: 2,
-		})
-	} else {
-		inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	udpNATOptions, err := directUDPNATOptions(options, udpTimeout)
+	if err != nil {
+		return nil, err
 	}
+	inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpNATOptions)
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -82,6 +73,38 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PacketHandler:     inbound,
 	})
 	return inbound, nil
+}
+
+func directUDPNATOptions(options option.DirectInboundOptions, timeout time.Duration) (udpnat.Options, error) {
+	capacity := options.UDPSessionCapacity
+	queueDepth := options.UDPQueueDepth
+	// Port 53 is request/response DNS. Source ports churn quickly and a large
+	// generic data-UDP session pool only retains idle goroutines and buffers.
+	if capacity == 0 {
+		if options.ListenPort == 53 {
+			capacity = 16
+		} else {
+			capacity = 1024
+		}
+	}
+	if queueDepth == 0 {
+		if options.ListenPort == 53 {
+			queueDepth = 2
+		} else {
+			queueDepth = 64
+		}
+	}
+	if capacity > 4096 {
+		return udpnat.Options{}, E.New("udp_session_capacity exceeds 4096")
+	}
+	if queueDepth < 1 || queueDepth > 256 {
+		return udpnat.Options{}, E.New("udp_queue_depth must be between 1 and 256")
+	}
+	return udpnat.Options{
+		Timeout:    timeout,
+		Capacity:   capacity,
+		QueueDepth: queueDepth,
+	}, nil
 }
 
 func (i *Inbound) Start(stage adapter.StartStage) error {
