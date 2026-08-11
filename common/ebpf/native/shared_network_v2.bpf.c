@@ -102,12 +102,12 @@ static __attribute__((always_inline)) bool learned_direct(const struct sb_dp2_pa
     return value && value->expires_ns > monotonic_ns();
 }
 
-static __attribute__((always_inline)) bool established_socket(struct __sk_buff *skb,
-                                                               const struct sb_dp2_packet *packet) {
+static __attribute__((always_inline)) int assign_established_socket(struct __sk_buff *skb,
+                                                                    const struct sb_dp2_packet *packet) {
 	/* TCP creates an accepted kernel socket. UDP remains on the shared listener
 	 * and its flow lifetime is owned by userspace, so a UDP lookup would merely
 	 * rediscover the listener and incorrectly bypass first packets. */
-	if (packet->protocol != IPPROTO_TCP) return false;
+	if (packet->protocol != IPPROTO_TCP) return 0;
     struct bpf_sock_tuple tuple = {};
     __u32 tuple_size;
     if (packet->family == SB_DP2_AF_INET) {
@@ -124,10 +124,14 @@ static __attribute__((always_inline)) bool established_socket(struct __sk_buff *
         tuple_size = sizeof(tuple.ipv6);
     }
 	struct bpf_sock *socket = lookup_tcp(skb, &tuple, tuple_size, BPF_F_CURRENT_NETNS, 0);
-    if (!socket) return false;
-	bool established = socket->state != BPF_TCP_LISTEN;
+    if (!socket) return 0;
+	if (socket->state == BPF_TCP_LISTEN) {
+		release_socket(socket);
+		return 0;
+	}
+	long result = assign_socket(skb, socket, 0);
     release_socket(socket);
-    return established;
+	return result == 0 ? 1 : -1;
 }
 
 static __attribute__((always_inline)) int remember_original(struct __sk_buff *skb,
@@ -179,10 +183,17 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     if ((packet.protocol == IPPROTO_TCP && !(control->flags & SB_SHARED_FLAG_TCP)) ||
         (packet.protocol == IPPROTO_UDP && !(control->flags & SB_SHARED_FLAG_UDP)))
         return TC_ACT_OK;
-    if (established_socket(skb, &packet)) {
+    skb->mark = control->routing_mark;
+	int established = assign_established_socket(skb, &packet);
+	if (established > 0) {
         count_stat(SB_SHARED_STAT_ESTABLISHED_BYPASS);
         return TC_ACT_OK;
     }
+	if (established < 0) {
+		count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
+		count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
+		return TC_ACT_OK;
+	}
     if (destination_bypass(&packet) ||
 		((control->flags & SB_SHARED_FLAG_FLOW_DIRECT) && learned_direct(&packet))) {
         count_stat(SB_SHARED_STAT_INGRESS_BYPASS);
@@ -209,7 +220,6 @@ int sb_share_v2_in(struct __sk_buff *skb) {
 		forget_original(&packet);
         return TC_ACT_OK;
     }
-    skb->mark = control->routing_mark;
     long result = assign_socket(skb, socket, 0);
 	/* The verifier tracks the relocated SOCKMAP lookup as a socket reference;
 	 * every branch must release it after bpf_sk_assign. */
