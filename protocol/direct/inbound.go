@@ -28,7 +28,7 @@ func RegisterInbound(registry *inbound.Registry) {
 type Inbound struct {
 	inbound.Adapter
 	ctx                 context.Context
-	router              adapter.ConnectionRouterEx
+	router              adapter.Router
 	logger              log.ContextLogger
 	listener            *listener.Listener
 	udpNat              *udpnat.Service
@@ -67,7 +67,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if options.ListenPort == 53 {
 		inbound.dnsMux = dnsmux.New(dnsmux.Options{
-			Handler: inbound,
+			Handle:  inbound.handleDNSPacket,
 			Timeout: udpTimeout,
 			Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 				_, prepareCtx, writer, onClose := inbound.preparePacketConnection(source, destination, userData)
@@ -86,6 +86,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		PacketHandler:     inbound,
 	})
 	return inbound, nil
+}
+
+func (i *Inbound) handleDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, _ any) {
+	metadata := adapter.InboundContext{
+		Inbound:     i.Tag(),
+		InboundType: i.Type(),
+		Network:     N.NetworkUDP,
+		Protocol:    C.ProtocolDNS,
+		Source:      source,
+		Destination: destination,
+	}
+	//nolint:staticcheck
+	metadata.InboundDetour = i.listener.ListenOptions().Detour
+	i.router.HijackDNSPacket(ctx, payload, writer, metadata)
 }
 
 func directUDPNATOptions(options option.DirectInboundOptions, timeout time.Duration) (udpnat.Options, error) {

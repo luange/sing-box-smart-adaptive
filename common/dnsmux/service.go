@@ -2,12 +2,8 @@ package dnsmux
 
 import (
 	"context"
-	"encoding/binary"
-	"hash/fnv"
 	"io"
-	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,18 +14,19 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-const (
-	defaultLaneQueue       = 256
-	defaultMaxTransactions = 4096
-)
+const defaultMaxTransactions = 4096
 
 type PrepareFunc func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc)
 
+// HandleFunc must consume or unpack payload before returning. A response may be
+// written asynchronously through writer; the service keeps only lightweight
+// transaction accounting, never a per-client PacketConn or goroutine.
+type HandleFunc func(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, userData any)
+
 type Options struct {
-	Handler         N.UDPConnectionHandlerEx
+	Handle          HandleFunc
 	Prepare         PrepareFunc
 	Timeout         time.Duration
-	LaneQueue       int
 	MaxTransactions int
 	LaneKey         func(source M.Socksaddr, userData any) string
 }
@@ -44,56 +41,47 @@ type RuntimeStats struct {
 	QueueDrops        uint64
 }
 
-type Service struct {
-	options    Options
-	access     sync.Mutex
-	lanes      map[string]*lane
-	closed     chan struct{}
-	once       sync.Once
-	queries    atomic.Uint64
-	replies    atomic.Uint64
-	misses     atomic.Uint64
-	rejected   atomic.Uint64
-	queueDrops atomic.Uint64
-}
-
-type packet struct {
-	buffer      *buf.Buffer
-	destination M.Socksaddr
-}
-
 type transaction struct {
-	writer    N.PacketWriter
+	laneKey   string
 	onClose   N.CloseHandlerFunc
 	createdAt time.Time
 }
 
 type lane struct {
-	parent       *Service
-	source       M.Socksaddr
-	packets      chan packet
-	done         chan struct{}
-	closeOnce    sync.Once
+	transactions int
+	lastActive   time.Time
+}
+
+type Service struct {
+	options      Options
 	access       sync.Mutex
-	transactions map[uint64][]transaction
-	transactionN int
-	lastActive   atomic.Int64
+	lanes        map[string]*lane
+	transactions map[uint64]transaction
+	nextID       atomic.Uint64
+	closed       chan struct{}
+	once         sync.Once
+	queries      atomic.Uint64
+	replies      atomic.Uint64
+	misses       atomic.Uint64
+	rejected     atomic.Uint64
 }
 
 func New(options Options) *Service {
-	if options.Handler == nil || options.Prepare == nil {
-		panic("dnsmux: missing handler or prepare callback")
+	if options.Handle == nil || options.Prepare == nil {
+		panic("dnsmux: missing handle or prepare callback")
 	}
 	if options.Timeout <= 0 {
 		options.Timeout = time.Minute
 	}
-	if options.LaneQueue <= 0 {
-		options.LaneQueue = defaultLaneQueue
-	}
 	if options.MaxTransactions <= 0 {
 		options.MaxTransactions = defaultMaxTransactions
 	}
-	service := &Service{options: options, lanes: make(map[string]*lane), closed: make(chan struct{})}
+	service := &Service{
+		options:      options,
+		lanes:        make(map[string]*lane),
+		transactions: make(map[uint64]transaction),
+		closed:       make(chan struct{}),
+	}
 	go service.reapLoop()
 	return service
 }
@@ -107,63 +95,80 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 		s.rejected.Add(1)
 		return false
 	}
-	key := defaultLaneKey(source)
-	if s.options.LaneKey != nil {
-		key = s.options.LaneKey(source, userData)
-	}
 	ctx, writer, onClose := s.options.Prepare(source, destination, userData)
 	if writer == nil {
 		s.rejected.Add(1)
 		return false
 	}
+	key := defaultLaneKey(source)
+	if s.options.LaneKey != nil {
+		key = s.options.LaneKey(source, userData)
+	}
+	now := time.Now()
+	id := s.nextID.Add(1)
 	s.access.Lock()
-	current := s.lanes[key]
-	if current != nil {
-		select {
-		case <-current.done:
-			delete(s.lanes, key)
-			current = nil
-		default:
-		}
-	}
-	if current == nil {
-		current = &lane{
-			parent: s, source: source, packets: make(chan packet, s.options.LaneQueue), done: make(chan struct{}),
-			transactions: make(map[uint64][]transaction),
-		}
-		current.lastActive.Store(time.Now().UnixNano())
-		s.lanes[key] = current
-		go s.options.Handler.NewPacketConnectionEx(ctx, current, source, destination, nil)
-	}
-	s.access.Unlock()
-
-	transactionKey := MessageKey(payload)
-	if transactionKey == 0 || !current.remember(transactionKey, transaction{writer: writer, onClose: onClose, createdAt: time.Now()}) {
+	if len(s.transactions) >= s.options.MaxTransactions {
+		s.access.Unlock()
 		if onClose != nil {
 			onClose(syscall.ENOBUFS)
 		}
 		s.rejected.Add(1)
 		return false
 	}
-	packetBuffer := buf.NewSize(len(payload))
-	packetBuffer.Write(payload)
-	queued := packet{buffer: packetBuffer, destination: destination}
-	select {
-	case current.packets <- queued:
-		current.lastActive.Store(time.Now().UnixNano())
-		s.queries.Add(1)
-		return true
-	case <-current.done:
-		packetBuffer.Release()
-		current.forget(transactionKey, writer, io.ErrClosedPipe)
-		s.queueDrops.Add(1)
-		return false
-	default:
-		packetBuffer.Release()
-		current.forget(transactionKey, writer, syscall.ENOBUFS)
-		s.queueDrops.Add(1)
-		return false
+	current := s.lanes[key]
+	if current == nil {
+		current = &lane{}
+		s.lanes[key] = current
 	}
+	current.transactions++
+	current.lastActive = now
+	s.transactions[id] = transaction{laneKey: key, onClose: onClose, createdAt: now}
+	s.access.Unlock()
+
+	s.queries.Add(1)
+	s.options.Handle(ctx, payload, &trackingWriter{service: s, id: id, writer: writer}, source, destination, userData)
+	return true
+}
+
+type trackingWriter struct {
+	service *Service
+	id      uint64
+	writer  N.PacketWriter
+	once    sync.Once
+}
+
+func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	err := w.writer.WritePacket(buffer, destination)
+	w.once.Do(func() { w.service.complete(w.id, err) })
+	return err
+}
+
+func (s *Service) complete(id uint64, writeErr error) {
+	entry, loaded := s.remove(id)
+	if !loaded {
+		s.misses.Add(1)
+		return
+	}
+	if entry.onClose != nil {
+		entry.onClose(writeErr)
+	}
+	if writeErr == nil {
+		s.replies.Add(1)
+	}
+}
+
+func (s *Service) remove(id uint64) (transaction, bool) {
+	s.access.Lock()
+	entry, loaded := s.transactions[id]
+	if loaded {
+		delete(s.transactions, id)
+		if current := s.lanes[entry.laneKey]; current != nil {
+			current.transactions--
+			current.lastActive = time.Now()
+		}
+	}
+	s.access.Unlock()
+	return entry, loaded
 }
 
 func (s *Service) reapLoop() {
@@ -176,36 +181,40 @@ func (s *Service) reapLoop() {
 	for {
 		select {
 		case now := <-ticker.C:
-			var expired []*lane
-			s.access.Lock()
-			for key, current := range s.lanes {
-				current.prune(now)
-				if now.Sub(time.Unix(0, current.lastActive.Load())) >= s.options.Timeout {
-					delete(s.lanes, key)
-					expired = append(expired, current)
-				}
-			}
-			s.access.Unlock()
-			for _, current := range expired {
-				_ = current.Close()
-			}
+			s.expire(now, false)
 		case <-s.closed:
 			return
 		}
 	}
 }
 
-func (s *Service) Purge() {
+func (s *Service) expire(now time.Time, all bool) {
+	var expired []transaction
 	s.access.Lock()
-	lanes := make([]*lane, 0, len(s.lanes))
+	for id, entry := range s.transactions {
+		if all || now.Sub(entry.createdAt) >= s.options.Timeout {
+			delete(s.transactions, id)
+			expired = append(expired, entry)
+			if current := s.lanes[entry.laneKey]; current != nil {
+				current.transactions--
+			}
+		}
+	}
 	for key, current := range s.lanes {
-		lanes = append(lanes, current)
-		delete(s.lanes, key)
+		if current.transactions == 0 && (all || now.Sub(current.lastActive) >= s.options.Timeout) {
+			delete(s.lanes, key)
+		}
 	}
 	s.access.Unlock()
-	for _, current := range lanes {
-		_ = current.Close()
+	for _, entry := range expired {
+		if entry.onClose != nil {
+			entry.onClose(io.ErrClosedPipe)
+		}
 	}
+}
+
+func (s *Service) Purge() {
+	s.expire(time.Now(), true)
 }
 
 func (s *Service) Close() {
@@ -215,186 +224,13 @@ func (s *Service) Close() {
 
 func (s *Service) RuntimeStats() RuntimeStats {
 	s.access.Lock()
-	lanes := uint64(len(s.lanes))
-	var transactions uint64
-	for _, current := range s.lanes {
-		current.access.Lock()
-		transactions += uint64(current.transactionN)
-		current.access.Unlock()
-	}
+	lanes := len(s.lanes)
+	transactions := len(s.transactions)
 	s.access.Unlock()
 	return RuntimeStats{
-		Lanes: lanes, Transactions: transactions, Queries: s.queries.Load(), Replies: s.replies.Load(),
-		TransactionMisses: s.misses.Load(), AdmissionRejected: s.rejected.Load(), QueueDrops: s.queueDrops.Load(),
+		Lanes: uint64(lanes), Transactions: uint64(transactions), Queries: s.queries.Load(),
+		Replies: s.replies.Load(), TransactionMisses: s.misses.Load(), AdmissionRejected: s.rejected.Load(),
 	}
-}
-
-func (l *lane) remember(key uint64, value transaction) bool {
-	l.access.Lock()
-	defer l.access.Unlock()
-	if l.transactionN >= l.parent.options.MaxTransactions {
-		return false
-	}
-	l.transactions[key] = append(l.transactions[key], value)
-	l.transactionN++
-	return true
-}
-
-func (l *lane) forget(key uint64, writer N.PacketWriter, closeErr error) {
-	l.access.Lock()
-	entries := l.transactions[key]
-	for index, entry := range entries {
-		if entry.writer == writer {
-			entries = append(entries[:index], entries[index+1:]...)
-			l.transactionN--
-			if len(entries) == 0 {
-				delete(l.transactions, key)
-			} else {
-				l.transactions[key] = entries
-			}
-			l.access.Unlock()
-			if entry.onClose != nil {
-				entry.onClose(closeErr)
-			}
-			return
-		}
-	}
-	l.access.Unlock()
-}
-
-func (l *lane) take(key uint64) (transaction, bool) {
-	l.access.Lock()
-	defer l.access.Unlock()
-	entries := l.transactions[key]
-	if len(entries) == 0 {
-		return transaction{}, false
-	}
-	entry := entries[0]
-	if len(entries) == 1 {
-		delete(l.transactions, key)
-	} else {
-		l.transactions[key] = entries[1:]
-	}
-	l.transactionN--
-	return entry, true
-}
-
-func (l *lane) prune(now time.Time) {
-	var expired []transaction
-	l.access.Lock()
-	for key, entries := range l.transactions {
-		kept := entries[:0]
-		for _, entry := range entries {
-			if now.Sub(entry.createdAt) < l.parent.options.Timeout {
-				kept = append(kept, entry)
-			} else {
-				expired = append(expired, entry)
-				l.transactionN--
-			}
-		}
-		if len(kept) == 0 {
-			delete(l.transactions, key)
-		} else {
-			l.transactions[key] = kept
-		}
-	}
-	l.access.Unlock()
-	for _, entry := range expired {
-		if entry.onClose != nil {
-			entry.onClose(os.ErrDeadlineExceeded)
-		}
-	}
-}
-
-func (l *lane) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
-	select {
-	case incoming := <-l.packets:
-		_, err := buffer.ReadOnceFrom(incoming.buffer)
-		incoming.buffer.Release()
-		return incoming.destination, err
-	case <-l.done:
-		return M.Socksaddr{}, io.ErrClosedPipe
-	}
-}
-
-func (l *lane) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	key := MessageKey(buffer.Bytes())
-	entry, loaded := l.take(key)
-	if !loaded {
-		buffer.Release()
-		l.parent.misses.Add(1)
-		return os.ErrNotExist
-	}
-	l.lastActive.Store(time.Now().UnixNano())
-	err := entry.writer.WritePacket(buffer, destination)
-	if entry.onClose != nil {
-		entry.onClose(err)
-	}
-	if err == nil {
-		l.parent.replies.Add(1)
-	}
-	return err
-}
-
-func (l *lane) Close() error {
-	l.closeOnce.Do(func() {
-		close(l.done)
-		for {
-			select {
-			case incoming := <-l.packets:
-				incoming.buffer.Release()
-			default:
-				l.prune(time.Now().Add(2 * l.parent.options.Timeout))
-				return
-			}
-		}
-	})
-	return nil
-}
-
-func (l *lane) LocalAddr() net.Addr              { return l.source }
-func (l *lane) SetDeadline(time.Time) error      { return os.ErrInvalid }
-func (l *lane) SetReadDeadline(time.Time) error  { return os.ErrInvalid }
-func (l *lane) SetWriteDeadline(time.Time) error { return os.ErrInvalid }
-
-func MessageKey(message []byte) uint64 {
-	if len(message) < 12 {
-		return 0
-	}
-	txID := binary.BigEndian.Uint16(message[:2])
-	questions := binary.BigEndian.Uint16(message[4:6])
-	if questions == 0 {
-		return uint64(txID)<<32 | 1
-	}
-	offset := 12
-	for labels := 0; labels < 128; labels++ {
-		if offset >= len(message) {
-			return uint64(txID)<<32 | 1
-		}
-		length := int(message[offset])
-		offset++
-		if length == 0 {
-			break
-		}
-		if length&0xc0 == 0xc0 {
-			if offset >= len(message) {
-				return uint64(txID)<<32 | 1
-			}
-			offset++
-			break
-		}
-		if length > 63 || offset+length > len(message) {
-			return uint64(txID)<<32 | 1
-		}
-		offset += length
-	}
-	if offset+4 > len(message) {
-		return uint64(txID)<<32 | 1
-	}
-	offset += 4
-	hash := fnv.New32a()
-	_, _ = hash.Write(message[12:offset])
-	return uint64(txID)<<32 | uint64(hash.Sum32())
 }
 
 func AddressLaneKey(source M.Socksaddr, suffix string) string {
@@ -405,4 +241,4 @@ func AddressLaneKey(source M.Socksaddr, suffix string) string {
 	return address.String() + "\x00" + suffix
 }
 
-var _ N.PacketConn = (*lane)(nil)
+var _ N.PacketWriter = (*trackingWriter)(nil)

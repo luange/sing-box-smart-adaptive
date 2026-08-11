@@ -57,7 +57,7 @@ func RegisterInbound(registry *inbound.Registry) {
 type Inbound struct {
 	inbound.Adapter
 	ctx                context.Context
-	router             adapter.ConnectionRouterEx
+	router             adapter.Router
 	logger             log.ContextLogger
 	networkManager     adapter.NetworkManager
 	listenOptions      option.ListenOptions
@@ -226,7 +226,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		QueueDepth: 64,
 	})
 	inbound.dnsMux = dnsmux.New(dnsmux.Options{
-		Handler: inbound,
+		Handle:  inbound.handleDNSPacket,
 		Timeout: min(udpTimeout, C.DNSTimeout),
 		Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 			ok, prepareCtx, writer, onClose := inbound.preparePacketConnection(source, destination, userData)
@@ -244,6 +244,28 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.listener6 = inbound.newListener(network, true)
 	}
 	return inbound, nil
+}
+
+func (i *Inbound) handleDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, _ any) {
+	metadata := adapter.InboundContext{
+		Inbound:     i.Tag(),
+		InboundType: i.Type(),
+		Network:     N.NetworkUDP,
+		Protocol:    C.ProtocolDNS,
+		Source:      source,
+		Destination: destination,
+	}
+	//nolint:staticcheck
+	metadata.InboundDetour = i.listenOptions.Detour
+	if clientState, loaded := i.udpClients.load(source.AddrPort()); loaded {
+		metadata.UDPConnect = clientState.isConnected()
+		if restored, err := restoreOriginalSource(source, destination.Addr, clientState.sourceUID()); err == nil {
+			metadata.Source = restored
+		} else {
+			i.logger.DebugContext(ctx, "restore DNS original source: ", err)
+		}
+	}
+	i.router.HijackDNSPacket(ctx, payload, writer, metadata)
 }
 
 func normalizeUDPNATCapacities(dataCapacity, dnsCapacity uint32) (uint32, uint32, []string) {

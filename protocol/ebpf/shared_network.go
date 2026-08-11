@@ -185,7 +185,7 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		QueueDepth: 64,
 	})
 	shared.dnsMux = dnsmux.New(dnsmux.Options{
-		Handler: shared,
+		Handle:  shared.handleDNSPacket,
 		Timeout: min(udpTimeout, C.DNSTimeout),
 		LaneKey: func(source M.Socksaddr, userData any) string {
 			var suffix string
@@ -203,6 +203,23 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		},
 	})
 	return shared
+}
+
+func (s *sharedNetwork) handleDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, _ any) {
+	metadata := adapter.InboundContext{
+		Inbound:     s.parent.Tag(),
+		InboundType: s.parent.Type(),
+		Network:     N.NetworkUDP,
+		Protocol:    C.ProtocolDNS,
+		Source:      source,
+		Destination: destination,
+	}
+	if interfaceName, loaded := ctx.Value(sharedNetworkIngressInterfaceKey{}).(string); loaded {
+		metadata.InboundInterface = interfaceName
+	}
+	//nolint:staticcheck
+	metadata.InboundDetour = s.parent.listenOptions.Detour
+	s.parent.router.HijackDNSPacket(ctx, payload, writer, metadata)
 }
 
 func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
