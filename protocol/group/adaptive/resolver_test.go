@@ -253,3 +253,29 @@ func TestObservedHealthTransportPrefersDestinationOverPrivateRemote(t *testing.T
 		t.Fatalf("destination FakeIP should win over private remote: %s", got)
 	}
 }
+
+func TestTransactionalUDPResponseExpectation(t *testing.T) {
+	hasher, err := NewIdentityHasher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewServiceResolver(hasher, ModeAdaptive)
+	for _, test := range []struct {
+		name        string
+		metadata    *adapter.InboundContext
+		destination string
+		expected    bool
+	}{
+		{name: "quic port", destination: "192.0.2.1:443", expected: true},
+		{name: "dns port", destination: "192.0.2.1:53", expected: true},
+		{name: "stun sniff", metadata: &adapter.InboundContext{Protocol: "stun"}, destination: "192.0.2.1:9000", expected: true},
+		{name: "one way data", destination: "192.0.2.1:9000", expected: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := resolver.Resolve(test.metadata, M.ParseSocksaddr(test.destination), N.NetworkUDP)
+			if service.ExpectUDPResponse != test.expected {
+				t.Fatalf("expect response=%v, want %v", service.ExpectUDPResponse, test.expected)
+			}
+		})
+	}
+}

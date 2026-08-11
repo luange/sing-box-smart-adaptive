@@ -86,18 +86,18 @@ int sb_ebpf_shared_network_prepare(
         0U);
     stage = "create redirect map";
     runtime->redirect_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_HASH,
+        BPF_MAP_TYPE_LRU_HASH,
         sizeof(struct sb_shared_redirect_key),
         sizeof(struct sb_shared_original_dst),
         SB_SHARED_NETWORK_MAP_ENTRIES,
-        BPF_F_NO_PREALLOC);
+        0U);
     stage = "create direct flow verdict map";
     runtime->flow_direct_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_HASH,
+        BPF_MAP_TYPE_LRU_HASH,
         sizeof(struct sb_shared_flow_key),
         sizeof(struct sb_shared_flow_value),
         SB_SHARED_NETWORK_MAP_ENTRIES,
-        BPF_F_NO_PREALLOC);
+        0U);
     stage = "create listener socket map";
     runtime->listener_socket_map_fd = sb_ebpf_create_map(
         BPF_MAP_TYPE_SOCKMAP,

@@ -29,10 +29,14 @@ struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
     }
 
 EXTERNAL_MAP(shared_control, BPF_MAP_TYPE_HASH, __u32, struct sb_shared_control, 1U, 0U);
-EXTERNAL_MAP(shared_redirect, BPF_MAP_TYPE_HASH, struct sb_shared_redirect_key,
-             struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES, BPF_F_NO_PREALLOC);
-EXTERNAL_MAP(shared_flow_direct, BPF_MAP_TYPE_HASH, struct sb_shared_flow_key,
-             struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES, BPF_F_NO_PREALLOC);
+/* TCP entries are consumed by accept. UDP entries remain readable for every
+ * datagram in a flow and are bounded by LRU eviction. */
+EXTERNAL_MAP(shared_redirect, BPF_MAP_TYPE_LRU_HASH, struct sb_shared_redirect_key,
+             struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES, 0U);
+/* Verdicts carry an expiry timestamp, but expiry alone does not release hash
+ * slots. LRU keeps stale flow epochs from exhausting the bounded map. */
+EXTERNAL_MAP(shared_flow_direct, BPF_MAP_TYPE_LRU_HASH, struct sb_shared_flow_key,
+             struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES, 0U);
 EXTERNAL_MAP(shared_listener_sockets, BPF_MAP_TYPE_SOCKMAP, __u32, __u64,
              SB_SHARED_LISTENER_COUNT, 0U);
 EXTERNAL_MAP(shared_stats, BPF_MAP_TYPE_ARRAY, __u32, __u64, SB_SHARED_STAT_COUNT, 0U);

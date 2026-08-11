@@ -974,13 +974,26 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex)
-		return s.interruptGroup.NewPacketConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
+		observed := newSmartObservedPacketConn(conn, startedAt, smartUDPExpectsResponse(destination), func(flowElapsed time.Duration) {
+			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
+			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+		})
+		return s.interruptGroup.NewPacketConnWithKey(observed, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible UDP candidates failed")
 	if len(attemptErrors) == 0 {
 		return nil, E.New("all smart UDP candidates are circuit-open or recovery-busy")
 	}
 	return nil, errors.Join(attemptErrors...)
+}
+
+func smartUDPExpectsResponse(destination M.Socksaddr) bool {
+	switch destination.Port {
+	case 53, 443, 3478:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Smart) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -1859,4 +1872,126 @@ func (c *smartObservedConn) observeWrite(n int64) {
 	if n > 0 {
 		c.writeBytes.Add(n)
 	}
+}
+
+// smartObservedPacketConn turns real transactional UDP blackholes into Smart
+// node evidence. It deliberately ignores one-way UDP and idle timeouts after
+// any response, so telemetry and long-lived QUIC sessions are not penalized.
+type smartObservedPacketConn struct {
+	net.PacketConn
+	startedAt      time.Time
+	expectResponse bool
+	writePackets   atomic.Uint64
+	readPackets    atomic.Uint64
+	closeOnce      sync.Once
+	onNoResponse   func(time.Duration)
+}
+
+func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expectResponse bool, onNoResponse func(time.Duration)) net.PacketConn {
+	base := &smartObservedPacketConn{
+		PacketConn:     conn,
+		startedAt:      startedAt,
+		expectResponse: expectResponse,
+		onNoResponse:   onNoResponse,
+	}
+	reader, hasReader := conn.(N.PacketReader)
+	writer, hasWriter := conn.(N.PacketWriter)
+	switch {
+	case hasReader && hasWriter:
+		return &smartObservedExtendedPacketConn{smartObservedPacketConn: base, reader: reader, writer: writer}
+	case hasReader:
+		return &smartObservedPacketReaderConn{smartObservedPacketConn: base, reader: reader}
+	case hasWriter:
+		return &smartObservedPacketWriterConn{smartObservedPacketConn: base, writer: writer}
+	default:
+		return base
+	}
+}
+
+func (c *smartObservedPacketConn) observeRead(count int) {
+	if count > 0 {
+		c.readPackets.Add(1)
+	}
+}
+
+func (c *smartObservedPacketConn) observeWrite(count int) {
+	if count > 0 {
+		c.writePackets.Add(1)
+	}
+}
+
+func (c *smartObservedPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
+	count, source, err := c.PacketConn.ReadFrom(payload)
+	c.observeRead(count)
+	return count, source, err
+}
+
+func (c *smartObservedPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	count, err := c.PacketConn.WriteTo(payload, destination)
+	if err == nil {
+		c.observeWrite(count)
+	}
+	return count, err
+}
+
+func (c *smartObservedPacketConn) Close() error {
+	c.closeOnce.Do(func() {
+		elapsed := time.Since(c.startedAt)
+		if c.expectResponse && c.writePackets.Load() > 0 && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
+			c.onNoResponse(elapsed)
+		}
+	})
+	return c.PacketConn.Close()
+}
+
+func (c *smartObservedPacketConn) Upstream() any         { return c.PacketConn }
+func (*smartObservedPacketConn) ReaderReplaceable() bool { return false }
+func (*smartObservedPacketConn) WriterReplaceable() bool { return false }
+
+type smartObservedPacketReaderConn struct {
+	*smartObservedPacketConn
+	reader N.PacketReader
+}
+
+func (c *smartObservedPacketReaderConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	before := buffer.Len()
+	destination, err := c.reader.ReadPacket(buffer)
+	c.observeRead(buffer.Len() - before)
+	return destination, err
+}
+
+type smartObservedPacketWriterConn struct {
+	*smartObservedPacketConn
+	writer N.PacketWriter
+}
+
+func (c *smartObservedPacketWriterConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	count := buffer.Len()
+	err := c.writer.WritePacket(buffer, destination)
+	if err == nil {
+		c.observeWrite(count)
+	}
+	return err
+}
+
+type smartObservedExtendedPacketConn struct {
+	*smartObservedPacketConn
+	reader N.PacketReader
+	writer N.PacketWriter
+}
+
+func (c *smartObservedExtendedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	before := buffer.Len()
+	destination, err := c.reader.ReadPacket(buffer)
+	c.observeRead(buffer.Len() - before)
+	return destination, err
+}
+
+func (c *smartObservedExtendedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	count := buffer.Len()
+	err := c.writer.WritePacket(buffer, destination)
+	if err == nil {
+		c.observeWrite(count)
+	}
+	return err
 }

@@ -515,6 +515,27 @@ func (b *SharedNetworkBackend) LookupOriginal(
 	client netip.AddrPort,
 	redirect netip.AddrPort,
 ) (OriginalDestination, error) {
+	return b.lookupOriginal(protocol, client, redirect, false)
+}
+
+// TakeOriginal returns and consumes an original-destination entry.  TCP only
+// needs the tuple while accepting a connection, whereas UDP may deliver many
+// datagrams for the same flow through the shared listener and must use
+// LookupOriginal for the whole flow lifetime.
+func (b *SharedNetworkBackend) TakeOriginal(
+	protocol uint8,
+	client netip.AddrPort,
+	redirect netip.AddrPort,
+) (OriginalDestination, error) {
+	return b.lookupOriginal(protocol, client, redirect, true)
+}
+
+func (b *SharedNetworkBackend) lookupOriginal(
+	protocol uint8,
+	client netip.AddrPort,
+	redirect netip.AddrPort,
+	deleteAfterLookup bool,
+) (OriginalDestination, error) {
 	if b == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -536,8 +557,10 @@ func (b *SharedNetworkBackend) LookupOriginal(
 		b.originalDstLost.Add(1)
 		return OriginalDestination{}, E.Cause(err, "lookup shared-network original destination")
 	}
-	if err = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
-		return OriginalDestination{}, E.Cause(err, "delete consumed shared-network original destination")
+	if deleteAfterLookup {
+		if err = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
+			return OriginalDestination{}, E.Cause(err, "delete consumed shared-network original destination")
+		}
 	}
 	address, err := originalDestinationAddress(original)
 	if err != nil {

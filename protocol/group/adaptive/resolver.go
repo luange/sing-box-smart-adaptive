@@ -40,6 +40,10 @@ type ServiceContext struct {
 	Host            string
 	Transport       string
 	HealthTransport string
+	// ExpectUDPResponse marks transactional UDP protocols (QUIC/DNS/STUN).
+	// A flow that transmitted but received nothing before the client closed is
+	// useful medium-confidence path evidence; one-way UDP must not be penalized.
+	ExpectUDPResponse bool
 }
 
 type ServiceResolver struct {
@@ -82,13 +86,32 @@ func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination 
 		}, "\x00")
 	}
 	return ServiceContext{
-		ID:              serviceID,
-		AffinityID:      serviceAffinityFamily(serviceID),
-		Session:         r.hasher.Session(clientScope, serviceAffinityFamily(serviceID)),
-		Mode:            mode,
-		Host:            host,
-		Transport:       transport,
-		HealthTransport: resolveHealthTransport(metadata, destination, transport),
+		ID:                serviceID,
+		AffinityID:        serviceAffinityFamily(serviceID),
+		Session:           r.hasher.Session(clientScope, serviceAffinityFamily(serviceID)),
+		Mode:              mode,
+		Host:              host,
+		Transport:         transport,
+		HealthTransport:   resolveHealthTransport(metadata, destination, transport),
+		ExpectUDPResponse: expectsUDPResponse(metadata, destination, transport),
+	}
+}
+
+func expectsUDPResponse(metadata *adapter.InboundContext, destination M.Socksaddr, transport string) bool {
+	if transport != N.NetworkUDP {
+		return false
+	}
+	if destination.Port == 53 || destination.Port == 443 || destination.Port == 3478 {
+		return true
+	}
+	if metadata == nil {
+		return false
+	}
+	switch strings.ToLower(metadata.Protocol) {
+	case "dns", "quic", "stun":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -86,6 +86,10 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 }
 
 func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) {
+	o.observeUDPFailureConfidence(err, delay, ConfidenceLow)
+}
+
+func (o *businessObservation) observeUDPFailureConfidence(err error, delay time.Duration, timeoutConfidence ObservationConfidence) {
 	if o == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 		return
 	}
@@ -93,9 +97,11 @@ func (o *businessObservation) observeUDPFailure(err error, delay time.Duration) 
 		confidence := ConfidenceLow
 		failure := FailureConnect
 		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
-			// Timeouts stay low-confidence — do not open breakers on slow DNS alone.
+			// Ordinary timeouts stay low-confidence. Transactional UDP with a
+			// confirmed write and no response may promote this to medium after the
+			// client itself gives up; repeated blackholes can then leave the plan.
 			failure = FailureTimeout
-			confidence = ConfidenceLow
+			confidence = timeoutConfidence
 		} else if isNodeNetworkIOError(err) {
 			// Strong network errors (reset/unreachable/refused/…) open transport breakers.
 			confidence = ConfidenceHigh
@@ -622,29 +628,53 @@ func (p *AdaptivePool) recordObservationPanic() {
 
 type observedPacketConn struct {
 	net.PacketConn
-	startedAt   time.Time
-	observation *businessObservation
-	closeOnce   sync.Once
-	closeErr    error
+	startedAt    time.Time
+	observation  *businessObservation
+	closeOnce    sync.Once
+	failureOnce  sync.Once
+	closeErr     error
+	writePackets atomic.Uint64
+	readPackets  atomic.Uint64
 }
 
 func (c *observedPacketConn) observeRead(payload []byte, count int) {
 	if count > 0 {
+		c.readPackets.Add(1)
 		c.observation.observeUDPSuccess(payload[:count], time.Since(c.startedAt))
 	}
+}
+
+func (c *observedPacketConn) observeFailure(err error) {
+	if c.readPackets.Load() > 0 && (errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err)) {
+		// A transactional UDP exchange already produced a response. A later read
+		// deadline is normal idle/teardown behavior, not evidence of a bad path.
+		return
+	}
+	c.failureOnce.Do(func() {
+		confidence := ConfidenceLow
+		if c.observation.service.ExpectUDPResponse && c.writePackets.Load() > 0 && c.readPackets.Load() == 0 &&
+			time.Since(c.startedAt) >= time.Second &&
+			(errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err)) {
+			confidence = ConfidenceMedium
+		}
+		c.observation.observeUDPFailureConfidence(err, time.Since(c.startedAt), confidence)
+	})
 }
 
 func (c *observedPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 	count, source, err := c.PacketConn.ReadFrom(payload)
 	c.observeRead(payload, count)
 	if count == 0 && err != nil {
-		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+		c.observeFailure(err)
 	}
 	return count, source, err
 }
 
 func (c *observedPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
 	count, err := c.PacketConn.WriteTo(payload, destination)
+	if count > 0 {
+		c.writePackets.Add(1)
+	}
 	if count == 0 && err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}
@@ -653,6 +683,9 @@ func (c *observedPacketConn) WriteTo(payload []byte, destination net.Addr) (int,
 
 func (c *observedPacketConn) Close() error {
 	c.closeOnce.Do(func() {
+		if c.observation.service.ExpectUDPResponse && c.writePackets.Load() > 0 && c.readPackets.Load() == 0 && time.Since(c.startedAt) >= time.Second {
+			c.observeFailure(context.DeadlineExceeded)
+		}
 		c.closeErr = c.PacketConn.Close()
 		c.observation.release()
 	})
@@ -677,7 +710,7 @@ func (c *observedPacketReaderConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, 
 		c.observeRead(buffer.Bytes()[before:], got)
 	}
 	if got == 0 && err != nil {
-		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+		c.observeFailure(err)
 	}
 	return destination, err
 }
@@ -688,7 +721,11 @@ type observedPacketWriterConn struct {
 }
 
 func (c *observedPacketWriterConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	count := buffer.Len()
 	err := c.writer.WritePacket(buffer, destination)
+	if err == nil && count > 0 {
+		c.writePackets.Add(1)
+	}
 	if err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}
@@ -709,13 +746,17 @@ func (c *observedExtendedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr
 		c.observeRead(buffer.Bytes()[before:], got)
 	}
 	if got == 0 && err != nil {
-		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
+		c.observeFailure(err)
 	}
 	return destination, err
 }
 
 func (c *observedExtendedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	count := buffer.Len()
 	err := c.writer.WritePacket(buffer, destination)
+	if err == nil && count > 0 {
+		c.writePackets.Add(1)
+	}
 	if err != nil {
 		c.observation.observeUDPFailure(err, time.Since(c.startedAt))
 	}

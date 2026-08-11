@@ -480,7 +480,7 @@ func (s *sharedNetwork) NewConnection(ctx context.Context, conn net.Conn, metada
 	}
 	client := M.SocksaddrFromNet(conn.RemoteAddr()).AddrPort()
 	redirect := M.SocksaddrFromNet(conn.LocalAddr()).AddrPort()
-	original, err := s.backend.LookupOriginal(ECommon.ProtocolTCP, client, redirect)
+	original, err := s.backend.TakeOriginal(ECommon.ProtocolTCP, client, redirect)
 	if err != nil {
 		s.parent.logger.ErrorContext(ctx, "lookup shared-network TCP original destination: ", err)
 		conn.Close()

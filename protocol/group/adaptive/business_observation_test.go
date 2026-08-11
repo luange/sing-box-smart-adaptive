@@ -972,11 +972,11 @@ type readFromErrorConn struct {
 	err error
 }
 
-func (c *readFromErrorConn) Read([]byte) (int, error)  { return 0, io.EOF }
-func (c *readFromErrorConn) Write(p []byte) (int, error) { return len(p), nil }
-func (c *readFromErrorConn) Close() error               { return nil }
-func (c *readFromErrorConn) LocalAddr() net.Addr        { return &net.TCPAddr{} }
-func (c *readFromErrorConn) RemoteAddr() net.Addr       { return &net.TCPAddr{} }
+func (c *readFromErrorConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *readFromErrorConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *readFromErrorConn) Close() error                     { return nil }
+func (c *readFromErrorConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *readFromErrorConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (c *readFromErrorConn) SetDeadline(time.Time) error      { return nil }
 func (c *readFromErrorConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *readFromErrorConn) SetWriteDeadline(time.Time) error { return nil }
@@ -1187,5 +1187,79 @@ func TestQualityUnreachableRecoversOnMediumSuccess(t *testing.T) {
 	st := health.StatusHandle(handle, DomainTransport, path, "")
 	if st.Health != HealthHealthy || st.NonBreakerFailures != 0 {
 		t.Fatalf("medium success did not clear quality blackhole: %+v", st)
+	}
+}
+
+func TestTransactionalUDPNoResponseIsMediumConfidence(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{185}, "udp-transaction", newTestOutbound("udp-transaction")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	service.ExpectUDPResponse = true
+	wrapped := pool.wrapBusinessPacketConn(&packetMemoryConn{}, snapshot, snapshot.Candidates[0], service, time.Now().Add(-2*time.Second))
+	if _, err := wrapped.WriteTo([]byte("quic-initial"), &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if status.NonBreakerFailures != 1 || status.Health != HealthDegraded {
+		t.Fatalf("transactional UDP no-response was not medium evidence: %+v", status)
+	}
+}
+
+func TestOneWayUDPCloseDoesNotCreateFailure(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{186}, "udp-one-way", newTestOutbound("udp-one-way")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	wrapped := pool.wrapBusinessPacketConn(&packetMemoryConn{}, snapshot, snapshot.Candidates[0], service, time.Now().Add(-2*time.Second))
+	if _, err := wrapped.WriteTo([]byte("telemetry"), &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 9000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if status.NonBreakerFailures != 0 || status.Failures != 0 {
+		t.Fatalf("one-way UDP was falsely penalized: %+v", status)
+	}
+}
+
+func TestTransactionalUDPTimeoutAndCloseOnlyCountOnce(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{187}, "udp-timeout-once", newTestOutbound("udp-timeout-once")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	service.ExpectUDPResponse = true
+	conn := pool.wrapBusinessPacketConn(&packetMemoryConn{}, snapshot, snapshot.Candidates[0], service, time.Now().Add(-2*time.Second)).(*observedExtendedPacketConn).observedPacketConn
+	conn.writePackets.Store(1)
+	conn.observeFailure(context.DeadlineExceeded)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if status.NonBreakerFailures != 1 {
+		t.Fatalf("one UDP flow submitted duplicate timeout evidence: %+v", status)
+	}
+}
+
+func TestTransactionalUDPIdleAfterResponseDoesNotFail(t *testing.T) {
+	health := NewHealthStore(time.Hour, 32)
+	pool, snapshot := newWiredObservationPool(t, health, wired(NodeID{188}, "udp-response", newTestOutbound("udp-response")))
+	service := testBusinessService(N.NetworkUDP)
+	service.HealthTransport = "udp_data/ipv4"
+	service.ExpectUDPResponse = true
+	conn := pool.wrapBusinessPacketConn(&packetMemoryConn{}, snapshot, snapshot.Candidates[0], service, time.Now().Add(-2*time.Second)).(*observedExtendedPacketConn).observedPacketConn
+	conn.writePackets.Store(1)
+	conn.readPackets.Store(1)
+	conn.observeFailure(context.DeadlineExceeded)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status := health.StatusHandle(snapshot.Candidates[0].Handle, DomainTransport, "udp_data/ipv4", "")
+	if status.NonBreakerFailures != 0 || status.Failures != 0 {
+		t.Fatalf("idle timeout after a UDP response was penalized: %+v", status)
 	}
 }

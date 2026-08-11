@@ -122,9 +122,9 @@ EXTERNAL_MAP(shared_interface_mac, __u32, struct sb_shared_interface_mac, SB_SHA
 EXTERNAL_MAP(shared_original_to_token, struct sb_shared_original_key, struct sb_shared_token_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 EXTERNAL_MAP(shared_token_to_original, struct sb_shared_reverse_key, struct sb_shared_reverse_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 EXTERNAL_MAP(shared_redirect, struct sb_shared_redirect_key, struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES);
-/* DAE-style exact-flow direct verdicts.  A HASH (not LRU) is intentional:
- * policy entries expire by timestamp/generation and must never evict a live
- * flow behind the userspace session's back. */
+/* Runtime owns this as a bounded LRU map. Exact five-tuple entries remain
+ * stable while active traffic refreshes them, while expired idle epochs can
+ * no longer exhaust all slots. */
 EXTERNAL_MAP(shared_flow_direct, struct sb_shared_flow_key, struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") shared_listener_sockets = {
     .type = BPF_MAP_TYPE_SOCKMAP,

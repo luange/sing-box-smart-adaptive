@@ -388,6 +388,80 @@ func TestSmartProbeCoversEveryCandidateRegardlessOfGroupSize(t *testing.T) {
 	}
 }
 
+type smartObservedTestPacketConn struct {
+	response []byte
+}
+
+func (c *smartObservedTestPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
+	if len(c.response) == 0 {
+		return 0, nil, net.ErrClosed
+	}
+	count := copy(payload, c.response)
+	return count, &net.UDPAddr{}, nil
+}
+
+func (*smartObservedTestPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	return len(payload), nil
+}
+
+func (*smartObservedTestPacketConn) Close() error                     { return nil }
+func (*smartObservedTestPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (*smartObservedTestPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*smartObservedTestPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*smartObservedTestPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSmartTransactionalUDPNoResponseReportsOnce(t *testing.T) {
+	var failures atomic.Int64
+	conn := newSmartObservedPacketConn(&smartObservedTestPacketConn{}, time.Now().Add(-2*time.Second), true, func(time.Duration) {
+		failures.Add(1)
+	})
+	if _, err := conn.WriteTo([]byte("quic"), &net.UDPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("transactional UDP failure count=%d, want 1", failures.Load())
+	}
+}
+
+func TestSmartUDPResponseAndOneWayTrafficDoNotFail(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		expectResponse bool
+		response       []byte
+	}{
+		{name: "transaction received response", expectResponse: true, response: []byte("ok")},
+		{name: "one way UDP", expectResponse: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var failures atomic.Int64
+			conn := newSmartObservedPacketConn(&smartObservedTestPacketConn{response: test.response}, time.Now().Add(-2*time.Second), test.expectResponse, func(time.Duration) {
+				failures.Add(1)
+			})
+			if _, err := conn.WriteTo([]byte("payload"), &net.UDPAddr{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(test.response) > 0 {
+				buffer := make([]byte, 16)
+				if _, _, err := conn.ReadFrom(buffer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if failures.Load() != 0 {
+				t.Fatalf("false UDP failure count=%d", failures.Load())
+			}
+		})
+	}
+}
+
 func TestSmartBrokenPermanentPinIsRetained(t *testing.T) {
 	first := newSmartFakeOutbound("first", errors.New("dial failed"))
 	second := newSmartFakeOutbound("second", nil)

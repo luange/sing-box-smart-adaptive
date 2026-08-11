@@ -239,7 +239,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		defer conn.Close()
 		client := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		redirect := conn.LocalAddr().(*net.TCPAddr).AddrPort()
-		original, lookupErr := backend.LookupOriginal(ECommon.ProtocolTCP, client, redirect)
+		original, lookupErr := backend.TakeOriginal(ECommon.ProtocolTCP, client, redirect)
 		if lookupErr != nil {
 			tcpResult <- lookupErr
 			return
@@ -250,6 +250,10 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		}
 		if original.IngressIfIndex == 0 {
 			tcpResult <- errors.New("missing TCP ingress interface index")
+			return
+		}
+		if _, secondErr := backend.LookupOriginal(ECommon.ProtocolTCP, client, redirect); secondErr == nil {
+			tcpResult <- errors.New("consumed TCP original destination remained readable")
 			return
 		}
 		_, writeErr := conn.Write([]byte("tcp-ok"))
@@ -285,7 +289,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		defer conn.Close()
 		client := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		redirect := conn.LocalAddr().(*net.TCPAddr).AddrPort()
-		original, lookupErr := backend.LookupOriginal(ECommon.ProtocolTCP, client, redirect)
+		original, lookupErr := backend.TakeOriginal(ECommon.ProtocolTCP, client, redirect)
 		if lookupErr != nil {
 			macTCPResult <- lookupErr
 			return
@@ -369,7 +373,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		defer conn.Close()
 		client := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
 		redirect := conn.LocalAddr().(*net.TCPAddr).AddrPort()
-		original, lookupErr := backend.LookupOriginal(ECommon.ProtocolTCP, client, redirect)
+		original, lookupErr := backend.TakeOriginal(ECommon.ProtocolTCP, client, redirect)
 		if lookupErr != nil {
 			tcp6Result <- lookupErr
 			return
@@ -434,6 +438,19 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		if original.IngressIfIndex == 0 {
 			udpResult <- errors.New("missing UDP ingress interface index")
 			return
+		}
+		// UDP uses one shared listener for the complete flow. Multiple queued
+		// datagrams must be able to resolve the same original tuple.
+		if socketAssign {
+			second, secondErr := backend.LookupOriginal(ECommon.ProtocolUDP, client, redirect)
+			if secondErr != nil {
+				udpResult <- secondErr
+				return
+			}
+			if second.Destination != original.Destination {
+				udpResult <- &unexpectedDestinationError{second.Destination}
+				return
+			}
 		}
 		if socketAssign {
 			udpResult <- writeTransparentUDPResponse(original.Destination, client, append([]byte("udp-ok:"), payload[:n]...))
