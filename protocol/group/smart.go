@@ -207,36 +207,45 @@ type Smart struct {
 	reachLastRun map[string]time.Time
 	reachForce   atomic.Bool
 
-	store                *smartStore
-	probeURL             string
-	probeInterval        time.Duration
-	probeCycleTimeout    time.Duration
-	probeTimeout         time.Duration
-	maxAttempts          int
-	attemptTimeout       time.Duration
-	siteStickiness       time.Duration
-	switchMargin         float64
-	exploration          float64
-	minSamples           int
-	halfLife             time.Duration
-	breakerFailures      int
-	breakerCooldown      time.Duration
-	historyRetention     time.Duration
-	maxHistoryEntries    int
-	interruptGroup       *interrupt.Group
-	interruptExternal    bool
-	probing              atomic.Bool
-	probeCursor          atomic.Uint64
-	closing              atomic.Bool
-	cancel               context.CancelFunc
-	worker               sync.WaitGroup
-	lifecycleAccess      sync.Mutex
-	postStarted          bool
-	retired              bool
-	workerStarted        bool
-	probeRegistry        *smartProbeRegistry
-	releaseProbeRegistry func()
-	probeStartupDelay    time.Duration
+	store                  *smartStore
+	probeURL               string
+	probeInterval          time.Duration
+	probeCycleTimeout      time.Duration
+	probeTimeout           time.Duration
+	maxAttempts            int
+	attemptTimeout         time.Duration
+	siteStickiness         time.Duration
+	switchMargin           float64
+	exploration            float64
+	minSamples             int
+	halfLife               time.Duration
+	breakerFailures        int
+	breakerCooldown        time.Duration
+	historyRetention       time.Duration
+	maxHistoryEntries      int
+	interruptGroup         *interrupt.Group
+	interruptExternal      bool
+	interruptMode          string
+	interruptIdle          time.Duration
+	interruptLongAge       time.Duration
+	interruptGrace         time.Duration
+	switchesTotal          atomic.Uint64
+	switchesForceAll       atomic.Uint64
+	switchesSelective      atomic.Uint64
+	connectionsInterrupted atomic.Uint64
+	connectionsKept        atomic.Uint64
+	probing                atomic.Bool
+	probeCursor            atomic.Uint64
+	closing                atomic.Bool
+	cancel                 context.CancelFunc
+	worker                 sync.WaitGroup
+	lifecycleAccess        sync.Mutex
+	postStarted            bool
+	retired                bool
+	workerStarted          bool
+	probeRegistry          *smartProbeRegistry
+	releaseProbeRegistry   func()
+	probeStartupDelay      time.Duration
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -315,6 +324,38 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if maxHistoryEntries <= 0 {
 		maxHistoryEntries = defaultSmartMaxHistoryEntries
 	}
+	interruptMode := options.InterruptPolicy.Mode
+	if interruptMode == "" {
+		if options.InterruptConnections {
+			interruptMode = "all"
+		} else {
+			interruptMode = "none"
+		}
+	}
+	if interruptMode != "none" && interruptMode != "selective" && interruptMode != "all" {
+		return nil, E.New("invalid smart interrupt_policy.mode: ", interruptMode)
+	}
+	interruptIdle := time.Duration(options.InterruptPolicy.IdleThreshold)
+	if interruptIdle <= 0 {
+		interruptIdle = 10 * time.Second
+	}
+	if interruptIdle < 5*time.Second {
+		return nil, E.New("smart interrupt_policy.idle_threshold must be at least 5s")
+	}
+	interruptLongAge := time.Duration(options.InterruptPolicy.LongConnectionAge)
+	if interruptLongAge <= 0 {
+		interruptLongAge = 30 * time.Second
+	}
+	if interruptLongAge < 15*time.Second {
+		return nil, E.New("smart interrupt_policy.long_connection_age must be at least 15s")
+	}
+	interruptGrace := time.Duration(options.InterruptPolicy.GracePeriod)
+	if interruptGrace <= 0 {
+		interruptGrace = 3 * time.Second
+	}
+	if options.InterruptPolicy.Mode != "" && options.InterruptConnections && logger != nil {
+		logger.Warn("smart interrupt_policy overrides deprecated interrupt_exist_connections")
+	}
 	historyPath := options.HistoryPath
 	if historyPath != "" && logger != nil {
 		// S2: field kept for config compat; no effect since rc44.
@@ -368,6 +409,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		maxHistoryEntries:    maxHistoryEntries,
 		interruptGroup:       interrupt.NewGroup(),
 		interruptExternal:    options.InterruptConnections,
+		interruptMode:        interruptMode,
+		interruptIdle:        interruptIdle,
+		interruptLongAge:     interruptLongAge,
+		interruptGrace:       interruptGrace,
 		reachTests:           reachTests,
 		reachResults:         make(map[string]map[string]adapter.SmartReachCandidateStatus),
 		reachLastRun:         make(map[string]time.Time),
@@ -575,6 +620,11 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.Candidates = append([]adapter.SmartCandidateStatus(nil), status.Candidates...)
 	status.StateCounts = cloneSmartStateCounts(status.StateCounts)
 	status.ReachTests = s.reachTestStatus()
+	status.SwitchesTotal = s.switchesTotal.Load()
+	status.SwitchesForceAll = s.switchesForceAll.Load()
+	status.SwitchesSelective = s.switchesSelective.Load()
+	status.ConnectionsInterrupted = s.connectionsInterrupted.Load()
+	status.ConnectionsKept = s.connectionsKept.Load()
 	return status
 }
 
@@ -703,7 +753,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex)
-		conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx))
+		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
 			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
 		}, func(bytes int64, duration time.Duration) {
@@ -924,7 +974,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex)
-		return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		return s.interruptGroup.NewPacketConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible UDP candidates failed")
 	if len(attemptErrors) == 0 {
@@ -1068,7 +1118,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	s.access.RLock()
 	ranking := acquireSmartRanking(len(s.candidates))
 	ranking.candidates = append(ranking.candidates, s.candidates...)
-	lastSelected := s.lastSelected[networkKey+"\x00"+transport]
+	lastSelected := s.lastSelected[smartSelectionKey(networkKey, siteKey, transport)]
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
 	s.access.RUnlock()
 
@@ -1228,7 +1278,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 
 func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int) {
 	now := time.Now()
-	key := networkKey + "\x00" + transport
+	key := smartSelectionKey(networkKey, siteKey, transport)
 	affinityKey := networkKey + "\x00" + siteKey + "\x00" + transport
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
@@ -1245,7 +1295,56 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, candidate.Tag(), reason)
 	if previous != "" && previous != candidate.Tag() {
-		s.interruptGroup.Interrupt(s.interruptExternal)
+		s.interruptPreviousCandidate(networkKey, siteKey, transport, previous, candidate.Tag())
+	}
+}
+
+func smartSelectionKey(networkKey, siteKey, transport string) string {
+	return networkKey + "\x00" + siteKey + "\x00" + transport
+}
+
+func smartConnectionKey(networkKey, siteKey, transport, candidate string) string {
+	return smartSelectionKey(networkKey, siteKey, transport) + "\x00" + candidate
+}
+
+func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previous, current string) {
+	if s.interruptMode == "none" {
+		return
+	}
+	forceAll := s.interruptMode == "all"
+	if !forceAll && s.probeRegistry != nil {
+		s.access.RLock()
+		probeKey := s.candidateProbeKey[previous]
+		s.access.RUnlock()
+		forceAll = s.probeRegistry.dead(probeKey)
+	}
+	if !forceAll {
+		forceAll = s.store.candidateDead(previous, time.Now())
+	}
+	policy := interrupt.InterruptPolicy{
+		IdleThreshold: s.interruptIdle,
+		LongConnAge:   s.interruptLongAge,
+		GracePeriod:   s.interruptGrace,
+		ForceAll:      forceAll,
+		TargetKey:     smartConnectionKey(networkKey, siteKey, transport, previous),
+	}
+	result := s.interruptGroup.InterruptSelective(policy)
+	s.switchesTotal.Add(1)
+	if forceAll {
+		s.switchesForceAll.Add(1)
+	} else {
+		s.switchesSelective.Add(1)
+	}
+	s.connectionsInterrupted.Add(uint64(result.Interrupted))
+	s.connectionsKept.Add(uint64(result.Kept))
+	if s.logger != nil {
+		reason := "latency"
+		if forceAll {
+			reason = "node_dead"
+		}
+		s.logger.Info("smart switch ", previous, " -> ", current, " reason=", reason,
+			" interrupted=", result.Interrupted, " idle=", result.Idle,
+			" short=", result.Short, " kept=", result.Kept, " kept_long=", result.KeptLong)
 	}
 }
 

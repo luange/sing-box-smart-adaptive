@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/sagernet/sing-box/common/dnsmux"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
 )
 
@@ -90,7 +91,9 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 						sharedStats.TokenFailures > lastSharedStats.TokenFailures ||
 						sharedStats.RewriteFailures > lastSharedStats.RewriteFailures ||
 						sharedStats.SocketAssignFailures > lastSharedStats.SocketAssignFailures ||
-						sharedStats.FlowUpdateFailures > lastSharedStats.FlowUpdateFailures
+						sharedStats.FlowUpdateFailures > lastSharedStats.FlowUpdateFailures ||
+						sharedStats.FallbackOpen > lastSharedStats.FallbackOpen ||
+						sharedStats.OriginalDstLost > lastSharedStats.OriginalDstLost
 					i.logSharedRuntimeStatsValue(reason, sharedStats, warning)
 					lastSharedStats = sharedStats
 				}
@@ -132,18 +135,30 @@ func (i *Inbound) logUDPNATMemoryStats(reason string) {
 	runtime.ReadMemStats(&memory)
 	dataSessions, dnsSessions := 0, 0
 	sharedDataSessions, sharedDNSSessions := 0, 0
+	var dataRejected, dataQueueDrops uint64
+	var sharedDataRejected, sharedDataQueueDrops uint64
 	if i.udpNat != nil {
-		dataSessions = i.udpNat.Len()
+		dataStats := i.udpNat.RuntimeStats()
+		dataSessions = int(dataStats.Sessions)
+		dataRejected = dataStats.NewSessionRejected
+		dataQueueDrops = dataStats.QueueDrops
 	}
-	if i.dnsUDPNat != nil {
-		dnsSessions = i.dnsUDPNat.Len()
+	var dnsMuxStats dnsmux.RuntimeStats
+	var sharedDNSMuxStats dnsmux.RuntimeStats
+	if i.dnsMux != nil {
+		dnsMuxStats = i.dnsMux.RuntimeStats()
+		dnsSessions = int(dnsMuxStats.Lanes)
 	}
 	if i.sharedNetwork != nil {
 		if i.sharedNetwork.udpNat != nil {
-			sharedDataSessions = i.sharedNetwork.udpNat.Len()
+			sharedDataStats := i.sharedNetwork.udpNat.RuntimeStats()
+			sharedDataSessions = int(sharedDataStats.Sessions)
+			sharedDataRejected = sharedDataStats.NewSessionRejected
+			sharedDataQueueDrops = sharedDataStats.QueueDrops
 		}
-		if i.sharedNetwork.dnsUDPNat != nil {
-			sharedDNSSessions = i.sharedNetwork.dnsUDPNat.Len()
+		if i.sharedNetwork.dnsMux != nil {
+			sharedDNSMuxStats = i.sharedNetwork.dnsMux.RuntimeStats()
+			sharedDNSSessions = int(sharedDNSMuxStats.Lanes)
 		}
 	}
 	i.logger.Info("eBPF userspace metrics: reason=", reason,
@@ -151,7 +166,19 @@ func (i *Inbound) logUDPNATMemoryStats(reason string) {
 		", dns:", dnsSessions,
 		", shared_data:", sharedDataSessions,
 		", shared_dns:", sharedDNSSessions,
-		"}, goroutines=", runtime.NumGoroutine(),
+		"}, dns_transactions=", dnsMuxStats.Transactions,
+		", dns_misses=", dnsMuxStats.TransactionMisses,
+		", dns_rejected=", dnsMuxStats.AdmissionRejected,
+		", dns_queue_drops=", dnsMuxStats.QueueDrops,
+		", shared_dns_transactions=", sharedDNSMuxStats.Transactions,
+		", shared_dns_misses=", sharedDNSMuxStats.TransactionMisses,
+		", shared_dns_rejected=", sharedDNSMuxStats.AdmissionRejected,
+		", shared_dns_queue_drops=", sharedDNSMuxStats.QueueDrops,
+		", data_rejected=", dataRejected,
+		", data_queue_drops=", dataQueueDrops,
+		", shared_data_rejected=", sharedDataRejected,
+		", shared_data_queue_drops=", sharedDataQueueDrops,
+		", goroutines=", runtime.NumGoroutine(),
 		", heap_alloc=", memory.HeapAlloc)
 }
 
@@ -278,6 +305,9 @@ func (i *Inbound) logSharedRuntimeStatsValue(
 		", socket_assign={success:", stats.SocketAssignments,
 		", failures:", stats.SocketAssignFailures,
 		", flow_update_failures:", stats.FlowUpdateFailures,
+		", fallback_open:", stats.FallbackOpen,
+		", established_bypass:", stats.EstablishedBypass,
+		", original_dst_lost:", stats.OriginalDstLost,
 		"}",
 	}
 	if warning {

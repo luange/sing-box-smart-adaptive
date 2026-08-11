@@ -91,6 +91,31 @@ func TestSmartSiteFailuresDoNotOpenGlobalCircuit(t *testing.T) {
 	}
 }
 
+func TestSmartCandidateDeadRequiresRecentGlobalConsecutiveFailures(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Now()
+	for range 2 {
+		store.observeDial(now, "ethernet", "", "node-a", "tcp", false, time.Second)
+	}
+	if store.candidateDead("node-a", now) {
+		t.Fatal("two failures must not mark candidate dead")
+	}
+	store.observeDial(now, "ethernet", "", "node-a", "tcp", false, time.Second)
+	if !store.candidateDead("node-a", now) {
+		t.Fatal("three recent failures must mark candidate dead")
+	}
+	store.observeDial(now, "ethernet", "", "node-a", "tcp", true, time.Millisecond)
+	if store.candidateDead("node-a", now) {
+		t.Fatal("success must clear candidate death")
+	}
+	for range 3 {
+		store.observeDial(now.Add(-time.Minute), "ethernet", "", "node-a", "tcp", false, time.Second)
+	}
+	if store.candidateDead("node-a", now) {
+		t.Fatal("stale failures must not mark candidate dead")
+	}
+}
+
 func TestSmartTCPAndUDPStateAreIndependent(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(5000, 0)

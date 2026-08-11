@@ -83,6 +83,18 @@ func TestSmartProbeCadence(t *testing.T) {
 	require.Equal(t, 5*time.Minute, smartProbeCadence(false, 0, 3))
 }
 
+func TestSmartProbeRegistryDeadRequiresThreeConsecutiveFailures(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	key := "endpoint"
+	registry.entries[key] = &smartProbeEntry{result: smartProbeResult{success: false, failures: 2}}
+	require.False(t, registry.dead(key))
+	registry.entries[key].result.failures = 3
+	require.True(t, registry.dead(key))
+	registry.entries[key].result.success = true
+	require.False(t, registry.dead(key))
+}
+
 func TestSmartProbeStartupDelay(t *testing.T) {
 	registry := newSmartProbeRegistry(context.Background())
 	defer registry.close()

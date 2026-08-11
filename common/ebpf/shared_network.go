@@ -45,6 +45,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -67,6 +68,8 @@ const (
 	sharedStatSocketAssignments
 	sharedStatSocketAssignFailures
 	sharedStatFlowUpdateFailures
+	sharedStatFallbackOpen
+	sharedStatEstablishedBypass
 	sharedStatCount
 )
 
@@ -81,6 +84,9 @@ type SharedNetworkRuntimeStats struct {
 	SocketAssignments    uint64
 	SocketAssignFailures uint64
 	FlowUpdateFailures   uint64
+	FallbackOpen         uint64
+	EstablishedBypass    uint64
+	OriginalDstLost      uint64
 }
 
 //go:embed native/shared_network_v2.bpf.o
@@ -143,11 +149,12 @@ const (
 )
 
 type SharedNetworkBackend struct {
-	access   sync.RWMutex
-	runtime  *C.struct_sb_ebpf_shared_network_runtime
-	control  sharedNetworkControl
-	hostIPv4 []netip.Prefix
-	hostIPv6 []netip.Prefix
+	access          sync.RWMutex
+	runtime         *C.struct_sb_ebpf_shared_network_runtime
+	control         sharedNetworkControl
+	hostIPv4        []netip.Prefix
+	hostIPv6        []netip.Prefix
+	originalDstLost atomic.Uint64
 }
 
 func PrepareSharedNetwork(
@@ -497,6 +504,9 @@ func (b *SharedNetworkBackend) RuntimeStats() (SharedNetworkRuntimeStats, error)
 		SocketAssignments:    values[sharedStatSocketAssignments],
 		SocketAssignFailures: values[sharedStatSocketAssignFailures],
 		FlowUpdateFailures:   values[sharedStatFlowUpdateFailures],
+		FallbackOpen:         values[sharedStatFallbackOpen],
+		EstablishedBypass:    values[sharedStatEstablishedBypass],
+		OriginalDstLost:      b.originalDstLost.Load(),
 	}, nil
 }
 
@@ -523,7 +533,11 @@ func (b *SharedNetworkBackend) LookupOriginal(
 		unsafe.Pointer(&key),
 		unsafe.Pointer(&original),
 	); err != nil {
+		b.originalDstLost.Add(1)
 		return OriginalDestination{}, E.Cause(err, "lookup shared-network original destination")
+	}
+	if err = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
+		return OriginalDestination{}, E.Cause(err, "delete consumed shared-network original destination")
 	}
 	address, err := originalDestinationAddress(original)
 	if err != nil {

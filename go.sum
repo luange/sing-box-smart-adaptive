@@ -195,6 +195,8 @@ github.com/luange/sing v0.8.0-beta.11.0.20260809091550-2a7137bfa3fe h1:kzJtQLOwU
 github.com/luange/sing v0.8.0-beta.11.0.20260809091550-2a7137bfa3fe/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/luange/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda h1:AkKxs80ayNXX6djgjtBEMdHV+AH/X36cYBojtvHEzSs=
 github.com/luange/sing v0.8.0-beta.11.0.20260809093149-e80fadbaacda/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/luange/sing v0.8.0-beta.11.0.20260811080023-ede5c3f06a70 h1:0yQ7d0IY5ruXhrx9XRcmQmoA33GNqjb5P6zvIRkVkfA=
+github.com/luange/sing v0.8.0-beta.11.0.20260811080023-ede5c3f06a70/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/luange/sing-anytls v0.0.14-0.20260803151749-763fb5bccb9d h1:oz5pmcbXoQLqXZ7zYAnyr6hoCFyRvbqqp6wODYsh+w4=
 github.com/luange/sing-anytls v0.0.14-0.20260803151749-763fb5bccb9d/go.mod h1:7rjN6IukwysmdusYsrV51Fgu1uW6vsrdd6ctjnEAln8=
 github.com/luange/sing-snell v0.0.0-20260808134633-c120d40d0d5b h1:pYkkyAb/LAvq2DZg/lfccO9Dw1jK1bq26IJpenc5cgE=

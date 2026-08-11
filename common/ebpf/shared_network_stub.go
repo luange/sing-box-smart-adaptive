@@ -24,6 +24,9 @@ type SharedNetworkRuntimeStats struct {
 	SocketAssignments    uint64
 	SocketAssignFailures uint64
 	FlowUpdateFailures   uint64
+	FallbackOpen         uint64
+	EstablishedBypass    uint64
+	OriginalDstLost      uint64
 }
 
 func PrepareSharedNetwork(

@@ -137,6 +137,16 @@ func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
 	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.nextProbeAt.IsZero() && time.Now().Before(entry.result.nextProbeAt)
 }
 
+func (r *smartProbeRegistry) dead(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	r.access.Lock()
+	defer r.access.Unlock()
+	entry := r.entries[key]
+	return entry != nil && !entry.inflight && !entry.result.success && entry.result.failures >= 3
+}
+
 func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
 	if success {
 		switch successes {

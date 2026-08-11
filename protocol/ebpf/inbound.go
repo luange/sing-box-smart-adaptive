@@ -19,6 +19,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/dnsmux"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
@@ -64,7 +65,7 @@ type Inbound struct {
 	listener4          *listener.Listener
 	listener6          *listener.Listener
 	udpNat             *udpnat.Service
-	dnsUDPNat          *udpnat.Service
+	dnsMux             *dnsmux.Service
 	backend            *ECommon.Backend
 	protectRegistered  bool
 	listenPort         uint16
@@ -222,12 +223,18 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
 		Timeout:    udpTimeout,
 		Capacity:   udpSessionCapacity,
-		QueueDepth: 8,
+		QueueDepth: 64,
 	})
-	inbound.dnsUDPNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpnat.Options{
-		Timeout:    min(udpTimeout, C.DNSTimeout),
-		Capacity:   dnsSessionCapacity,
-		QueueDepth: 4,
+	inbound.dnsMux = dnsmux.New(dnsmux.Options{
+		Handler: inbound,
+		Timeout: min(udpTimeout, C.DNSTimeout),
+		Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			ok, prepareCtx, writer, onClose := inbound.preparePacketConnection(source, destination, userData)
+			if !ok {
+				return prepareCtx, nil, onClose
+			}
+			return prepareCtx, writer, onClose
+		},
 	})
 	inbound.udpCleanupInterval = udpNATCleanupInterval(udpTimeout)
 	if redirectIPv4.IsValid() {
@@ -241,11 +248,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 func normalizeUDPNATCapacities(dataCapacity, dnsCapacity uint32) (uint32, uint32, []string) {
 	const (
-		defaultDataCapacity = 512
-		// DNS is request-oriented and should not consume the same budget as
-		// long-lived data UDP. Keep a small bounded pool by default; deployments
-		// with unusually high concurrent DNS fan-out can override it explicitly.
-		defaultDNSCapacity  = 16
+		defaultDataCapacity = 1024
+		defaultDNSCapacity  = 1024
 		minimumDataCapacity = 64
 		minimumDNSCapacity  = 16
 		maximumCapacity     = 8192
@@ -566,7 +570,7 @@ func (i *Inbound) closeLocked() error {
 	i.stopRuntimeStatsMonitor()
 	i.stopUDPNATCleanup()
 	i.udpNat.Purge()
-	i.dnsUDPNat.Purge()
+	i.dnsMux.Close()
 	i.stopBypassRuleSets()
 	offloadErr := i.closeOutboundOffload()
 	var sharedErr error
@@ -625,10 +629,8 @@ func (i *Inbound) startUDPNATCleanup() {
 				return
 			case <-ticker.C:
 				i.udpNat.PurgeExpired()
-				i.dnsUDPNat.PurgeExpired()
 				if i.sharedNetwork != nil {
 					i.sharedNetwork.udpNat.PurgeExpired()
-					i.sharedNetwork.dnsUDPNat.PurgeExpired()
 				}
 			}
 		}
@@ -1071,6 +1073,7 @@ func (i *Inbound) logBypassCIDRUpdate() {
 
 func (i *Inbound) InterfaceUpdated() {
 	i.udpNat.Purge()
+	i.dnsMux.Purge()
 	i.bypassRuleSetAccess.Lock()
 	var updated bool
 	var refreshErr error
@@ -1170,11 +1173,11 @@ func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) 
 	)
 	i.udpClients.setUID(client, original.UID)
 	i.deleteUDPRedirects(releasedRedirects)
-	natService := i.udpNat
 	if original.Destination.Port() == 53 {
-		natService = i.dnsUDPNat
+		i.dnsMux.NewPacket(buffer.Bytes(), source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
+		return
 	}
-	natService.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
+	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
 }
 
 func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {

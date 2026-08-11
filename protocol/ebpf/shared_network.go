@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dnsmux"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/redir"
@@ -66,7 +68,7 @@ type sharedNetwork struct {
 	udp4         *listener.Listener
 	udp6         *listener.Listener
 	udpNat       *udpnat.Service
-	dnsUDPNat    *udpnat.Service
+	dnsMux       *dnsmux.Service
 	udpClients   udpClientTable
 	udpWarnings  udpWarningLimiters
 	listenPort   uint16
@@ -150,7 +152,7 @@ func validateSharedNetworkProtocols(options option.EBPFSharedNetworkOptions, ena
 
 func sharedNetworkDropUDP443(options option.EBPFSharedNetworkOptions) bool {
 	if options.DropUDP443 == nil {
-		return true
+		return false
 	}
 	return *options.DropUDP443
 }
@@ -180,12 +182,25 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 	shared.udpNat = udpnat.NewWithOptions(shared, shared.preparePacketConnection, udpnat.Options{
 		Timeout:    udpTimeout,
 		Capacity:   parent.udpSessionCapacity,
-		QueueDepth: 8,
+		QueueDepth: 64,
 	})
-	shared.dnsUDPNat = udpnat.NewWithOptions(shared, shared.preparePacketConnection, udpnat.Options{
-		Timeout:    min(udpTimeout, C.DNSTimeout),
-		Capacity:   parent.dnsSessionCapacity,
-		QueueDepth: 4,
+	shared.dnsMux = dnsmux.New(dnsmux.Options{
+		Handler: shared,
+		Timeout: min(udpTimeout, C.DNSTimeout),
+		LaneKey: func(source M.Socksaddr, userData any) string {
+			var suffix string
+			if ifIndex, loaded := userData.(uint32); loaded {
+				suffix = strconv.FormatUint(uint64(ifIndex), 10)
+			}
+			return dnsmux.AddressLaneKey(source, suffix)
+		},
+		Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			ok, prepareCtx, writer, onClose := shared.preparePacketConnection(source, destination, userData)
+			if !ok {
+				return prepareCtx, nil, onClose
+			}
+			return prepareCtx, writer, onClose
+		},
 	})
 	return shared
 }
@@ -373,7 +388,7 @@ func (s *sharedNetwork) registerListenerSockets() error {
 
 func (s *sharedNetwork) InterfaceUpdated() {
 	s.udpNat.Purge()
-	s.dnsUDPNat.Purge()
+	s.dnsMux.Purge()
 	if s.flowVerdict && s.backend != nil {
 		if err := s.backend.InvalidateFlowDirect(); err != nil {
 			s.parent.logger.Debug("invalidate shared-network direct flow verdicts: ", err)
@@ -391,6 +406,7 @@ func (s *sharedNetwork) Close() error {
 	s.closeAccess.Lock()
 	defer s.closeAccess.Unlock()
 	s.udpNat.Purge()
+	s.dnsMux.Close()
 	if s.tc != nil {
 		if err := s.tc.Close(); err != nil {
 			return err
@@ -490,11 +506,11 @@ func (s *sharedNetwork) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 	}
 	released := s.udpClients.setBinding(client, original.Destination, redirect.Addr(), false)
 	s.deleteUDPRedirects(client, released)
-	natService := s.udpNat
 	if original.Destination.Port() == 53 {
-		natService = s.dnsUDPNat
+		s.dnsMux.NewPacket(buffer.Bytes(), source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
+		return
 	}
-	natService.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
+	s.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.IngressIfIndex)
 }
 
 func (s *sharedNetwork) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {

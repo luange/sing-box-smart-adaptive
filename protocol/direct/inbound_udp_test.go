@@ -13,8 +13,8 @@ func TestDirectUDPNATOptions(t *testing.T) {
 		ListenOptions: option.ListenOptions{ListenPort: 53},
 	}, 5*time.Second)
 	require.NoError(t, err)
-	require.Equal(t, uint32(16), dnsOptions.Capacity)
-	require.Equal(t, 2, dnsOptions.QueueDepth)
+	require.Equal(t, uint32(1024), dnsOptions.Capacity)
+	require.Equal(t, 64, dnsOptions.QueueDepth)
 
 	dataOptions, err := directUDPNATOptions(option.DirectInboundOptions{}, time.Minute)
 	require.NoError(t, err)

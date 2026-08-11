@@ -174,6 +174,23 @@ func (s *smartStore) observeDial(now time.Time, network, site, candidate, transp
 	}
 }
 
+func (s *smartStore) candidateDead(candidate string, now time.Time) bool {
+	if s == nil || candidate == "" {
+		return false
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	for key, metric := range s.metrics {
+		if key.Candidate != candidate || key.Site != "" || now.Sub(metric.LastUpdated) > 30*time.Second {
+			continue
+		}
+		if metric.ConsecutiveFailures >= 3 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *smartStore) observeDialLocked(now time.Time, key smartMetricKey, success bool, elapsed time.Duration, weight float64, updateBreaker bool) {
 	metric := s.metric(key, now)
 	metric.decay(now, s.halfLife)

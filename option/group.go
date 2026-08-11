@@ -50,24 +50,32 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL                  string                  `json:"url,omitempty"`
-	ProbeInterval        badoption.Duration      `json:"probe_interval,omitempty"`
-	ProbeCycleTimeout    badoption.Duration      `json:"probe_cycle_timeout,omitempty"`
-	ProbeTimeout         badoption.Duration      `json:"probe_timeout,omitempty"`
-	MaxAttempts          int                     `json:"max_attempts,omitempty"`
-	AttemptTimeout       badoption.Duration      `json:"attempt_timeout,omitempty"`
-	SiteStickiness       badoption.Duration      `json:"site_stickiness,omitempty"`
-	SwitchMargin         *float64                `json:"switch_margin,omitempty"`
-	Exploration          *float64                `json:"exploration,omitempty"`
-	MinSamples           int                     `json:"min_samples,omitempty"`
-	BreakerFailures      int                     `json:"breaker_failures,omitempty"`
-	BreakerCooldown      badoption.Duration      `json:"breaker_cooldown,omitempty"`
-	HalfLife             badoption.Duration      `json:"half_life,omitempty"`
-	HistoryPath          string                  `json:"history_path,omitempty"`
-	HistoryRetention     badoption.Duration      `json:"history_retention,omitempty"`
-	MaxHistoryEntries    int                     `json:"max_history_entries,omitempty"`
-	InterruptConnections bool                    `json:"interrupt_exist_connections,omitempty"`
-	ReachTests           []SmartReachTestOptions `json:"reach_tests,omitempty"`
+	URL                  string                      `json:"url,omitempty"`
+	ProbeInterval        badoption.Duration          `json:"probe_interval,omitempty"`
+	ProbeCycleTimeout    badoption.Duration          `json:"probe_cycle_timeout,omitempty"`
+	ProbeTimeout         badoption.Duration          `json:"probe_timeout,omitempty"`
+	MaxAttempts          int                         `json:"max_attempts,omitempty"`
+	AttemptTimeout       badoption.Duration          `json:"attempt_timeout,omitempty"`
+	SiteStickiness       badoption.Duration          `json:"site_stickiness,omitempty"`
+	SwitchMargin         *float64                    `json:"switch_margin,omitempty"`
+	Exploration          *float64                    `json:"exploration,omitempty"`
+	MinSamples           int                         `json:"min_samples,omitempty"`
+	BreakerFailures      int                         `json:"breaker_failures,omitempty"`
+	BreakerCooldown      badoption.Duration          `json:"breaker_cooldown,omitempty"`
+	HalfLife             badoption.Duration          `json:"half_life,omitempty"`
+	HistoryPath          string                      `json:"history_path,omitempty"`
+	HistoryRetention     badoption.Duration          `json:"history_retention,omitempty"`
+	MaxHistoryEntries    int                         `json:"max_history_entries,omitempty"`
+	InterruptConnections bool                        `json:"interrupt_exist_connections,omitempty"`
+	InterruptPolicy      SmartInterruptPolicyOptions `json:"interrupt_policy,omitempty"`
+	ReachTests           []SmartReachTestOptions     `json:"reach_tests,omitempty"`
+}
+
+type SmartInterruptPolicyOptions struct {
+	Mode              string             `json:"mode,omitempty"`
+	IdleThreshold     badoption.Duration `json:"idle_threshold,omitempty"`
+	LongConnectionAge badoption.Duration `json:"long_connection_age,omitempty"`
+	GracePeriod       badoption.Duration `json:"grace_period,omitempty"`
 }
 
 type SmartReachTestOptions struct {

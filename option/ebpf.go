@@ -66,8 +66,8 @@ type EBPFSharedNetworkOptions struct {
 	// Set higher (e.g. 10) if you need other TC filters at prio 1 to run first.
 	TCPriority uint16 `json:"tc_priority,omitempty"`
 	// DropUDP443 drops QUIC (UDP/443) inside the TC program before divert, matching classic
-	// tproxy nft bypass ("udp dport 443 drop") so clients fall back to TCP. Default true when omitted.
-	// Set to false to allow UDP/443 through shared_network (experimental).
+	// tproxy nft bypass ("udp dport 443 drop") so clients fall back to TCP. Default false when omitted;
+	// enable only as an explicit compatibility policy because it disables QUIC/HTTP3.
 	DropUDP443 *bool `json:"drop_udp_443,omitempty"`
 	// FlowVerdict enables the dae-style exact-flow direct fast path. After a
 	// userspace route proves a flow is DIRECT, subsequent packets bypass the

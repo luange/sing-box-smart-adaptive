@@ -15,6 +15,13 @@
 #define SB_DP2_AF_INET 2U
 #define SB_DP2_AF_INET6 10U
 
+struct sb_dp2_ipv6_frag_hdr {
+    __u8 nexthdr;
+    __u8 reserved;
+    __be16 frag_off;
+    __be32 identification;
+};
+
 static __attribute__((always_inline)) void sb_dp2_copy4(__u8 out[16], __be32 value) {
     __builtin_memset(out, 0, 16);
     __builtin_memcpy(out, &value, 4);
@@ -56,6 +63,25 @@ static __attribute__((always_inline)) int sb_dp2_parse(void *data, void *data_en
         packet->protocol = ip6->nexthdr;
         __builtin_memcpy(packet->source, &ip6->saddr, 16);
         __builtin_memcpy(packet->destination, &ip6->daddr, 16);
+#pragma unroll
+        for (int extension = 0; extension < 3; extension++) {
+            if (packet->protocol == IPPROTO_FRAGMENT) {
+				struct sb_dp2_ipv6_frag_hdr *fragment = data + transport_offset;
+                if ((void *)(fragment + 1) > data_end) return -1;
+                packet->fragmented = 1;
+                packet->protocol = fragment->nexthdr;
+                transport_offset += sizeof(*fragment);
+                break;
+            }
+            if (packet->protocol != IPPROTO_HOPOPTS && packet->protocol != IPPROTO_ROUTING &&
+                packet->protocol != IPPROTO_DSTOPTS) break;
+            struct ipv6_opt_hdr *option = data + transport_offset;
+            if ((void *)(option + 1) > data_end) return -1;
+            __u64 option_length = ((__u64)option->hdrlen + 1U) * 8U;
+            if (option_length < 8U || data + transport_offset + option_length > data_end) return -1;
+            packet->protocol = option->nexthdr;
+            transport_offset += option_length;
+        }
     } else {
         return -1;
     }

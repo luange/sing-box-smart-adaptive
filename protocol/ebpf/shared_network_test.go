@@ -112,12 +112,12 @@ func TestSharedNetworkTCPriorityPrecedesAndroidTethering(t *testing.T) {
 	if sharedNetworkResolveTCPriority(option.EBPFSharedNetworkOptions{TCPriority: 10}) != 10 {
 		t.Fatal("expected explicit tc_priority to be honored")
 	}
-	if !sharedNetworkDropUDP443(option.EBPFSharedNetworkOptions{}) {
-		t.Fatal("expected drop_udp_443 default true")
+	if sharedNetworkDropUDP443(option.EBPFSharedNetworkOptions{}) {
+		t.Fatal("expected drop_udp_443 default false")
 	}
-	off := false
-	if sharedNetworkDropUDP443(option.EBPFSharedNetworkOptions{DropUDP443: &off}) {
-		t.Fatal("expected drop_udp_443=false to disable")
+	on := true
+	if !sharedNetworkDropUDP443(option.EBPFSharedNetworkOptions{DropUDP443: &on}) {
+		t.Fatal("expected drop_udp_443=true to enable explicit compatibility drop")
 	}
 }
 

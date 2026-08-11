@@ -29,8 +29,8 @@ struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
     }
 
 EXTERNAL_MAP(shared_control, BPF_MAP_TYPE_HASH, __u32, struct sb_shared_control, 1U, 0U);
-EXTERNAL_MAP(shared_redirect, BPF_MAP_TYPE_LRU_HASH, struct sb_shared_redirect_key,
-             struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES, 0U);
+EXTERNAL_MAP(shared_redirect, BPF_MAP_TYPE_HASH, struct sb_shared_redirect_key,
+             struct sb_shared_original_dst, SB_SHARED_NETWORK_MAP_ENTRIES, BPF_F_NO_PREALLOC);
 EXTERNAL_MAP(shared_flow_direct, BPF_MAP_TYPE_HASH, struct sb_shared_flow_key,
              struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES, BPF_F_NO_PREALLOC);
 EXTERNAL_MAP(shared_listener_sockets, BPF_MAP_TYPE_SOCKMAP, __u32, __u64,
@@ -51,8 +51,11 @@ EXTERNAL_MAP(shared_dns_direct_ipv6, BPF_MAP_TYPE_LPM_TRIE, struct sb_dp2_lpm6, 
 
 static void *(*map_lookup)(void *, const void *) = (void *)BPF_FUNC_map_lookup_elem;
 static long (*map_update)(void *, const void *, const void *, __u64) = (void *)BPF_FUNC_map_update_elem;
+static long (*map_delete)(void *, const void *) = (void *)BPF_FUNC_map_delete_elem;
 static long (*assign_socket)(struct __sk_buff *, void *, __u64) = (void *)BPF_FUNC_sk_assign;
 static long (*release_socket)(void *) = (void *)BPF_FUNC_sk_release;
+static struct bpf_sock *(*lookup_tcp)(void *, struct bpf_sock_tuple *, __u32, __u64, __u64) =
+    (void *)BPF_FUNC_skc_lookup_tcp;
 static __u64 (*monotonic_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 
 static __attribute__((always_inline)) void count_stat(__u32 key) {
@@ -85,9 +88,7 @@ static __attribute__((always_inline)) bool destination_bypass(const struct sb_dp
            lpm6_has(&shared_dns_direct_ipv6, packet->destination);
 }
 
-static __attribute__((always_inline)) bool learned_direct(const struct sb_dp2_packet *packet,
-                                                           const struct sb_shared_control *control) {
-    if (!(control->flags & SB_SHARED_FLAG_FLOW_DIRECT)) return false;
+static __attribute__((always_inline)) bool learned_direct(const struct sb_dp2_packet *packet) {
     struct sb_shared_flow_key key = {};
     key.family = packet->family;
     key.protocol = packet->protocol;
@@ -96,7 +97,37 @@ static __attribute__((always_inline)) bool learned_direct(const struct sb_dp2_pa
     __builtin_memcpy(key.client_addr, packet->source, 16);
     __builtin_memcpy(key.original_addr, packet->destination, 16);
     struct sb_shared_flow_value *value = map_lookup(&shared_flow_direct, &key);
-    return value && value->generation == control->flow_generation && value->expires_ns > monotonic_ns();
+	/* The exact five-tuple is the flow epoch. A policy generation change only
+	 * affects future tuples and never invalidates an established direct flow. */
+    return value && value->expires_ns > monotonic_ns();
+}
+
+static __attribute__((always_inline)) bool established_socket(struct __sk_buff *skb,
+                                                               const struct sb_dp2_packet *packet) {
+	/* TCP creates an accepted kernel socket. UDP remains on the shared listener
+	 * and its flow lifetime is owned by userspace, so a UDP lookup would merely
+	 * rediscover the listener and incorrectly bypass first packets. */
+	if (packet->protocol != IPPROTO_TCP) return false;
+    struct bpf_sock_tuple tuple = {};
+    __u32 tuple_size;
+    if (packet->family == SB_DP2_AF_INET) {
+        __builtin_memcpy(&tuple.ipv4.saddr, packet->source, 4);
+        __builtin_memcpy(&tuple.ipv4.daddr, packet->destination, 4);
+        tuple.ipv4.sport = __builtin_bswap16(packet->source_port);
+        tuple.ipv4.dport = __builtin_bswap16(packet->destination_port);
+        tuple_size = sizeof(tuple.ipv4);
+    } else {
+        __builtin_memcpy(tuple.ipv6.saddr, packet->source, 16);
+        __builtin_memcpy(tuple.ipv6.daddr, packet->destination, 16);
+        tuple.ipv6.sport = __builtin_bswap16(packet->source_port);
+        tuple.ipv6.dport = __builtin_bswap16(packet->destination_port);
+        tuple_size = sizeof(tuple.ipv6);
+    }
+	struct bpf_sock *socket = lookup_tcp(skb, &tuple, tuple_size, BPF_F_CURRENT_NETNS, 0);
+    if (!socket) return false;
+	bool established = socket->state != BPF_TCP_LISTEN;
+    release_socket(socket);
+    return established;
 }
 
 static __attribute__((always_inline)) int remember_original(struct __sk_buff *skb,
@@ -113,9 +144,20 @@ static __attribute__((always_inline)) int remember_original(struct __sk_buff *sk
     value.family = packet->family;
     value.protocol = packet->protocol;
     value.port = packet->destination_port;
-    value.socket_cookie = skb->ifindex;
+    value.socket_cookie = 0;
     __builtin_memcpy(value.addr, packet->destination, 16);
     return map_update(&shared_redirect, &key, &value, BPF_ANY);
+}
+
+static __attribute__((always_inline)) void forget_original(const struct sb_dp2_packet *packet) {
+    struct sb_shared_redirect_key key = {};
+    key.family = packet->family;
+    key.protocol = packet->protocol;
+    key.redirect_port = packet->destination_port;
+    key.client_port = packet->source_port;
+    __builtin_memcpy(key.redirect_addr, packet->destination, 16);
+    __builtin_memcpy(key.client_addr, packet->source, 16);
+    map_delete(&shared_redirect, &key);
 }
 
 SEC("classifier/ingress")
@@ -137,7 +179,12 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     if ((packet.protocol == IPPROTO_TCP && !(control->flags & SB_SHARED_FLAG_TCP)) ||
         (packet.protocol == IPPROTO_UDP && !(control->flags & SB_SHARED_FLAG_UDP)))
         return TC_ACT_OK;
-    if (destination_bypass(&packet) || learned_direct(&packet, control)) {
+    if (established_socket(skb, &packet)) {
+        count_stat(SB_SHARED_STAT_ESTABLISHED_BYPASS);
+        return TC_ACT_OK;
+    }
+    if (destination_bypass(&packet) ||
+		((control->flags & SB_SHARED_FLAG_FLOW_DIRECT) && learned_direct(&packet))) {
         count_stat(SB_SHARED_STAT_INGRESS_BYPASS);
         return TC_ACT_OK;
     }
@@ -148,7 +195,8 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     }
     if (remember_original(skb, &packet) != 0) {
         count_stat(SB_SHARED_STAT_FLOW_UPDATE_FAILURES);
-        return TC_ACT_SHOT;
+        count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
+        return TC_ACT_OK;
     }
 
     __u32 listener = packet.family == SB_DP2_AF_INET ?
@@ -157,15 +205,21 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     void *socket = map_lookup(&shared_listener_sockets, &listener);
     if (!socket) {
         count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
-        return TC_ACT_SHOT;
-    }
-    long result = assign_socket(skb, socket, 0);
-    release_socket(socket);
-    if (result != 0) {
-        count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
-        return TC_ACT_SHOT;
+        count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
+		forget_original(&packet);
+        return TC_ACT_OK;
     }
     skb->mark = control->routing_mark;
+    long result = assign_socket(skb, socket, 0);
+	/* The verifier tracks the relocated SOCKMAP lookup as a socket reference;
+	 * every branch must release it after bpf_sk_assign. */
+	release_socket(socket);
+    if (result != 0) {
+        count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
+        count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
+		forget_original(&packet);
+        return TC_ACT_OK;
+    }
     count_stat(SB_SHARED_STAT_SOCKET_ASSIGNMENTS);
     count_stat(SB_SHARED_STAT_INGRESS_REDIRECTS);
     return TC_ACT_OK;

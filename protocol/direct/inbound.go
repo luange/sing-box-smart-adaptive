@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/dnsmux"
 	"github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -31,6 +32,7 @@ type Inbound struct {
 	logger              log.ContextLogger
 	listener            *listener.Listener
 	udpNat              *udpnat.Service
+	dnsMux              *dnsmux.Service
 	overrideOption      int
 	overrideDestination M.Socksaddr
 }
@@ -63,7 +65,18 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpNATOptions)
+	if options.ListenPort == 53 {
+		inbound.dnsMux = dnsmux.New(dnsmux.Options{
+			Handler: inbound,
+			Timeout: udpTimeout,
+			Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+				_, prepareCtx, writer, onClose := inbound.preparePacketConnection(source, destination, userData)
+				return prepareCtx, writer, onClose
+			},
+		})
+	} else {
+		inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpNATOptions)
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -78,21 +91,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 func directUDPNATOptions(options option.DirectInboundOptions, timeout time.Duration) (udpnat.Options, error) {
 	capacity := options.UDPSessionCapacity
 	queueDepth := options.UDPQueueDepth
-	// Port 53 is request/response DNS. Source ports churn quickly and a large
-	// generic data-UDP session pool only retains idle goroutines and buffers.
 	if capacity == 0 {
-		if options.ListenPort == 53 {
-			capacity = 16
-		} else {
-			capacity = 1024
-		}
+		capacity = 1024
 	}
 	if queueDepth == 0 {
-		if options.ListenPort == 53 {
-			queueDepth = 2
-		} else {
-			queueDepth = 64
-		}
+		queueDepth = 64
 	}
 	if capacity > 4096 {
 		return udpnat.Options{}, E.New("udp_session_capacity exceeds 4096")
@@ -115,18 +118,39 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (i *Inbound) InterfaceUpdated() {
-	i.udpNat.Purge()
+	if i.udpNat != nil {
+		i.udpNat.Purge()
+	}
+	if i.dnsMux != nil {
+		i.dnsMux.Purge()
+	}
 }
 
 func (i *Inbound) Close() error {
+	if i.dnsMux != nil {
+		i.dnsMux.Close()
+	}
 	return i.listener.Close()
 }
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+	if i.dnsMux != nil {
+		i.dnsMux.NewPacket(buffer.Bytes(), source, i.listener.UDPAddr(), nil)
+		return
+	}
 	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, i.listener.UDPAddr(), nil)
 }
 
 func (i *Inbound) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr) {
+	if i.dnsMux != nil {
+		for index, buffer := range buffers {
+			if index < len(sources) {
+				i.dnsMux.NewPacket(buffer.Bytes(), sources[index], i.listener.UDPAddr(), nil)
+			}
+			buffer.Release()
+		}
+		return
+	}
 	i.udpNat.NewPacketBatch(buffers, sources, i.listener.UDPAddr(), nil)
 }
 

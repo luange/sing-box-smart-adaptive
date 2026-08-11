@@ -222,6 +222,11 @@ type SmartGroupStatus struct {
 	OverrideRemainingSeconds  int64                  `json:"override_remaining_seconds,omitempty"`
 	OverrideReason            string                 `json:"override_reason,omitempty"`
 	ReachTests                []SmartReachTestStatus `json:"reach_tests,omitempty"`
+	SwitchesTotal             uint64                 `json:"switches_total,omitempty"`
+	SwitchesForceAll          uint64                 `json:"switches_force_all,omitempty"`
+	SwitchesSelective         uint64                 `json:"switches_selective,omitempty"`
+	ConnectionsInterrupted    uint64                 `json:"connections_interrupted,omitempty"`
+	ConnectionsKept           uint64                 `json:"connections_kept,omitempty"`
 	Candidates                []SmartCandidateStatus `json:"candidates"`
 }
 
