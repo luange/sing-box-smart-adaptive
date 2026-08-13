@@ -193,7 +193,9 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		if _, linkErr = attachSharedTCFilter(
 			hostDevice,
 			netlink.HANDLE_MIN_EGRESS,
-			backend.EgressProgramFD(),
+			// Any sched_cls program is sufficient to simulate the stale token
+			// filter. v2 intentionally has no egress program of its own.
+			backend.IngressProgramFD(),
 			"sb_share_out",
 			sharedEgressFilterHandle,
 			sharedNetworkTCPriorityDefault,
