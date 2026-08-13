@@ -23,7 +23,7 @@ func MarkAsInternal(conn any) {
 
 type Conn struct {
 	net.Conn
-	group   *Group
+	shard   *groupShard
 	element *list.Element[*groupConnItem]
 }
 
@@ -49,9 +49,9 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 func (c *Conn) Close() error {
 	if c.element.Value.removed.CompareAndSwap(false, true) {
-		c.group.access.Lock()
-		c.group.connections.Remove(c.element)
-		c.group.access.Unlock()
+		c.shard.access.Lock()
+		c.shard.connections.Remove(c.element)
+		c.shard.access.Unlock()
 	}
 	return c.Conn.Close()
 }
@@ -70,7 +70,7 @@ func (c *Conn) Upstream() any {
 
 type PacketConn struct {
 	net.PacketConn
-	group   *Group
+	shard   *groupShard
 	element *list.Element[*groupConnItem]
 }
 
@@ -130,9 +130,9 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 
 func (c *PacketConn) Close() error {
 	if c.element.Value.removed.CompareAndSwap(false, true) {
-		c.group.access.Lock()
-		c.group.connections.Remove(c.element)
-		c.group.access.Unlock()
+		c.shard.access.Lock()
+		c.shard.connections.Remove(c.element)
+		c.shard.access.Unlock()
 	}
 	return c.PacketConn.Close()
 }

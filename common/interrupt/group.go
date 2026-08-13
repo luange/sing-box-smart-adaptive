@@ -11,6 +11,10 @@ import (
 )
 
 type Group struct {
+	shards [64]groupShard
+}
+
+type groupShard struct {
 	access      sync.Mutex
 	connections list.List[*groupConnItem]
 }
@@ -47,18 +51,33 @@ func NewGroup() *Group {
 	return &Group{}
 }
 
+func connectionShardIndex(key string) uint32 {
+	// FNV-1a is stable, allocation-free and sufficient for lock distribution.
+	var hash uint32 = 2166136261
+	for index := 0; index < len(key); index++ {
+		hash ^= uint32(key[index])
+		hash *= 16777619
+	}
+	return hash & 63
+}
+
+func (g *Group) shard(key string) *groupShard {
+	return &g.shards[connectionShardIndex(key)]
+}
+
 func (g *Group) NewConn(conn net.Conn, isExternal, isProvider bool) net.Conn {
 	return g.NewConnWithKey(conn, isExternal, isProvider, "")
 }
 
 func (g *Group) NewConnWithKey(conn net.Conn, isExternal, isProvider bool, key string) net.Conn {
-	g.access.Lock()
-	defer g.access.Unlock()
+	shard := g.shard(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
 	now := time.Now()
 	value := &groupConnItem{conn: conn, isExternal: isExternal, isProvider: isProvider, key: key, createdAt: now}
 	value.lastActive.Store(now.UnixNano())
-	item := g.connections.PushBack(value)
-	return &Conn{Conn: conn, group: g, element: item}
+	item := shard.connections.PushBack(value)
+	return &Conn{Conn: conn, shard: shard, element: item}
 }
 
 func (g *Group) NewPacketConn(conn net.PacketConn, isExternal, isProvider bool) net.PacketConn {
@@ -66,28 +85,34 @@ func (g *Group) NewPacketConn(conn net.PacketConn, isExternal, isProvider bool) 
 }
 
 func (g *Group) NewPacketConnWithKey(conn net.PacketConn, isExternal, isProvider bool, key string) net.PacketConn {
-	g.access.Lock()
-	defer g.access.Unlock()
+	shard := g.shard(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
 	now := time.Now()
 	value := &groupConnItem{conn: conn, isExternal: isExternal, isProvider: isProvider, key: key, createdAt: now}
 	value.lastActive.Store(now.UnixNano())
-	item := g.connections.PushBack(value)
-	return &PacketConn{PacketConn: conn, group: g, element: item}
+	item := shard.connections.PushBack(value)
+	return &PacketConn{PacketConn: conn, shard: shard, element: item}
 }
 
 func (g *Group) Interrupt(interruptExternalConnections bool) {
-	g.access.Lock()
-	defer g.access.Unlock()
-	var toDelete []*list.Element[*groupConnItem]
-	for element := g.connections.Front(); element != nil; element = element.Next() {
-		if !element.Value.isProvider && (!element.Value.isExternal || interruptExternalConnections) {
-			element.Value.removed.Store(true)
-			element.Value.conn.Close()
-			toDelete = append(toDelete, element)
+	var closeItems []*groupConnItem
+	for shardIndex := range g.shards {
+		shard := &g.shards[shardIndex]
+		shard.access.Lock()
+		for element := shard.connections.Front(); element != nil; {
+			next := element.Next()
+			if !element.Value.isProvider && (!element.Value.isExternal || interruptExternalConnections) &&
+				element.Value.removed.CompareAndSwap(false, true) {
+				closeItems = append(closeItems, element.Value)
+				shard.connections.Remove(element)
+			}
+			element = next
 		}
+		shard.access.Unlock()
 	}
-	for _, element := range toDelete {
-		g.connections.Remove(element)
+	for _, item := range closeItems {
+		_ = item.conn.Close()
 	}
 }
 
@@ -99,47 +124,52 @@ func (g *Group) InterruptSelective(policy InterruptPolicy) InterruptResult {
 		policy.LongConnAge = 30 * time.Second
 	}
 	now := time.Now()
-	g.access.Lock()
 	var result InterruptResult
 	var immediate []*groupConnItem
 	var delayed []*groupConnItem
-	for element := g.connections.Front(); element != nil; {
-		next := element.Next()
-		item := element.Value
-		if item.isProvider || (policy.TargetKey != "" && item.key != policy.TargetKey) {
-			result.Kept++
+	visit := func(shard *groupShard) {
+		shard.access.Lock()
+		defer shard.access.Unlock()
+		for element := shard.connections.Front(); element != nil; {
+			next := element.Next()
+			item := element.Value
+			if item.isProvider || (policy.TargetKey != "" && item.key != policy.TargetKey) {
+				result.Kept++
+				element = next
+				continue
+			}
+			lastActive := time.Unix(0, item.lastActive.Load())
+			idle := now.Sub(lastActive) >= policy.IdleThreshold
+			longActive := now.Sub(item.createdAt) >= policy.LongConnAge && !idle
+			if !policy.ForceAll && longActive {
+				result.Kept++
+				result.KeptLong++
+				element = next
+				continue
+			}
+			if !item.removed.CompareAndSwap(false, true) {
+				element = next
+				continue
+			}
+			if idle {
+				result.Idle++
+			} else {
+				result.Short++
+			}
+			shard.connections.Remove(element)
+			if !policy.ForceAll && !idle && policy.GracePeriod > 0 {
+				delayed = append(delayed, item)
+				result.Deferred++
+			} else {
+				immediate = append(immediate, item)
+				result.Interrupted++
+			}
 			element = next
-			continue
 		}
-		lastActive := time.Unix(0, item.lastActive.Load())
-		idle := now.Sub(lastActive) >= policy.IdleThreshold
-		longActive := now.Sub(item.createdAt) >= policy.LongConnAge && !idle
-		if !policy.ForceAll && longActive {
-			result.Kept++
-			result.KeptLong++
-			element = next
-			continue
-		}
-		if !item.removed.CompareAndSwap(false, true) {
-			element = next
-			continue
-		}
-		if idle {
-			result.Idle++
-		} else {
-			result.Short++
-		}
-		g.connections.Remove(element)
-		if !policy.ForceAll && !idle && policy.GracePeriod > 0 {
-			delayed = append(delayed, item)
-			result.Deferred++
-		} else {
-			immediate = append(immediate, item)
-			result.Interrupted++
-		}
-		element = next
 	}
-	g.access.Unlock()
+	for shardIndex := range g.shards {
+		visit(&g.shards[shardIndex])
+	}
 	for _, item := range immediate {
 		_ = item.conn.Close()
 		if policy.OnInterrupted != nil {

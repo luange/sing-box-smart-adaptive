@@ -1,6 +1,7 @@
 package interrupt
 
 import (
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -87,5 +88,33 @@ func TestInterruptSelectiveForceAllOnlyTargetsSelectedCandidate(t *testing.T) {
 	result := group.InterruptSelective(InterruptPolicy{ForceAll: true, TargetKey: "old"})
 	if result.Interrupted != 1 || result.Kept != 1 {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestInterruptSelectiveDoesNotGloballyBlockConnectionAdmission(t *testing.T) {
+	group := NewGroup()
+	for index := 0; index < 4096; index++ {
+		left, right := net.Pipe()
+		t.Cleanup(func() { _ = right.Close() })
+		key := fmt.Sprintf("candidate-%d", index%64)
+		_ = group.NewConnWithKey(left, false, false, key)
+	}
+	done := make(chan struct{})
+	go func() {
+		group.InterruptSelective(InterruptPolicy{TargetKey: "candidate-1", ForceAll: true})
+		close(done)
+	}()
+	left, right := net.Pipe()
+	defer right.Close()
+	started := time.Now()
+	conn := group.NewConnWithKey(left, false, false, "unrelated-admission-key")
+	defer conn.Close()
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("unrelated connection admission blocked by selective scan: %v", elapsed)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("selective interrupt did not complete")
 	}
 }
