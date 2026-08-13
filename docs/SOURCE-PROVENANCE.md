@@ -7,7 +7,7 @@ boundary.
 ## Canonical locations
 
 - Build and Claude review copy:
-  `/Volumes/WeChat/CodexBuild/sing-box-beta12-smart-mem9`
+  `/Volumes/WeChat/CodexBuild/sing-box-beta14-smart-tcv2.21`
 - Codex review copy:
   `/Users/luan/Documents/Codex/2026-06-18/version-3-9-services-sub-store/work/a53-beta14-smart-tcv2.21-review`
 - Published repository:
@@ -43,4 +43,3 @@ Every functional iteration must record:
 
 Binary backups belong in the NAS content-addressed core repository. They must
 not be duplicated in space-constrained VMs.
-
