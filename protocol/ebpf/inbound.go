@@ -224,6 +224,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Timeout:    udpTimeout,
 		Capacity:   udpSessionCapacity,
 		QueueDepth: 64,
+		OnNewSessionRejected: func(_, _ M.Socksaddr) {
+			inbound.udpWarnings.admission.warnMessage(inbound.logger,
+				"eBPF UDP session capacity exhausted; preserving active sessions and rejecting a new tuple")
+		},
 	})
 	inbound.dnsMux = dnsmux.New(dnsmux.Options{
 		Handle:  inbound.handleDNSPacket,

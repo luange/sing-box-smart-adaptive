@@ -50,6 +50,7 @@ int sb_ebpf_shared_network_prepare(
     int bypass_ipv6_map_fd,
     int dns_direct_ipv4_map_fd,
     int dns_direct_ipv6_map_fd,
+    bool data_plane_v2,
     struct sb_ebpf_shared_network_runtime *runtime) {
     if (object == NULL || object_size == 0U || runtime == NULL) {
         errno = EINVAL;
@@ -63,27 +64,29 @@ int sb_ebpf_shared_network_prepare(
         sizeof(struct sb_shared_control),
         1U,
         0U);
-    stage = "create interface MAC map";
-    runtime->interface_mac_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_HASH,
-        sizeof(uint32_t),
-        sizeof(struct sb_shared_interface_mac),
-        SB_SHARED_NETWORK_INTERFACE_ENTRIES,
-        0U);
-    stage = "create original-to-token map";
-    runtime->original_to_token_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_LRU_HASH,
-        sizeof(struct sb_shared_original_key),
-        sizeof(struct sb_shared_token_value),
-        SB_SHARED_NETWORK_MAP_ENTRIES,
-        0U);
-    stage = "create token-to-original map";
-    runtime->token_to_original_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_LRU_HASH,
-        sizeof(struct sb_shared_reverse_key),
-        sizeof(struct sb_shared_reverse_value),
-        SB_SHARED_NETWORK_MAP_ENTRIES,
-        0U);
+    if (!data_plane_v2) {
+        stage = "create interface MAC map";
+        runtime->interface_mac_map_fd = sb_ebpf_create_map(
+            BPF_MAP_TYPE_HASH,
+            sizeof(uint32_t),
+            sizeof(struct sb_shared_interface_mac),
+            SB_SHARED_NETWORK_INTERFACE_ENTRIES,
+            0U);
+        stage = "create original-to-token map";
+        runtime->original_to_token_map_fd = sb_ebpf_create_map(
+            BPF_MAP_TYPE_LRU_HASH,
+            sizeof(struct sb_shared_original_key),
+            sizeof(struct sb_shared_token_value),
+            SB_SHARED_NETWORK_MAP_ENTRIES,
+            0U);
+        stage = "create token-to-original map";
+        runtime->token_to_original_map_fd = sb_ebpf_create_map(
+            BPF_MAP_TYPE_LRU_HASH,
+            sizeof(struct sb_shared_reverse_key),
+            sizeof(struct sb_shared_reverse_value),
+            SB_SHARED_NETWORK_MAP_ENTRIES,
+            0U);
+    }
     stage = "create redirect map";
     runtime->redirect_map_fd = sb_ebpf_create_map(
         BPF_MAP_TYPE_LRU_HASH,
@@ -115,24 +118,26 @@ int sb_ebpf_shared_network_prepare(
     stage = "create host maps";
     runtime->host_ipv4_map_fd = shared_network_create_lpm4();
     runtime->host_ipv6_map_fd = shared_network_create_lpm6();
-    stage = "create scratch map";
-    runtime->scratch_map_fd = sb_ebpf_create_map(
-        BPF_MAP_TYPE_PERCPU_ARRAY,
-        sizeof(uint32_t),
-        sizeof(struct sb_shared_scratch),
-        1U,
-        0U);
+    if (!data_plane_v2) {
+        stage = "create scratch map";
+        runtime->scratch_map_fd = sb_ebpf_create_map(
+            BPF_MAP_TYPE_PERCPU_ARRAY,
+            sizeof(uint32_t),
+            sizeof(struct sb_shared_scratch),
+            1U,
+            0U);
+    }
     if (runtime->control_map_fd < 0 ||
-        runtime->interface_mac_map_fd < 0 ||
-        runtime->original_to_token_map_fd < 0 ||
-        runtime->token_to_original_map_fd < 0 ||
+        (!data_plane_v2 && runtime->interface_mac_map_fd < 0) ||
+        (!data_plane_v2 && runtime->original_to_token_map_fd < 0) ||
+        (!data_plane_v2 && runtime->token_to_original_map_fd < 0) ||
         runtime->redirect_map_fd < 0 ||
         runtime->flow_direct_map_fd < 0 ||
         runtime->listener_socket_map_fd < 0 ||
         runtime->stats_map_fd < 0 ||
         runtime->host_ipv4_map_fd < 0 ||
         runtime->host_ipv6_map_fd < 0 ||
-        runtime->scratch_map_fd < 0) {
+        (!data_plane_v2 && runtime->scratch_map_fd < 0)) {
         goto fail;
     }
     if (bypass_ipv4_map_fd < 0) {
@@ -167,6 +172,7 @@ int sb_ebpf_shared_network_prepare(
             bypass_ipv6_map_fd,
             dns_direct_ipv4_map_fd,
             dns_direct_ipv6_map_fd,
+            data_plane_v2,
             runtime) != 0) {
         goto fail;
     }

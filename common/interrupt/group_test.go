@@ -2,6 +2,7 @@ package interrupt
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,6 +47,31 @@ func TestInterruptSelectiveTargetsPreviousCandidateAndKeepsLongActive(t *testing
 	}
 	if result.Kept != 4 || result.KeptLong != 3 {
 		t.Fatalf("unexpected kept result: %+v", result)
+	}
+}
+
+func TestInterruptSelectiveCountsGraceCloseWhenItHappens(t *testing.T) {
+	group := NewGroup()
+	left, right := net.Pipe()
+	defer right.Close()
+	group.NewConnWithKey(left, true, false, "old")
+	var closed atomic.Uint64
+	result := group.InterruptSelective(InterruptPolicy{
+		IdleThreshold: time.Minute,
+		LongConnAge:   time.Minute,
+		GracePeriod:   10 * time.Millisecond,
+		TargetKey:     "old",
+		OnInterrupted: func() { closed.Add(1) },
+	})
+	if result.Interrupted != 0 || result.Deferred != 1 || closed.Load() != 0 {
+		t.Fatalf("grace close counted before deadline: result=%+v closed=%d", result, closed.Load())
+	}
+	deadline := time.Now().Add(time.Second)
+	for closed.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if closed.Load() != 1 {
+		t.Fatal("grace close was not observed")
 	}
 }
 

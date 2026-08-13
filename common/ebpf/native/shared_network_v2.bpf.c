@@ -28,7 +28,7 @@ struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
         .map_flags = flags_value, \
     }
 
-EXTERNAL_MAP(shared_control, BPF_MAP_TYPE_HASH, __u32, struct sb_shared_control, 1U, 0U);
+EXTERNAL_MAP(shared_control, BPF_MAP_TYPE_ARRAY, __u32, struct sb_shared_control, 1U, 0U);
 /* TCP entries are consumed by accept. UDP entries remain readable for every
  * datagram in a flow and are bounded by LRU eviction. */
 EXTERNAL_MAP(shared_redirect, BPF_MAP_TYPE_LRU_HASH, struct sb_shared_redirect_key,
@@ -148,6 +148,12 @@ static __attribute__((always_inline)) int remember_original(struct __sk_buff *sk
     __builtin_memcpy(key.redirect_addr, packet->destination, 16);
     __builtin_memcpy(key.client_addr, packet->source, 16);
 
+    /* UDP reuses this entry for the lifetime of its tuple.  Avoid a map write
+     * for every QUIC/datagram packet; an LRU eviction is recoverable because
+     * the next packet still carries the original destination and recreates it
+     * before socket assignment. */
+    if (map_lookup(&shared_redirect, &key)) return 0;
+
     struct sb_shared_original_dst value = {};
     value.family = packet->family;
     value.protocol = packet->protocol;
@@ -187,9 +193,9 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     if ((packet.protocol == IPPROTO_TCP && !(control->flags & SB_SHARED_FLAG_TCP)) ||
         (packet.protocol == IPPROTO_UDP && !(control->flags & SB_SHARED_FLAG_UDP)))
         return TC_ACT_OK;
-    skb->mark = control->routing_mark;
 	int established = assign_established_socket(skb, &packet);
 	if (established > 0) {
+		skb->mark = control->routing_mark;
         count_stat(SB_SHARED_STAT_ESTABLISHED_BYPASS);
         return TC_ACT_OK;
     }
@@ -225,15 +231,15 @@ int sb_share_v2_in(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     long result = assign_socket(skb, socket, 0);
-	/* The verifier tracks the relocated SOCKMAP lookup as a socket reference;
-	 * every branch must release it after bpf_sk_assign. */
-	release_socket(socket);
+	/* A SOCKMAP lookup returns a map-owned socket pointer, not a referenced
+	 * bpf_sock from skc_lookup_tcp.  bpf_sk_release is only valid for the latter. */
     if (result != 0) {
         count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
         count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
 		forget_original(&packet);
         return TC_ACT_OK;
     }
+	skb->mark = control->routing_mark;
     count_stat(SB_SHARED_STAT_SOCKET_ASSIGNMENTS);
     count_stat(SB_SHARED_STAT_INGRESS_REDIRECTS);
     return TC_ACT_OK;

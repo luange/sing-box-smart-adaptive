@@ -15,6 +15,7 @@ static int singbox_ebpf_shared_network_prepare(
 	int bypass_ipv6_map_fd,
 	int dns_direct_ipv4_map_fd,
 	int dns_direct_ipv6_map_fd,
+	bool data_plane_v2,
 	struct sb_ebpf_shared_network_runtime *runtime,
 	int *saved_errno) {
 	int result = sb_ebpf_shared_network_prepare(
@@ -24,6 +25,7 @@ static int singbox_ebpf_shared_network_prepare(
 		bypass_ipv6_map_fd,
 		dns_direct_ipv4_map_fd,
 		dns_direct_ipv6_map_fd,
+		data_plane_v2,
 		runtime);
 	if (result != 0) *saved_errno = errno;
 	return result;
@@ -89,8 +91,11 @@ type SharedNetworkRuntimeStats struct {
 	OriginalDstLost      uint64
 }
 
+//go:embed native/shared_network.bpf.o
+var sharedNetworkV1Object []byte
+
 //go:embed native/shared_network_v2.bpf.o
-var sharedNetworkObject []byte
+var sharedNetworkV2Object []byte
 
 type sharedNetworkControl struct {
 	Enabled        uint32
@@ -155,6 +160,7 @@ type SharedNetworkBackend struct {
 	hostIPv4        []netip.Prefix
 	hostIPv6        []netip.Prefix
 	originalDstLost atomic.Uint64
+	dataPlaneV2     bool
 }
 
 func PrepareSharedNetwork(
@@ -189,6 +195,10 @@ func PrepareSharedNetwork(
 	if !redirectIPv4.IsValid() && !redirectIPv6.IsValid() {
 		return nil, E.New("missing shared-network redirect address")
 	}
+	sharedNetworkObject := sharedNetworkV1Object
+	if socketAssign {
+		sharedNetworkObject = sharedNetworkV2Object
+	}
 	if len(sharedNetworkObject) == 0 {
 		return nil, E.New("missing embedded shared-network eBPF object")
 	}
@@ -217,6 +227,7 @@ func PrepareSharedNetwork(
 		C.int(parent.bypassIPv6CIDRMap),
 		C.int(dnsDirect4),
 		C.int(dnsDirect6),
+		C.bool(socketAssign),
 		runtimeState,
 		&savedErrno,
 	)
@@ -229,7 +240,7 @@ func PrepareSharedNetwork(
 		)
 	}
 
-	backend := &SharedNetworkBackend{runtime: runtimeState}
+	backend := &SharedNetworkBackend{runtime: runtimeState, dataPlaneV2: socketAssign}
 	backend.control.BridgePort = bridgePort
 	if enableTCP {
 		backend.control.Flags |= sharedNetworkFlagTCP
@@ -419,6 +430,9 @@ func (b *SharedNetworkBackend) UpdateInterfaceMAC(ifIndex uint32, hardwareAddres
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	if b.dataPlaneV2 {
+		return nil
+	}
 	return updateMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex), unsafe.Pointer(&value))
 }
 
@@ -430,6 +444,9 @@ func (b *SharedNetworkBackend) DeleteInterfaceMAC(ifIndex uint32) error {
 	defer b.access.RUnlock()
 	if b.runtime == nil {
 		return osErrClosed
+	}
+	if b.dataPlaneV2 {
+		return nil
 	}
 	err := deleteMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex))
 	if errors.Is(err, syscall.ENOENT) {

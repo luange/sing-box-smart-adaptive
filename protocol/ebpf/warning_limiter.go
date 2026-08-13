@@ -56,8 +56,21 @@ func (l *warningLimiter) warnValueError(logger warningLogger, prefix string, val
 	logger.Warn(prefix, value, suffix, err)
 }
 
+func (l *warningLimiter) warnMessage(logger warningLogger, message string) {
+	allowed, suppressed := l.allow(time.Now())
+	if !allowed {
+		return
+	}
+	if suppressed > 0 {
+		logger.Warn(message, " (", suppressed, " similar warnings suppressed)")
+		return
+	}
+	logger.Warn(message)
+}
+
 type udpWarningLimiters struct {
 	packetInfo          warningLimiter
 	originalDestination warningLimiter
 	cleanup             warningLimiter
+	admission           warningLimiter
 }

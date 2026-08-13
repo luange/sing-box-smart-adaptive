@@ -182,6 +182,7 @@ int sb_ebpf_load_shared_network_programs(
     int bypass_ipv6_map_fd,
     int dns_direct_ipv4_map_fd,
     int dns_direct_ipv6_map_fd,
+    bool data_plane_v2,
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_prepare(
     const uint8_t *object,
@@ -190,6 +191,7 @@ int sb_ebpf_shared_network_prepare(
     int bypass_ipv6_map_fd,
     int dns_direct_ipv4_map_fd,
     int dns_direct_ipv6_map_fd,
+    bool data_plane_v2,
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime);
 

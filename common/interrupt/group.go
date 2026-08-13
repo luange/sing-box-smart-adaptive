@@ -31,10 +31,12 @@ type InterruptPolicy struct {
 	GracePeriod   time.Duration
 	ForceAll      bool
 	TargetKey     string
+	OnInterrupted func()
 }
 
 type InterruptResult struct {
 	Interrupted int
+	Deferred    int
 	Idle        int
 	Short       int
 	Kept        int
@@ -99,7 +101,7 @@ func (g *Group) InterruptSelective(policy InterruptPolicy) InterruptResult {
 	now := time.Now()
 	g.access.Lock()
 	var result InterruptResult
-	var immediate []*list.Element[*groupConnItem]
+	var immediate []*groupConnItem
 	var delayed []*groupConnItem
 	for element := g.connections.Front(); element != nil; {
 		next := element.Next()
@@ -118,8 +120,10 @@ func (g *Group) InterruptSelective(policy InterruptPolicy) InterruptResult {
 			element = next
 			continue
 		}
-		result.Interrupted++
-		item.removed.Store(true)
+		if !item.removed.CompareAndSwap(false, true) {
+			element = next
+			continue
+		}
 		if idle {
 			result.Idle++
 		} else {
@@ -128,14 +132,19 @@ func (g *Group) InterruptSelective(policy InterruptPolicy) InterruptResult {
 		g.connections.Remove(element)
 		if !policy.ForceAll && !idle && policy.GracePeriod > 0 {
 			delayed = append(delayed, item)
+			result.Deferred++
 		} else {
-			immediate = append(immediate, element)
+			immediate = append(immediate, item)
+			result.Interrupted++
 		}
 		element = next
 	}
 	g.access.Unlock()
-	for _, element := range immediate {
-		_ = element.Value.conn.Close()
+	for _, item := range immediate {
+		_ = item.conn.Close()
+		if policy.OnInterrupted != nil {
+			policy.OnInterrupted()
+		}
 	}
 	for _, item := range delayed {
 		if conn, loaded := item.conn.(net.Conn); loaded {
@@ -143,7 +152,12 @@ func (g *Group) InterruptSelective(policy InterruptPolicy) InterruptResult {
 		} else if conn, loaded := item.conn.(net.PacketConn); loaded {
 			_ = conn.SetDeadline(now.Add(policy.GracePeriod))
 		}
-		time.AfterFunc(policy.GracePeriod, func() { _ = item.conn.Close() })
+		time.AfterFunc(policy.GracePeriod, func() {
+			_ = item.conn.Close()
+			if policy.OnInterrupted != nil {
+				policy.OnInterrupted()
+			}
+		})
 	}
 	return result
 }

@@ -183,6 +183,10 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		Timeout:    udpTimeout,
 		Capacity:   parent.udpSessionCapacity,
 		QueueDepth: 64,
+		OnNewSessionRejected: func(_, _ M.Socksaddr) {
+			shared.udpWarnings.admission.warnMessage(parent.logger,
+				"shared-network UDP session capacity exhausted; preserving active sessions and rejecting a new tuple")
+		},
 	})
 	shared.dnsMux = dnsmux.New(dnsmux.Options{
 		Handle:  shared.handleDNSPacket,

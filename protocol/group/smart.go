@@ -1340,6 +1340,7 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 		GracePeriod:   s.interruptGrace,
 		ForceAll:      forceAll,
 		TargetKey:     smartConnectionKey(networkKey, siteKey, transport, previous),
+		OnInterrupted: func() { s.connectionsInterrupted.Add(1) },
 	}
 	result := s.interruptGroup.InterruptSelective(policy)
 	s.switchesTotal.Add(1)
@@ -1348,7 +1349,6 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 	} else {
 		s.switchesSelective.Add(1)
 	}
-	s.connectionsInterrupted.Add(uint64(result.Interrupted))
 	s.connectionsKept.Add(uint64(result.Kept))
 	if s.logger != nil {
 		reason := "latency"
@@ -1356,7 +1356,7 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 			reason = "node_dead"
 		}
 		s.logger.Info("smart switch ", previous, " -> ", current, " reason=", reason,
-			" interrupted=", result.Interrupted, " idle=", result.Idle,
+			" interrupted=", result.Interrupted, " deferred=", result.Deferred, " idle=", result.Idle,
 			" short=", result.Short, " kept=", result.Kept, " kept_long=", result.KeptLong)
 	}
 }
