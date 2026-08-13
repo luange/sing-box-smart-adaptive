@@ -54,6 +54,27 @@ jobs:
         with:
           ndk-version: r29
 
+      # Test the object that go:embed will use before any generator is allowed
+      # to overwrite it.  This is the same path used by plain `go build` and
+      # catches a stale committed object even when generated objects are valid.
+      - name: Validate committed embedded v2 object
+        if: matrix.toolchain == 'system-clang'
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -S common/ebpf/native/shared_network_v2.bpf.o \
+            | tee committed-object.log
+          grep -q '[.]maps' committed-object.log
+          grep -q '[.]BTF' committed-object.log
+          grep -q '[.]BTF.ext' committed-object.log
+          sudo env \
+            "PATH=$PATH" \
+            SING_BOX_EBPF_SHARED_INTEGRATION=1 \
+            SING_BOX_EBPF_SHARED_DATA_PLANE=socket_assign \
+            go test -v -count=1 -run '^TestSharedNetworkDataPathIntegration$' \
+              -tags with_ebpf ./protocol/ebpf 2>&1 \
+            | tee -a committed-object.log
+
       - name: Generate eBPF objects with system Clang
         if: matrix.toolchain == 'system-clang'
         env:
