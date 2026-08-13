@@ -290,8 +290,8 @@ func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error 
 	if b == nil || key >= 4 || fd < 0 {
 		return E.New("invalid shared-network listener socket")
 	}
-	b.access.Lock()
-	defer b.access.Unlock()
+	b.access.RLock()
+	defer b.access.RUnlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -366,8 +366,8 @@ func (b *SharedNetworkBackend) PutDirectFlow(protocol uint8, source, destination
 	if err != nil {
 		return err
 	}
-	b.access.Lock()
-	defer b.access.Unlock()
+	b.access.RLock()
+	defer b.access.RUnlock()
 	if b.runtime == nil || b.control.Flags&(1<<7) == 0 {
 		return osErrClosed
 	}
