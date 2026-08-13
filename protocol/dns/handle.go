@@ -152,15 +152,6 @@ func NewDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 }
 
 func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn N.PacketConn, readWaiter N.PacketReadWaiter, readCounters []N.CountFunc, cached []*N.PacketBuffer, metadata adapter.InboundContext) error {
-	// Bound outstanding exchanges per client UDP flow. A DNS source port is a
-	// small request/response lane, not a bulk transport: keeping 64 concurrent
-	// queries for every NAT entry multiplies the session budget into thousands
-	// of contexts, timers and response buffers. UDP DNS transaction IDs still
-	// allow clients to pipeline, but serializing each source-port lane preserves
-	// ordering and bounds memory; the independent session pool provides
-	// concurrency across clients.
-	const maxConcurrentDNSQueries = 1
-	querySlots := make(chan struct{}, maxConcurrentDNSQueries)
 	frontHeadroom := N.CalculateFrontHeadroom(conn)
 	rearHeadroom := N.CalculateRearHeadroom(conn)
 	fastClose, cancel := context.WithCancelCause(ctx)
@@ -206,13 +197,7 @@ func newDNSPacketConnection(ctx context.Context, router adapter.DNSRouter, conn 
 				timeout.Update()
 			}
 			metadataInQuery := metadata
-			select {
-			case querySlots <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
 			router.ExchangeAsync(adapter.WithContext(ctx, &metadataInQuery), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, err error) {
-				<-querySlots
 				if err != nil {
 					cancel(err)
 					return

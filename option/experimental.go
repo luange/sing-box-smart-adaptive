@@ -1,9 +1,6 @@
 package option
 
-import (
-	"github.com/sagernet/sing/common/byteformats"
-	"github.com/sagernet/sing/common/json/badoption"
-)
+import "github.com/sagernet/sing/common/json/badoption"
 
 type ExperimentalOptions struct {
 	CacheFile           *CacheFileOptions `json:"cache_file,omitempty"`
@@ -34,7 +31,6 @@ type ClashAPIOptions struct {
 	ModeList                         []string                   `json:"-"`
 	AccessControlAllowOrigin         badoption.Listable[string] `json:"access_control_allow_origin,omitempty"`
 	AccessControlAllowPrivateNetwork bool                       `json:"access_control_allow_private_network,omitempty"`
-	MemoryReclaim                    *MemoryReclaimOptions      `json:"memory_reclaim,omitempty"`
 
 	// Deprecated: migrated to global cache file
 	CacheFile string `json:"cache_file,omitempty" schema:"omit"`
@@ -48,18 +44,6 @@ type ClashAPIOptions struct {
 	StoreFakeIP bool `json:"store_fakeip,omitempty" schema:"omit"`
 	// Deprecated: use external_ui_http_client instead
 	ExternalUIDownloadDetour string `json:"external_ui_download_detour,omitempty" reference:"outbound" schema:"omit"`
-}
-
-// MemoryReclaimOptions controls conservative return of unused Go heap pages to
-// the operating system. It never discards live objects or connection state.
-type MemoryReclaimOptions struct {
-	Enabled             bool                     `json:"enabled,omitempty"`
-	CheckInterval       badoption.Duration       `json:"check_interval,omitempty"`
-	Cooldown            badoption.Duration       `json:"cooldown,omitempty"`
-	MinimumProcessAge   badoption.Duration       `json:"minimum_process_age,omitempty"`
-	MinimumIdle         *byteformats.MemoryBytes `json:"minimum_idle,omitempty"`
-	MaximumHeapAlloc    *byteformats.MemoryBytes `json:"maximum_heap_alloc,omitempty"`
-	ConsecutiveEligible int                      `json:"consecutive_eligible,omitempty"`
 }
 
 type V2RayAPIOptions struct {

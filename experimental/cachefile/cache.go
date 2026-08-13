@@ -59,6 +59,7 @@ type CacheFile struct {
 	DB                 *bbolt.DB
 	resetAccess        sync.Mutex
 	saveMetadataAccess sync.Mutex
+	saveMetadata       *adapter.FakeIPMetadata
 	saveMetadataTimer  *time.Timer
 	saveFakeIPAccess   sync.RWMutex
 	saveDomain         map[netip.Addr]string
@@ -233,32 +234,10 @@ func (c *CacheFile) start() error {
 }
 
 func (c *CacheFile) Close() error {
-	c.saveMetadataAccess.Lock()
-	if c.saveMetadataTimer != nil {
-		c.saveMetadataTimer.Stop()
-		c.saveMetadataTimer = nil
+	if c.DB == nil {
+		return nil
 	}
-	c.saveMetadataAccess.Unlock()
-	c.saveFakeIPAccess.Lock()
-	clear(c.saveDomain)
-	clear(c.saveAddress4)
-	clear(c.saveAddress6)
-	c.saveDomain = make(map[netip.Addr]string)
-	c.saveAddress4 = make(map[string]netip.Addr)
-	c.saveAddress6 = make(map[string]netip.Addr)
-	c.saveFakeIPAccess.Unlock()
-	c.saveRDRCAccess.Lock()
-	clear(c.saveRDRC)
-	c.saveRDRC = make(map[saveCacheKey]bool)
-	c.saveRDRCAccess.Unlock()
-	c.saveDNSCacheAccess.Lock()
-	clear(c.saveDNSCache)
-	c.saveDNSCache = make(map[saveCacheKey]saveDNSCacheEntry)
-	c.saveDNSCacheAccess.Unlock()
-	if c.DB != nil {
-		return c.DB.Close()
-	}
-	return nil
+	return c.DB.Close()
 }
 
 func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
