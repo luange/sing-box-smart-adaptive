@@ -61,9 +61,9 @@ jobs:
         run: |
           "$BPF_CLANG" --version | tee verifier.log
           make -C common/ebpf generate
-          llvm-readelf -S common/ebpf/native/shared_network_v2.bpf.o | tee -a verifier.log
-          llvm-readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]maps'
-          llvm-readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]BTF'
+          readelf -S common/ebpf/native/shared_network_v2.bpf.o | tee -a verifier.log
+          readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]maps'
+          readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]BTF'
           go clean -cache
 
       - name: Generate eBPF objects with NDK r29 Clang 21
