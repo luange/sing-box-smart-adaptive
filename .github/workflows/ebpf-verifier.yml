@@ -67,6 +67,13 @@ jobs:
           grep -q '[.]maps' committed-object.log
           grep -q '[.]BTF' committed-object.log
           grep -q '[.]BTF.ext' committed-object.log
+          # v1 and splice objects are intentionally generated-only and are
+          # required for the Go package to compile.  Preserve and restore the
+          # committed v2 object so the test below cannot consume a regenerated
+          # replacement.
+          cp common/ebpf/native/shared_network_v2.bpf.o /tmp/committed-v2.bpf.o
+          make -C common/ebpf generate
+          cp /tmp/committed-v2.bpf.o common/ebpf/native/shared_network_v2.bpf.o
           sudo env \
             "PATH=$PATH" \
             SING_BOX_EBPF_SHARED_INTEGRATION=1 \
