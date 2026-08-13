@@ -103,7 +103,8 @@ jobs:
             ver="${{ inputs.version }}"
           else
             short="$(git rev-parse --short HEAD)"
-            ver="1.14.0-beta.3-reF1nd-luan-adaptive.rc31-${short}"
+            base="$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo v0.0.0-dev)"
+            ver="${base#v}-${short}"
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "VERSION=$ver" >> "$GITHUB_ENV"
