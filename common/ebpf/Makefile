@@ -3,7 +3,7 @@ BPF_SYSTEM_INCLUDE ?= /usr/include
 BPF_HOST_CC ?= cc
 BPF_MULTIARCH ?= $(shell $(BPF_HOST_CC) -print-multiarch 2>/dev/null)
 BPF_MULTIARCH_INCLUDE ?= $(BPF_SYSTEM_INCLUDE)/$(BPF_MULTIARCH)
-BPF_CFLAGS ?= -target bpfel -mcpu=v1 -O2 -g0 -ffreestanding
+BPF_CFLAGS ?= -target bpfel -mcpu=v1 -O2 -g -ffreestanding
 BPF_INCLUDE_FLAGS := -Inative -I$(BPF_SYSTEM_INCLUDE)
 ifneq (,$(wildcard $(BPF_MULTIARCH_INCLUDE)))
 BPF_INCLUDE_FLAGS += -I$(BPF_MULTIARCH_INCLUDE)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "dataplane_v2_parser.h"
+#include "btf_map.h"
 #include "shared_network.h"
 
 #include <linux/bpf.h>
@@ -10,24 +11,11 @@
 
 #define SEC(name) __attribute__((section(name), used))
 
-struct bpf_map_def {
-    __u32 type;
-    __u32 key_size;
-    __u32 value_size;
-    __u32 max_entries;
-    __u32 map_flags;
-};
-
 struct sb_dp2_lpm4 { __u32 prefixlen; __u8 addr[4]; };
 struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
 struct sb_dp2_mac { __u8 addr[6]; __u8 reserved[2]; };
 
-#define EXTERNAL_MAP(name, map_type, key_type, value_type, count, flags_value) \
-    struct bpf_map_def SEC("maps") name = { \
-        .type = map_type, .key_size = sizeof(key_type), \
-        .value_size = sizeof(value_type), .max_entries = count, \
-        .map_flags = flags_value, \
-    }
+#define EXTERNAL_MAP SB_BTF_MAP
 
 EXTERNAL_MAP(shared_control, BPF_MAP_TYPE_ARRAY, __u32, struct sb_shared_control, 1U, 0U);
 /* TCP entries are consumed by accept. UDP entries remain readable for every

@@ -64,6 +64,53 @@ static const Elf64_Shdr *object_find_section(
 	return NULL;
 }
 
+struct sb_btf_ext_header {
+	uint16_t magic;
+	uint8_t version;
+	uint8_t flags;
+	uint32_t hdr_len;
+	uint32_t func_info_off;
+	uint32_t func_info_len;
+	uint32_t line_info_off;
+	uint32_t line_info_len;
+	uint32_t core_relo_off;
+	uint32_t core_relo_len;
+};
+
+/* This loader consumes standard BTF map metadata but deliberately does not
+ * pretend to apply CO-RE field relocations.  Programs using preserve_access_index
+ * must be rejected until a relocation engine is present; silently ignoring
+ * .BTF.ext core_relo would create kernel-dependent memory accesses. */
+static int object_validate_btf_ext(const Elf64_Ehdr *header, size_t object_size) {
+	const Elf64_Shdr *btf = object_find_section(header, object_size, ".BTF", NULL);
+	const Elf64_Shdr *btf_ext = object_find_section(header, object_size, ".BTF.ext", NULL);
+	if (btf == NULL && btf_ext == NULL) {
+		errno = 0;
+		return 0;
+	}
+	if (btf == NULL || btf_ext == NULL ||
+	    !object_range_valid(btf->sh_offset, btf->sh_size, object_size) ||
+	    !object_range_valid(btf_ext->sh_offset, btf_ext->sh_size, object_size) ||
+	    btf_ext->sh_size < sizeof(struct sb_btf_ext_header)) {
+		errno = ENOEXEC;
+		return -1;
+	}
+	const struct sb_btf_ext_header *ext =
+		(const struct sb_btf_ext_header *)((const uint8_t *)header + btf_ext->sh_offset);
+	if (ext->magic != 0xeb9fU || ext->version != 1U ||
+	    ext->hdr_len < sizeof(*ext) || ext->hdr_len > btf_ext->sh_size ||
+	    ext->core_relo_off > btf_ext->sh_size - ext->hdr_len ||
+	    ext->core_relo_len > btf_ext->sh_size - ext->hdr_len - ext->core_relo_off) {
+		errno = ENOEXEC;
+		return -1;
+	}
+	if (ext->core_relo_len != 0U) {
+		errno = ENOTSUP;
+		return -1;
+	}
+	return 0;
+}
+
 static int object_map_fd(const char *name, const struct sb_ebpf_object_map_table *maps) {
 	if (name == NULL || maps == NULL || maps->entries == NULL) {
 		errno = ENOENT;
@@ -194,6 +241,10 @@ int sb_ebpf_object_load_section(
 	    header->e_ident[EI_DATA] != ELFDATA2LSB ||
 	    header->e_machine != EM_BPF) {
 		errno = ENOEXEC;
+		return -1;
+	}
+	if (object_validate_btf_ext(header, object_size) != 0) {
+		fprintf(stderr, "%s BTF/CO-RE validation failed: errno=%d\n", section_name, errno);
 		return -1;
 	}
 
