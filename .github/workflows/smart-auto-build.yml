@@ -235,6 +235,26 @@ jobs:
       - name: Record merge sha
         id: commit
         run: |
+          # Smart/eBPF is one atomic component.  A clean Git merge can add or
+          # replace files without producing conflicts, so conflict-only policy
+          # is insufficient and previously created a tree whose callers and
+          # dependency APIs came from different sides.  Reassert the complete
+          # component from the first parent of a newly-created merge commit.
+          if [[ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]]; then
+            component_paths=(
+              common/ebpf protocol/ebpf common/interrupt common/listener
+              protocol/group option/ebpf.go option/group.go include/ebpf.go
+              include/ebpf_stub.go include/ebpf_test.go go.mod go.sum
+            )
+            git rm -r --ignore-unmatch -- "${component_paths[@]}" >/dev/null
+            for path in "${component_paths[@]}"; do
+              if git cat-file -e "HEAD^1:$path" 2>/dev/null; then
+                git checkout HEAD^1 -- "$path"
+              fi
+            done
+            git add -A -- "${component_paths[@]}"
+            git commit --amend --no-edit
+          fi
           echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           git log -1 --oneline
 
