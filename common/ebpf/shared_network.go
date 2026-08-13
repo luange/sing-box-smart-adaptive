@@ -167,6 +167,7 @@ type SharedNetworkBackend struct {
 	hostIPv6        []netip.Prefix
 	originalDstLost atomic.Uint64
 	dataPlaneV2     bool
+	v2InterfaceMAC  map[uint32]sharedNetworkInterfaceMAC
 }
 
 func PrepareSharedNetwork(
@@ -246,7 +247,7 @@ func PrepareSharedNetwork(
 		)
 	}
 
-	backend := &SharedNetworkBackend{runtime: runtimeState, dataPlaneV2: socketAssign}
+	backend := &SharedNetworkBackend{runtime: runtimeState, dataPlaneV2: socketAssign, v2InterfaceMAC: make(map[uint32]sharedNetworkInterfaceMAC)}
 	backend.control.BridgePort = bridgePort
 	if enableTCP {
 		backend.control.Flags |= sharedNetworkFlagTCP
@@ -289,8 +290,8 @@ func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error 
 	if b == nil || key >= 4 || fd < 0 {
 		return E.New("invalid shared-network listener socket")
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -365,8 +366,8 @@ func (b *SharedNetworkBackend) PutDirectFlow(protocol uint8, source, destination
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil || b.control.Flags&(1<<7) == 0 {
 		return osErrClosed
 	}
@@ -431,12 +432,16 @@ func (b *SharedNetworkBackend) UpdateInterfaceMAC(ifIndex uint32, hardwareAddres
 	}
 	var value sharedNetworkInterfaceMAC
 	copy(value.Addr[:], hardwareAddress)
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
 	if b.dataPlaneV2 {
+		if err := updateMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&value), unsafe.Pointer(&ifIndex)); err != nil {
+			return err
+		}
+		b.v2InterfaceMAC[ifIndex] = value
 		return nil
 	}
 	return updateMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex), unsafe.Pointer(&value))
@@ -446,13 +451,24 @@ func (b *SharedNetworkBackend) DeleteInterfaceMAC(ifIndex uint32) error {
 	if b == nil {
 		return osErrClosed
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
 	if b.dataPlaneV2 {
-		return nil
+		value, loaded := b.v2InterfaceMAC[ifIndex]
+		if !loaded {
+			return nil
+		}
+		err := deleteMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&value))
+		if errors.Is(err, syscall.ENOENT) {
+			err = nil
+		}
+		if err == nil {
+			delete(b.v2InterfaceMAC, ifIndex)
+		}
+		return err
 	}
 	err := deleteMap(int(b.runtime.interface_mac_map_fd), unsafe.Pointer(&ifIndex))
 	if errors.Is(err, syscall.ENOENT) {

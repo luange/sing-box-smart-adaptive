@@ -64,14 +64,14 @@ int sb_ebpf_shared_network_prepare(
         sizeof(struct sb_shared_control),
         1U,
         0U);
-    if (!data_plane_v2) {
-        stage = "create interface MAC map";
-        runtime->interface_mac_map_fd = sb_ebpf_create_map(
+    stage = "create interface MAC map";
+    runtime->interface_mac_map_fd = sb_ebpf_create_map(
             BPF_MAP_TYPE_HASH,
-            sizeof(uint32_t),
-            sizeof(struct sb_shared_interface_mac),
+            data_plane_v2 ? sizeof(struct sb_shared_interface_mac) : sizeof(uint32_t),
+            data_plane_v2 ? sizeof(uint32_t) : sizeof(struct sb_shared_interface_mac),
             SB_SHARED_NETWORK_INTERFACE_ENTRIES,
             0U);
+    if (!data_plane_v2) {
         stage = "create original-to-token map";
         runtime->original_to_token_map_fd = sb_ebpf_create_map(
             BPF_MAP_TYPE_LRU_HASH,
@@ -128,7 +128,7 @@ int sb_ebpf_shared_network_prepare(
             0U);
     }
     if (runtime->control_map_fd < 0 ||
-        (!data_plane_v2 && runtime->interface_mac_map_fd < 0) ||
+        runtime->interface_mac_map_fd < 0 ||
         (!data_plane_v2 && runtime->original_to_token_map_fd < 0) ||
         (!data_plane_v2 && runtime->token_to_original_map_fd < 0) ||
         runtime->redirect_map_fd < 0 ||

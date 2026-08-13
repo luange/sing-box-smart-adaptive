@@ -20,6 +20,7 @@ struct bpf_map_def {
 
 struct sb_dp2_lpm4 { __u32 prefixlen; __u8 addr[4]; };
 struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
+struct sb_dp2_mac { __u8 addr[6]; __u8 reserved[2]; };
 
 #define EXTERNAL_MAP(name, map_type, key_type, value_type, count, flags_value) \
     struct bpf_map_def SEC("maps") name = { \
@@ -39,6 +40,8 @@ EXTERNAL_MAP(shared_flow_direct, BPF_MAP_TYPE_LRU_HASH, struct sb_shared_flow_ke
              struct sb_shared_flow_value, SB_SHARED_NETWORK_MAP_ENTRIES, 0U);
 EXTERNAL_MAP(shared_listener_sockets, BPF_MAP_TYPE_SOCKMAP, __u32, __u64,
              SB_SHARED_LISTENER_COUNT, 0U);
+EXTERNAL_MAP(shared_interface_mac, BPF_MAP_TYPE_HASH, struct sb_dp2_mac, __u32,
+             SB_SHARED_NETWORK_INTERFACE_ENTRIES, 0U);
 EXTERNAL_MAP(shared_stats, BPF_MAP_TYPE_ARRAY, __u32, __u64, SB_SHARED_STAT_COUNT, 0U);
 EXTERNAL_MAP(shared_host_ipv4, BPF_MAP_TYPE_LPM_TRIE, struct sb_dp2_lpm4, __u8,
              SB_SHARED_NETWORK_MAP_ENTRIES, BPF_F_NO_PREALLOC);
@@ -139,7 +142,8 @@ static __attribute__((always_inline)) int assign_established_socket(struct __sk_
 }
 
 static __attribute__((always_inline)) int remember_original(struct __sk_buff *skb,
-                                                             const struct sb_dp2_packet *packet) {
+                                                             const struct sb_dp2_packet *packet,
+                                                             const struct ethhdr *ethernet) {
     struct sb_shared_redirect_key key = {};
     key.family = packet->family;
     key.protocol = packet->protocol;
@@ -160,7 +164,11 @@ static __attribute__((always_inline)) int remember_original(struct __sk_buff *sk
     value.port = packet->destination_port;
     /* Reuse the ABI field that v1 uses for ingress ownership.  Userspace
      * consumes it as IngressIfIndex when constructing routing metadata. */
-    value.socket_cookie = skb->ingress_ifindex ? skb->ingress_ifindex : skb->ifindex;
+    struct sb_dp2_mac mac = {};
+    __builtin_memcpy(mac.addr, ethernet->h_dest, 6);
+    __u32 *logical_ifindex = map_lookup(&shared_interface_mac, &mac);
+    value.socket_cookie = logical_ifindex ? *logical_ifindex :
+        (skb->ingress_ifindex ? skb->ingress_ifindex : skb->ifindex);
     __builtin_memcpy(value.addr, packet->destination, 16);
     return map_update(&shared_redirect, &key, &value, BPF_ANY);
 }
@@ -218,7 +226,7 @@ int sb_share_v2_in(struct __sk_buff *skb) {
         count_stat(SB_SHARED_STAT_INGRESS_DROPS);
         return TC_ACT_SHOT;
     }
-    if (remember_original(skb, &packet) != 0) {
+    if (remember_original(skb, &packet, data) != 0) {
         count_stat(SB_SHARED_STAT_FLOW_UPDATE_FAILURES);
         count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
         return TC_ACT_OK;

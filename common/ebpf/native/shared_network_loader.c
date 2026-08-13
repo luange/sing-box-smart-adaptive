@@ -24,15 +24,16 @@ static void shared_network_fill_map_table(
 		entries[1] = (struct sb_ebpf_object_map_entry){"shared_redirect", runtime->redirect_map_fd};
 		entries[2] = (struct sb_ebpf_object_map_entry){"shared_flow_direct", runtime->flow_direct_map_fd};
 		entries[3] = (struct sb_ebpf_object_map_entry){"shared_listener_sockets", runtime->listener_socket_map_fd};
-		entries[4] = (struct sb_ebpf_object_map_entry){"shared_stats", runtime->stats_map_fd};
-		entries[5] = (struct sb_ebpf_object_map_entry){"shared_host_ipv4", runtime->host_ipv4_map_fd};
-		entries[6] = (struct sb_ebpf_object_map_entry){"shared_host_ipv6", runtime->host_ipv6_map_fd};
-		entries[7] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv4", bypass_ipv4_map_fd};
-		entries[8] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv6", bypass_ipv6_map_fd};
-		entries[9] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv4", dns_direct_ipv4_map_fd};
-		entries[10] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv6", dns_direct_ipv6_map_fd};
+		entries[4] = (struct sb_ebpf_object_map_entry){"shared_interface_mac", runtime->interface_mac_map_fd};
+		entries[5] = (struct sb_ebpf_object_map_entry){"shared_stats", runtime->stats_map_fd};
+		entries[6] = (struct sb_ebpf_object_map_entry){"shared_host_ipv4", runtime->host_ipv4_map_fd};
+		entries[7] = (struct sb_ebpf_object_map_entry){"shared_host_ipv6", runtime->host_ipv6_map_fd};
+		entries[8] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv4", bypass_ipv4_map_fd};
+		entries[9] = (struct sb_ebpf_object_map_entry){"shared_bypass_ipv6", bypass_ipv6_map_fd};
+		entries[10] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv4", dns_direct_ipv4_map_fd};
+		entries[11] = (struct sb_ebpf_object_map_entry){"shared_dns_direct_ipv6", dns_direct_ipv6_map_fd};
 		table->entries = entries;
-		table->count = 11U;
+		table->count = 12U;
 		return;
 	}
 	entries[1] = (struct sb_ebpf_object_map_entry){"shared_interface_mac", runtime->interface_mac_map_fd};
