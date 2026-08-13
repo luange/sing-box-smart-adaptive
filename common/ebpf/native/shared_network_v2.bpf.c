@@ -160,7 +160,7 @@ static __attribute__((always_inline)) int remember_original(struct __sk_buff *sk
     value.port = packet->destination_port;
     /* Reuse the ABI field that v1 uses for ingress ownership.  Userspace
      * consumes it as IngressIfIndex when constructing routing metadata. */
-    value.socket_cookie = skb->ifindex;
+    value.socket_cookie = skb->ingress_ifindex ? skb->ingress_ifindex : skb->ifindex;
     __builtin_memcpy(value.addr, packet->destination, 16);
     return map_update(&shared_redirect, &key, &value, BPF_ANY);
 }

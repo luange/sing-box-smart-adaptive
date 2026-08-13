@@ -5,6 +5,7 @@ package ebpf
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -299,7 +300,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 			return
 		}
 		if original.IngressIfIndex != uint32(macInterface.Index) {
-			macTCPResult <- errors.New("macvlan ingress interface was not preserved")
+			macTCPResult <- fmt.Errorf("macvlan ingress interface was not preserved: got=%d want=%d", original.IngressIfIndex, macInterface.Index)
 			return
 		}
 		_, writeErr := conn.Write([]byte("macvlan-ok"))
