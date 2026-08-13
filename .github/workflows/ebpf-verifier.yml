@@ -94,7 +94,7 @@ jobs:
           CGO_ENABLED: '1'
         run: |
           go build -trimpath \
-            -tags with_ebpf,with_gvisor,with_quic,with_wireguard,with_clash_api,with_tailscale,with_utls,badlinkname,tfogo_checklinkname0 \
+            -tags with_ebpf,with_gvisor,with_quic,with_wireguard,with_clash_api,with_tailscale,with_utls \
             -o sing-box-v2-linux-amd64 ./cmd/sing-box
           sha256sum sing-box-v2-linux-amd64 | tee sing-box-v2-linux-amd64.sha256
 
