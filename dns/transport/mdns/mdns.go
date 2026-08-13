@@ -11,7 +11,6 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/dns/transport/local/systemconfig"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -61,7 +60,6 @@ func RegisterTransport(registry *dns.TransportRegistry) {
 var (
 	_ adapter.DNSTransport                    = (*Transport)(nil)
 	_ adapter.DNSTransportWithPreferredDomain = (*Transport)(nil)
-	_ adapter.DNSTransportWithEnvironment     = (*Transport)(nil)
 )
 
 type Transport struct {
@@ -70,7 +68,6 @@ type Transport struct {
 	logger         logger.ContextLogger
 	networkManager adapter.NetworkManager
 	interfaceNames badoption.Listable[string]
-	configSource   *systemconfig.Source
 }
 
 func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.MDNSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -80,7 +77,6 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
 		logger:           logger,
 		networkManager:   service.FromContext[adapter.NetworkManager](ctx),
 		interfaceNames:   options.Interface,
-		configSource:     systemconfig.NewSource(ctx),
 	}, nil
 }
 
@@ -98,27 +94,14 @@ func (t *Transport) Start(stage adapter.StartStage) error {
 }
 
 func (t *Transport) Close() error {
-	if t.configSource != nil {
-		return t.configSource.Close()
-	}
 	return nil
 }
 
 func (t *Transport) Reset() {
-	if t.configSource != nil {
-		t.configSource.Reset()
-	}
 }
 
 func (t *Transport) PreferredDomain(domain string) bool {
 	return IsLocalDomain(domain)
-}
-
-func (t *Transport) Environment() []string {
-	if t.configSource == nil {
-		return nil
-	}
-	return t.configSource.Configuration().Signature()
 }
 
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {

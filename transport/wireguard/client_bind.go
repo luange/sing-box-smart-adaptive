@@ -32,7 +32,6 @@ type ClientBind struct {
 	bindCtx             context.Context
 	bindDone            context.CancelFunc
 	dialer              N.Dialer
-	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 	connAccess          sync.Mutex
 	conn                *wireConn
@@ -190,9 +189,7 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			buf = buf[offset:]
 		}
 		if len(buf) > 3 {
-			c.reservedAccess.RLock()
 			reserved, loaded := c.reservedForEndpoint[destination]
-			c.reservedAccess.RUnlock()
 			if !loaded {
 				reserved = c.reserved
 			}
@@ -220,47 +217,7 @@ func (c *ClientBind) BatchSize() int {
 }
 
 func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
-	c.reservedAccess.Lock()
 	c.reservedForEndpoint[destination] = reserved
-	c.reservedAccess.Unlock()
-}
-
-func (c *ClientBind) waitActive() bool {
-	for c.pauseManager != nil && c.pauseManager.IsPaused() {
-		if !c.waitDelay(clientBindPausePollInterval) {
-			return false
-		}
-	}
-	return !isDone(c.done)
-}
-
-func (c *ClientBind) waitAfterFailure() bool {
-	if c.pauseManager != nil && c.pauseManager.IsPaused() {
-		return c.waitActive()
-	}
-	return c.waitDelay(clientBindRetryInterval)
-}
-
-func (c *ClientBind) waitDelay(delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-c.done:
-		return false
-	case <-c.ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-func isDone(done <-chan struct{}) bool {
-	select {
-	case <-done:
-		return true
-	default:
-		return false
-	}
 }
 
 func (c *ClientBind) waitActive() bool {

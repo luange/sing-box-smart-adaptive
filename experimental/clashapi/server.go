@@ -70,6 +70,9 @@ type Server struct {
 	lastEtag                 string
 	lastUpdated              time.Time
 	ticker                   *time.Ticker
+	memoryReclaim            *memoryReclaimState
+	memoryReclaimConfig      memoryReclaimConfig
+	memoryReclaimCancel      context.CancelFunc
 }
 
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.ClashServer, error) {
@@ -111,6 +114,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 
 		//nolint:staticcheck
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
+	}
+	if reclaimConfig, enabled := newMemoryReclaimConfig(options.MemoryReclaim); enabled {
+		s.memoryReclaim = &memoryReclaimState{startedAt: time.Now()}
+		s.memoryReclaimConfig = reclaimConfig
 	}
 	defaultMode := "Rule"
 	if options.DefaultMode != "" {
@@ -193,6 +200,11 @@ func (s *Server) Start(stage adapter.StartStage) error {
 			}
 		}
 	case adapter.StartStateStarted:
+		if s.memoryReclaim != nil && s.memoryReclaimCancel == nil {
+			var reclaimCtx context.Context
+			reclaimCtx, s.memoryReclaimCancel = context.WithCancel(s.ctx)
+			go s.memoryReclaim.run(reclaimCtx, s.memoryReclaimConfig)
+		}
 		if s.externalController {
 			if s.externalUI != "" && s.externalUIUpdateInterval != 0 {
 				if s.cacheFile != nil {
@@ -251,6 +263,9 @@ func (s *Server) loopUpdate() {
 }
 
 func (s *Server) Close() error {
+	if s.memoryReclaimCancel != nil {
+		s.memoryReclaimCancel()
+	}
 	if s.ticker != nil {
 		s.ticker.Stop()
 	}

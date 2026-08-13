@@ -2,6 +2,7 @@ package interrupt
 
 import (
 	"net"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -26,14 +27,32 @@ type Conn struct {
 	element *list.Element[*groupConnItem]
 }
 
+func (c *Conn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (c *Conn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
 /*func (c *Conn) MarkAsInternal() {
 	c.element.Value.internal = true
 }*/
 
 func (c *Conn) Close() error {
-	c.group.access.Lock()
-	defer c.group.access.Unlock()
-	c.group.connections.Remove(c.element)
+	if c.element.Value.removed.CompareAndSwap(false, true) {
+		c.group.access.Lock()
+		c.group.connections.Remove(c.element)
+		c.group.access.Unlock()
+	}
 	return c.Conn.Close()
 }
 
@@ -55,15 +74,38 @@ type PacketConn struct {
 	element *list.Element[*groupConnItem]
 }
 
+func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, address, err := c.PacketConn.ReadFrom(p)
+	if n > 0 {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
+	return n, address, err
+}
+
+func (c *PacketConn) WriteTo(p []byte, address net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, address)
+	if n > 0 {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
 /*func (c *PacketConn) MarkAsInternal() {
 	c.element.Value.internal = true
 }*/
 
 func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	if packetReader, ok := c.PacketConn.(N.PacketReader); ok {
-		return packetReader.ReadPacket(buffer)
+		destination, err := packetReader.ReadPacket(buffer)
+		if buffer.Len() > 0 {
+			c.element.Value.lastActive.Store(time.Now().UnixNano())
+		}
+		return destination, err
 	}
 	_, addr, err := buffer.ReadPacketFrom(c.PacketConn)
+	if buffer.Len() > 0 {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
@@ -72,17 +114,26 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 
 func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if packetWriter, ok := c.PacketConn.(N.PacketWriter); ok {
-		return packetWriter.WritePacket(buffer, destination)
+		err := packetWriter.WritePacket(buffer, destination)
+		if err == nil {
+			c.element.Value.lastActive.Store(time.Now().UnixNano())
+		}
+		return err
 	}
 	defer buffer.Release()
 	_, err := c.PacketConn.WriteTo(buffer.Bytes(), destination.UDPAddr())
+	if err == nil {
+		c.element.Value.lastActive.Store(time.Now().UnixNano())
+	}
 	return err
 }
 
 func (c *PacketConn) Close() error {
-	c.group.access.Lock()
-	defer c.group.access.Unlock()
-	c.group.connections.Remove(c.element)
+	if c.element.Value.removed.CompareAndSwap(false, true) {
+		c.group.access.Lock()
+		c.group.connections.Remove(c.element)
+		c.group.access.Unlock()
+	}
 	return c.PacketConn.Close()
 }
 

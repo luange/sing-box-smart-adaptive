@@ -7,14 +7,14 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
-	"github.com/sagernet/sing-box/dns/transport/local/systemconfig"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 
 	mDNS "github.com/miekg/dns"
 )
 
 type localServerSet struct {
-	config     *systemconfig.Config
+	config     *dnsConfig
 	transports []adapter.DNSTransport
 }
 
@@ -24,7 +24,7 @@ func (s *localServerSet) Close() {
 	}
 }
 
-func (t *Transport) serverSetFor(systemConfig *systemconfig.Config) (*localServerSet, error) {
+func (t *Transport) serverSetFor(systemConfig *dnsConfig) (*localServerSet, error) {
 	serverSet := t.serverSet.Load()
 	if serverSet != nil && serverSet.config == systemConfig {
 		return serverSet, nil
@@ -35,10 +35,14 @@ func (t *Transport) serverSetFor(systemConfig *systemconfig.Config) (*localServe
 	if serverSet != nil && serverSet.config == systemConfig {
 		return serverSet, nil
 	}
-	transports := make([]adapter.DNSTransport, 0, len(systemConfig.Servers))
-	for _, serverAddr := range systemConfig.Servers {
+	transports := make([]adapter.DNSTransport, 0, len(systemConfig.servers))
+	for _, server := range systemConfig.servers {
+		serverAddr := M.ParseSocksaddr(server)
+		if serverAddr.Port == 0 {
+			serverAddr.Port = 53
+		}
 		var serverTransport adapter.DNSTransport
-		if systemConfig.UseTCP {
+		if systemConfig.useTCP {
 			serverTransport = transport.NewTCPRaw(dns.NewTransportAdapter(C.DNSTypeTCP, "", nil), t.dialer, serverAddr)
 		} else {
 			serverTransport = transport.NewUDPRaw(t.logger, dns.NewTransportAdapter(C.DNSTypeUDP, "", nil), t.dialer, serverAddr)
@@ -64,13 +68,13 @@ func (t *Transport) serverSetFor(systemConfig *systemconfig.Config) (*localServe
 }
 
 func (t *Transport) exchangeAsync(ctx context.Context, message *mDNS.Msg, domain string, callback func(response *mDNS.Msg, err error)) {
-	systemConfig := t.configSource.Configuration()
+	systemConfig := getSystemDNSConfig(t.ctx)
 	serverSet, err := t.serverSetFor(systemConfig)
 	if err != nil {
 		callback(nil, err)
 		return
 	}
-	names := systemConfig.NameList(domain)
+	names := systemConfig.nameList(domain)
 	if len(names) == 0 {
 		callback(nil, E.New("invalid domain: ", domain))
 		return
@@ -80,23 +84,23 @@ func (t *Transport) exchangeAsync(ctx context.Context, message *mDNS.Msg, domain
 		nameExchangers = append(nameExchangers, newNameExchanger(systemConfig, serverSet, message, fqdn))
 	}
 	question := message.Question[0]
-	if systemConfig.SingleRequest || !(question.Qtype == mDNS.TypeA || question.Qtype == mDNS.TypeAAAA) {
+	if systemConfig.singleRequest || !(question.Qtype == mDNS.TypeA || question.Qtype == mDNS.TypeAAAA) {
 		transport.ExchangeSequential(ctx, nameExchangers, nil, callback)
 	} else {
 		transport.ExchangeRace(ctx, nameExchangers, callback)
 	}
 }
 
-func newNameExchanger(systemConfig *systemconfig.Config, serverSet *localServerSet, message *mDNS.Msg, fqdn string) transport.AsyncExchanger {
-	serverOffset := systemConfig.ServerOffset()
+func newNameExchanger(systemConfig *dnsConfig, serverSet *localServerSet, message *mDNS.Msg, fqdn string) transport.AsyncExchanger {
+	serverOffset := systemConfig.serverOffset()
 	serverCount := uint32(len(serverSet.transports))
-	attemptExchangers := make([]transport.AsyncExchanger, 0, systemConfig.Attempts*int(serverCount))
-	for i := 0; i < systemConfig.Attempts; i++ {
+	attemptExchangers := make([]transport.AsyncExchanger, 0, systemConfig.attempts*int(serverCount))
+	for i := 0; i < systemConfig.attempts; i++ {
 		for j := range serverCount {
 			serverTransport := serverSet.transports[(serverOffset+j)%serverCount]
 			attemptExchangers = append(attemptExchangers, func(ctx context.Context, callback func(response *mDNS.Msg, err error)) {
-				attemptCtx, cancel := context.WithTimeout(ctx, systemConfig.Timeout)
-				serverTransport.ExchangeAsync(attemptCtx, transport.NewFanOutRequest(message, fqdn, systemConfig.TrustAD), func(response *mDNS.Msg, err error) {
+				attemptCtx, cancel := context.WithTimeout(ctx, systemConfig.timeout)
+				serverTransport.ExchangeAsync(attemptCtx, transport.NewFanOutRequest(message, fqdn, systemConfig.trustAD), func(response *mDNS.Msg, err error) {
 					cancel()
 					callback(response, err)
 				})

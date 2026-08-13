@@ -8,12 +8,14 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/dnsmux"
 	"github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/udpnat2"
@@ -26,10 +28,11 @@ func RegisterInbound(registry *inbound.Registry) {
 type Inbound struct {
 	inbound.Adapter
 	ctx                 context.Context
-	router              adapter.ConnectionRouterEx
+	router              adapter.Router
 	logger              log.ContextLogger
 	listener            *listener.Listener
 	udpNat              *udpnat.Service
+	dnsMux              *dnsmux.Service
 	overrideOption      int
 	overrideDestination M.Socksaddr
 }
@@ -58,7 +61,22 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	udpNATOptions, err := directUDPNATOptions(options, udpTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if options.ListenPort == 53 {
+		inbound.dnsMux = dnsmux.New(dnsmux.Options{
+			Handle:  inbound.handleDNSPacket,
+			Timeout: udpTimeout,
+			Prepare: func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+				_, prepareCtx, writer, onClose := inbound.preparePacketConnection(source, destination, userData)
+				return prepareCtx, writer, onClose
+			},
+		})
+	} else {
+		inbound.udpNat = udpnat.NewWithOptions(inbound, inbound.preparePacketConnection, udpNATOptions)
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -70,6 +88,42 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
+func (i *Inbound) handleDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, _ any) {
+	metadata := adapter.InboundContext{
+		Inbound:     i.Tag(),
+		InboundType: i.Type(),
+		Network:     N.NetworkUDP,
+		Protocol:    C.ProtocolDNS,
+		Source:      source,
+		Destination: destination,
+	}
+	//nolint:staticcheck
+	metadata.InboundDetour = i.listener.ListenOptions().Detour
+	i.router.HijackDNSPacket(ctx, payload, writer, metadata)
+}
+
+func directUDPNATOptions(options option.DirectInboundOptions, timeout time.Duration) (udpnat.Options, error) {
+	capacity := options.UDPSessionCapacity
+	queueDepth := options.UDPQueueDepth
+	if capacity == 0 {
+		capacity = 1024
+	}
+	if queueDepth == 0 {
+		queueDepth = 64
+	}
+	if capacity > 4096 {
+		return udpnat.Options{}, E.New("udp_session_capacity exceeds 4096")
+	}
+	if queueDepth < 1 || queueDepth > 256 {
+		return udpnat.Options{}, E.New("udp_queue_depth must be between 1 and 256")
+	}
+	return udpnat.Options{
+		Timeout:    timeout,
+		Capacity:   capacity,
+		QueueDepth: queueDepth,
+	}, nil
+}
+
 func (i *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
@@ -78,18 +132,39 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (i *Inbound) InterfaceUpdated() {
-	i.udpNat.Purge()
+	if i.udpNat != nil {
+		i.udpNat.Purge()
+	}
+	if i.dnsMux != nil {
+		i.dnsMux.Purge()
+	}
 }
 
 func (i *Inbound) Close() error {
+	if i.dnsMux != nil {
+		i.dnsMux.Close()
+	}
 	return i.listener.Close()
 }
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+	if i.dnsMux != nil {
+		i.dnsMux.NewPacket(buffer.Bytes(), source, i.listener.UDPAddr(), nil)
+		return
+	}
 	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, i.listener.UDPAddr(), nil)
 }
 
 func (i *Inbound) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr) {
+	if i.dnsMux != nil {
+		for index, buffer := range buffers {
+			if index < len(sources) {
+				i.dnsMux.NewPacket(buffer.Bytes(), sources[index], i.listener.UDPAddr(), nil)
+			}
+			buffer.Release()
+		}
+		return
+	}
 	i.udpNat.NewPacketBatch(buffers, sources, i.listener.UDPAddr(), nil)
 }
 

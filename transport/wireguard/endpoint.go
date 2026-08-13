@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-tun"
@@ -146,11 +148,24 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	}, nil
 }
 
-func (e *Endpoint) Start(postStart bool) error {
-	hasDomainPeer := common.Any(e.peers, func(peer peerConfig) bool {
-		return peer.destination.IsDomain()
-	})
-	if postStart != hasDomainPeer {
+func (e *Endpoint) Start(resolve bool) error {
+	if common.Any(e.peers, func(peer peerConfig) bool {
+		return !peer.endpoint.IsValid() && peer.destination.IsDomain()
+	}) {
+		if !resolve {
+			return nil
+		}
+		for peerIndex, peer := range e.peers {
+			if peer.endpoint.IsValid() || !peer.destination.IsDomain() {
+				continue
+			}
+			destinationAddress, err := e.options.ResolvePeer(peer.destination.Fqdn)
+			if err != nil {
+				return E.Cause(err, "resolve endpoint domain for peer[", peerIndex, "]: ", peer.destination)
+			}
+			e.peers[peerIndex].endpoint = netip.AddrPortFrom(destinationAddress, peer.destination.Port)
+		}
+	} else if resolve {
 		return nil
 	}
 	var bind conn.Bind
@@ -174,18 +189,16 @@ func (e *Endpoint) Start(postStart bool) error {
 			connectAddr netip.AddrPort
 			reserved    [3]uint8
 		)
-		if len(e.peers) == 1 {
+		if len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
+			isConnect = true
+			connectAddr = e.peers[0].endpoint
 			reserved = e.peers[0].reserved
-			if e.peers[0].endpoint.IsValid() {
-				isConnect = true
-				connectAddr = e.peers[0].endpoint
-			}
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
 	}
 	if isUDPListener || len(e.peers) > 1 {
 		for _, peer := range e.peers {
-			if peer.endpoint.IsValid() && peer.reserved != [3]uint8{} {
+			if peer.reserved != [3]uint8{} {
 				bind.SetReservedForEndpoint(peer.endpoint, peer.reserved)
 			}
 		}
@@ -214,37 +227,6 @@ func (e *Endpoint) Start(postStart bool) error {
 		wgDevice.Close()
 		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
 	}
-	for _, peer := range e.peers {
-		if !peer.destination.IsDomain() {
-			continue
-		}
-		var publicKey device.NoisePublicKey
-		common.Must(publicKey.FromHex(peer.publicKeyHex))
-		wgPeer, found := wgDevice.LookupActivePeer(publicKey)
-		if !found {
-			wgDevice.Close()
-			return E.New("missing configured peer: ", peer.destination)
-		}
-		wgPeer.SetEndpointResolver(func() ([]conn.Endpoint, error) {
-			addresses, lookupErr := e.options.ResolvePeer(peer.destination.Fqdn)
-			if lookupErr != nil {
-				return nil, lookupErr
-			}
-			endpoints := make([]conn.Endpoint, 0, len(addresses))
-			for _, address := range addresses {
-				destination := netip.AddrPortFrom(address, peer.destination.Port)
-				if peer.reserved != ([3]uint8{}) {
-					bind.SetReservedForEndpoint(destination, peer.reserved)
-				}
-				endpoint, parseErr := bind.ParseEndpoint(destination.String())
-				if parseErr != nil {
-					return nil, parseErr
-				}
-				endpoints = append(endpoints, endpoint)
-			}
-			return endpoints, nil
-		})
-	}
 	e.deviceAccess.Lock()
 	e.device = wgDevice
 	e.deviceAccess.Unlock()
@@ -252,7 +234,7 @@ func (e *Endpoint) Start(postStart bool) error {
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
-	e.allowedIPs = wgDevice.AllowedIPs()
+	e.allowedIPs = (*device.AllowedIPs)(unsafe.Pointer(reflect.Indirect(reflect.ValueOf(wgDevice)).FieldByName("allowedips").UnsafeAddr()))
 	return nil
 }
 
