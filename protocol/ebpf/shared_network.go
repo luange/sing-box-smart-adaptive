@@ -52,27 +52,29 @@ const (
 )
 
 type sharedNetwork struct {
-	parent       *Inbound
-	interfaces   []string
-	tcPriority   uint16
-	dropUDP443   bool
-	dataPlane    string
-	flowVerdict  bool
-	routingMark  uint32
-	routingTable uint32
-	backend      *ECommon.SharedNetworkBackend
-	policyRoute  *sharedNetworkPolicyRoute
-	tc           *sharedTCManager
-	tcp4         *listener.Listener
-	tcp6         *listener.Listener
-	udp4         *listener.Listener
-	udp6         *listener.Listener
-	udpNat       *udpnat.Service
-	dnsMux       *dnsmux.Service
-	udpClients   udpClientTable
-	udpWarnings  udpWarningLimiters
-	listenPort   uint16
-	closeAccess  sync.Mutex
+	parent             *Inbound
+	interfaces         []string
+	tcPriority         uint16
+	dropUDP443         bool
+	dataPlane          string
+	flowVerdict        bool
+	transparentAccess  sync.Mutex
+	transparentWriters map[netip.AddrPort]*transparentWriterEntry
+	routingMark        uint32
+	routingTable       uint32
+	backend            *ECommon.SharedNetworkBackend
+	policyRoute        *sharedNetworkPolicyRoute
+	tc                 *sharedTCManager
+	tcp4               *listener.Listener
+	tcp6               *listener.Listener
+	udp4               *listener.Listener
+	udp6               *listener.Listener
+	udpNat             *udpnat.Service
+	dnsMux             *dnsmux.Service
+	udpClients         udpClientTable
+	udpWarnings        udpWarningLimiters
+	listenPort         uint16
+	closeAccess        sync.Mutex
 }
 
 type sharedNetworkIngressInterfaceKey struct{}
@@ -428,6 +430,7 @@ func (s *sharedNetwork) Close() error {
 	defer s.closeAccess.Unlock()
 	s.udpNat.Purge()
 	s.dnsMux.Close()
+	s.closeTransparentWriters()
 	if s.tc != nil {
 		if err := s.tc.Close(); err != nil {
 			return err
@@ -562,9 +565,7 @@ func (s *sharedNetwork) preparePacketConnection(source M.Socksaddr, destination 
 	client := source.AddrPort()
 	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		writer := &sharedPacketWriter{shared: s, client: client}
-		return true, ctx, writer, func(error) {
-			common.Close(common.PtrOrNil(writer.conn))
-		}
+		return true, ctx, writer, func(error) { writer.closeTransparent() }
 	}
 	clientState := s.udpClients.retain(client)
 	writer := &sharedPacketWriter{
@@ -596,6 +597,12 @@ type sharedPacketWriter struct {
 	clientState *udpClientState
 	conn        *net.UDPConn
 	bound       M.Socksaddr
+	transparent *transparentWriterEntry
+}
+
+type transparentWriterEntry struct {
+	conn *net.UDPConn
+	refs int
 }
 
 func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -627,36 +634,92 @@ func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 }
 
 func (w *sharedPacketWriter) writeTransparent(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if w.conn != nil && w.bound == destination {
-		_, err := w.conn.WriteToUDPAddrPort(buffer.Bytes(), w.client)
-		if err == nil {
-			return nil
+	if w.transparent == nil || w.bound != destination {
+		w.closeTransparent()
+		entry, err := w.shared.retainTransparentWriter(destination)
+		if err != nil {
+			return err
 		}
-		_ = w.conn.Close()
-		w.conn = nil
+		w.transparent = entry
+		w.bound = destination
 	}
-	current := w.shared.udp4
+	udpConn := w.transparent.conn
+	_, err := udpConn.WriteToUDPAddrPort(buffer.Bytes(), w.client)
+	if err != nil {
+		w.shared.invalidateTransparentWriter(destination.AddrPort(), w.transparent)
+		w.transparent = nil
+		w.bound = M.Socksaddr{}
+	}
+	return err
+}
+
+func (s *sharedNetwork) retainTransparentWriter(destination M.Socksaddr) (*transparentWriterEntry, error) {
+	key := destination.AddrPort()
+	s.transparentAccess.Lock()
+	defer s.transparentAccess.Unlock()
+	if current := s.transparentWriters[key]; current != nil {
+		current.refs++
+		return current, nil
+	}
+	current := s.udp4
 	if destination.Addr.Is6() {
-		current = w.shared.udp6
+		current = s.udp6
 	}
 	if current == nil {
-		return E.New("shared-network transparent UDP listener is unavailable")
+		return nil, E.New("shared-network transparent UDP listener is unavailable")
 	}
 	var listenConfig net.ListenConfig
 	listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
 	listenConfig.Control = control.Append(listenConfig.Control, redir.TProxyWriteBack())
-	packetConn, err := current.ListenPacket(listenConfig, w.shared.parent.ctx, "udp", destination.String())
+	packetConn, err := current.ListenPacket(listenConfig, s.parent.ctx, "udp", destination.String())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	udpConn := packetConn.(*net.UDPConn)
-	if _, err = udpConn.WriteToUDPAddrPort(buffer.Bytes(), w.client); err != nil {
-		udpConn.Close()
-		return err
+	entry := &transparentWriterEntry{conn: packetConn.(*net.UDPConn), refs: 1}
+	if s.transparentWriters == nil {
+		s.transparentWriters = make(map[netip.AddrPort]*transparentWriterEntry)
 	}
-	w.conn = udpConn
-	w.bound = destination
-	return nil
+	s.transparentWriters[key] = entry
+	return entry, nil
+}
+
+func (w *sharedPacketWriter) closeTransparent() {
+	if w.transparent == nil {
+		return
+	}
+	w.shared.releaseTransparentWriter(w.bound.AddrPort(), w.transparent)
+	w.transparent = nil
+	w.bound = M.Socksaddr{}
+}
+
+func (s *sharedNetwork) releaseTransparentWriter(key netip.AddrPort, writer *transparentWriterEntry) {
+	s.transparentAccess.Lock()
+	if s.transparentWriters[key] == writer {
+		writer.refs--
+		if writer.refs == 0 {
+			delete(s.transparentWriters, key)
+			_ = writer.conn.Close()
+		}
+	}
+	s.transparentAccess.Unlock()
+}
+
+func (s *sharedNetwork) invalidateTransparentWriter(key netip.AddrPort, writer *transparentWriterEntry) {
+	s.transparentAccess.Lock()
+	if s.transparentWriters[key] == writer {
+		delete(s.transparentWriters, key)
+		_ = writer.conn.Close()
+	}
+	s.transparentAccess.Unlock()
+}
+
+func (s *sharedNetwork) closeTransparentWriters() {
+	s.transparentAccess.Lock()
+	for key, writer := range s.transparentWriters {
+		_ = writer.conn.Close()
+		delete(s.transparentWriters, key)
+	}
+	s.transparentAccess.Unlock()
 }
 
 type sharedTCManager struct {
