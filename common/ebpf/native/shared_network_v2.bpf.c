@@ -158,7 +158,9 @@ static __attribute__((always_inline)) int remember_original(struct __sk_buff *sk
     value.family = packet->family;
     value.protocol = packet->protocol;
     value.port = packet->destination_port;
-    value.socket_cookie = 0;
+    /* Reuse the ABI field that v1 uses for ingress ownership.  Userspace
+     * consumes it as IngressIfIndex when constructing routing metadata. */
+    value.socket_cookie = skb->ifindex;
     __builtin_memcpy(value.addr, packet->destination, 16);
     return map_update(&shared_redirect, &key, &value, BPF_ANY);
 }
@@ -185,6 +187,7 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     struct sb_dp2_packet packet = {};
     if (sb_dp2_parse(data, data_end, &packet) != 0 || packet.fragmented) {
+        count_stat(SB_SHARED_STAT_PARSE_FAILURES);
         count_stat(SB_SHARED_STAT_INGRESS_BYPASS);
         return TC_ACT_OK;
     }
@@ -206,6 +209,7 @@ int sb_share_v2_in(struct __sk_buff *skb) {
 	}
     if (destination_bypass(&packet) ||
 		((control->flags & SB_SHARED_FLAG_FLOW_DIRECT) && learned_direct(&packet))) {
+        count_stat(SB_SHARED_STAT_POLICY_BYPASS);
         count_stat(SB_SHARED_STAT_INGRESS_BYPASS);
         return TC_ACT_OK;
     }
@@ -225,6 +229,7 @@ int sb_share_v2_in(struct __sk_buff *skb) {
         (packet.protocol == IPPROTO_TCP ? SB_SHARED_LISTENER_TCP6 : SB_SHARED_LISTENER_UDP6);
     void *socket = map_lookup(&shared_listener_sockets, &listener);
     if (!socket) {
+        count_stat(SB_SHARED_STAT_LISTENER_MISSES);
         count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
         count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
 		forget_original(&packet);

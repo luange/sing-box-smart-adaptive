@@ -26,6 +26,9 @@ type SharedNetworkRuntimeStats struct {
 	FlowUpdateFailures   uint64
 	FallbackOpen         uint64
 	EstablishedBypass    uint64
+	ParseFailures        uint64
+	PolicyBypass         uint64
+	ListenerMisses       uint64
 	OriginalDstLost      uint64
 }
 

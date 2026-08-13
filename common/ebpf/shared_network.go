@@ -72,6 +72,9 @@ const (
 	sharedStatFlowUpdateFailures
 	sharedStatFallbackOpen
 	sharedStatEstablishedBypass
+	sharedStatParseFailures
+	sharedStatPolicyBypass
+	sharedStatListenerMisses
 	sharedStatCount
 )
 
@@ -88,6 +91,9 @@ type SharedNetworkRuntimeStats struct {
 	FlowUpdateFailures   uint64
 	FallbackOpen         uint64
 	EstablishedBypass    uint64
+	ParseFailures        uint64
+	PolicyBypass         uint64
+	ListenerMisses       uint64
 	OriginalDstLost      uint64
 }
 
@@ -523,6 +529,9 @@ func (b *SharedNetworkBackend) RuntimeStats() (SharedNetworkRuntimeStats, error)
 		FlowUpdateFailures:   values[sharedStatFlowUpdateFailures],
 		FallbackOpen:         values[sharedStatFallbackOpen],
 		EstablishedBypass:    values[sharedStatEstablishedBypass],
+		ParseFailures:        values[sharedStatParseFailures],
+		PolicyBypass:         values[sharedStatPolicyBypass],
+		ListenerMisses:       values[sharedStatListenerMisses],
 		OriginalDstLost:      b.originalDstLost.Load(),
 	}, nil
 }

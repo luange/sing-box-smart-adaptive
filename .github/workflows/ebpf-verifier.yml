@@ -88,6 +88,18 @@ jobs:
               -tags with_ebpf,ebpf_integration \
               ./common/ebpf 2>&1 | tee -a verifier.log
 
+      - name: Exercise socket-assignment v2 data path
+        if: matrix.toolchain == 'system-clang'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env \
+            "PATH=$PATH" \
+            SING_BOX_EBPF_SHARED_INTEGRATION=1 \
+            SING_BOX_EBPF_SHARED_DATA_PLANE=socket_assign \
+            go test -v -count=1 -run '^TestSharedNetworkDataPathIntegration$' \
+              -tags with_ebpf ./protocol/ebpf 2>&1 | tee -a verifier.log
+
       - name: Build Linux validation core
         if: matrix.toolchain == 'system-clang'
         env:

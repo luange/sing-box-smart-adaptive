@@ -307,6 +307,9 @@ func (i *Inbound) logSharedRuntimeStatsValue(
 		", flow_update_failures:", stats.FlowUpdateFailures,
 		", fallback_open:", stats.FallbackOpen,
 		", established_bypass:", stats.EstablishedBypass,
+		", parse_failures:", stats.ParseFailures,
+		", policy_bypass:", stats.PolicyBypass,
+		", listener_misses:", stats.ListenerMisses,
 		", original_dst_lost:", stats.OriginalDstLost,
 		"}",
 	}
