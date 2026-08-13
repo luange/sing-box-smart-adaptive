@@ -601,8 +601,13 @@ type sharedPacketWriter struct {
 }
 
 type transparentWriterEntry struct {
-	conn *net.UDPConn
+	conn transparentPacketConn
 	refs int
+}
+
+type transparentPacketConn interface {
+	WriteToUDPAddrPort(buffer []byte, destination netip.AddrPort) (int, error)
+	Close() error
 }
 
 func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -645,12 +650,19 @@ func (w *sharedPacketWriter) writeTransparent(buffer *buf.Buffer, destination M.
 	}
 	udpConn := w.transparent.conn
 	_, err := udpConn.WriteToUDPAddrPort(buffer.Bytes(), w.client)
-	if err != nil {
+	if err != nil && isTransparentSocketFatal(err) {
+		// Only tear down the shared socket when the descriptor itself is no
+		// longer usable.  Per-packet/transient failures such as ENOBUFS must not
+		// invalidate the socket for every client sharing this source address.
 		w.shared.invalidateTransparentWriter(destination.AddrPort(), w.transparent)
 		w.transparent = nil
 		w.bound = M.Socksaddr{}
 	}
 	return err
+}
+
+func isTransparentSocketFatal(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, unix.EBADF) || errors.Is(err, unix.ENOTSOCK)
 }
 
 func (s *sharedNetwork) retainTransparentWriter(destination M.Socksaddr) (*transparentWriterEntry, error) {

@@ -89,6 +89,7 @@ jobs:
         run: |
           "$BPF_CLANG" --version | tee verifier.log
           make -C common/ebpf generate
+          make -C common/ebpf check
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | tee -a verifier.log
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]maps'
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]BTF'

@@ -543,12 +543,10 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 		IP:   net.ParseIP("192.0.2.1"),
 		Port: 67,
 	})
-	if err != nil && !errors.Is(err, unix.EADDRINUSE) {
+	if err != nil {
 		t.Fatal(err)
 	}
-	if dhcpListener == nil {
-		t.Log("DHCP bypass subcase skipped because UDP/67 is already in use")
-	} else {
+	{
 		defer dhcpListener.Close()
 		dhcpResult := make(chan error, 1)
 		go func() {

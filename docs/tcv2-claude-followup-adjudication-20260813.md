@@ -67,3 +67,21 @@ would double count their distinct semantics.
   not required to establish correctness of TC v2 and is not represented as
   completed here.
 
+## Second follow-up
+
+The review of the transparent UDP writer pool identified a valid shared-fate
+issue.  A per-packet transient error previously removed and closed the socket
+shared by all clients using the same source address.  This is fixed by keeping
+the shared socket for transient and destination-specific failures (including
+`ENOBUFS`) and invalidating it only when the descriptor itself is unusable
+(`net.ErrClosed`, `EBADF`, or `ENOTSOCK`).  Tests cover both paths with two
+references to the same entry.
+
+The suggested `refs--` in the invalidation path was not used: the writer's
+normal close callback would decrement the same reference again.  Classifying
+descriptor-fatal errors avoids that double-release ambiguity while containing
+transient failures to the packet that experienced them.
+
+The DHCP bypass/mark regression is no longer skippable when port 67 cannot be
+bound, and the system-Clang generation step now immediately runs
+`make -C common/ebpf check` with that same toolchain.

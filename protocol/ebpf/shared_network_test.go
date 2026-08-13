@@ -3,16 +3,90 @@
 package ebpf
 
 import (
+	"errors"
 	"net"
+	"net/netip"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
 
 	"golang.org/x/sys/unix"
 )
+
+type transparentPacketConnStub struct {
+	err    atomic.Value
+	closed atomic.Int32
+}
+
+func (c *transparentPacketConnStub) WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error) {
+	err, _ := c.err.Load().(error)
+	return 0, err
+}
+
+func (c *transparentPacketConnStub) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+func TestTransparentWriterTransientFailureDoesNotInvalidateSharedSocket(t *testing.T) {
+	destination := M.ParseSocksaddr("192.0.2.1:53")
+	connection := new(transparentPacketConnStub)
+	connection.err.Store(error(unix.ENOBUFS))
+	entry := &transparentWriterEntry{conn: connection, refs: 2}
+	shared := &sharedNetwork{transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
+		destination.AddrPort(): entry,
+	}}
+	writer := &sharedPacketWriter{
+		shared:      shared,
+		client:      netip.MustParseAddrPort("192.0.2.2:53000"),
+		bound:       destination,
+		transparent: entry,
+	}
+	buffer := buf.New()
+	_, _ = buffer.Write([]byte("dns"))
+	if err := writer.WritePacket(buffer, destination); !errors.Is(err, unix.ENOBUFS) {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if shared.transparentWriters[destination.AddrPort()] != entry || writer.transparent != entry {
+		t.Fatal("transient packet error invalidated a shared transparent socket")
+	}
+	if connection.closed.Load() != 0 || entry.refs != 2 {
+		t.Fatalf("transient error changed shared socket lifetime: closed=%d refs=%d", connection.closed.Load(), entry.refs)
+	}
+}
+
+func TestTransparentWriterFatalFailureInvalidatesSharedSocket(t *testing.T) {
+	destination := M.ParseSocksaddr("192.0.2.1:53")
+	connection := new(transparentPacketConnStub)
+	connection.err.Store(error(unix.EBADF))
+	entry := &transparentWriterEntry{conn: connection, refs: 2}
+	shared := &sharedNetwork{transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
+		destination.AddrPort(): entry,
+	}}
+	writer := &sharedPacketWriter{
+		shared:      shared,
+		client:      netip.MustParseAddrPort("192.0.2.2:53000"),
+		bound:       destination,
+		transparent: entry,
+	}
+	buffer := buf.New()
+	_, _ = buffer.Write([]byte("dns"))
+	if err := writer.WritePacket(buffer, destination); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if shared.transparentWriters[destination.AddrPort()] != nil || writer.transparent != nil {
+		t.Fatal("fatal socket error retained an unusable shared socket")
+	}
+	if connection.closed.Load() != 1 {
+		t.Fatalf("fatal socket was closed %d times", connection.closed.Load())
+	}
+}
 
 func TestNormalizeSharedNetworkOptions(t *testing.T) {
 	options, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
