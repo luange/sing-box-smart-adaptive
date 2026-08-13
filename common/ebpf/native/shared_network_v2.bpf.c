@@ -95,6 +95,20 @@ static __attribute__((always_inline)) bool destination_bypass(const struct sb_dp
            lpm6_has(&shared_dns_direct_ipv6, packet->destination);
 }
 
+static __attribute__((always_inline)) bool protocol_bypass(
+    const struct sb_dp2_packet *packet, const struct sb_shared_control *control) {
+    if (packet->protocol == IPPROTO_UDP &&
+        (packet->source_port == 67 || packet->source_port == 68 ||
+         packet->source_port == 546 || packet->source_port == 547 ||
+         packet->destination_port == 67 || packet->destination_port == 68 ||
+         packet->destination_port == 546 || packet->destination_port == 547)) return true;
+    if (packet->destination_port != 53) return destination_bypass(packet);
+    if (!(control->flags & SB_SHARED_FLAG_DNS_HIJACK)) return true;
+    if (packet->family == SB_DP2_AF_INET)
+        return lpm4_has(&shared_dns_direct_ipv4, packet->destination);
+    return lpm6_has(&shared_dns_direct_ipv6, packet->destination);
+}
+
 static __attribute__((always_inline)) bool learned_direct(const struct sb_dp2_packet *packet) {
     struct sb_shared_flow_key key = {};
     key.family = packet->family;
@@ -215,7 +229,7 @@ int sb_share_v2_in(struct __sk_buff *skb) {
 		count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
 		return TC_ACT_OK;
 	}
-    if (destination_bypass(&packet) ||
+    if (protocol_bypass(&packet, control) ||
 		((control->flags & SB_SHARED_FLAG_FLOW_DIRECT) && learned_direct(&packet))) {
         count_stat(SB_SHARED_STAT_POLICY_BYPASS);
         count_stat(SB_SHARED_STAT_INGRESS_BYPASS);
