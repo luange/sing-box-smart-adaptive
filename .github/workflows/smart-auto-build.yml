@@ -182,25 +182,25 @@ jobs:
           # THEIRS: general upstream code
           for f in "${conflicts[@]}"; do
             [[ -z "$f" ]] && continue
+            ours_exists=false
+            theirs_exists=false
+            git cat-file -e "HEAD:$f" 2>/dev/null && ours_exists=true
+            git cat-file -e "MERGE_HEAD:$f" 2>/dev/null && theirs_exists=true
             case "$f" in
               protocol/ebpf/*|common/ebpf/*|option/ebpf.go|include/ebpf.go|include/ebpf_stub.go|include/ebpf_test.go|docs/configuration/inbound/ebpf*|docs/manual/misc/ebpf*)
-                git checkout --ours -- "$f"
-                git add -- "$f"
+                if $ours_exists; then git checkout --ours -- "$f"; git add -- "$f"; else git rm --ignore-unmatch -- "$f"; fi
                 echo "OURS_EBPF $f"
                 ;;
               option/group.go|protocol/group/*|adapter/experimental.go|constant/proxy.go|adapter/provider.go|adapter/inbound.go|adapter/outbound.go|option/rule.go|option/rule_dns.go|route/rule/rule_default.go|route/rule/rule_abstract.go|route/rule/rule_item_match_class.go)
-                git checkout --ours -- "$f"
-                git add -- "$f"
+                if $ours_exists; then git checkout --ours -- "$f"; git add -- "$f"; else git rm --ignore-unmatch -- "$f"; fi
                 echo "OURS_ADAPT $f"
                 ;;
               .github/workflows/*)
-                git checkout --ours -- "$f" 2>/dev/null || git checkout --theirs -- "$f"
-                git add -- "$f" 2>/dev/null || true
+                if $ours_exists; then git checkout --ours -- "$f"; git add -- "$f"; elif $theirs_exists; then git checkout --theirs -- "$f"; git add -- "$f"; else git rm --ignore-unmatch -- "$f"; fi
                 echo "OURS_CI $f"
                 ;;
               *)
-                git checkout --theirs -- "$f"
-                git add -- "$f"
+                if $theirs_exists; then git checkout --theirs -- "$f"; git add -- "$f"; else git rm --ignore-unmatch -- "$f"; fi
                 echo "THEIRS $f"
                 ;;
             esac
@@ -281,10 +281,9 @@ jobs:
         run: go mod download
 
       - name: Focused tests
-        continue-on-error: true
         run: |
-          set -uo pipefail
-          go test ./protocol/group ./dns -count=1 -timeout=180s || true
+          set -euo pipefail
+          go test ./protocol/group ./dns -count=1 -timeout=180s
 
       - name: Compile (no CGO)
         env:

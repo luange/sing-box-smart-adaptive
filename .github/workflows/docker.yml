@@ -5,16 +5,13 @@ on:
   #  branches:
   #    - stable
   #    - testing
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
         description: "The tag version you want to build"
 
 env:
-  REGISTRY_IMAGE: ghcr.io/sagernet/sing-box
+  REGISTRY_IMAGE: ghcr.io/luange/sing-box-smart-adaptive
 
 jobs:
   build_binary:

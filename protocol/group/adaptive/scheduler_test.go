@@ -264,7 +264,9 @@ func TestProbeSchedulerManualTriggerKeepsRecurringSchedule(t *testing.T) {
 		Timeout:  time.Second,
 		Run: func(context.Context) ProbeResult {
 			runs.Add(1)
-			return ProbeResult{Outcome: OutcomeSuccess}
+			// Deferred keeps the explicit short interval. Successful production
+			// coverage probes intentionally enter the 5m/15m/30m stable backoff.
+			return ProbeResult{Outcome: OutcomeDeferred}
 		},
 	}
 	if err := scheduler.Enqueue(task); err != nil {
