@@ -93,11 +93,17 @@ int sb_ebpf_load_shared_network_programs(
 	if (runtime->ingress_prog_fd < 0) {
 		return -1;
 	}
+	if (data_plane_v2) {
+		/* socket_assign preserves the original tuple and replies through the
+		 * normal kernel stack. It deliberately has no egress TC program. */
+		runtime->egress_prog_fd = -1;
+		return 0;
+	}
 	runtime->egress_prog_fd = sb_ebpf_object_load_section(
 		object,
 		object_size,
 		"classifier/egress",
-		data_plane_v2 ? "sb_share_v2_out" : "sb_share_out",
+		"sb_share_out",
 		BPF_PROG_TYPE_SCHED_CLS,
 		(enum bpf_attach_type)0,
 		&maps);

@@ -274,10 +274,4 @@ int sb_share_v2_in(struct __sk_buff *skb) {
     return TC_ACT_OK;
 }
 
-SEC("classifier/egress")
-int sb_share_v2_out(struct __sk_buff *skb) {
-    (void)skb;
-    return TC_ACT_OK;
-}
-
 char sb_dp2_license[] SEC("license") = "GPL";
