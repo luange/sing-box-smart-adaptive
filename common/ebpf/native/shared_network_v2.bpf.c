@@ -231,8 +231,10 @@ int sb_share_v2_in(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     long result = assign_socket(skb, socket, 0);
-	/* A SOCKMAP lookup returns a map-owned socket pointer, not a referenced
-	 * bpf_sock from skc_lookup_tcp.  bpf_sk_release is only valid for the latter. */
+	/* The Linux TC verifier exposes a SOCKMAP lookup as ref_obj_id and rejects
+	 * every exit path that does not release it.  This is covered by the real
+	 * kernel verifier matrix rather than assumed from generic map semantics. */
+	release_socket(socket);
     if (result != 0) {
         count_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURES);
         count_stat(SB_SHARED_STAT_FALLBACK_OPEN);
