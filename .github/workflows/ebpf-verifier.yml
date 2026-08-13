@@ -67,6 +67,7 @@ jobs:
           grep -q '[.]maps' committed-object.log
           grep -q '[.]BTF' committed-object.log
           grep -q '[.]BTF.ext' committed-object.log
+          make -C common/ebpf check-v2-source
           # v1 and splice objects are intentionally generated-only and are
           # required for the Go package to compile.  Preserve and restore the
           # committed v2 object so the test below cannot consume a regenerated
@@ -89,7 +90,6 @@ jobs:
         run: |
           "$BPF_CLANG" --version | tee verifier.log
           make -C common/ebpf generate
-          make -C common/ebpf check
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | tee -a verifier.log
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]maps'
           readelf -S common/ebpf/native/shared_network_v2.bpf.o | grep -q '[.]BTF'

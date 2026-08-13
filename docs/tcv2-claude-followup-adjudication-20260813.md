@@ -85,3 +85,19 @@ transient failures to the packet that experienced them.
 The DHCP bypass/mark regression is no longer skippable when port 67 cannot be
 bound, and the system-Clang generation step now immediately runs
 `make -C common/ebpf check` with that same toolchain.
+
+### Provenance gate correction
+
+The follow-up correctly observed that running `make check` immediately after
+`make generate` only proves compiler determinism and does not compare the
+committed v2 object with its source.  That placement has been removed.
+
+The proposed direct pre-generation byte comparison was not adopted because
+the committed object is produced by Clang 19.1.7 while the GitHub Ubuntu runner
+uses Clang 18.1.3; their valid ELF, DWARF, and BTF encodings differ.  Instead,
+generation now hashes the v2 source, map ABI, parser, BTF declarations, and
+generation Makefile into an ELF `.sb.source` section.  CI recomputes and checks
+that provenance hash on the committed object before any generation.  This
+closes source/object drift without conflating it with cross-compiler byte
+reproducibility, while the existing verifier and data-path gates still validate
+the embedded bytes themselves.

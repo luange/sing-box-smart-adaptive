@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "dataplane_v2_parser.h"
+
 #include "btf_map.h"
 #include "shared_network.h"
 
@@ -10,6 +11,12 @@
 #include <stdbool.h>
 
 #define SEC(name) __attribute__((section(name), used))
+
+#ifndef SB_SOURCE_HASH
+#define SB_SOURCE_HASH "untracked"
+#endif
+
+const char sb_dp2_source_hash[] SEC(".sb.source") = SB_SOURCE_HASH;
 
 struct sb_dp2_lpm4 { __u32 prefixlen; __u8 addr[4]; };
 struct sb_dp2_lpm6 { __u32 prefixlen; __u8 addr[16]; };
