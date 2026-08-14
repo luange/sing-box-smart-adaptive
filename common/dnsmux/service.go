@@ -2,6 +2,7 @@ package dnsmux
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net/netip"
 	"sync"
@@ -59,6 +60,7 @@ type transaction struct {
 type responder struct {
 	writer  N.PacketWriter
 	onClose N.CloseHandlerFunc
+	queryID uint16
 }
 
 type lane struct {
@@ -132,7 +134,11 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 		key = s.options.LaneKey(source, userData)
 	}
 	now := time.Now()
-	dedupeKey := key + "\x00" + destination.String() + "\x00" + string(payload)
+	// DNS clients are free to retransmit an identical question with a new ID.
+	// The ID is a client-side correlation value, not part of the upstream work,
+	// so exclude it from the in-flight key and restore it per responder later.
+	dedupeKey := key + "\x00" + destination.String() + "\x00" + string(payload[2:])
+	queryID := binary.BigEndian.Uint16(payload[:2])
 	s.access.Lock()
 	if existingID, loaded := s.inflight[dedupeKey]; loaded {
 		currentTransaction, exists := s.transactions[existingID]
@@ -146,7 +152,9 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 				s.followerRejected.Add(1)
 				return false
 			}
-			currentTransaction.responders = append(currentTransaction.responders, responder{writer: writer, onClose: onClose})
+			currentTransaction.responders = append(currentTransaction.responders, responder{
+				writer: writer, onClose: onClose, queryID: queryID,
+			})
 			s.transactions[existingID] = currentTransaction
 			s.access.Unlock()
 			s.queries.Add(1)
@@ -174,7 +182,7 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 	current.lastActive = now
 	s.transactions[id] = transaction{
 		laneKey: key, dedupeKey: dedupeKey,
-		responders: []responder{{writer: writer, onClose: onClose}}, createdAt: now,
+		responders: []responder{{writer: writer, onClose: onClose, queryID: queryID}}, createdAt: now,
 	}
 	s.inflight[dedupeKey] = id
 	transactionCount := uint64(len(s.transactions))
@@ -222,6 +230,9 @@ func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr
 		if index != len(entry.responders)-1 {
 			response = buf.NewSize(buffer.Len())
 			response.Write(buffer.Bytes())
+		}
+		if response.Len() >= 2 {
+			binary.BigEndian.PutUint16(response.Bytes()[:2], current.queryID)
 		}
 		err := current.writer.WritePacket(response, destination)
 		if writeErr == nil && err != nil {

@@ -22,6 +22,14 @@ func (w countingWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
 	return nil
 }
 
+type idWriter struct{ ids chan uint16 }
+
+func (w idWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	w.ids <- binary.BigEndian.Uint16(buffer.Bytes()[:2])
+	buffer.Release()
+	return nil
+}
+
 func TestServiceSharesOneLaneAcrossHighCardinalitySourcePorts(t *testing.T) {
 	var replies atomic.Uint64
 	service := New(Options{
@@ -62,14 +70,14 @@ func TestServiceBoundsOutstandingTransactions(t *testing.T) {
 		Timeout: time.Minute, MaxTransactions: 2,
 	})
 	defer service.Close()
-	message := make([]byte, 12)
+	message := make([]byte, 13)
 	source := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 10000}
 	destination := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.53"), Port: 53}
-	binary.BigEndian.PutUint16(message[:2], 1)
+	message[12] = 1
 	require.True(t, service.NewPacket(message, source, destination, nil))
-	binary.BigEndian.PutUint16(message[:2], 2)
+	message[12] = 2
 	require.True(t, service.NewPacket(message, source, destination, nil))
-	binary.BigEndian.PutUint16(message[:2], 3)
+	message[12] = 3
 	require.False(t, service.NewPacket(message, source, destination, nil))
 	stats := service.RuntimeStats()
 	require.Equal(t, uint64(2), stats.Transactions)
@@ -79,8 +87,8 @@ func TestServiceBoundsOutstandingTransactions(t *testing.T) {
 }
 
 func TestServiceCoalescesIdenticalInflightQueriesAndFansOut(t *testing.T) {
-	var replies atomic.Uint64
 	var handles atomic.Uint64
+	ids := make(chan uint16, 2)
 	responseWriter := make(chan N.PacketWriter, 1)
 	service := New(Options{
 		Handle: func(_ context.Context, _ []byte, writer N.PacketWriter, _, _ M.Socksaddr, _ any) {
@@ -88,7 +96,7 @@ func TestServiceCoalescesIdenticalInflightQueriesAndFansOut(t *testing.T) {
 			responseWriter <- writer
 		},
 		Prepare: func(M.Socksaddr, M.Socksaddr, any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
-			return context.Background(), countingWriter{replies: &replies}, nil
+			return context.Background(), idWriter{ids: ids}, nil
 		},
 		Timeout: time.Minute,
 	})
@@ -100,6 +108,7 @@ func TestServiceCoalescesIdenticalInflightQueriesAndFansOut(t *testing.T) {
 	destination := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.53"), Port: 53}
 	require.True(t, service.NewPacket(message,
 		M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 10000}, destination, nil))
+	binary.BigEndian.PutUint16(message[:2], 43)
 	require.True(t, service.NewPacket(message,
 		M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 10001}, destination, nil))
 	require.Equal(t, uint64(1), handles.Load())
@@ -110,7 +119,7 @@ func TestServiceCoalescesIdenticalInflightQueriesAndFansOut(t *testing.T) {
 	response := buf.NewSize(len(message))
 	response.Write(message)
 	require.NoError(t, (<-responseWriter).WritePacket(response, destination))
-	require.Equal(t, uint64(2), replies.Load())
+	require.ElementsMatch(t, []uint16{42, 43}, []uint16{<-ids, <-ids})
 	require.Equal(t, uint64(0), service.RuntimeStats().Transactions)
 }
 
