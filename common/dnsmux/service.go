@@ -15,6 +15,7 @@ import (
 )
 
 const defaultMaxTransactions = 4096
+const defaultMaxCoalescedResponders = 64
 
 type PrepareFunc func(source, destination M.Socksaddr, userData any) (context.Context, N.PacketWriter, N.CloseHandlerFunc)
 
@@ -24,11 +25,12 @@ type PrepareFunc func(source, destination M.Socksaddr, userData any) (context.Co
 type HandleFunc func(ctx context.Context, payload []byte, writer N.PacketWriter, source, destination M.Socksaddr, userData any)
 
 type Options struct {
-	Handle          HandleFunc
-	Prepare         PrepareFunc
-	Timeout         time.Duration
-	MaxTransactions int
-	LaneKey         func(source M.Socksaddr, userData any) string
+	Handle                 HandleFunc
+	Prepare                PrepareFunc
+	Timeout                time.Duration
+	MaxTransactions        int
+	MaxCoalescedResponders int
+	LaneKey                func(source M.Socksaddr, userData any) string
 }
 
 type RuntimeStats struct {
@@ -38,13 +40,25 @@ type RuntimeStats struct {
 	Replies           uint64
 	TransactionMisses uint64
 	AdmissionRejected uint64
+	InvalidRejected   uint64
+	WriterRejected    uint64
+	CapacityRejected  uint64
+	FollowerRejected  uint64
+	Coalesced         uint64
+	PeakTransactions  uint64
 	QueueDrops        uint64
 }
 
 type transaction struct {
-	laneKey   string
-	onClose   N.CloseHandlerFunc
-	createdAt time.Time
+	laneKey    string
+	dedupeKey  string
+	responders []responder
+	createdAt  time.Time
+}
+
+type responder struct {
+	writer  N.PacketWriter
+	onClose N.CloseHandlerFunc
 }
 
 type lane struct {
@@ -53,17 +67,24 @@ type lane struct {
 }
 
 type Service struct {
-	options      Options
-	access       sync.Mutex
-	lanes        map[string]*lane
-	transactions map[uint64]transaction
-	nextID       atomic.Uint64
-	closed       chan struct{}
-	once         sync.Once
-	queries      atomic.Uint64
-	replies      atomic.Uint64
-	misses       atomic.Uint64
-	rejected     atomic.Uint64
+	options          Options
+	access           sync.Mutex
+	lanes            map[string]*lane
+	transactions     map[uint64]transaction
+	inflight         map[string]uint64
+	nextID           atomic.Uint64
+	closed           chan struct{}
+	once             sync.Once
+	queries          atomic.Uint64
+	replies          atomic.Uint64
+	misses           atomic.Uint64
+	rejected         atomic.Uint64
+	invalidRejected  atomic.Uint64
+	writerRejected   atomic.Uint64
+	capacityRejected atomic.Uint64
+	followerRejected atomic.Uint64
+	coalesced        atomic.Uint64
+	peakTransactions atomic.Uint64
 }
 
 func New(options Options) *Service {
@@ -76,10 +97,14 @@ func New(options Options) *Service {
 	if options.MaxTransactions <= 0 {
 		options.MaxTransactions = defaultMaxTransactions
 	}
+	if options.MaxCoalescedResponders <= 0 {
+		options.MaxCoalescedResponders = defaultMaxCoalescedResponders
+	}
 	service := &Service{
 		options:      options,
 		lanes:        make(map[string]*lane),
 		transactions: make(map[uint64]transaction),
+		inflight:     make(map[string]uint64),
 		closed:       make(chan struct{}),
 	}
 	go service.reapLoop()
@@ -93,11 +118,13 @@ func defaultLaneKey(source M.Socksaddr) string {
 func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, userData any) bool {
 	if len(payload) < 12 {
 		s.rejected.Add(1)
+		s.invalidRejected.Add(1)
 		return false
 	}
 	ctx, writer, onClose := s.options.Prepare(source, destination, userData)
 	if writer == nil {
 		s.rejected.Add(1)
+		s.writerRejected.Add(1)
 		return false
 	}
 	key := defaultLaneKey(source)
@@ -105,16 +132,39 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 		key = s.options.LaneKey(source, userData)
 	}
 	now := time.Now()
-	id := s.nextID.Add(1)
+	dedupeKey := key + "\x00" + destination.String() + "\x00" + string(payload)
 	s.access.Lock()
+	if existingID, loaded := s.inflight[dedupeKey]; loaded {
+		currentTransaction, exists := s.transactions[existingID]
+		if exists {
+			if len(currentTransaction.responders) >= s.options.MaxCoalescedResponders {
+				s.access.Unlock()
+				if onClose != nil {
+					onClose(syscall.ENOBUFS)
+				}
+				s.rejected.Add(1)
+				s.followerRejected.Add(1)
+				return false
+			}
+			currentTransaction.responders = append(currentTransaction.responders, responder{writer: writer, onClose: onClose})
+			s.transactions[existingID] = currentTransaction
+			s.access.Unlock()
+			s.queries.Add(1)
+			s.coalesced.Add(1)
+			return true
+		}
+		delete(s.inflight, dedupeKey)
+	}
 	if len(s.transactions) >= s.options.MaxTransactions {
 		s.access.Unlock()
 		if onClose != nil {
 			onClose(syscall.ENOBUFS)
 		}
 		s.rejected.Add(1)
+		s.capacityRejected.Add(1)
 		return false
 	}
+	id := s.nextID.Add(1)
 	current := s.lanes[key]
 	if current == nil {
 		current = &lane{}
@@ -122,39 +172,66 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 	}
 	current.transactions++
 	current.lastActive = now
-	s.transactions[id] = transaction{laneKey: key, onClose: onClose, createdAt: now}
+	s.transactions[id] = transaction{
+		laneKey: key, dedupeKey: dedupeKey,
+		responders: []responder{{writer: writer, onClose: onClose}}, createdAt: now,
+	}
+	s.inflight[dedupeKey] = id
+	transactionCount := uint64(len(s.transactions))
 	s.access.Unlock()
+	for {
+		peak := s.peakTransactions.Load()
+		if transactionCount <= peak || s.peakTransactions.CompareAndSwap(peak, transactionCount) {
+			break
+		}
+	}
 
 	s.queries.Add(1)
-	s.options.Handle(ctx, payload, &trackingWriter{service: s, id: id, writer: writer}, source, destination, userData)
+	s.options.Handle(ctx, payload, &trackingWriter{service: s, id: id}, source, destination, userData)
 	return true
 }
 
 type trackingWriter struct {
 	service *Service
 	id      uint64
-	writer  N.PacketWriter
-	once    sync.Once
+	access  sync.Mutex
+	done    bool
 }
 
 func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	err := w.writer.WritePacket(buffer, destination)
-	w.once.Do(func() { w.service.complete(w.id, err) })
-	return err
-}
-
-func (s *Service) complete(id uint64, writeErr error) {
-	entry, loaded := s.remove(id)
-	if !loaded {
-		s.misses.Add(1)
-		return
+	w.access.Lock()
+	if w.done {
+		w.access.Unlock()
+		buffer.Release()
+		return io.ErrClosedPipe
 	}
-	if entry.onClose != nil {
-		entry.onClose(writeErr)
+	w.done = true
+	w.access.Unlock()
+	entry, loaded := w.service.remove(w.id)
+	if !loaded {
+		buffer.Release()
+		w.service.misses.Add(1)
+		return io.ErrClosedPipe
+	}
+	var writeErr error
+	for index, current := range entry.responders {
+		response := buffer
+		if index != len(entry.responders)-1 {
+			response = buf.NewSize(buffer.Len())
+			response.Write(buffer.Bytes())
+		}
+		err := current.writer.WritePacket(response, destination)
+		if writeErr == nil && err != nil {
+			writeErr = err
+		}
+		if current.onClose != nil {
+			current.onClose(err)
+		}
 	}
 	if writeErr == nil {
-		s.replies.Add(1)
+		w.service.replies.Add(1)
 	}
+	return writeErr
 }
 
 func (s *Service) remove(id uint64) (transaction, bool) {
@@ -162,6 +239,9 @@ func (s *Service) remove(id uint64) (transaction, bool) {
 	entry, loaded := s.transactions[id]
 	if loaded {
 		delete(s.transactions, id)
+		if s.inflight[entry.dedupeKey] == id {
+			delete(s.inflight, entry.dedupeKey)
+		}
 		if current := s.lanes[entry.laneKey]; current != nil {
 			current.transactions--
 			current.lastActive = time.Now()
@@ -194,6 +274,9 @@ func (s *Service) expire(now time.Time, all bool) {
 	for id, entry := range s.transactions {
 		if all || now.Sub(entry.createdAt) >= s.options.Timeout {
 			delete(s.transactions, id)
+			if s.inflight[entry.dedupeKey] == id {
+				delete(s.inflight, entry.dedupeKey)
+			}
 			expired = append(expired, entry)
 			if current := s.lanes[entry.laneKey]; current != nil {
 				current.transactions--
@@ -207,8 +290,10 @@ func (s *Service) expire(now time.Time, all bool) {
 	}
 	s.access.Unlock()
 	for _, entry := range expired {
-		if entry.onClose != nil {
-			entry.onClose(io.ErrClosedPipe)
+		for _, current := range entry.responders {
+			if current.onClose != nil {
+				current.onClose(io.ErrClosedPipe)
+			}
 		}
 	}
 }
@@ -230,6 +315,9 @@ func (s *Service) RuntimeStats() RuntimeStats {
 	return RuntimeStats{
 		Lanes: uint64(lanes), Transactions: uint64(transactions), Queries: s.queries.Load(),
 		Replies: s.replies.Load(), TransactionMisses: s.misses.Load(), AdmissionRejected: s.rejected.Load(),
+		InvalidRejected: s.invalidRejected.Load(), WriterRejected: s.writerRejected.Load(),
+		CapacityRejected: s.capacityRejected.Load(), FollowerRejected: s.followerRejected.Load(),
+		Coalesced: s.coalesced.Load(), PeakTransactions: s.peakTransactions.Load(),
 	}
 }
 
