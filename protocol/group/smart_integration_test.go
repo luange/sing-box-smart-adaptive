@@ -154,12 +154,14 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		control:           &smartControlState{},
 		lastSelected:      make(map[string]string),
 		affinity:          make(map[string]smartAffinity),
+		switchChallenges:  make(map[string]smartSwitchChallenge),
 		halfOpen:          make(map[string]struct{}),
 		store:             newSmartStore(time.Hour, 1, time.Minute),
 		maxAttempts:       3,
 		attemptTimeout:    time.Second,
 		probeTimeout:      100 * time.Millisecond,
 		siteStickiness:    time.Minute,
+		switchConfirm:     30 * time.Second,
 		switchMargin:      0.10,
 		exploration:       0,
 		minSamples:        3,
@@ -522,6 +524,124 @@ func TestSmartSiteAffinityPreventsMinorOscillation(t *testing.T) {
 	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.ParseSocksaddr("video.example:443"))
 	if ranks[0].outbound.Tag() != "first" {
 		t.Fatalf("expected affinity to retain first, got %s", ranks[0].outbound.Tag())
+	}
+}
+
+func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.switchConfirm = 20 * time.Millisecond
+	smart.switchMargin = 0
+	now := time.Now()
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("search.example:443")
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	for range 10 {
+		smart.store.observeDial(now, networkKey, siteKey, first.Tag(), N.NetworkTCP, true, 200*time.Millisecond)
+		smart.store.observeDial(now, networkKey, siteKey, second.Tag(), N.NetworkTCP, true, 20*time.Millisecond)
+	}
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0)
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
+	if ranks[0].outbound.Tag() != first.Tag() {
+		t.Fatalf("healthy current candidate switched immediately to %s", ranks[0].outbound.Tag())
+	}
+	time.Sleep(25 * time.Millisecond)
+	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, destination)
+	if ranks[0].outbound.Tag() != second.Tag() {
+		t.Fatalf("sustained better candidate was not selected: %s", ranks[0].outbound.Tag())
+	}
+}
+
+func TestSmartDialFailureBypassesLazySwitchConfirmation(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	destination := M.ParseSocksaddr("search.example:443")
+	networkKey := smart.networkFingerprint()
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0)
+	first.dialError = errors.New("node unavailable")
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer (<-second.peers).Close()
+	if first.dials.Load() != 1 || second.dials.Load() != 1 {
+		t.Fatalf("failure did not fail over in the same request: first=%d second=%d", first.dials.Load(), second.dials.Load())
+	}
+}
+
+func TestSmartPerformanceSwitchKeepsEstablishedConnection(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.interruptMode = "selective"
+	networkKey := "network"
+	siteKey := "site"
+	smart.markSelected(first, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0)
+	left, right := net.Pipe()
+	defer right.Close()
+	wrapped := smart.interruptGroup.NewConnWithKey(left, true, false, smartConnectionKey(networkKey, siteKey, N.NetworkTCP, first.Tag()))
+	defer wrapped.Close()
+	smart.markSelected(second, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0)
+	_ = right.SetWriteDeadline(time.Now().Add(time.Second))
+	_ = wrapped.SetReadDeadline(time.Now().Add(time.Second))
+	go func() { _, _ = right.Write([]byte{1}) }()
+	buffer := make([]byte, 1)
+	if _, err := wrapped.Read(buffer); err != nil {
+		t.Fatalf("performance switch interrupted established connection: %v", err)
+	}
+	if smart.connectionsInterrupted.Load() != 0 {
+		t.Fatalf("performance switch reported interrupted connections: %d", smart.connectionsInterrupted.Load())
+	}
+}
+
+func TestSmartSiteIdentityUsesSniffHostForIPDestination(t *testing.T) {
+	metadata := &adapter.InboundContext{SniffHost: "www.google.com"}
+	display, key := smartSiteIdentity(metadata, M.ParseSocksaddr("142.251.156.119:443"))
+	if display != "service:google" || key == "" {
+		t.Fatalf("sniffed host was not inherited: display=%q key=%q", display, key)
+	}
+}
+
+func TestSmartGoogleServiceFamilySharesAffinityIdentity(t *testing.T) {
+	hosts := []string{
+		"www.google.com", "accounts.google.com", "www.googleapis.com",
+		"ssl.gstatic.com", "lh3.googleusercontent.com", "mtalk.google.com", "mail.google.com",
+	}
+	var expectedKey string
+	for _, host := range hosts {
+		display, key := smartSiteIdentity(nil, M.ParseSocksaddr(host+":443"))
+		if display != "service:google" {
+			t.Fatalf("Google host %s resolved to %q", host, display)
+		}
+		if expectedKey == "" {
+			expectedKey = key
+		} else if key != expectedKey {
+			t.Fatalf("Google host %s split affinity: %s != %s", host, key, expectedKey)
+		}
+	}
+}
+
+func TestSmartGoogleProductsKeepIndependentFamilies(t *testing.T) {
+	tests := map[string]string{
+		"www.youtube.com":                   "service:youtube",
+		"r1.googlevideo.com":                "service:youtube",
+		"gemini.google.com":                 "service:gemini",
+		"generativelanguage.googleapis.com": "service:gemini",
+	}
+	keys := make(map[string]string)
+	for host, expected := range tests {
+		display, key := smartSiteIdentity(nil, M.ParseSocksaddr(host+":443"))
+		if display != expected {
+			t.Fatalf("host %s resolved to %q, want %q", host, display, expected)
+		}
+		keys[expected] = key
+	}
+	if keys["service:youtube"] == keys["service:gemini"] {
+		t.Fatal("YouTube and Gemini unexpectedly share one affinity family")
 	}
 }
 

@@ -43,6 +43,7 @@ const (
 	defaultSmartProbeTimeout      = 5 * time.Second
 	defaultSmartAttemptTimeout    = 4 * time.Second
 	defaultSmartSiteStickiness    = 10 * time.Minute
+	defaultSmartSwitchConfirm     = 30 * time.Second
 	defaultSmartHedgeDelay        = 450 * time.Millisecond
 	minSmartHedgeDelay            = 250 * time.Millisecond
 	maxSmartHedgeDelay            = 750 * time.Millisecond
@@ -194,6 +195,7 @@ type Smart struct {
 	control           *smartControlState
 	lastSelected      map[string]string
 	affinity          map[string]smartAffinity
+	switchChallenges  map[string]smartSwitchChallenge
 	halfOpen          map[string]struct{}
 	latest            common.TypedValue[adapter.Outbound]
 	fingerprint       atomic.Pointer[smartFingerprintCache]
@@ -215,6 +217,7 @@ type Smart struct {
 	maxAttempts            int
 	attemptTimeout         time.Duration
 	siteStickiness         time.Duration
+	switchConfirm          time.Duration
 	switchMargin           float64
 	exploration            float64
 	minSamples             int
@@ -246,6 +249,11 @@ type Smart struct {
 	probeRegistry          *smartProbeRegistry
 	releaseProbeRegistry   func()
 	probeStartupDelay      time.Duration
+}
+
+type smartSwitchChallenge struct {
+	Candidate string
+	Since     time.Time
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -291,6 +299,13 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	siteStickiness := time.Duration(options.SiteStickiness)
 	if siteStickiness <= 0 {
 		siteStickiness = defaultSmartSiteStickiness
+	}
+	switchConfirm := time.Duration(options.SwitchConfirm)
+	if switchConfirm <= 0 {
+		switchConfirm = defaultSmartSwitchConfirm
+	}
+	if switchConfirm < 5*time.Second {
+		return nil, E.New("smart switch_confirm must be at least 5s")
 	}
 	switchMargin := defaultSmartSwitchMargin
 	if options.SwitchMargin != nil {
@@ -389,6 +404,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		control:           &smartControlState{},
 		lastSelected:      make(map[string]string),
 		affinity:          make(map[string]smartAffinity),
+		switchChallenges:  make(map[string]smartSwitchChallenge),
 		halfOpen:          make(map[string]struct{}),
 		store:             store,
 
@@ -399,6 +415,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		maxAttempts:          maxAttempts,
 		attemptTimeout:       attemptTimeout,
 		siteStickiness:       siteStickiness,
+		switchConfirm:        switchConfirm,
 		switchMargin:         switchMargin,
 		exploration:          exploration,
 		minSamples:           minSamples,
@@ -503,12 +520,14 @@ func (s *Smart) Close() error {
 	clear(s.candidateByTag)
 	clear(s.lastSelected)
 	clear(s.affinity)
+	clear(s.switchChallenges)
 	clear(s.halfOpen)
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
 	s.candidateProbeKey = make(map[string]string)
 	s.lastSelected = make(map[string]string)
 	s.affinity = make(map[string]smartAffinity)
+	s.switchChallenges = make(map[string]smartSwitchChallenge)
 	s.halfOpen = make(map[string]struct{})
 	s.access.Unlock()
 	s.providerAccess.Lock()
@@ -1268,20 +1287,35 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	bestScore := ranks[0].status.Score
+	selectionKey := smartSelectionKey(networkKey, siteKey, transport)
+	current := lastSelected
 	if affinity.Candidate != "" && affinity.ExpiresAt.After(now) {
-		if index := smartRankIndex(ranks, affinity.Candidate); index >= 0 && ranks[index].status.State != "open" && ranks[index].status.Score <= bestScore+s.switchMargin {
-			ranks[index].status.Reason = "site affinity within switch margin"
-			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("site affinity"))
-			return ranking, networkKey, siteKey, siteDisplay
-		}
+		current = affinity.Candidate
 	}
-	if lastSelected != "" {
-		if index := smartRankIndex(ranks, lastSelected); index >= 0 && ranks[index].status.State != "open" && ranks[index].status.Score <= bestScore+s.switchMargin {
-			ranks[index].status.Reason = "current candidate within switch margin"
-			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("switch margin retained current candidate"))
-			return ranking, networkKey, siteKey, siteDisplay
+	if current != "" {
+		if index := smartRankIndex(ranks, current); index >= 0 && ranks[index].status.State != "open" {
+			currentScore := ranks[index].status.Score
+			bestCandidate := ranks[0].outbound.Tag()
+			switchConfirmed := false
+			switchReason := "current candidate within switch margin"
+			switchStatusReason := "switch margin retained current candidate"
+			switch {
+			case current == bestCandidate:
+				s.clearSwitchChallenge(selectionKey)
+			case currentScore <= bestScore+s.switchMargin:
+				s.clearSwitchChallenge(selectionKey)
+			case s.confirmSwitchChallenge(selectionKey, bestCandidate, now):
+				switchConfirmed = true
+			default:
+				switchReason = "better candidate awaiting sustained confirmation"
+				switchStatusReason = "healthy current candidate retained during switch confirmation"
+			}
+			if !switchConfirmed {
+				ranks[index].status.Reason = switchReason
+				moveSmartRankFirst(ranks, index)
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason(switchStatusReason))
+				return ranking, networkKey, siteKey, siteDisplay
+			}
 		}
 	}
 	ranks[0].status.Reason = "lowest confidence-adjusted score"
@@ -1297,6 +1331,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
 	s.lastSelected[key] = candidate.Tag()
+	delete(s.switchChallenges, key)
 	if siteKey != "" {
 		s.affinity[affinityKey] = smartAffinity{Candidate: candidate.Tag(), ExpiresAt: now.Add(s.siteStickiness)}
 	}
@@ -1308,8 +1343,30 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, candidate.Tag(), reason)
 	if previous != "" && previous != candidate.Tag() {
+		s.switchesTotal.Add(1)
 		s.interruptPreviousCandidate(networkKey, siteKey, transport, previous, candidate.Tag())
 	}
+}
+
+func (s *Smart) clearSwitchChallenge(key string) {
+	s.access.Lock()
+	delete(s.switchChallenges, key)
+	s.access.Unlock()
+}
+
+func (s *Smart) confirmSwitchChallenge(key, candidate string, now time.Time) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	challenge := s.switchChallenges[key]
+	if challenge.Candidate != candidate || challenge.Since.IsZero() {
+		s.switchChallenges[key] = smartSwitchChallenge{Candidate: candidate, Since: now}
+		return false
+	}
+	if now.Sub(challenge.Since) < s.switchConfirm {
+		return false
+	}
+	delete(s.switchChallenges, key)
+	return true
 }
 
 func smartSelectionKey(networkKey, siteKey, transport string) string {
@@ -1334,6 +1391,15 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 	if !forceAll {
 		forceAll = s.store.candidateDead(previous, time.Now())
 	}
+	// A performance-driven switch must be invisible to established flows. New
+	// connections use the better candidate while existing healthy connections
+	// drain naturally. Only a confirmed dead candidate justifies interruption.
+	if !forceAll {
+		if s.logger != nil {
+			s.logger.Info("smart switch ", previous, " -> ", current, " reason=confirmed_performance kept_existing=true")
+		}
+		return
+	}
 	policy := interrupt.InterruptPolicy{
 		IdleThreshold: s.interruptIdle,
 		LongConnAge:   s.interruptLongAge,
@@ -1343,11 +1409,8 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 		OnInterrupted: func() { s.connectionsInterrupted.Add(1) },
 	}
 	result := s.interruptGroup.InterruptSelective(policy)
-	s.switchesTotal.Add(1)
 	if forceAll {
 		s.switchesForceAll.Add(1)
-	} else {
-		s.switchesSelective.Add(1)
 	}
 	s.connectionsKept.Add(uint64(result.Kept))
 	if s.logger != nil {
@@ -1705,6 +1768,8 @@ func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr
 		switch {
 		case metadata.Domain != "":
 			host = metadata.Domain
+		case metadata.SniffHost != "":
+			host = metadata.SniffHost
 		}
 	}
 	if host == "" && destination.IsDomain() {
@@ -1712,6 +1777,10 @@ func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr
 	}
 	if host != "" {
 		if net.ParseIP(host) == nil {
+			if family := smartServiceFamily(host); family != "" {
+				display := "service:" + family
+				return display, "site-" + hashSmartIdentity(display)
+			}
 			if etld, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
 				host = etld
 			}
@@ -1729,6 +1798,31 @@ func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr
 		return display, "site-" + hashSmartIdentity(display)
 	}
 	return "", ""
+}
+
+func smartServiceFamily(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	switch {
+	case smartDomainMatches(host, "youtube.com", "youtu.be", "ytimg.com", "ggpht.com", "googlevideo.com", "youtube-nocookie.com"):
+		return "youtube"
+	case smartDomainMatches(host, "gemini.google.com", "bard.google.com", "generativelanguage.googleapis.com"):
+		return "gemini"
+	case smartDomainMatches(host,
+		"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
+		"gmail.com", "googlemail.com", "1e100.net"):
+		return "google"
+	default:
+		return ""
+	}
+}
+
+func smartDomainMatches(host string, suffixes ...string) bool {
+	for _, suffix := range suffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func smartEstimateReason(estimate smartEstimate) string {
