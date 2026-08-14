@@ -136,3 +136,32 @@ func TestServiceBoundsCoalescedFollowers(t *testing.T) {
 	require.Equal(t, uint64(1), stats.Coalesced)
 	require.Equal(t, uint64(1), stats.FollowerRejected)
 }
+
+func TestServiceFailureCompletionReleasesCoalescedTransaction(t *testing.T) {
+	var closes atomic.Uint64
+	responseWriter := make(chan N.PacketWriter, 1)
+	service := New(Options{
+		Handle: func(_ context.Context, _ []byte, writer N.PacketWriter, _, _ M.Socksaddr, _ any) {
+			responseWriter <- writer
+		},
+		Prepare: func(M.Socksaddr, M.Socksaddr, any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			return context.Background(), countingWriter{replies: new(atomic.Uint64)}, func(error) { closes.Add(1) }
+		},
+		Timeout: time.Minute,
+	})
+	defer service.Close()
+	message := make([]byte, 12)
+	source := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 10000}
+	destination := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.53"), Port: 53}
+	require.True(t, service.NewPacket(message, source, destination, nil))
+	source.Port++
+	require.True(t, service.NewPacket(message, source, destination, nil))
+	writer := <-responseWriter
+	completionWriter, loaded := writer.(interface{ Close(error) })
+	require.True(t, loaded)
+	completionWriter.Close(context.DeadlineExceeded)
+	stats := service.RuntimeStats()
+	require.Equal(t, uint64(0), stats.Transactions)
+	require.Equal(t, uint64(1), stats.Coalesced)
+	require.Equal(t, uint64(2), closes.Load())
+}

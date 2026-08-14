@@ -198,16 +198,19 @@ type trackingWriter struct {
 	done    bool
 }
 
-func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+func (w *trackingWriter) take() (transaction, bool) {
 	w.access.Lock()
 	if w.done {
 		w.access.Unlock()
-		buffer.Release()
-		return io.ErrClosedPipe
+		return transaction{}, false
 	}
 	w.done = true
 	w.access.Unlock()
-	entry, loaded := w.service.remove(w.id)
+	return w.service.remove(w.id)
+}
+
+func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	entry, loaded := w.take()
 	if !loaded {
 		buffer.Release()
 		w.service.misses.Add(1)
@@ -232,6 +235,23 @@ func (w *trackingWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr
 		w.service.replies.Add(1)
 	}
 	return writeErr
+}
+
+// Close completes an accepted DNS transaction which cannot produce a packet
+// response (for example an unpack error, policy rejection or upstream timeout).
+// DNS routing is asynchronous, so relying only on WritePacket would retain
+// failed transactions until the reap timeout and allow failure bursts to fill
+// the admission table.
+func (w *trackingWriter) Close(closeErr error) {
+	entry, loaded := w.take()
+	if !loaded {
+		return
+	}
+	for _, current := range entry.responders {
+		if current.onClose != nil {
+			current.onClose(closeErr)
+		}
+	}
 }
 
 func (s *Service) remove(id uint64) (transaction, bool) {

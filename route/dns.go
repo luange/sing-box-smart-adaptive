@@ -45,6 +45,7 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 	var message mDNS.Msg
 	err := message.Unpack(payload)
 	if err != nil {
+		closeDNSPacketWriter(writer, err)
 		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
 		return
 	}
@@ -54,10 +55,23 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 		if exchangeErr == nil {
 			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
 		}
+		if exchangeErr != nil {
+			closeDNSPacketWriter(writer, exchangeErr)
+		}
 		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
 			r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
 		}
 	})
+}
+
+type dnsPacketCompletionWriter interface {
+	Close(error)
+}
+
+func closeDNSPacketWriter(writer N.PacketWriter, err error) {
+	if completionWriter, loaded := writer.(dnsPacketCompletionWriter); loaded {
+		completionWriter.Close(err)
+	}
 }
 
 func (r *Router) writeDNSPacketResponse(message *mDNS.Msg, response *mDNS.Msg, writer N.PacketWriter, destination M.Socksaddr) error {
