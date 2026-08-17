@@ -72,12 +72,14 @@ func sniffOrDomain(metadata *adapter.InboundContext) string {
 	return metadata.Domain
 }
 
-
 func RegisterSmart(registry *outbound.Registry) {
 	outbound.Register[option.SmartOutboundOptions](registry, C.TypeSmart, NewSmart)
 }
 
-var _ adapter.SmartGroup = (*Smart)(nil)
+var (
+	_ adapter.SmartGroup            = (*Smart)(nil)
+	_ adapter.PreMatchOutboundGroup = (*Smart)(nil)
+)
 
 var errSmartNoCandidates = errors.New("smart group has no leaf candidates")
 
@@ -609,6 +611,45 @@ func (s *Smart) All() []string {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return common.Map(s.candidates, func(it adapter.Outbound) string { return it.Tag() })
+}
+
+// SelectPreMatchOutbound picks a stable leaf for transparent pre-match without
+// advancing hedge/retry/selection state (those remain on the L4 path).
+func (s *Smart) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	leaf := s.preMatchLeaf(metadata)
+	if leaf == nil {
+		return nil, adapter.PreMatchContinue
+	}
+	return selectOutbound(leaf)
+}
+
+func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound {
+	now := time.Now()
+	pinned, temporary, _, _ := s.controlSnapshot(now)
+	s.access.RLock()
+	defer s.access.RUnlock()
+	pick := func(tag string) adapter.Outbound {
+		if tag == "" {
+			return nil
+		}
+		return s.candidateByTag[tag]
+	}
+	if detour := pick(temporary); detour != nil {
+		return detour
+	}
+	if detour := pick(pinned); detour != nil {
+		return detour
+	}
+	if selected := s.latest.Load(); selected != nil {
+		if _, ok := s.candidateByTag[selected.Tag()]; ok {
+			return selected
+		}
+	}
+	if len(s.candidates) > 0 {
+		return s.candidates[0]
+	}
+	_ = metadata
+	return nil
 }
 
 func (s *Smart) SmartStatus() adapter.SmartGroupStatus {

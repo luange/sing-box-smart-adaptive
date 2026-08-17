@@ -91,13 +91,18 @@ type SmartGroup interface {
 	ClearTemporarySelection()
 }
 
+// PreMatchOutboundGroup lets groups pick a stable leaf for transparent pre-match
+// without advancing consumptive selection (retry/hedge/observation stay on L4).
+type PreMatchOutboundGroup interface {
+	OutboundGroup
+	SelectPreMatchOutbound(metadata *InboundContext, selectOutbound func(Outbound) (Outbound, PreMatchAction)) (Outbound, PreMatchAction)
+}
 
 // PreMatchDisabledOutbound keeps transparent flows on the L4 outbound path.
 // Groups use it when resolving to a leaf would bypass retry or observation.
 type PreMatchDisabledOutbound interface {
 	DisablePreMatch()
 }
-
 
 // SelectorGroup is implemented by selector outbound (stable Selected leaf).
 type SelectorGroup interface {

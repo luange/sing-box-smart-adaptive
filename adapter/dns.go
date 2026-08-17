@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -120,4 +121,59 @@ type DNSTransportManager interface {
 // blocks the DNS path.
 type DNSAnswerObserver interface {
 	OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool)
+}
+
+// DNSAnswerObserverHub fans out DNS answers to multiple observers (e.g. several eBPF inbounds).
+// The DNS router still resolves a single adapter.DNSAnswerObserver from context — the hub.
+type DNSAnswerObserverHub struct {
+	access    sync.Mutex
+	observers []DNSAnswerObserver
+}
+
+// NewDNSAnswerObserverHub returns an empty fan-out hub.
+func NewDNSAnswerObserverHub() *DNSAnswerObserverHub {
+	return &DNSAnswerObserverHub{}
+}
+
+// Add registers an observer. Duplicates are ignored.
+func (h *DNSAnswerObserverHub) Add(observer DNSAnswerObserver) {
+	if h == nil || observer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, existing := range h.observers {
+		if existing == observer {
+			return
+		}
+	}
+	h.observers = append(h.observers, observer)
+}
+
+// Remove unregisters an observer.
+func (h *DNSAnswerObserverHub) Remove(observer DNSAnswerObserver) {
+	if h == nil || observer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for i, existing := range h.observers {
+		if existing == observer {
+			h.observers = append(h.observers[:i], h.observers[i+1:]...)
+			return
+		}
+	}
+}
+
+// OnDNSAnswer implements DNSAnswerObserver.
+func (h *DNSAnswerObserverHub) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool) {
+	if h == nil {
+		return
+	}
+	h.access.Lock()
+	snapshot := append([]DNSAnswerObserver(nil), h.observers...)
+	h.access.Unlock()
+	for _, observer := range snapshot {
+		observer.OnDNSAnswer(domain, addresses, fromFakeIP)
+	}
 }
