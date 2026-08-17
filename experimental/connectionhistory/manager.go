@@ -391,6 +391,15 @@ func recordFromMetadata(metadata trafficcontrol.TrackerMetadata) Record {
 	if metadata.Metadata.Destination.Addr.IsValid() {
 		destinationIP = metadata.Metadata.Destination.Addr.String()
 	}
+	// Prefer finalized leaf chain (populated on close via RealOutbound + Now()).
+	chain := metadata.EffectiveChain()
+	if len(chain) == 0 {
+		chain = append([]string(nil), metadata.Chain...)
+	}
+	outboundTag := metadata.Outbound
+	if len(chain) > 0 {
+		outboundTag = chain[0]
+	}
 	return Record{
 		ID:              metadata.ID.String(),
 		Network:         metadata.Metadata.Network,
@@ -404,9 +413,9 @@ func recordFromMetadata(metadata trafficcontrol.TrackerMetadata) Record {
 		Domain:          domain,
 		Process:         process,
 		User:            metadata.Metadata.User,
-		Outbound:        metadata.Outbound,
+		Outbound:        outboundTag,
 		OutboundType:    metadata.OutboundType,
-		Chain:           append([]string(nil), metadata.Chain...),
+		Chain:           chain,
 		Rule:            rule,
 		StartedAt:       metadata.CreatedAt,
 		ClosedAt:        metadata.ClosedAt,

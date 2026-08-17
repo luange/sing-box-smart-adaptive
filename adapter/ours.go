@@ -165,3 +165,139 @@ func (h *DirectOffloadHub) NoteRoutedDirect(metadata InboundContext, outbound Ou
 		offload.NoteRoutedDirect(metadata, outbound)
 	}
 }
+
+// VerdictLearnerHub fans out dial-time DIRECT learn to every eBPF inbound.
+// ConnectionManager resolves a single VerdictLearner from context — the hub.
+type VerdictLearnerHub struct {
+	access   sync.Mutex
+	learners []VerdictLearner
+}
+
+func NewVerdictLearnerHub() *VerdictLearnerHub {
+	return &VerdictLearnerHub{}
+}
+
+func (h *VerdictLearnerHub) Add(learner VerdictLearner) {
+	if h == nil || learner == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, existing := range h.learners {
+		if existing == learner {
+			return
+		}
+	}
+	h.learners = append(h.learners, learner)
+}
+
+func (h *VerdictLearnerHub) Remove(learner VerdictLearner) {
+	if h == nil || learner == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for i, existing := range h.learners {
+		if existing == learner {
+			h.learners = append(h.learners[:i], h.learners[i+1:]...)
+			return
+		}
+	}
+}
+
+func (h *VerdictLearnerHub) MaybeLearnTCP(ctx context.Context, dialer N.Dialer, metadata InboundContext, remote netip.AddrPort) {
+	if h == nil {
+		return
+	}
+	h.access.Lock()
+	snapshot := append([]VerdictLearner(nil), h.learners...)
+	h.access.Unlock()
+	for _, learner := range snapshot {
+		learner.MaybeLearnTCP(ctx, dialer, metadata, remote)
+	}
+}
+
+func (h *VerdictLearnerHub) MaybeLearnUDP(ctx context.Context, dialer N.Dialer, metadata InboundContext, remote netip.AddrPort) {
+	if h == nil {
+		return
+	}
+	h.access.Lock()
+	snapshot := append([]VerdictLearner(nil), h.learners...)
+	h.access.Unlock()
+	for _, learner := range snapshot {
+		learner.MaybeLearnUDP(ctx, dialer, metadata, remote)
+	}
+}
+
+// ConnectionSplicerHub fans out sockmap splice attempts. First success wins
+// (one connection cannot be spliced twice). Fail-open when all return false.
+type ConnectionSplicerHub struct {
+	access   sync.Mutex
+	splicers []ConnectionSplicer
+}
+
+func NewConnectionSplicerHub() *ConnectionSplicerHub {
+	return &ConnectionSplicerHub{}
+}
+
+func (h *ConnectionSplicerHub) Add(splicer ConnectionSplicer) {
+	if h == nil || splicer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, existing := range h.splicers {
+		if existing == splicer {
+			return
+		}
+	}
+	h.splicers = append(h.splicers, splicer)
+}
+
+func (h *ConnectionSplicerHub) Remove(splicer ConnectionSplicer) {
+	if h == nil || splicer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for i, existing := range h.splicers {
+		if existing == splicer {
+			h.splicers = append(h.splicers[:i], h.splicers[i+1:]...)
+			return
+		}
+	}
+}
+
+func (h *ConnectionSplicerHub) TrySpliceTCP(
+	ctx context.Context,
+	inboundType string,
+	dialer N.Dialer,
+	local net.Conn,
+	remote net.Conn,
+	metadata InboundContext,
+	onClose N.CloseHandlerFunc,
+) bool {
+	if h == nil {
+		return false
+	}
+	h.access.Lock()
+	snapshot := append([]ConnectionSplicer(nil), h.splicers...)
+	h.access.Unlock()
+	for _, splicer := range snapshot {
+		if splicer.TrySpliceTCP(ctx, inboundType, dialer, local, remote, metadata, onClose) {
+			return true
+		}
+	}
+	return false
+}
+
+// NoteRealOutbound records the leaf actually dialed by a group (smart/selector/
+// urltest/loadbalance/adaptive). Shared Extended pointer keeps history/trackers in sync.
+func NoteRealOutbound(ctx context.Context, leaf Outbound) {
+	if leaf == nil {
+		return
+	}
+	if metadata := ContextFrom(ctx); metadata != nil {
+		metadata.AppendRealOutbound(leaf.Tag())
+	}
+}

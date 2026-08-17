@@ -13,6 +13,10 @@ import (
 
 func connectionHistoryRouter(history connectionhistory.Service) http.Handler {
 	router := chi.NewRouter()
+	// Root → status so GET /history is usable without memorizing subpaths.
+	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		render.JSON(w, r, history.Status())
+	})
 	router.Get("/summary", func(w http.ResponseWriter, r *http.Request) {
 		query, loaded := parseHistoryQuery(w, r)
 		if !loaded {

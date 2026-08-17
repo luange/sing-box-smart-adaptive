@@ -795,6 +795,11 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	}
 	p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 	p.setLatest(candidate.PrimaryTag)
+	if candidate.PrimaryTag != "" {
+		if metadata := adapter.ContextFrom(ctx); metadata != nil {
+			metadata.AppendRealOutbound(candidate.PrimaryTag)
+		}
+	}
 	return p.wrapBusinessConn(conn, snapshot, candidate, serviceContext, startedAt), nil
 }
 
@@ -1098,6 +1103,11 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 		}
 		p.rememberPolicySelectionWithReason(serviceContext, candidate, plan.Reason)
 		p.setLatest(candidate.PrimaryTag)
+		if candidate.PrimaryTag != "" {
+			if metadata := adapter.ContextFrom(ctx); metadata != nil {
+				metadata.AppendRealOutbound(candidate.PrimaryTag)
+			}
+		}
 		return p.wrapBusinessPacketConn(packetConn, snapshot, candidate, serviceContext, startedAt), nil
 	}
 	if reservation != nil {

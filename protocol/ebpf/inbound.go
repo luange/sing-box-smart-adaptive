@@ -698,7 +698,11 @@ func (i *Inbound) startOutboundOffload() error {
 			return err
 		}
 		if i.outboundCoord.Verdict() != nil {
-			service.MustRegister[adapter.VerdictLearner](i.ctx, i)
+			if hub := service.FromContext[*adapter.VerdictLearnerHub](i.ctx); hub != nil {
+				hub.Add(i)
+			} else {
+				service.MustRegister[adapter.VerdictLearner](i.ctx, i)
+			}
 		}
 	}
 	if i.outboundCoord != nil {
@@ -708,12 +712,25 @@ func (i *Inbound) startOutboundOffload() error {
 	}
 	// Register for ConnectionManager fail-open splice hooks (master §6.1).
 	if i.outboundCoord.enabled() && i.outboundCoord.Splice() != nil {
-		service.MustRegister[adapter.ConnectionSplicer](i.ctx, i)
+		if hub := service.FromContext[*adapter.ConnectionSplicerHub](i.ctx); hub != nil {
+			hub.Add(i)
+		} else {
+			service.MustRegister[adapter.ConnectionSplicer](i.ctx, i)
+		}
 	}
 	return nil
 }
 
 func (i *Inbound) closeOutboundOffload() error {
+	if i == nil {
+		return nil
+	}
+	if hub := service.FromContext[*adapter.VerdictLearnerHub](i.ctx); hub != nil {
+		hub.Remove(i)
+	}
+	if hub := service.FromContext[*adapter.ConnectionSplicerHub](i.ctx); hub != nil {
+		hub.Remove(i)
+	}
 	if i.outboundCoord == nil {
 		return nil
 	}
@@ -725,7 +742,8 @@ func (i *Inbound) closeOutboundOffload() error {
 // NoteRoutedDirect implements adapter.DirectOffload.
 // Called when route selected a DIRECT/ebpf leaf for an eBPF inbound connection.
 // Publishes destination IPs into TC bypass LPM so subsequent packets skip userspace
-// without waiting for dial-time learn. Smart/proxy outbounds are ignored.
+// without waiting for dial-time learn. Smart/proxy outbounds are ignored unless
+// their sticky Now() leaf is already a stable DIRECT/ebpf type.
 func (i *Inbound) NoteRoutedDirect(metadata adapter.InboundContext, outbound adapter.Outbound) {
 	if i == nil || outbound == nil {
 		return
@@ -734,7 +752,27 @@ func (i *Inbound) NoteRoutedDirect(metadata adapter.InboundContext, outbound ada
 	if metadata.InboundType != C.TypeEBPF && metadata.InboundType != C.TypeMixed {
 		return
 	}
-	if !isStableDirectLeafType(outbound.Type()) {
+	// Unwrap sticky group Now() when the route target is a group parked on DIRECT.
+	outbounds := service.FromContext[adapter.OutboundManager](i.ctx)
+	for depth := 0; depth < 8 && outbound != nil; depth++ {
+		if isStableDirectLeafType(outbound.Type()) {
+			break
+		}
+		group, isGroup := outbound.(adapter.OutboundGroup)
+		if !isGroup || outbounds == nil {
+			return
+		}
+		now := group.Now()
+		if now == "" {
+			return
+		}
+		next, loaded := outbounds.Outbound(now)
+		if !loaded || next == nil {
+			return
+		}
+		outbound = next
+	}
+	if outbound == nil || !isStableDirectLeafType(outbound.Type()) {
 		return
 	}
 	addrs := collectDirectOffloadAddrs(metadata)
@@ -820,6 +858,15 @@ func collectDirectOffloadAddrs(metadata adapter.InboundContext) []netip.Addr {
 	return out
 }
 
+// ebpfLearnEligible is true for native eBPF inbounds and shared-network
+// transparent paths that still surface as mixed in metadata.
+func (i *Inbound) ebpfLearnEligible(inboundType string) bool {
+	if inboundType == C.TypeEBPF {
+		return true
+	}
+	return inboundType == C.TypeMixed && i != nil && i.sharedOptions.Enabled
+}
+
 // MaybeLearnTCP implements adapter.VerdictLearner (Module A learn path).
 func (i *Inbound) MaybeLearnTCP(
 	ctx context.Context,
@@ -830,13 +877,16 @@ func (i *Inbound) MaybeLearnTCP(
 	if i == nil || i.outboundCoord == nil {
 		return
 	}
+	if !i.ebpfLearnEligible(metadata.InboundType) {
+		return
+	}
 	i.outboundCoord.MaybeLearnTCP(ctx, dialer, metadata, remote)
 	// Publish the same exact-flow verdict used by UDP after the first
 	// userspace connection is proven DIRECT. The existing destination-level
 	// learner remains the compatibility path; this tuple path is opt-in through
 	// shared_network.flow_verdict and cannot bypass a proxy dialer.
 	if i.sharedNetwork == nil || !i.sharedNetwork.flowVerdict ||
-		metadata.InboundType != C.TypeEBPF || !verdictIsEmptyDirect(dialer) || !remote.IsValid() {
+		!verdictIsEmptyDirect(dialer) || !remote.IsValid() {
 		return
 	}
 	opts := i.outboundCoord.verdictLearn
@@ -866,7 +916,7 @@ func (i *Inbound) MaybeLearnUDP(
 	metadata adapter.InboundContext,
 	remote netip.AddrPort,
 ) {
-	if i == nil || metadata.InboundType != C.TypeEBPF {
+	if i == nil || !i.ebpfLearnEligible(metadata.InboundType) {
 		return
 	}
 	if i.outboundCoord != nil {

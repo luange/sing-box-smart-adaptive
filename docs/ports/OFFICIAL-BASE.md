@@ -11,10 +11,50 @@
 
 ## Branch `adaptive/official-beta17`
 - Base: pure `v1.14.0-beta.17`
-- Version: `1.14.0-beta.17-official-smart-ebpf`
-- Default tags include `with_ebpf` (build script) and `with_connection_history` (DEFAULT_BUILD_TAGS_OTHERS)
+- Version: `1.14.0-beta.17-official-smart-ebpf` (+ `-ha` suffix on HA builds)
+- Default tags include `with_ebpf` and `with_connection_history`
+
+## Coherence model (must stay true)
+
+```
+route match
+  └─ MatchInputs (per winning rule, incl. RuleSetItem.MatchClass)
+        └─ verdict learn (IP-only) + NoteRoutedDirect (DIRECT leaf / sticky DIRECT)
+DNS answer
+  └─ DNSAnswerObserverHub → eBPF dns_prefill promote
+dial success (ConnectionManager)
+  └─ VerdictLearnerHub.MaybeLearn{TCP,UDP}
+  └─ ConnectionSplicerHub.TrySpliceTCP (opt-in)
+group dial leaf
+  └─ NoteRealOutbound / AppendRealOutbound (shared Extended)
+        └─ traffic tracker FinalizeChain on close → connection_history
+multi eBPF inbound
+  └─ hubs: DirectOffload / DNSAnswer / VerdictLearner / ConnectionSplicer
+```
+
+### Why hubs
+Single-slot `MustRegister` cannot host multiple eBPF inbounds. Every cross-cutting
+hook is a hub registered once in `box.New`, with each inbound `Add`/`Remove` on start/close.
+
+### Why ConnectionManager hooks
+Learn + splice only fire **after** a proven dial. Registering the learner without
+wiring `route/conn.go` is a silent no-op (was a production gap).
+
+### Why FinalizeChain
+Tracker snapshots chain at route time via group `Now()`. Smart may dial another
+leaf. Groups call `NoteRealOutbound`; on close, history rebuilds leaf → root.
+
+### RuleSet MatchClass
+Pure geoip (`ContainsIPCIDRRule` only) → `RouteMatchIP` (learn allowed).
+Domain/process/wifi mixed sets OR non-IP bits → learn fail-closed.
+Static `bypass_rule_set` still covers bulk CN without waiting for learn.
+
+### AdaptivePool PreMatch
+Intentionally `PreMatchDisabled` — unwrapping would skip observation/retry.
+Smart/selector/urltest/loadbalance implement `PreMatchOutboundGroup`.
 
 ## Feature enable notes
+
 ### connection_history
 ```json
 {
@@ -28,32 +68,24 @@
   }
 }
 ```
-API: `GET /history/summary|trend|connections|domains|...` when clash_api is up.
+API: `GET /history` (status), `/history/summary|trend|connections|domains|...`
 
 ### eBPF splice (proxy zero-copy)
-Requires kernel sockmap support. Config on eBPF inbound:
-```json
-"outbound_offload": {
-  "splice": {
-    "enabled": true,
-    "accounting": true,
-    "half_close": "close",
-    "allow_outbound_types": ["direct", "ebpf", "socks", "http"],
-    "max_pairs": 8192
-  },
-  "verdict": { "mode": "learn", "ttl": "5m", "promote_bypass": true },
-  "dns_prefill": { "enabled": true, "ttl": "5m" }
-}
-```
-Default on 115 keeps splice disabled for stability; path is fully wired when enabled.
+Requires kernel sockmap. Config on eBPF inbound `outbound_offload.splice`.
+Default on 115 keeps splice disabled for stability; path is fully wired when enabled
+(ConnectionManager → SplicerHub → inbound coordinator).
 
-### loadbalance / pass
-Outbound types `loadbalance` and `pass` are registered. Strategies: `round-robin`, `consistent-hashing`, `sticky-sessions`.
+### loadbalance / pass / adaptive_pool
+Registered outbound types. Production 115 uses smart groups; others are optional.
+
+### provider duplicates
+Duplicate node names get a **content-stable** suffix (` #` + 8 hex) so reloads do not
+churn smart pins the way order-based ` (2)` did. Fallback remains ` (n)`.
 
 ## Build
 ```bash
 ./scripts/cross-build-official-smart-ebpf.sh
-# VERSION=1.14.0-beta.17-official-smart-ebpf
+# or on vm112 with full tags + with_ebpf + with_connection_history
 ```
 
 ## Deploy checklist
@@ -61,3 +93,6 @@ Outbound types `loadbalance` and `pass` are registered. Strategies: `round-robin
 2. `sing-box version` prints `official-smart-ebpf`
 3. `sing-box check -c config.json`
 4. Log: `direct_offload=route+prefill+learn`
+5. Restart twice with no `sing-box did not close!`
+6. After DIRECT traffic: verdict metrics / learn skips move off zero when hooks engaged
+7. `/history/connections` shows leaf tags under smart (not only group tag)

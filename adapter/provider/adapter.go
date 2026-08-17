@@ -2,6 +2,9 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -153,10 +156,7 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 		} else {
 			baseTag = F.ToString(a.providerTag, "/", i)
 		}
-		tag := baseTag
-		for n := 2; seen[tag]; n++ {
-			tag = F.ToString(baseTag, " (", n, ")")
-		}
+		tag := uniqueProviderTag(baseTag, providerOutboundIdentity(opt), seen)
 		if tag != baseTag {
 			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
 		}
@@ -164,6 +164,32 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 		tags[i] = tag
 	}
 	return tags
+}
+
+// providerOutboundIdentity fingerprints an outbound for stable duplicate rename
+// across provider reloads (order-independent). Avoids " (2)" churn that breaks
+// smart pins/filters when the subscription list reorders.
+func providerOutboundIdentity(opt option.Outbound) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%#v", opt.Type, opt.Tag, opt.Options)))
+	return hex.EncodeToString(sum[:4])
+}
+
+func uniqueProviderTag(baseTag, identity string, seen map[string]bool) string {
+	if !seen[baseTag] {
+		return baseTag
+	}
+	if identity != "" {
+		stable := F.ToString(baseTag, " #", identity)
+		if !seen[stable] {
+			return stable
+		}
+	}
+	for n := 2; ; n++ {
+		tag := F.ToString(baseTag, " (", n, ")")
+		if !seen[tag] {
+			return tag
+		}
+	}
 }
 
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
@@ -390,10 +416,9 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 		} else {
 			baseTag = F.ToString(a.providerTag, "/endpoint-", i)
 		}
-		tag := baseTag
-		for n := 2; seen[tag]; n++ {
-			tag = F.ToString(baseTag, " (", n, ")")
-		}
+		identitySum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%#v", opt.Type, opt.Tag, opt.Options)))
+		identity := hex.EncodeToString(identitySum[:4])
+		tag := uniqueProviderTag(baseTag, identity, seen)
 		if tag != baseTag {
 			a.logger.Warn("duplicate endpoint tag ", baseTag, " in provider, renamed to ", tag)
 		}

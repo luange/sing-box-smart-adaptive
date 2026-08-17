@@ -826,6 +826,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	}
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
+		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
@@ -1047,6 +1048,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			continue
 		}
 		s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
+		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex)
 		observed := newSmartObservedPacketConn(conn, startedAt, smartUDPExpectsResponse(destination), func(flowElapsed time.Duration) {
 			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
