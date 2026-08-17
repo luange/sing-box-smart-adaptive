@@ -241,6 +241,12 @@ func (i *Inbound) logVerdictRuntimeStatsValue(reason string, stats ECommon.Verdi
 	i.logger.Info("eBPF direct offload: route_promotes=", i.routeDirectPromotes.Load(),
 		" dns_prefill_promotes=", i.dnsPrefillPromotes.Load(),
 		" promoted_live=", promotedLive)
+	if i.bypassMiss != nil {
+		km, us, heal := i.bypassMiss.Snapshot()
+		i.logger.Info("eBPF bypass miss sample: kernel_miss=", km,
+			" userspace_sampled=", us, " gap_heal=", heal,
+			" (every ", i.bypassMiss.every, " tcp)")
+	}
 	if i.outboundCoord != nil {
 		sr := i.outboundCoord.SkipReasonSnapshot()
 		// 2=sniff/matchInputs 3=non-direct 4=process 5=nodest 7=addr-mismatch

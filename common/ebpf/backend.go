@@ -564,6 +564,28 @@ func (b *Backend) BypassCIDRCount() (int, int) {
 	return len(b.bypassIPv4CIDR), len(b.bypassIPv6CIDR)
 }
 
+// BypassContains reports whether addr is covered by the installed bypass LPM
+// policy (Go-side mirror of the eBPF map). Used for userspace miss sampling:
+// if true but the flow still entered userspace, TC did not honor the map.
+func (b *Backend) BypassContains(addr netip.Addr) bool {
+	if b == nil || !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	b.access.RLock()
+	defer b.access.RUnlock()
+	list := b.bypassIPv4CIDR
+	if addr.Is6() {
+		list = b.bypassIPv6CIDR
+	}
+	for _, prefix := range list {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 const maxDNSDirectCIDREntries = 256
 
 // UpdateDNSDirectCIDR installs dns_kernel_direct.server_cidr into the :53 exception LPM

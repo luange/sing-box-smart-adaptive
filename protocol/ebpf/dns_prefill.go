@@ -77,8 +77,9 @@ func (i *Inbound) dnsPrefillApply(
 		}
 		if i.promoteLearnedBypass(addr, ttl) {
 			i.dnsPrefillPromotes.Add(1)
+			// Debug: promote volume follows DNS QPS; keep metrics in runtime_stats.
 			if i.logger != nil {
-				i.logger.Info("eBPF dns_prefill promote ", addr.String(), " domain=", domain)
+				i.logger.Debug("eBPF dns_prefill promote ", addr.String(), " domain=", domain)
 			}
 		} else if i.logger != nil {
 			i.logger.Debug("eBPF dns_prefill refresh ", addr.String(), " domain=", domain)

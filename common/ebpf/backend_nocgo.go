@@ -39,6 +39,8 @@ func (b *Backend) UpdateBypassCIDR([]netip.Prefix) (bool, error) {
 	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
 }
 
+func (b *Backend) BypassContains(netip.Addr) bool { return false }
+
 func (b *Backend) BypassCIDRCount() (int, int) {
 	return 0, 0
 }

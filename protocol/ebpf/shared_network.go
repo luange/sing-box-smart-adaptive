@@ -490,7 +490,11 @@ func (s *sharedNetwork) NewConnection(ctx context.Context, conn net.Conn, metada
 	metadata.InboundInterface = sharedNetworkIngressInterface(original.IngressIfIndex)
 	metadata.Source = M.SocksaddrFromNetIP(client)
 	metadata.Destination = M.SocksaddrFromNetIP(original.Destination)
-	s.parent.logger.InfoContext(ctx, "shared-network inbound connection to ", metadata.Destination)
+	// Debug: production gateways log multi-k connections/s at Info otherwise.
+	s.parent.logger.DebugContext(ctx, "shared-network inbound connection to ", metadata.Destination)
+	if dest := metadata.Destination.Addr; dest.IsValid() {
+		s.parent.bypassMiss.ObserveTCP(s.parent, dest)
+	}
 	s.parent.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 

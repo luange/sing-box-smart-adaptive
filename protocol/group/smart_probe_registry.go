@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -259,14 +258,11 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
-	// Release the admission slot before any optional GC so other groups
-	// (and shutdown waiters) are never blocked behind a STW collection.
+	// Release the admission slot immediately — never block peers behind GC.
 	<-r.slots
-	// Probe transports are short-lived; throttle GC so HA restarts are not
-	// serialized behind full heap scans after every single URL test.
-	if n := r.completedProbes.Add(1); n%32 == 0 && r.ctx.Err() == nil && ctx.Err() == nil {
-		runtime.GC()
-	}
+	r.completedProbes.Add(1)
+	// Let the runtime GC on its own schedule. Forced STW after probes hurt
+	// gateway latency and HA close under multi-smart catalogs.
 	completedAt := time.Now()
 	r.access.Lock()
 	previous := entry.result
