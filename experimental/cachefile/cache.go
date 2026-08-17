@@ -425,3 +425,14 @@ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
 		return bucket.Put([]byte(tag), setBinary)
 	})
 }
+
+func (c *CacheFile) LoadSubscription(tag string) *adapter.SavedBinary {
+	// Minimal stub: provider remote cache optional on pure official base.
+	return nil
+}
+
+func (c *CacheFile) SaveSubscription(tag string, sub *adapter.SavedBinary) error {
+	_ = tag
+	_ = sub
+	return nil
+}

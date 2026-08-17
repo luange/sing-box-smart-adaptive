@@ -114,3 +114,10 @@ type DNSTransportManager interface {
 	Remove(tag string) error
 	Create(ctx context.Context, logger log.ContextLogger, tag string, outboundType string, options any) error
 }
+
+// DNSAnswerObserver is an optional service hook after a successful userspace DNS
+// A/AAAA answer (e.g. eBPF weak dns_prefill → TC promote). Fail-open: never
+// blocks the DNS path.
+type DNSAnswerObserver interface {
+	OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool)
+}
