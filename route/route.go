@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/bufio/deadline"
@@ -163,6 +164,11 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	if selectedOutbound != nil && metadata.InboundType == C.TypeEBPF {
+		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
+			offload.NoteRoutedDirect(metadata, selectedOutbound)
+		}
+	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -290,6 +296,11 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	for _, buffer := range packetBuffers {
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
+	}
+	if selectedOutbound != nil && metadata.InboundType == C.TypeEBPF {
+		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
+			offload.NoteRoutedDirect(metadata, selectedOutbound)
+		}
 	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)

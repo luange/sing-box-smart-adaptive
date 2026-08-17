@@ -92,6 +92,39 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 	}
 }
 
+
+// TrackCloser registers an arbitrary closer (e.g. eBPF splice pair) so CloseAll
+// releases it. Returns a wrapper that unregisters on Close.
+func (m *ConnectionManager) TrackCloser(closer io.Closer) io.Closer {
+	if closer == nil {
+		return nil
+	}
+	m.access.Lock()
+	element := m.connections.PushBack(closer)
+	m.access.Unlock()
+	return &trackedCloser{
+		Closer:  closer,
+		manager: m,
+		element: element,
+	}
+}
+
+type trackedCloser struct {
+	io.Closer
+	manager *ConnectionManager
+	element *list.Element[io.Closer]
+}
+
+func (c *trackedCloser) Close() error {
+	c.manager.access.Lock()
+	if c.element != nil {
+		c.manager.connections.Remove(c.element)
+		c.element = nil
+	}
+	c.manager.access.Unlock()
+	return c.Closer.Close()
+}
+
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (

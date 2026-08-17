@@ -46,6 +46,7 @@ type InboundManager interface {
 
 type InboundContext struct {
 	Inbound     string
+	InboundInterface string
 	InboundType string
 	IPVersion   uint8
 	Network     string
@@ -58,6 +59,7 @@ type InboundContext struct {
 
 	Protocol     string
 	Domain       string
+	SniffHost    string
 	Client       string
 	SniffContext any
 	SnifferNames []string
@@ -98,6 +100,8 @@ type InboundContext struct {
 	QueryDNSSEC                         bool
 	FakeIP                              bool
 	PreMatch                            bool
+	// MatchInputs accumulates condition classes evaluated during routing.
+	MatchInputs                         RouteMatchInputs
 
 	// rule cache
 
@@ -200,3 +204,25 @@ func OverrideContext(ctx context.Context) context.Context {
 	}
 	return ctx
 }
+
+// RouteMatchInputs is a bitset of rule condition classes evaluated for a flow.
+type RouteMatchInputs uint32
+
+const RouteMatchUnknown RouteMatchInputs = 0
+
+const (
+	RouteMatchIP RouteMatchInputs = 1 << iota // ip_cidr / geoip / ip_is_private / ip_version
+	RouteMatchPort
+	RouteMatchNetwork
+	RouteMatchDomain
+	RouteMatchProcess
+	RouteMatchUser
+	RouteMatchSSID
+	RouteMatchClashMode
+	RouteMatchProtocol
+	RouteMatchPackageName
+	RouteMatchOther
+)
+
+// RouteMatchIPOnly is the whitelist for destination-level DIRECT learn.
+const RouteMatchIPOnly = RouteMatchIP | RouteMatchPort | RouteMatchNetwork

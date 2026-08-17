@@ -171,3 +171,11 @@ var Options = []Note{
 	OptionStoreRDRC,
 	OptionImplicitDefaultHTTPClient,
 }
+
+var OptionLegacyProviderDownloadDetour = Note{
+	Name:              "provider.download_detour",
+	Description:       "provider download_detour is deprecated; use http_client instead",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_PROVIDER_DOWNLOAD_DETOUR",
+}
