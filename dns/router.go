@@ -1189,6 +1189,7 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		return nil, err
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyDNSAnswerObservers(message, response, transport)
 	return response, nil
 }
 
@@ -1222,6 +1223,7 @@ func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTra
 		return
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyDNSAnswerObservers(message, response, transport)
 	callback(response, nil)
 }
 
@@ -1241,6 +1243,9 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	printResult := func() {
 		if err == nil && len(responseAddrs) == 0 {
 			err = E.New("empty result")
+		}
+		if err == nil && len(responseAddrs) > 0 {
+			r.notifyDNSLookupObservers(domain, responseAddrs)
 		}
 		if err != nil {
 			if errors.Is(err, ErrResponseRejectedCached) {
@@ -1746,4 +1751,48 @@ func dnsRuleRace(rule option.DNSRule) bool {
 	default:
 		return false
 	}
+}
+
+// notifyDNSAnswerObservers delivers A/AAAA to optional DNSAnswerObserver (eBPF dns_prefill).
+// Fail-open; cheap no-op when no observer is registered.
+func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
+	if response == nil || len(response.Answer) == 0 || message == nil || len(message.Question) == 0 {
+		return
+	}
+	observer := service.FromContext[adapter.DNSAnswerObserver](r.ctx)
+	if observer == nil {
+		return
+	}
+	if transport != nil && transport.Type() == C.DNSTypeFakeIP {
+		return
+	}
+	addresses := make([]netip.Addr, 0, 4)
+	for _, answer := range response.Answer {
+		switch record := answer.(type) {
+		case *mDNS.A:
+			if addr := M.AddrFromIP(record.A); addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		case *mDNS.AAAA:
+			if addr := M.AddrFromIP(record.AAAA); addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		}
+	}
+	if len(addresses) == 0 {
+		return
+	}
+	observer.OnDNSAnswer(FqdnToDomain(message.Question[0].Name), addresses, false)
+}
+
+// notifyDNSLookupObservers covers dial-time Lookup paths that never surface a full DNS message.
+func (r *Router) notifyDNSLookupObservers(domain string, addresses []netip.Addr) {
+	if domain == "" || len(addresses) == 0 {
+		return
+	}
+	observer := service.FromContext[adapter.DNSAnswerObserver](r.ctx)
+	if observer == nil {
+		return
+	}
+	observer.OnDNSAnswer(FqdnToDomain(domain), addresses, false)
 }

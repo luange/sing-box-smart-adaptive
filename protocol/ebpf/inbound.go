@@ -717,7 +717,11 @@ func (i *Inbound) closeOutboundOffload() error {
 // Publishes destination IPs into TC bypass LPM so subsequent packets skip userspace
 // without waiting for dial-time learn. Smart/proxy outbounds are ignored.
 func (i *Inbound) NoteRoutedDirect(metadata adapter.InboundContext, outbound adapter.Outbound) {
-	if i == nil || outbound == nil || metadata.InboundType != C.TypeEBPF {
+	if i == nil || outbound == nil {
+		return
+	}
+	// Accept eBPF inbound and shared-network flows that still carry mixed metadata.
+	if metadata.InboundType != C.TypeEBPF && metadata.InboundType != C.TypeMixed {
 		return
 	}
 	if !isStableDirectLeafType(outbound.Type()) {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/batch"
@@ -71,6 +72,36 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 		timeout:  timeout,
 		interval: interval,
 	}
+}
+
+// stripTCPFastOpenForAnyTLS clears dialer TFO on anytls outbounds so create
+// does not fail on pure SagerNet (anytls rejects tcp_fast_open).
+func stripTCPFastOpenForAnyTLS(outbound option.Outbound) option.Outbound {
+	if outbound.Type != C.TypeAnyTLS {
+		return outbound
+	}
+	switch opts := outbound.Options.(type) {
+	case *option.AnyTLSOutboundOptions:
+		if opts != nil && opts.TCPFastOpen {
+			clone := *opts
+			clone.TCPFastOpen = false
+			outbound.Options = &clone
+		}
+	case option.AnyTLSOutboundOptions:
+		if opts.TCPFastOpen {
+			opts.TCPFastOpen = false
+			outbound.Options = &opts
+		}
+	default:
+		if w, ok := outbound.Options.(option.DialerOptionsWrapper); ok {
+			d := w.TakeDialerOptions()
+			if d.TCPFastOpen {
+				d.TCPFastOpen = false
+				w.ReplaceDialerOptions(d)
+			}
+		}
+	}
+	return outbound
 }
 
 func (a *Adapter) Start() error {
@@ -152,6 +183,7 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 		outbound, exist := a.outbound.Outbound(tag)
 		_, active := activeTags[tag]
 		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+			opt = stripTCPFastOpenForAnyTLS(opt)
 			err := a.outbound.Create(
 				adapter.WithContext(a.ctx, &adapter.InboundContext{
 					Outbound: tag,

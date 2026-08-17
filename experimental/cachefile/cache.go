@@ -21,16 +21,18 @@ import (
 )
 
 var (
-	bucketSelected = []byte("selected")
-	bucketExpand   = []byte("group_expand")
-	bucketMode     = []byte("clash_mode")
-	bucketRuleSet  = []byte("rule_set")
+	bucketSelected         = []byte("selected")
+	bucketExpand           = []byte("group_expand")
+	bucketMode             = []byte("clash_mode")
+	bucketRuleSet          = []byte("rule_set")
+	bucketOutboundProvider = []byte("outbound_provider")
 
 	bucketNameList = []string{
 		string(bucketSelected),
 		string(bucketExpand),
 		string(bucketMode),
 		string(bucketRuleSet),
+		string(bucketOutboundProvider),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}
@@ -427,12 +429,34 @@ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
 }
 
 func (c *CacheFile) LoadSubscription(tag string) *adapter.SavedBinary {
-	// Minimal stub: provider remote cache optional on pure official base.
-	return nil
+	var savedSet adapter.SavedBinary
+	err := c.DB.View(func(t *bbolt.Tx) error {
+		bucket := c.bucket(t, bucketOutboundProvider)
+		if bucket == nil {
+			return os.ErrNotExist
+		}
+		setBinary := bucket.Get([]byte(tag))
+		if len(setBinary) == 0 {
+			return os.ErrInvalid
+		}
+		return unmarshalSubscriptionBinary(&savedSet, setBinary)
+	})
+	if err != nil {
+		return nil
+	}
+	return &savedSet
 }
 
 func (c *CacheFile) SaveSubscription(tag string, sub *adapter.SavedBinary) error {
-	_ = tag
-	_ = sub
-	return nil
+	return c.batch(func(t *bbolt.Tx) error {
+		bucket, err := c.createBucket(t, bucketOutboundProvider)
+		if err != nil {
+			return err
+		}
+		setBinary, err := marshalSubscriptionBinary(sub)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(tag), setBinary)
+	})
 }
