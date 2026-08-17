@@ -239,6 +239,13 @@ func New(options Options) (*Box, error) {
 	directOffloadHub := adapter.NewDirectOffloadHub()
 	service.MustRegister[*adapter.DirectOffloadHub](ctx, directOffloadHub)
 	service.MustRegister[adapter.DirectOffload](ctx, directOffloadHub)
+	// Multi-eBPF-inbound fan-out for dial-time learn + sockmap splice (same pattern as DirectOffload).
+	verdictLearnerHub := adapter.NewVerdictLearnerHub()
+	service.MustRegister[*adapter.VerdictLearnerHub](ctx, verdictLearnerHub)
+	service.MustRegister[adapter.VerdictLearner](ctx, verdictLearnerHub)
+	connectionSplicerHub := adapter.NewConnectionSplicerHub()
+	service.MustRegister[*adapter.ConnectionSplicerHub](ctx, connectionSplicerHub)
+	service.MustRegister[adapter.ConnectionSplicer](ctx, connectionSplicerHub)
 	service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportManager)
 	service.MustRegister[adapter.ServiceManager](ctx, serviceManager)
 	service.MustRegister[adapter.CertificateProviderManager](ctx, certificateProviderManager)

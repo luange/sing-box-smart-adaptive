@@ -26,6 +26,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
+	"github.com/sagernet/sing/service"
 )
 
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
@@ -126,6 +127,9 @@ func (c *trackedCloser) Close() error {
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// Share Extended with traffic trackers so group leaf tags recorded during
+	// DialContext are visible to connection_history on close.
+	metadata.InitExtended()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remoteConn net.Conn
@@ -146,6 +150,9 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		var dialerString string
 		if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 			dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+			if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+				dialerString += "[" + strings.Join(chain, " -> ") + "]"
+			}
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -159,6 +166,14 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
+	}
+	// Module A: learn path after dial success (first connection still userspace). Fail-open.
+	// Shared-network transparent flows may surface as mixed; hub learners gate eligibility.
+	if metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := M.AddrPortFromNet(remoteConn.RemoteAddr())
+			learner.MaybeLearnTCP(ctx, this, metadata, remoteAP)
+		}
 	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
@@ -182,11 +197,19 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
+	// Module B: eBPF sockmap splice (opt-in, fail-open). Master §6.1.
+	if splicer := service.FromContext[adapter.ConnectionSplicer](ctx); splicer != nil {
+		if splicer.TrySpliceTCP(ctx, metadata.InboundType, this, conn, remoteConn, metadata, onClose) {
+			m.logger.DebugContext(ctx, "connection handed to eBPF splice")
+			return
+		}
+	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.InitExtended()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
@@ -221,6 +244,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			var dialerString string
 			if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+				if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+					dialerString += "[" + strings.Join(chain, " -> ") + "]"
+				}
 			}
 			err = E.Cause(err, "open packet connection to ", remoteString, dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -244,6 +270,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			var dialerString string
 			if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+				if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+					dialerString += "[" + strings.Join(chain, " -> ") + "]"
+				}
 			}
 			err = E.Cause(err, "listen packet connection using ", dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -257,6 +286,22 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		remotePacketConn.Close()
 		m.logger.ErrorContext(ctx, "report handshake success: ", err)
 		return
+	}
+	// UDP DIRECT learn after proven bind/connect (fail-open).
+	if metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := metadata.Destination.AddrPort()
+			if destinationAddress.IsValid() {
+				remoteAP = netip.AddrPortFrom(destinationAddress, metadata.Destination.Port)
+			} else if remoteConn != nil {
+				if ap := M.AddrPortFromNet(remoteConn.RemoteAddr()); ap.IsValid() {
+					remoteAP = ap
+				}
+			}
+			if remoteAP.IsValid() {
+				learner.MaybeLearnUDP(ctx, this, metadata, remoteAP)
+			}
+		}
 	}
 	if destinationAddress.IsValid() {
 		var originDestination M.Socksaddr

@@ -164,6 +164,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	// Share Extended with trackers + dial path before any routing side-effects.
+	metadata.InitExtended()
 	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
 		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
 			offload.NoteRoutedDirect(metadata, selectedOutbound)
@@ -297,6 +299,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
+	metadata.InitExtended()
 	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
 		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
 			offload.NoteRoutedDirect(metadata, selectedOutbound)

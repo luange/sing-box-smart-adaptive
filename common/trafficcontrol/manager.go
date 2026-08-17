@@ -121,6 +121,8 @@ func (m *Manager) leave(tracker Tracker) {
 	if !loaded {
 		return
 	}
+	// Rebuild leaf chain after dial so smart/selector/etc. real outbounds win.
+	metadata.FinalizeChain()
 	closedAt := time.Now()
 	metadata.ClosedAt = closedAt
 	metadataCopy := *metadata

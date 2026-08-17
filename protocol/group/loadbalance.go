@@ -223,9 +223,7 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	if outbound == nil || !common.Contains(outbound.Network(), network) {
 		return nil, E.New("missing supported outbound")
 	}
-	if metadata != nil {
-		metadata.AppendRealOutbound(outbound.Tag())
-	}
+	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
 		return s.group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
@@ -242,9 +240,7 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	if outbound == nil || !common.Contains(outbound.Network(), N.NetworkUDP) {
 		return nil, E.New("missing supported outbound")
 	}
-	if metadata != nil {
-		metadata.AppendRealOutbound(outbound.Tag())
-	}
+	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
 		return s.group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil

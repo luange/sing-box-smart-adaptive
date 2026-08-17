@@ -16,21 +16,80 @@ import (
 )
 
 type TrackerMetadata struct {
-	ID           uuid.UUID
-	Metadata     adapter.InboundContext
-	CreatedAt    time.Time
-	ClosedAt     time.Time
-	Upload       *atomic.Int64
-	Download     *atomic.Int64
-	Chain        []string
-	Rule         adapter.Rule
-	Outbound     string
-	OutboundType string
+	ID              uuid.UUID
+	Metadata        adapter.InboundContext
+	CreatedAt       time.Time
+	ClosedAt        time.Time
+	Upload          *atomic.Int64
+	Download        *atomic.Int64
+	Chain           []string
+	Rule            adapter.Rule
+	Outbound        string
+	OutboundType    string
+	outboundManager adapter.OutboundManager
 }
 
 type Tracker interface {
 	Metadata() *TrackerMetadata
 	Close() error
+}
+
+// FinalizeChain rebuilds Chain/Outbound from the route root plus any real leaf
+// tags groups recorded during Dial (smart/selector/urltest/loadbalance/adaptive).
+// Call on close so history sees the leaf that actually carried traffic, not the
+// sticky Now() snapshotted at route time.
+func (t *TrackerMetadata) FinalizeChain() {
+	if t == nil || t.outboundManager == nil {
+		return
+	}
+	root := ""
+	if len(t.Chain) > 0 {
+		// Display order is leaf → … → root.
+		root = t.Chain[len(t.Chain)-1]
+	} else if t.Outbound != "" {
+		root = t.Outbound
+	} else {
+		return
+	}
+	real := t.Metadata.GetRealOutboundChain()
+	var chain []string
+	next := root
+	realIdx := 0
+	seen := make(map[string]struct{}, 8)
+	for depth := 0; depth < 16 && next != ""; depth++ {
+		if _, dup := seen[next]; dup {
+			break
+		}
+		seen[next] = struct{}{}
+		detour, loaded := t.outboundManager.Outbound(next)
+		if !loaded {
+			break
+		}
+		chain = append(chain, next)
+		t.Outbound = detour.Tag()
+		t.OutboundType = detour.Type()
+		group, isGroup := detour.(adapter.OutboundGroup)
+		if !isGroup {
+			break
+		}
+		if realIdx < len(real) {
+			next = real[realIdx]
+			realIdx++
+			continue
+		}
+		next = group.Now()
+	}
+	if len(chain) > 0 {
+		t.Chain = common.Reverse(chain)
+	}
+}
+
+// EffectiveChain returns the finalized display chain (leaf first).
+func (t TrackerMetadata) EffectiveChain() []string {
+	if len(t.Chain) == 0 {
+		return nil
+	}
+	return append([]string(nil), t.Chain...)
 }
 
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
@@ -77,6 +136,9 @@ func (m *Manager) RoutedFlow(ctx context.Context, metadata adapter.InboundContex
 }
 
 func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound, upload *atomic.Int64, download *atomic.Int64) TrackerMetadata {
+	// Ensure Extended is allocated so Dial-time AppendRealOutbound mutates the
+	// same slice the tracker holds (value-copied InboundContext keeps the pointer).
+	metadata.InitExtended()
 	id, _ := uuid.NewV4()
 	var (
 		chain        []string
@@ -102,17 +164,21 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
 			break
 		}
 		next = outboundGroup.Now()
+		if next == "" {
+			break
+		}
 	}
 	return TrackerMetadata{
-		ID:           id,
-		Metadata:     metadata,
-		CreatedAt:    time.Now(),
-		Upload:       upload,
-		Download:     download,
-		Chain:        common.Reverse(chain),
-		Rule:         matchedRule,
-		Outbound:     outbound,
-		OutboundType: outboundType,
+		ID:              id,
+		Metadata:        metadata,
+		CreatedAt:       time.Now(),
+		Upload:          upload,
+		Download:        download,
+		Chain:           common.Reverse(chain),
+		Rule:            matchedRule,
+		Outbound:        outbound,
+		OutboundType:    outboundType,
+		outboundManager: m.outbound,
 	}
 }
 
