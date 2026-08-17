@@ -1,0 +1,244 @@
+name: Release Linux Binaries
+
+# Portable static (CGO=0, no eBPF) + gateway eBPF (CGO=1, with_ebpf) for amd64/arm64.
+# Trigger: tag v* or manual dispatch.
+
+on:
+  push:
+    tags:
+      - "v1.14.0-beta.17-official-smart-ebpf*"
+      - "v1.14.0-beta.17-official-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version baked into binary (empty = git describe / tag)"
+        required: false
+        type: string
+      publish_release:
+        description: "Upload GitHub Release assets"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  static:
+    name: static linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build static (CGO=0, no with_ebpf)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          if [[ -z "$ver" ]]; then
+            ver="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+            ver="${ver#v}"
+          fi
+          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          # ensure no with_ebpf in static build
+          tags="${tags//with_ebpf,/}"
+          tags="${tags//,with_ebpf/}"
+          ldflags="$(tr -d '\n' < release/LDFLAGS)"
+          mkdir -p dist
+          out="dist/sing-box-linux-${GOARCH}-static"
+          go build -trimpath -tags "$tags" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid= -extldflags '-static'" \
+            -o "$out" ./cmd/sing-box
+          chmod +x "$out"
+          file "$out" | tee "dist/sing-box-linux-${GOARCH}-static.file"
+          # static check (may still say dynamically linked if Go runtime; try ldd)
+          (ldd "$out" 2>&1 || true) | tee "dist/sing-box-linux-${GOARCH}-static.ldd" || true
+          sha256sum "$out" | tee "dist/sing-box-linux-${GOARCH}-static.sha256"
+          if [[ "$GOARCH" == "amd64" ]]; then
+            "$out" version | tee dist/version-static.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-linux-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  ebpf:
+    name: ebpf linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm make pkg-config libelf-dev zlib1g-dev linux-libc-dev
+          if [[ "${{ matrix.goarch }}" == "arm64" ]]; then
+            sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate eBPF objects
+        run: |
+          set -euo pipefail
+          make -C common/ebpf generate
+          ls -la common/ebpf/native/*.o
+
+      - name: Build eBPF (CGO=1)
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          if [[ -z "$ver" ]]; then
+            ver="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+            ver="${ver#v}"
+          fi
+          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf"
+          ldflags="$(tr -d '\n' < release/LDFLAGS)"
+          if [[ "$GOARCH" == "arm64" ]]; then
+            export CC=aarch64-linux-gnu-gcc
+          else
+            export CC=gcc
+          fi
+          mkdir -p dist
+          out="dist/sing-box-linux-${GOARCH}-ebpf"
+          go build -trimpath -tags "$tags" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid=" \
+            -o "$out" ./cmd/sing-box
+          chmod +x "$out"
+          file "$out" | tee "dist/sing-box-linux-${GOARCH}-ebpf.file"
+          (ldd "$out" 2>&1 || true) | tee "dist/sing-box-linux-${GOARCH}-ebpf.ldd" || true
+          sha256sum "$out" | tee "dist/sing-box-linux-${GOARCH}-ebpf.sha256"
+          if [[ "$GOARCH" == "amd64" ]]; then
+            "$out" version | tee dist/version-ebpf.txt
+            cat > /tmp/ebpf-check.json <<'EOF'
+          {
+            "log": {"level": "error"},
+            "inbounds": [{
+              "type": "ebpf",
+              "tag": "ebpf-in",
+              "network": ["tcp", "udp"],
+              "dns_mode": "hijack",
+              "shared_network": {"enabled": true, "include_interface": ["eth0"]}
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+          }
+          EOF
+            "$out" check -c /tmp/ebpf-check.json
+          fi
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-linux-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [static, ebpf]
+    if: ${{ github.event_name == 'push' || inputs.publish_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        id: assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f \( -name 'sing-box-*' -o -name '*.sha256' -o -name 'version*.txt' -o -name '*.file' -o -name '*.ldd' \) \
+            -exec cp -a {} release-assets/ \;
+          ls -lah release-assets/
+          ver="${{ inputs.version }}"
+          if [[ -z "$ver" ]]; then
+            ver="${GITHUB_REF_NAME#v}"
+            if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+              ver="$(git describe --tags --always | sed 's/^v//')"
+            fi
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          tag="v${ver}"
+          # prefer existing tag on push
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.assets.outputs.tag }}"
+          ver="${{ steps.assets.outputs.version }}"
+          notes="$(cat <<EOF
+          ## sing-box adaptive ${ver}
+
+          Pure **SagerNet v1.14.0-beta.17** base + first-party smart / eBPF / provider / connection_history.
+
+          ### Assets
+
+          | Artifact | Notes |
+          |----------|--------|
+          | \`sing-box-linux-*-static\` | **Fully static** (\`CGO_ENABLED=0\`). No \`with_ebpf\` (TC gateway needs eBPF build). |
+          | \`sing-box-linux-*-ebpf\` | Gateway build with \`with_ebpf\` + history. **Dynamically linked to glibc** (not fully static). |
+
+          See \`CHANGELOG.adaptive.md\` and \`README.md\`.
+
+          ### Tags baked in
+          - static: \`release/DEFAULT_BUILD_TAGS_OTHERS\`
+          - ebpf: above + \`with_ebpf\`
+          EOF
+          )"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+            gh release edit "$tag" --notes "$notes" || true
+          else
+            gh release create "$tag" release-assets/* \
+              --title "adaptive ${ver}" \
+              --notes "$notes"
+          fi
