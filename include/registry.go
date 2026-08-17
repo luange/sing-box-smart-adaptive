@@ -29,6 +29,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/naive"
+	"github.com/sagernet/sing-box/protocol/pass"
 	"github.com/sagernet/sing-box/protocol/redirect"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
@@ -82,7 +83,6 @@ func InboundRegistry() *inbound.Registry {
 	return registry
 }
 
-
 func ProviderRegistry() *provider.Registry {
 	registry := provider.NewRegistry()
 
@@ -98,12 +98,14 @@ func OutboundRegistry() *outbound.Registry {
 
 	direct.RegisterOutbound(registry)
 	bridge.RegisterOutbound(registry)
+	pass.RegisterOutbound(registry)
 	registerEBPFOutbound(registry)
 
 	block.RegisterOutbound(registry)
 
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
+	group.RegisterLoadBalance(registry)
 	group.RegisterSmart(registry)
 	adaptive.Register(registry)
 

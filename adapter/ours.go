@@ -81,6 +81,12 @@ type SmartGroupStatus struct {
 	Candidates                []SmartCandidateStatus `json:"candidates"`
 }
 
+// LoadBalanceGroup is implemented by protocol/group loadbalance outbound.
+type LoadBalanceGroup interface {
+	OutboundGroup
+	URLTest(ctx context.Context) (map[string]uint16, error)
+}
+
 // SmartGroup is implemented by protocol/group smart outbound.
 type SmartGroup interface {
 	URLTestGroup
