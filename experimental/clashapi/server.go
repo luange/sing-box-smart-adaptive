@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental"
+	"github.com/sagernet/sing-box/experimental/connectionhistory"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -52,6 +53,7 @@ type Server struct {
 	httpServer     *http.Server
 	trafficManager *trafficcontrol.Manager
 	urlTestHistory *urltest.HistoryStorage
+	history        connectionhistory.Service
 	logDebug       bool
 
 	mode             string
@@ -90,6 +92,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		},
 		trafficManager:           trafficManager,
 		urlTestHistory:           urlTestHistory,
+		history:                  service.FromContext[connectionhistory.Service](ctx),
 		logDebug:                 logFactory.Level() >= log.LevelDebug,
 		modeList:                 options.ModeList,
 		externalController:       options.ExternalController != "",
@@ -133,6 +136,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/connections", connectionRouter(s.ctx, s.network, trafficManager))
 		r.Mount("/providers/proxies", proxyProviderRouter(s))
 		r.Mount("/providers/rules", ruleProviderRouter())
+		if s.history != nil {
+			r.Mount("/history", connectionHistoryRouter(s.history))
+		}
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))

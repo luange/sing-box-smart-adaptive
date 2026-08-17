@@ -50,6 +50,7 @@ const (
 const (
 	TypeSelector     = "selector"
 	TypeURLTest      = "urltest"
+	TypeLoadBalance  = "loadbalance"
 	TypeSmart        = "smart"
 	TypeAdaptivePool = "adaptive_pool"
 )
@@ -124,6 +125,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
+	case TypeLoadBalance:
+		return "LoadBalance"
 	case TypeSmart:
 		return "Smart"
 	case TypeAdaptivePool:

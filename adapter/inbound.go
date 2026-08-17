@@ -102,6 +102,7 @@ type InboundContext struct {
 	PreMatch                            bool
 	// MatchInputs accumulates condition classes evaluated during routing.
 	MatchInputs RouteMatchInputs
+	Extended    *InboundContextExtended
 
 	// rule cache
 
@@ -114,6 +115,29 @@ type InboundContext struct {
 	DestinationPortMatch         bool
 	DidMatch                     bool
 	IgnoreDestinationIPCIDRMatch bool
+}
+
+// InboundContextExtended holds optional chain diagnostics (loadbalance/smart).
+type InboundContextExtended struct {
+	RealOutboundChain []string
+}
+
+func (c *InboundContext) InitExtended() {
+	if c.Extended == nil {
+		c.Extended = new(InboundContextExtended)
+	}
+}
+
+func (c *InboundContext) AppendRealOutbound(tag string) {
+	c.InitExtended()
+	c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
+}
+
+func (c *InboundContext) GetRealOutboundChain() []string {
+	if c.Extended == nil {
+		return nil
+	}
+	return c.Extended.RealOutboundChain
 }
 
 func (c *InboundContext) ResetRuleCache() {
