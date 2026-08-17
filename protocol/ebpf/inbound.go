@@ -98,6 +98,8 @@ type Inbound struct {
 	promotedBypass map[netip.Addr]time.Time
 	// routeDirectPromotes counts NoteRoutedDirect TC publishes (ops / periodic metrics).
 	routeDirectPromotes atomic.Uint64
+	// bypassMiss samples userspace admits vs static LPM (PBR CN gap detector).
+	bypassMiss *bypassMissSampler
 	// dnsPrefillPromotes counts successful dns_prefill TC publishes.
 	dnsPrefillPromotes atomic.Uint64
 
@@ -201,6 +203,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		dnsKernelDirectEnabled: dnsKernelEnabled,
 		dnsKernelDirectCIDRs:   dnsKernelCIDRs,
 		dnsPrefill:             dnsPrefillOptionsFrom(offloadOptions.DNSPrefill),
+		bypassMiss:             newBypassMissSampler(),
 		policy: ECommon.Policy{
 			DisableLocalCapture: options.CaptureLocal != nil && !*options.CaptureLocal,
 			HijackDNS:           dnsMode == dnsModeHijack,
@@ -1194,7 +1197,7 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool 
 			}
 		}
 		if !existed {
-			i.logger.Info("eBPF promote TC bypass /32: ", addr.String(), " ttl=", ttl, " promoted=", len(i.promotedBypass))
+			i.logger.Debug("eBPF promote TC bypass /32: ", addr.String(), " ttl=", ttl, " promoted=", len(i.promotedBypass))
 		} else {
 			i.logger.Debug("eBPF promote TC bypass refresh: ", addr.String(), " ttl=", ttl)
 		}
@@ -1343,7 +1346,11 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	if err != nil {
 		i.logger.DebugContext(ctx, "restore TCP original source: ", err)
 	}
-	i.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	// Connection-level spam is Debug: gateway traffic can be thousands/s.
+	i.logger.DebugContext(ctx, "inbound connection to ", metadata.Destination)
+	if dest := metadata.Destination.Addr; dest.IsValid() {
+		i.bypassMiss.ObserveTCP(i, dest)
+	}
 	i.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -1396,8 +1403,8 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			i.logger.DebugContext(ctx, "restore UDP original source: ", err)
 		}
 	}
-	i.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	i.logger.InfoContext(ctx, "inbound packet connection to ", destination)
+	i.logger.DebugContext(ctx, "inbound packet connection from ", metadata.Source)
+	i.logger.DebugContext(ctx, "inbound packet connection to ", destination)
 	i.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 

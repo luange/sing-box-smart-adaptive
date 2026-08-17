@@ -595,10 +595,14 @@ func (s *Smart) run(ctx context.Context) {
 	if ctx.Err() != nil || s.closing.Load() {
 		return
 	}
-	// Cold start builds process-local endpoint profiles only once. Give the
-	// shared bounded scheduler enough time to cover large provider catalogs;
-	// steady-state cycles retain the configured shorter deadline below.
-	probeCtx, cancel := context.WithTimeout(ctx, max(s.probeCycleTimeout, 2*time.Minute))
+	// Cold start once. Default cap 45s (was 2m) so multi-smart Close stays in HA
+	// budget; catalogs rotate on probe_interval. Explicit probe_cycle_timeout
+	// above 45s is honored when set.
+	cold := 45 * time.Second
+	if s.probeCycleTimeout > cold {
+		cold = s.probeCycleTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, cold)
 	_, _ = s.probe(probeCtx)
 	cancel()
 	for {
