@@ -87,6 +87,11 @@ func Context(
 		ctx = service.ContextWith[option.InboundOptionsRegistry](ctx, inboundRegistry)
 		ctx = service.ContextWith[adapter.InboundRegistry](ctx, inboundRegistry)
 	}
+	if service.FromContext[option.ProviderOptionsRegistry](ctx) == nil ||
+		service.FromContext[adapter.ProviderRegistry](ctx) == nil {
+		ctx = service.ContextWith[option.ProviderOptionsRegistry](ctx, providerRegistry)
+		ctx = service.ContextWith[adapter.ProviderRegistry](ctx, providerRegistry)
+	}
 	if service.FromContext[option.OutboundOptionsRegistry](ctx) == nil ||
 		service.FromContext[adapter.OutboundRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.OutboundOptionsRegistry](ctx, outboundRegistry)
