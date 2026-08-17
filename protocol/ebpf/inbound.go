@@ -519,7 +519,11 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 			return combineStartError(err, i.cleanupStartFailure())
 		}
 		// Route-time DIRECT→TC publish (independent of verdict learn mode).
-		service.MustRegister[adapter.DirectOffload](i.ctx, i)
+		if hub := service.FromContext[*adapter.DirectOffloadHub](i.ctx); hub != nil {
+			hub.Add(i)
+		} else {
+			service.MustRegister[adapter.DirectOffload](i.ctx, i)
+		}
 		i.wireDNSPrefill()
 		i.startRuntimeStatsMonitor(backend)
 		i.startUDPNATCleanup()
@@ -623,6 +627,9 @@ func (i *Inbound) closeLocked() error {
 			return backendErr
 		}
 		i.setBackend(nil)
+	}
+	if hub := service.FromContext[*adapter.DirectOffloadHub](i.ctx); hub != nil {
+		hub.Remove(i)
 	}
 	i.unregisterSocketProtector()
 	return E.Errors(offloadErr, sharedErr, backendErr, i.closeListeners(), i.removeLocalRoutes())
