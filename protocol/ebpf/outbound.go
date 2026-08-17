@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -48,8 +49,10 @@ type outboundCoordinator struct {
 	// Set by inbound after construction; nil = no-op.
 	promoteToBypass func(addr netip.Addr, ttl time.Duration)
 	clearPromoted   func()
-	// skipReason counts for learn gates (index = verdictSkip* const).
-	skipReason [8]uint64
+	// skipReason counts for learn gates (index = verdictSkip* const). Atomic for
+	// hot non_direct path under smart/proxy traffic without taking access lock.
+	skipReason   [8]atomic.Uint64
+	learnInvoked atomic.Uint64
 	// splice skip tallies (high-cardinality path → Debug log + periodic Info)
 	spliceSkipBareTCP   uint64
 	spliceSkipType      uint64
@@ -557,10 +560,7 @@ func (c *outboundCoordinator) noteSkipReason(reason int) {
 	if c == nil || reason < 0 || reason >= len(c.skipReason) {
 		return
 	}
-	// lock-free approximate counter is enough for ops
-	c.access.Lock()
-	c.skipReason[reason]++
-	c.access.Unlock()
+	c.skipReason[reason].Add(1)
 }
 
 func (c *outboundCoordinator) SkipReasonSnapshot() [8]uint64 {
@@ -568,9 +568,17 @@ func (c *outboundCoordinator) SkipReasonSnapshot() [8]uint64 {
 	if c == nil {
 		return out
 	}
-	c.access.RLock()
-	defer c.access.RUnlock()
-	return c.skipReason
+	for i := range c.skipReason {
+		out[i] = c.skipReason[i].Load()
+	}
+	return out
+}
+
+func (c *outboundCoordinator) LearnInvoked() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.learnInvoked.Load()
 }
 
 func (c *outboundCoordinator) noteSpliceSkipBareTCP() {

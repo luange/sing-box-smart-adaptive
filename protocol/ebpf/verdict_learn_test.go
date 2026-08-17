@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -96,6 +97,51 @@ func TestEvaluateVerdictLearn_Off(t *testing.T) {
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipDisabled {
 		t.Fatalf("want disabled, ok=%v reason=%d", ok, reason)
+	}
+}
+
+func TestVerdictInboundEligible(t *testing.T) {
+	if !verdictInboundEligible(C.TypeEBPF) {
+		t.Fatal("ebpf inbound must be eligible")
+	}
+	if !verdictInboundEligible(C.TypeMixed) {
+		t.Fatal("mixed (shared-network) must be eligible at coordinator gate")
+	}
+	if verdictInboundEligible(C.TypeTun) || verdictInboundEligible(C.TypeSOCKS) || verdictInboundEligible("") {
+		t.Fatal("tun/socks/empty must not poison verdict map")
+	}
+}
+
+func TestMaybeLearnTCPCountsNonDirectAndAcceptsMixed(t *testing.T) {
+	coord := &outboundCoordinator{
+		verdictLearn: verdictLearnOptions{mode: "learn", ttl: time.Minute},
+		// nil verdict backend: still counts invoke + non_direct before backend use
+	}
+	// non-direct leaves early after invoke
+	coord.MaybeLearnTCP(context.Background(), stubDirectDialer{empty: false},
+		adapter.InboundContext{InboundType: C.TypeEBPF},
+		netip.MustParseAddrPort("1.2.3.4:443"))
+	if coord.LearnInvoked() != 1 {
+		t.Fatalf("invoked=%d", coord.LearnInvoked())
+	}
+	sr := coord.SkipReasonSnapshot()
+	if sr[verdictSkipNonDirect] != 1 {
+		t.Fatalf("non_direct skip=%d want 1", sr[verdictSkipNonDirect])
+	}
+	// mixed type must not be dropped at inbound-type gate
+	coord.MaybeLearnTCP(context.Background(), stubDirectDialer{empty: false},
+		adapter.InboundContext{InboundType: C.TypeMixed},
+		netip.MustParseAddrPort("1.2.3.4:443"))
+	if coord.LearnInvoked() != 2 {
+		t.Fatalf("mixed invoke not counted: %d", coord.LearnInvoked())
+	}
+	// tun must not count as learn path
+	before := coord.LearnInvoked()
+	coord.MaybeLearnTCP(context.Background(), stubDirectDialer{empty: true},
+		adapter.InboundContext{InboundType: C.TypeTun},
+		netip.MustParseAddrPort("1.2.3.4:443"))
+	if coord.LearnInvoked() != before {
+		t.Fatal("tun must not enter learn path")
 	}
 }
 
