@@ -65,14 +65,7 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 	for {
 		select {
 		case <-ctx.Done():
-			stats, err := backend.RuntimeStats()
-			if err == nil {
-				i.logRuntimeStats("final", stats, false)
-			}
-			i.logSharedRuntimeStats("final", false)
-			i.logSpliceRuntimeStats("final", false)
-			i.logVerdictRuntimeStats("final", false)
-			i.logUDPNATMemoryStats("final")
+			// Skip final BPF stats on shutdown — map lookups must not stall Close().
 			return
 		case <-timer.C:
 			reason := "periodic"

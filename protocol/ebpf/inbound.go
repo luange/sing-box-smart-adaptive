@@ -596,7 +596,9 @@ func (i *Inbound) cleanupStartFailure() error {
 }
 
 // closeLocked is the shared teardown path for Close and cleanupStartFailure.
-// Must keep close order and E.Errors aggregation identical to the pre-dedup code.
+// Always finish hub unregister / listener teardown even when a backend
+// reports a partial close failure — incomplete cleanup leaves maps and
+// hub slots live across restarts and hurts HA.
 func (i *Inbound) closeLocked() error {
 	i.stopDNSPrefill()
 	i.stopRuntimeStatsMonitor()
@@ -612,9 +614,10 @@ func (i *Inbound) closeLocked() error {
 			if sharedErr == nil {
 				sharedErr = E.New("shared-network eBPF backend remained open after close")
 			}
-			return sharedErr
+			// Continue teardown: listeners/hubs must not leak on partial eBPF close.
+		} else {
+			i.sharedNetwork = nil
 		}
-		i.sharedNetwork = nil
 	}
 	backend := i.backendInstance()
 	var backendErr error
@@ -624,9 +627,9 @@ func (i *Inbound) closeLocked() error {
 			if backendErr == nil {
 				backendErr = E.New("eBPF backend remained open after close")
 			}
-			return backendErr
+		} else {
+			i.setBackend(nil)
 		}
-		i.setBackend(nil)
 	}
 	if hub := service.FromContext[*adapter.DirectOffloadHub](i.ctx); hub != nil {
 		hub.Remove(i)

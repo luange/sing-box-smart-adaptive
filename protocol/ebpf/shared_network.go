@@ -607,6 +607,9 @@ func (w *sharedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 	if w.shared.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		return w.writeTransparent(buffer, destination)
 	}
+	if w.clientState == nil {
+		return E.New("missing shared-network UDP client state for ", destination)
+	}
 	redirectAddress, loaded := w.clientState.redirectAddress(destination.AddrPort())
 	if !loaded {
 		return E.New("missing shared-network UDP token for ", destination)

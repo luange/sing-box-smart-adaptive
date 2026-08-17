@@ -516,7 +516,10 @@ func (s *Smart) Close() error {
 	}
 	s.stopWorker()
 	s.unregisterProviderCallbacks()
-	s.worker.Wait()
+	// Bound wait: in-flight URL tests + shared probe slots can stall each group
+	// for several seconds. Five smart groups closed serially would otherwise
+	// exceed FatalStopTimeout (10s) and crash with "sing-box did not close!".
+	s.waitWorkerStop(2 * time.Second)
 	s.access.Lock()
 	clear(s.candidateByTag)
 	clear(s.lastSelected)
@@ -546,6 +549,25 @@ func (s *Smart) Close() error {
 	return nil
 }
 
+// waitWorkerStop waits for the probe worker up to timeout after cancel.
+// Stragglers must honor s.closing / cancelled ctx and not touch cleared maps.
+func (s *Smart) waitWorkerStop(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.worker.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		if s.logger != nil {
+			s.logger.Warn("smart probe worker did not stop within ", timeout, "; continuing close for high availability")
+		}
+	}
+}
+
 func (s *Smart) unregisterProviderCallbacks() {
 	s.providerAccess.Lock()
 	for tag, handle := range s.providerHandles {
@@ -570,6 +592,9 @@ func (s *Smart) run(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+	if ctx.Err() != nil || s.closing.Load() {
+		return
+	}
 	// Cold start builds process-local endpoint profiles only once. Give the
 	// shared bounded scheduler enough time to cover large provider catalogs;
 	// steady-state cycles retain the configured shorter deadline below.
@@ -581,6 +606,9 @@ func (s *Smart) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-probeTicker.C:
+			if s.closing.Load() {
+				return
+			}
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			_, _ = s.probe(probeCtx)
 			cancel()
@@ -1067,6 +1095,9 @@ func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	result := make(map[string]uint16)
+	if ctx.Err() != nil || s.closing.Load() {
+		return result, ctx.Err()
+	}
 	if s.probing.Swap(true) {
 		return result, nil
 	}
@@ -1078,6 +1109,9 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 		probeKeys[tag] = key
 	}
 	s.access.RUnlock()
+	if len(candidates) == 0 || s.closing.Load() {
+		return result, nil
+	}
 	if len(candidates) > 1 {
 		start := int(s.probeCursor.Add(1)-1) % len(candidates)
 		candidates = append(candidates[start:], candidates[:start]...)
@@ -1097,6 +1131,10 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 		go func() {
 			defer waitGroup.Done()
 			for candidate := range jobs {
+				if ctx.Err() != nil || s.closing.Load() {
+					results <- probeResult{candidate: candidate, err: context.Canceled}
+					continue
+				}
 				identity := probeKeys[candidate.Tag()]
 				key := smartProbeKey(identity, s.probeURL, s.probeTimeout)
 				var delay uint16
@@ -1114,7 +1152,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
 					cancel()
 				}
-				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil
+				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
 			}
 		}()
@@ -1135,6 +1173,10 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	close(jobs)
 	waitGroup.Wait()
 	close(results)
+	if s.closing.Load() || ctx.Err() != nil {
+		// Shutdown: skip store mutations so Close can clear maps safely.
+		return result, ctx.Err()
+	}
 	collected := make([]probeResult, 0, len(candidates))
 	successes := 0
 	for probe := range results {
