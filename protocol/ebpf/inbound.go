@@ -860,6 +860,8 @@ func collectDirectOffloadAddrs(metadata adapter.InboundContext) []netip.Addr {
 
 // ebpfLearnEligible is true for native eBPF inbounds and shared-network
 // transparent paths that still surface as mixed in metadata.
+// Aligns with package-level verdictInboundEligible; extra gate: mixed only
+// when this inbound actually runs shared_network (avoids bare mixed poisoning).
 func (i *Inbound) ebpfLearnEligible(inboundType string) bool {
 	if inboundType == C.TypeEBPF {
 		return true

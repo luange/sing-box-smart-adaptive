@@ -244,8 +244,9 @@ func (i *Inbound) logVerdictRuntimeStatsValue(reason string, stats ECommon.Verdi
 	if i.outboundCoord != nil {
 		sr := i.outboundCoord.SkipReasonSnapshot()
 		// 2=sniff/matchInputs 3=non-direct 4=process 5=nodest 7=addr-mismatch
-		// non_direct is no longer counted (proxy leaves return early).
-		i.logger.Info("eBPF verdict learn skip reasons: sniff/match=", sr[2],
+		// non_direct counts proxy leaves (smart/trojan) — proves CM→learn is wired.
+		i.logger.Info("eBPF verdict learn skip reasons: invoked=", i.outboundCoord.LearnInvoked(),
+			" sniff/match=", sr[2],
 			" non_direct=", sr[3], " process=", sr[4], " no_dest=", sr[5],
 			" addr_mismatch=", sr[7])
 		if i.offloadOptions.Splice.Enabled {

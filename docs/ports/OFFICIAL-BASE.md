@@ -37,6 +37,11 @@ Single-slot `MustRegister` cannot host multiple eBPF inbounds. Every cross-cutti
 hook is a hub registered once in `box.New`, with each inbound `Add`/`Remove` on start/close.
 
 ### Why ConnectionManager hooks
+### Learn metrics (ops)
+After dial, `invoked` / `non_direct` must move under proxy traffic (proves CM→hub→coord).
+`writes>0` only when empty DIRECT dials userspace (CN bulk is static bypass_rule_set).
+Mixed shared-network is eligible; tun/socks are not.
+
 Learn + splice only fire **after** a proven dial. Registering the learner without
 wiring `route/conn.go` is a silent no-op (was a production gap).
 

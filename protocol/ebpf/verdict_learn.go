@@ -210,9 +210,16 @@ func resolveLearnDestination(metadata adapter.InboundContext, remoteAddr netip.A
 	return netip.AddrPort{}, verdictSkipAddrMismatch
 }
 
+// verdictInboundEligible: native eBPF inbound, or shared-network transparent
+// flows that still surface as mixed. Socks/tun/other stay out (A4).
+// Must match Inbound.ebpfLearnEligible — single gate for CM + coordinator.
+func verdictInboundEligible(inboundType string) bool {
+	return inboundType == C.TypeEBPF || inboundType == C.TypeMixed
+}
+
 // MaybeLearnTCP is the ConnectionManager hook after successful dial.
 // Fail-open: never returns an error that aborts the connection.
-// A4/F-3: only eBPF inbound may write (cgroup capture surface).
+// A4/F-3: only eBPF / shared-network mixed may write the cgroup verdict map.
 func (c *outboundCoordinator) MaybeLearnTCP(
 	ctx context.Context,
 	outboundDialer N.Dialer,
@@ -222,27 +229,27 @@ func (c *outboundCoordinator) MaybeLearnTCP(
 	if c == nil {
 		return
 	}
-	// A4: mixed/socks/tun must not poison the cgroup-level verdict map.
-	if metadata.InboundType != C.TypeEBPF {
+	// A4: reject socks/tun/etc. Mixed is allowed for shared-network socket_assign
+	// (Inbound.ebpfLearnEligible already filtered hub members with shared off).
+	if !verdictInboundEligible(metadata.InboundType) {
+		return
+	}
+	c.learnInvoked.Add(1)
+	// Perf: gate non-direct BEFORE resolve/backend. Count for ops (atomic).
+	if !verdictIsEmptyDirect(outboundDialer) {
+		c.noteSkipReason(verdictSkipNonDirect)
 		return
 	}
 	c.access.RLock()
 	backend := c.verdict
 	opts := c.verdictLearn
+	closed := c.closed
 	c.access.RUnlock()
-	if backend == nil {
+	if backend == nil || closed {
 		return
 	}
 	// W3: mode enum is off|learn only ("dns" rejected at normalize).
 	if opts.mode != "learn" {
-		return
-	}
-	if c.isClosed() {
-		return
-	}
-	// Perf: gate non-direct BEFORE resolve. Smart/proxy leaves are not offloadable;
-	// do not inflate skip counters (route DirectOffload covers DIRECT only).
-	if !verdictIsEmptyDirect(outboundDialer) {
 		return
 	}
 	dest, resolveReason := resolveLearnDestination(metadata, remote)
@@ -284,17 +291,23 @@ func (c *outboundCoordinator) MaybeLearnUDP(
 	metadata adapter.InboundContext,
 	remote netip.AddrPort,
 ) {
-	if c == nil || metadata.InboundType != C.TypeEBPF {
+	if c == nil {
+		return
+	}
+	if !verdictInboundEligible(metadata.InboundType) {
+		return
+	}
+	c.learnInvoked.Add(1)
+	if !verdictIsEmptyDirect(outboundDialer) {
+		c.noteSkipReason(verdictSkipNonDirect)
 		return
 	}
 	c.access.RLock()
 	backend := c.verdict
 	opts := c.verdictLearn
+	closed := c.closed
 	c.access.RUnlock()
-	if backend == nil || opts.mode != "learn" || c.isClosed() {
-		return
-	}
-	if !verdictIsEmptyDirect(outboundDialer) {
+	if backend == nil || opts.mode != "learn" || closed {
 		return
 	}
 	dest, resolveReason := resolveLearnDestination(metadata, remote)
@@ -302,6 +315,8 @@ func (c *outboundCoordinator) MaybeLearnUDP(
 		backend.Skip()
 		if resolveReason != verdictSkipNone {
 			c.noteSkipReason(resolveReason)
+		} else if dest.Port() == 53 {
+			c.noteSkipReason(verdictSkipPort53)
 		}
 		return
 	}
