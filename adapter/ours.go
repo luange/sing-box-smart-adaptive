@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	N "github.com/sagernet/sing/common/network"
@@ -113,4 +114,54 @@ type PreMatchDisabledOutbound interface {
 // SelectorGroup is implemented by selector outbound (stable Selected leaf).
 type SelectorGroup interface {
 	Selected() Outbound
+}
+
+// DirectOffloadHub fans out NoteRoutedDirect to all eBPF inbounds that registered.
+type DirectOffloadHub struct {
+	access   sync.Mutex
+	offloads []DirectOffload
+}
+
+func NewDirectOffloadHub() *DirectOffloadHub {
+	return &DirectOffloadHub{}
+}
+
+func (h *DirectOffloadHub) Add(offload DirectOffload) {
+	if h == nil || offload == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, existing := range h.offloads {
+		if existing == offload {
+			return
+		}
+	}
+	h.offloads = append(h.offloads, offload)
+}
+
+func (h *DirectOffloadHub) Remove(offload DirectOffload) {
+	if h == nil || offload == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for i, existing := range h.offloads {
+		if existing == offload {
+			h.offloads = append(h.offloads[:i], h.offloads[i+1:]...)
+			return
+		}
+	}
+}
+
+func (h *DirectOffloadHub) NoteRoutedDirect(metadata InboundContext, outbound Outbound) {
+	if h == nil {
+		return
+	}
+	h.access.Lock()
+	snapshot := append([]DirectOffload(nil), h.offloads...)
+	h.access.Unlock()
+	for _, offload := range snapshot {
+		offload.NoteRoutedDirect(metadata, outbound)
+	}
 }

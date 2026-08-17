@@ -12,6 +12,17 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
+func testIPNet(ip string) *net.IPNet {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		panic(ip)
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: parsed, Mask: net.CIDRMask(128, 128)}
+}
+
 func TestRestoreOriginalSource(t *testing.T) {
 	source := M.SocksaddrFrom(netip.MustParseAddr("127.0.0.1"), 23456)
 	destination := netip.MustParseAddr("1.1.1.1")
@@ -25,7 +36,7 @@ func TestRestoreOriginalSource(t *testing.T) {
 		if options == nil || options.UID == nil || *options.UID != 10001 {
 			t.Fatalf("unexpected route UID options: %+v", options)
 		}
-		return []netlink.Route{{Src: net.ParseIP("192.0.2.10")}}, nil
+		return []netlink.Route{{Src: testIPNet("192.0.2.10")}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +53,7 @@ func TestRestoreOriginalSourceIPv6(t *testing.T) {
 		netip.MustParseAddr("2001:db8::1"),
 		0,
 		func(net.IP, *netlink.RouteGetOptions) ([]netlink.Route, error) {
-			return []netlink.Route{{Src: net.ParseIP("2001:db8::10")}}, nil
+			return []netlink.Route{{Src: testIPNet("2001:db8::10")}}, nil
 		},
 	)
 	if err != nil {
