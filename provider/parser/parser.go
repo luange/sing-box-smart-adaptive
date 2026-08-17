@@ -2,7 +2,9 @@ package parser
 
 import (
 	"context"
+	"log"
 	"reflect"
+	"sync"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -15,6 +17,16 @@ var subscriptionParsers = []func(ctx context.Context, content string) ([]option.
 	ParseClashSubscription,
 	ParseSIP008Subscription,
 	ParseRawSubscription,
+}
+
+var ignoredProviderFieldOnce sync.Map
+
+func warnIgnoredProviderField(field, reason string) {
+	key := field + "|" + reason
+	if _, loaded := ignoredProviderFieldOnce.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("provider: ignoring unsupported field %q (%s)", field, reason)
 }
 
 func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
@@ -97,9 +109,11 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
 			if overrideAnyTLSOptions != nil {
 				if overrideAnyTLSOptions.ClientMetadata != nil {
-				options.ClientMetadata = *overrideAnyTLSOptions.ClientMetadata
-			}
-				_ = overrideAnyTLSOptions.DisableReuse // not on pure SagerNet
+					options.ClientMetadata = *overrideAnyTLSOptions.ClientMetadata
+				}
+				if overrideAnyTLSOptions.DisableReuse != nil {
+					warnIgnoredProviderField("anytls.disable_reuse", "not supported on pure SagerNet AnyTLS options")
+				}
 			}
 			outbound.Options = options
 		case C.TypeShadowsocks:
@@ -205,8 +219,9 @@ func overrideDialerOption(options option.DialerOptions, overrideDialerOptions *o
 	if overrideDialerOptions.FallbackDelay != nil {
 		options.FallbackDelay = *overrideDialerOptions.FallbackDelay
 	}
-	// TCPKeepAliveCount not on pure SagerNet DialerOptions.
-	_ = overrideDialerOptions.TCPKeepAliveCount
+	if overrideDialerOptions.TCPKeepAliveCount != nil {
+		warnIgnoredProviderField("override_dialer.tcp_keep_alive_count", "not supported on pure SagerNet DialerOptions")
+	}
 	if overrideDialerOptions.DisableTCPKeepAlive != nil {
 		options.DisableTCPKeepAlive = *overrideDialerOptions.DisableTCPKeepAlive
 	}
@@ -238,8 +253,9 @@ func overrideTLSOption(options *option.OutboundTLSOptions, overrideTLSOptions *o
 	if overrideTLSOptions.ServerName != nil {
 		options.ServerName = *overrideTLSOptions.ServerName
 	}
-	// CertificateServerName not on pure SagerNet OutboundTLSOptions.
-	_ = overrideTLSOptions.CertificateServerName
+	if overrideTLSOptions.CertificateServerName != nil {
+		warnIgnoredProviderField("override_tls.certificate_server_name", "not supported on pure SagerNet OutboundTLSOptions")
+	}
 	if overrideTLSOptions.Insecure != nil {
 		options.Insecure = *overrideTLSOptions.Insecure
 	}

@@ -45,15 +45,15 @@ type InboundManager interface {
 }
 
 type InboundContext struct {
-	Inbound     string
+	Inbound          string
 	InboundInterface string
-	InboundType string
-	IPVersion   uint8
-	Network     string
-	Source      M.Socksaddr
-	Destination M.Socksaddr
-	User        string
-	Outbound    string
+	InboundType      string
+	IPVersion        uint8
+	Network          string
+	Source           M.Socksaddr
+	Destination      M.Socksaddr
+	User             string
+	Outbound         string
 
 	// sniffer
 
@@ -101,7 +101,7 @@ type InboundContext struct {
 	FakeIP                              bool
 	PreMatch                            bool
 	// MatchInputs accumulates condition classes evaluated during routing.
-	MatchInputs                         RouteMatchInputs
+	MatchInputs RouteMatchInputs
 
 	// rule cache
 
@@ -119,6 +119,9 @@ type InboundContext struct {
 func (c *InboundContext) ResetRuleCache() {
 	c.IPCIDRMatchSource = false
 	c.IPCIDRAcceptEmpty = false
+	// MatchInputs is scoped per rule evaluation; only the final matched rule's
+	// classes must survive for eBPF verdict learn (not prior failed rules).
+	c.MatchInputs = 0
 	c.ResetRuleMatchCache()
 }
 

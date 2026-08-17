@@ -55,12 +55,24 @@ func (r *abstractDefaultRule) Match(metadata *adapter.InboundContext) bool {
 	if len(r.allItems) == 0 {
 		return true
 	}
+	// Accumulate classes into a scratch copy so failed rules never pollute
+	// the caller's MatchInputs (even without ResetRuleCache).
+	before := metadata.MatchInputs
+	metadata.MatchInputs = 0
 	matched := r.matchInner(metadata)
+	ruleInputs := metadata.MatchInputs
 	if r.invert {
 		if matched && metadata.IgnoreDestinationIPCIDRMatch && !metadata.DidMatch && len(r.destinationIPCIDRItems) > 0 {
-			return true
+			matched = true
+		} else {
+			matched = !matched
 		}
-		return !matched
+	}
+	if matched {
+		// Commit only the winning rule's evaluated classes onto the prior base.
+		metadata.MatchInputs = before | ruleInputs
+	} else {
+		metadata.MatchInputs = before
 	}
 	return matched
 }
@@ -217,6 +229,8 @@ func (r *abstractLogicalRule) Close() error {
 
 func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 	var matched bool
+	var collected adapter.RouteMatchInputs
+	before := metadata.MatchInputs
 	if r.mode == C.LogicalTypeAnd {
 		matched = true
 		for _, rule := range r.rules {
@@ -226,6 +240,8 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 				matched = false
 				break
 			}
+			// AND: union classes from every satisfied sub-rule.
+			collected |= nestedMetadata.MatchInputs
 		}
 	} else {
 		for _, rule := range r.rules {
@@ -233,12 +249,19 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 			nestedMetadata.ResetRuleCache()
 			if rule.Match(&nestedMetadata) {
 				matched = true
+				// OR: first satisfied sub-rule defines classes.
+				collected = nestedMetadata.MatchInputs
 				break
 			}
 		}
 	}
 	if r.invert {
-		return !matched
+		matched = !matched
+	}
+	if matched {
+		metadata.MatchInputs = before | collected
+	} else {
+		metadata.MatchInputs = before
 	}
 	return matched
 }

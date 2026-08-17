@@ -107,7 +107,12 @@ func (i *Inbound) wireDNSPrefill() {
 	i.dnsPrefillRouter = routeRouter
 	i.dnsPrefillOutbounds = outbounds
 	i.dnsPrefillClosed.Store(false)
-	service.MustRegister[adapter.DNSAnswerObserver](i.ctx, i)
+	if hub := service.FromContext[*adapter.DNSAnswerObserverHub](i.ctx); hub != nil {
+		hub.Add(i)
+	} else {
+		// Fallback for tests / partial contexts without hub.
+		service.MustRegister[adapter.DNSAnswerObserver](i.ctx, i)
+	}
 	i.logger.Info("eBPF dns_prefill enabled ttl=", i.dnsPrefill.ttl)
 }
 
@@ -116,6 +121,9 @@ func (i *Inbound) stopDNSPrefill() {
 		return
 	}
 	i.dnsPrefillClosed.Store(true)
+	if hub := service.FromContext[*adapter.DNSAnswerObserverHub](i.ctx); hub != nil {
+		hub.Remove(i)
+	}
 }
 
 // filterPrefillAddresses drops invalid/private/dupes. Preserves first-seen order.

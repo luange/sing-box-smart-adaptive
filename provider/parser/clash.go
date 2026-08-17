@@ -779,19 +779,21 @@ func (t *TLSOptions) Build() *option.OutboundTLSOptions {
 	if t == nil || !t.TLS {
 		return nil
 	}
+	if t.Fingerprint != "" {
+		warnIgnoredProviderField("tls.fingerprint/pinSHA256", "not available on pure SagerNet OutboundTLSOptions")
+	}
 	return &option.OutboundTLSOptions{
-		Enabled:              t.TLS,
-		ServerName:           t.SNI,
-		Insecure:             t.SkipCertVerify,
-		// CertificatePinSHA256 not on pure; fingerprint ignored
-		ALPN:                 t.ALPN,
-		UTLS:                 clashClientFingerprint(t.ClientFingerprint),
-		Certificate:          trimStringArray(strings.Split(t.CustomCAString, "\n")),
-		CertificatePath:      t.CustomCA,
-		ECH:                  t.ECHOpts.Build(),
-		Reality:              t.RealityOpts.Build(),
-		KernelTx:             t.KernelTx,
-		KernelRx:             t.KernelRx,
+		Enabled:         t.TLS,
+		ServerName:      t.SNI,
+		Insecure:        t.SkipCertVerify,
+		ALPN:            t.ALPN,
+		UTLS:            clashClientFingerprint(t.ClientFingerprint),
+		Certificate:     trimStringArray(strings.Split(t.CustomCAString, "\n")),
+		CertificatePath: t.CustomCA,
+		ECH:             t.ECHOpts.Build(),
+		Reality:         t.RealityOpts.Build(),
+		KernelTx:        t.KernelTx,
+		KernelRx:        t.KernelRx,
 	}
 }
 

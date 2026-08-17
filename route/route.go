@@ -440,6 +440,39 @@ func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R
 	}
 }
 
+func (r *Router) selectPreMatchOutbound(metadata *adapter.InboundContext, outbound adapter.Outbound, depth int) (adapter.Outbound, adapter.PreMatchAction) {
+	if outbound == nil || depth > 8 {
+		return nil, adapter.PreMatchContinue
+	}
+	if _, disabled := outbound.(adapter.PreMatchDisabledOutbound); disabled {
+		return nil, adapter.PreMatchContinue
+	}
+	if preMatchGroup, isPreMatchGroup := outbound.(adapter.PreMatchOutboundGroup); isPreMatchGroup {
+		return preMatchGroup.SelectPreMatchOutbound(metadata, func(selectedOutbound adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction) {
+			return r.selectPreMatchOutbound(metadata, selectedOutbound, depth+1)
+		})
+	}
+	if group, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
+		if !selectedLoaded {
+			return nil, adapter.PreMatchContinue
+		}
+		return r.selectPreMatchOutbound(metadata, selectedOutbound, depth+1)
+	}
+	if !common.Contains(outbound.Network(), metadata.Network) {
+		return nil, adapter.PreMatchContinue
+	}
+	flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound)
+	if !isFlowOutbound {
+		return nil, adapter.PreMatchContinue
+	}
+	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
+	if flowAction == adapter.PreMatchContinue {
+		return nil, adapter.PreMatchContinue
+	}
+	return outbound, flowAction
+}
+
 func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundContext, packetDestination M.Socksaddr, matchedRule adapter.Rule, outboundTag string) adapter.PreMatchResult {
 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
 	var outbound adapter.Outbound
@@ -452,25 +485,10 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
-	for range 8 {
-		group, isGroup := outbound.(adapter.OutboundGroup)
-		if !isGroup {
-			break
-		}
-		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
-		if !selectedLoaded {
-			return continueResult
-		}
-		outbound = selectedOutbound
-	}
-	if !common.Contains(outbound.Network(), metadata.Network) {
+	outbound, flowAction := r.selectPreMatchOutbound(metadata, outbound, 0)
+	if outbound == nil {
 		return continueResult
 	}
-	flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound)
-	if !isFlowOutbound {
-		return continueResult
-	}
-	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
 	if flowAction != adapter.PreMatchFlow {
 		return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
 	}
@@ -507,9 +525,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			}
 			return adapter.PreMatchResult{Action: adapter.PreMatchReject}
 		}
-		flowAction = flowOutbound.PreMatchFlow(metadata.Network, newDestination)
-		if flowAction != adapter.PreMatchFlow {
-			return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
+		if flowOutbound, ok := outbound.(adapter.FlowOutbound); ok {
+			flowAction = flowOutbound.PreMatchFlow(metadata.Network, newDestination)
+			if flowAction != adapter.PreMatchFlow {
+				return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
+			}
 		}
 		result.Destination = netip.AddrPortFrom(newDestination, metadata.Destination.Port)
 	} else if metadata.Destination != packetDestination {

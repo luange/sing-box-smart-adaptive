@@ -26,6 +26,7 @@ func RegisterSelector(registry *outbound.Registry) {
 var (
 	_ adapter.OutboundGroup           = (*Selector)(nil)
 	_ adapter.SelectorGroup           = (*Selector)(nil)
+	_ adapter.PreMatchOutboundGroup   = (*Selector)(nil)
 	_ adapter.ConnectionHandler       = (*Selector)(nil)
 	_ adapter.PacketConnectionHandler = (*Selector)(nil)
 )
@@ -123,6 +124,11 @@ func (s *Selector) All() []string {
 
 func (s *Selector) Selected() adapter.Outbound {
 	return s.selected.Load()
+}
+
+func (s *Selector) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	_ = metadata
+	return selectOutbound(s.selected.Load())
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {

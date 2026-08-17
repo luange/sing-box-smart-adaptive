@@ -24,6 +24,8 @@ import (
 	"github.com/sagernet/sing/service/pause"
 )
 
+var _ adapter.PreMatchOutboundGroup = (*URLTest)(nil)
+
 func RegisterURLTest(registry *outbound.Registry) {
 	outbound.Register[option.URLTestOutboundOptions](registry, C.TypeURLTest, NewURLTest)
 }
@@ -107,6 +109,29 @@ func (s *URLTest) Now() string {
 
 func (s *URLTest) All() []string {
 	return s.tags
+}
+
+func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	network := ""
+	if metadata != nil {
+		network = metadata.Network
+	}
+	var outbound adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		outbound = s.group.selectedOutboundTCP
+	case N.NetworkUDP:
+		outbound = s.group.selectedOutboundUDP
+	default:
+		outbound = s.group.selectedOutboundTCP
+		if outbound == nil {
+			outbound = s.group.selectedOutboundUDP
+		}
+	}
+	if outbound == nil {
+		return nil, adapter.PreMatchContinue
+	}
+	return selectOutbound(outbound)
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {

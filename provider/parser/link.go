@@ -697,8 +697,7 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 		case "sni":
 			TLSOptions.ServerName = value
 		case "pinSHA256":
-			// pinSHA256 ignored on pure SagerNet TLS options
-			_ = value
+			warnIgnoredProviderField("link.pinSHA256", "not available on pure SagerNet OutboundTLSOptions")
 		case "insecure", "skip-cert-verify":
 			if value == "1" || value == "true" {
 				TLSOptions.Insecure = true
