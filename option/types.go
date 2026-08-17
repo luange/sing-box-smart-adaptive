@@ -26,16 +26,26 @@ func (v *NetworkList) UnmarshalJSON(content []byte) error {
 		if err != nil {
 			return err
 		}
-		networkList = []string{networkItem}
+		// Accept joined forms written by Build()/older caches: "tcp\nudp", "tcp,udp".
+		networkItem = strings.ReplaceAll(networkItem, ",", "\n")
+		networkList = strings.FieldsFunc(networkItem, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ' ' || r == '\t'
+		})
 	}
+	normalized := make([]string, 0, len(networkList))
 	for _, networkName := range networkList {
+		networkName = strings.TrimSpace(networkName)
+		if networkName == "" {
+			continue
+		}
 		switch networkName {
 		case N.NetworkTCP, N.NetworkUDP:
+			normalized = append(normalized, networkName)
 		default:
 			return E.New("unknown network: " + networkName)
 		}
 	}
-	*v = NetworkList(strings.Join(networkList, "\n"))
+	*v = NetworkList(strings.Join(normalized, "\n"))
 	return nil
 }
 

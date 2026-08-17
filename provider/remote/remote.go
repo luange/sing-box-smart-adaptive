@@ -184,7 +184,16 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial outbound provider: ", s.Tag())
+			// Better than reF1nd hard-fail: prefer local path when remote is rate-limited.
+			if s.path != "" {
+				if loaded, loadErr := s.loadCacheFile(); loadErr == nil && loaded {
+					s.logger.Warn(E.Cause(err, "initial fetch failed; using local provider path"))
+				} else {
+					return E.Cause(err, "initial outbound provider: ", s.Tag())
+				}
+			} else {
+				return E.Cause(err, "initial outbound provider: ", s.Tag())
+			}
 		}
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
@@ -405,14 +414,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 		if closeErr != nil {
 			return false, closeErr
 		}
-		if saveSub != nil {
-			if !s.hash.Equal(hash.MakeHash(content)) {
-				return false, E.New("load outbound provider cache file failed: validation failed")
-			}
+		if saveSub != nil && s.hash.IsValid() && s.hash.Equal(hash.MakeHash(content)) {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {
+			// Path content is authoritative for cold start. Hash mismatch only
+			// means we skip If-None-Match until the next successful fetch.
+			if saveSub != nil && s.hash.IsValid() {
+				s.logger.Warn("provider path hash mismatch; loading local path without etag")
+			}
+			s.hash = hash.HashType{}
 			lastUpdated = fileInfo.ModTime()
+			lastEtag = ""
 		}
 	} else if saveSub != nil && len(saveSub.Content) > 0 {
 		content = saveSub.Content

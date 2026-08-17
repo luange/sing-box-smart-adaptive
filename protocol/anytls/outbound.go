@@ -13,7 +13,6 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
-	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -57,7 +56,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// before establishment, but anytls SOCKS wrapper tries to access the remote address
 	// during handshake, causing a null pointer dereference crash.
 	if options.DialerOptions.TCPFastOpen {
-		return nil, E.New("tcp_fast_open is not supported with anytls outbound")
+		// Clear instead of failing: keep provider nodes (better than skip-create).
+		options.DialerOptions.TCPFastOpen = false
 	}
 
 	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))

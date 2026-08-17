@@ -69,12 +69,14 @@ func (r *abstractDefaultRule) matchInner(metadata *adapter.InboundContext) bool 
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
 		metadata.DidMatch = true
+		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return false
 		}
 	}
 	if r.ruleSetItem != nil {
 		metadata.DidMatch = true
+		metadata.MatchInputs |= itemMatchClass(r.ruleSetItem)
 		return r.ruleSetItem.matchWithOuterGroups(metadata, groups)
 	}
 	return groups.done()
@@ -84,6 +86,7 @@ func (r *abstractDefaultRule) evaluateForMerge(metadata *adapter.InboundContext)
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
 		metadata.DidMatch = true
+		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return ruleGroupMatch{}, false
 		}
@@ -103,6 +106,7 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	var groups ruleGroupMatch
 	if len(r.sourceAddressItems) > 0 {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.sourceAddressItems)
 		groups.required |= ruleMatchSourceAddress
 		if matchAnyItem(r.sourceAddressItems, metadata) {
 			groups.satisfied |= ruleMatchSourceAddress
@@ -110,6 +114,7 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	}
 	if r.destinationIPCIDRMatchesSource(metadata) {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchSourceAddress
 		if !groups.satisfied.has(ruleMatchSourceAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
 			groups.satisfied |= ruleMatchSourceAddress
@@ -117,6 +122,7 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	}
 	if len(r.sourcePortItems) > 0 {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.sourcePortItems)
 		groups.required |= ruleMatchSourcePort
 		if matchAnyItem(r.sourcePortItems, metadata) {
 			groups.satisfied |= ruleMatchSourcePort
@@ -124,6 +130,7 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	}
 	if len(r.destinationAddressItems) > 0 {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.destinationAddressItems)
 		groups.required |= ruleMatchDestinationAddress
 		if matchAnyItem(r.destinationAddressItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationAddress
@@ -131,6 +138,7 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	}
 	if r.destinationIPCIDRMatchesDestination(metadata) {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchDestinationAddress
 		if !groups.satisfied.has(ruleMatchDestinationAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationAddress
@@ -138,12 +146,19 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 	}
 	if len(r.destinationPortItems) > 0 {
 		metadata.DidMatch = true
+		accumulateItemClasses(metadata, r.destinationPortItems)
 		groups.required |= ruleMatchDestinationPort
 		if matchAnyItem(r.destinationPortItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationPort
 		}
 	}
 	return groups
+}
+
+func accumulateItemClasses(metadata *adapter.InboundContext, items []RuleItem) {
+	for _, item := range items {
+		metadata.MatchInputs |= itemMatchClass(item)
+	}
 }
 
 func (r *abstractDefaultRule) Action() adapter.RuleAction {

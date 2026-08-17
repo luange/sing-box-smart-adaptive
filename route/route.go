@@ -17,7 +17,6 @@ import (
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/bufio/deadline"
@@ -26,6 +25,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/exp/slices"
 )
@@ -164,7 +164,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
-	if selectedOutbound != nil && metadata.InboundType == C.TypeEBPF {
+	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
 		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
 			offload.NoteRoutedDirect(metadata, selectedOutbound)
 		}
@@ -297,7 +297,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
-	if selectedOutbound != nil && metadata.InboundType == C.TypeEBPF {
+	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
 		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
 			offload.NoteRoutedDirect(metadata, selectedOutbound)
 		}
@@ -571,6 +571,9 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
 		if loaded {
 			metadata.Domain = domain
+			if metadata.SniffHost == "" {
+				metadata.SniffHost = domain
+			}
 			r.logger.DebugContext(ctx, "found reserve mapped domain: ", metadata.Domain)
 		}
 	}
