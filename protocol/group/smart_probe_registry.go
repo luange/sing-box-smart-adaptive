@@ -36,13 +36,14 @@ type smartProbeEntry struct {
 }
 
 type smartProbeRegistry struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	access  sync.Mutex
-	entries map[string]*smartProbeEntry
-	probe   func(context.Context, string, adapter.Outbound) (uint16, error)
-	slots   chan struct{}
-	groups  atomic.Uint32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	access          sync.Mutex
+	entries         map[string]*smartProbeEntry
+	probe           func(context.Context, string, adapter.Outbound) (uint16, error)
+	slots           chan struct{}
+	groups          atomic.Uint32
+	completedProbes atomic.Uint64
 }
 
 func (r *smartProbeRegistry) startupDelay() time.Duration {
@@ -169,6 +170,12 @@ func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
 }
 
 func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if r.ctx.Err() != nil {
+		return 0, r.ctx.Err()
+	}
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
@@ -192,6 +199,8 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
 		case <-done:
 		}
 		r.access.Lock()
@@ -209,7 +218,12 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		r.pruneLocked(now)
 		if len(r.entries) >= smartProbeRegistryLimit {
 			r.access.Unlock()
-			probeCtx, cancel := context.WithTimeout(r.ctx, timeout)
+			// Overflow path must honor the caller's ctx so shutdown cancels promptly.
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			if probeCtx.Err() != nil {
+				cancel()
+				return 0, probeCtx.Err()
+			}
 			delay, err := r.probe(probeCtx, probeURL, candidate)
 			cancel()
 			if err != nil {
@@ -232,17 +246,27 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		entry.done = nil
 		r.access.Unlock()
 		return 0, errSharedSmartProbeDeferred
+	case <-r.ctx.Done():
+		r.access.Lock()
+		entry.result = smartProbeResult{completedAt: time.Now(), nextProbeAt: time.Now(), deferred: true}
+		entry.inflight = false
+		close(entry.done)
+		entry.done = nil
+		r.access.Unlock()
+		return 0, errSharedSmartProbeDeferred
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	delay, err := r.probe(probeCtx, probeURL, candidate)
 	cancel()
-	// Probe transports and protocol stacks are intentionally short-lived. A
-	// large catalog can otherwise accumulate their dead buffers until the
-	// process-wide heap goal is reached. Collect at a bounded unit of completed
-	// probe work instead of using a periodic unconditional memory purge.
-	runtime.GC()
+	// Release the admission slot before any optional GC so other groups
+	// (and shutdown waiters) are never blocked behind a STW collection.
 	<-r.slots
+	// Probe transports are short-lived; throttle GC so HA restarts are not
+	// serialized behind full heap scans after every single URL test.
+	if n := r.completedProbes.Add(1); n%32 == 0 && r.ctx.Err() == nil && ctx.Err() == nil {
+		runtime.GC()
+	}
 	completedAt := time.Now()
 	r.access.Lock()
 	previous := entry.result

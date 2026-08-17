@@ -2,8 +2,15 @@ package group
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
+	C "github.com/sagernet/sing-box/constant"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func TestSmartReliabilityUsesConfidence(t *testing.T) {
@@ -282,6 +289,75 @@ func TestSmartWorkerStartsOnPostStart(t *testing.T) {
 	}
 	if err := smart.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type smartCloseStubOutbound struct {
+	outbound.Adapter
+}
+
+func (s *smartCloseStubOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (s *smartCloseStubOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, net.ErrClosed
+}
+
+// TestSmartCloseDoesNotBlockIndefinitely ensures HA restart budget: Close must
+// return even if the probe worker is slow to observe cancel.
+func TestSmartCloseDoesNotBlockIndefinitely(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	block := make(chan struct{})
+	registry := &smartProbeRegistry{
+		ctx:     ctx,
+		cancel:  func() {},
+		entries: make(map[string]*smartProbeEntry),
+		slots:   make(chan struct{}, 1),
+		probe: func(probeCtx context.Context, _ string, _ adapter.Outbound) (uint16, error) {
+			select {
+			case <-probeCtx.Done():
+				return 0, probeCtx.Err()
+			case <-block:
+				return 1, nil
+			}
+		},
+	}
+	// Occupy the single admission slot so run() waits; Close must still finish.
+	registry.slots <- struct{}{}
+	defer func() { <-registry.slots; close(block) }()
+
+	leaf := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "leaf", []string{N.NetworkTCP}, nil)}
+	smart := &Smart{
+		ctx:               ctx,
+		store:             newSmartStore(time.Hour, 3, time.Minute),
+		probeInterval:     time.Hour,
+		probeCycleTimeout: time.Minute,
+		probeTimeout:      30 * time.Second,
+		halfLife:          time.Hour,
+		breakerFailures:   3,
+		breakerCooldown:   time.Minute,
+		historyRetention:  time.Hour,
+		maxHistoryEntries: 100,
+		probeRegistry:     registry,
+		candidates:        []adapter.Outbound{leaf},
+		candidateByTag:    map[string]adapter.Outbound{"leaf": leaf},
+		candidateProbeKey: map[string]string{"leaf": "leaf-id"},
+	}
+	if err := smart.PostStart(); err != nil {
+		t.Fatal(err)
+	}
+	// Give the worker a moment to enter cold-start probe and block on the slot.
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	if err := smart.Close(); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// Bound is 2s; allow a little scheduling slack.
+	if elapsed > 3*time.Second {
+		t.Fatalf("smart.Close blocked too long for HA: %v", elapsed)
 	}
 }
 

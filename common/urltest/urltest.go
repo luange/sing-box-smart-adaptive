@@ -121,6 +121,14 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	if err != nil {
 		return
 	}
+	// Prefer the caller's deadline (smart probe is typically 5s). Falling back
+	// to TCPTimeout (15s) made serial smart-group Close exceed FatalStopTimeout.
+	clientTimeout := C.TCPTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < clientTimeout {
+			clientTimeout = remaining
+		}
+	}
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -134,7 +142,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: C.TCPTimeout,
+		Timeout: clientTimeout,
 	}
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req.WithContext(ctx))

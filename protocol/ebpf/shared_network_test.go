@@ -39,9 +39,14 @@ func TestTransparentWriterTransientFailureDoesNotInvalidateSharedSocket(t *testi
 	connection := new(transparentPacketConnStub)
 	connection.err.Store(error(unix.ENOBUFS))
 	entry := &transparentWriterEntry{conn: connection, refs: 2}
-	shared := &sharedNetwork{transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
-		destination.AddrPort(): entry,
-	}}
+	// dataPlane must be socket_assign so WritePacket uses the transparent path
+	// (token mode would dereference a nil clientState).
+	shared := &sharedNetwork{
+		dataPlane: sharedNetworkDataPlaneSocketAssign,
+		transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
+			destination.AddrPort(): entry,
+		},
+	}
 	writer := &sharedPacketWriter{
 		shared:      shared,
 		client:      netip.MustParseAddrPort("192.0.2.2:53000"),
@@ -66,9 +71,12 @@ func TestTransparentWriterFatalFailureInvalidatesSharedSocket(t *testing.T) {
 	connection := new(transparentPacketConnStub)
 	connection.err.Store(error(unix.EBADF))
 	entry := &transparentWriterEntry{conn: connection, refs: 2}
-	shared := &sharedNetwork{transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
-		destination.AddrPort(): entry,
-	}}
+	shared := &sharedNetwork{
+		dataPlane: sharedNetworkDataPlaneSocketAssign,
+		transparentWriters: map[netip.AddrPort]*transparentWriterEntry{
+			destination.AddrPort(): entry,
+		},
+	}
 	writer := &sharedPacketWriter{
 		shared:      shared,
 		client:      netip.MustParseAddrPort("192.0.2.2:53000"),
