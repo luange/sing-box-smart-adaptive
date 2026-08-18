@@ -65,6 +65,9 @@ type Server struct {
 	externalUI               string
 	externalUIDownloadURL    string
 	externalUIDownloadDetour string
+
+	memoryReclaim       *memoryReclaimState
+	memoryReclaimConfig memoryReclaimConfig
 }
 
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.ClashServer, error) {
@@ -98,6 +101,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
+	}
+	if reclaimConfig, enabled := newMemoryReclaimConfig(options.MemoryReclaim); enabled {
+		s.memoryReclaim = &memoryReclaimState{startedAt: time.Now()}
+		s.memoryReclaimConfig = reclaimConfig
 	}
 	defaultMode := "Rule"
 	if options.DefaultMode != "" {
@@ -177,6 +184,12 @@ func (s *Server) Start(stage adapter.StartStage) error {
 			}
 		}
 	case adapter.StartStateStarted:
+		if s.memoryReclaim != nil {
+			go s.memoryReclaim.run(s.ctx, s.memoryReclaimConfig)
+			s.logger.Info("memory reclaim enabled: interval=", s.memoryReclaimConfig.interval,
+				" cooldown=", s.memoryReclaimConfig.cooldown,
+				" min_idle=", s.memoryReclaimConfig.minimumIdle)
+		}
 		if s.externalController {
 			s.checkAndDownloadExternalUI()
 			var (

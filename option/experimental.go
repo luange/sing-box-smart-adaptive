@@ -1,6 +1,9 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"github.com/sagernet/sing/common/byteformats"
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type ExperimentalOptions struct {
 	CacheFile         *CacheFileOptions         `json:"cache_file,omitempty"`
@@ -37,6 +40,7 @@ type ClashAPIOptions struct {
 	ModeList                         []string                   `json:"-"`
 	AccessControlAllowOrigin         badoption.Listable[string] `json:"access_control_allow_origin,omitempty"`
 	AccessControlAllowPrivateNetwork bool                       `json:"access_control_allow_private_network,omitempty"`
+	MemoryReclaim                    *MemoryReclaimOptions      `json:"memory_reclaim,omitempty"`
 
 	// Deprecated: migrated to global cache file
 	CacheFile string `json:"cache_file,omitempty" schema:"omit"`
@@ -48,6 +52,22 @@ type ClashAPIOptions struct {
 	StoreSelected bool `json:"store_selected,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
 	StoreFakeIP bool `json:"store_fakeip,omitempty" schema:"omit"`
+}
+
+
+// MemoryReclaimOptions controls conservative return of unused Go heap pages to
+// the operating system. It never discards live objects or connection state.
+// Behavior mirrors reF1nd clash memory_reclaim: eligible idle heap is returned
+// via debug.FreeOSMemory on a cooldown, which lowers zashboard inuse
+// (StackInuse+HeapInuse+HeapIdle-HeapReleased) without changing the metric formula.
+type MemoryReclaimOptions struct {
+	Enabled             bool                     `json:"enabled,omitempty"`
+	CheckInterval       badoption.Duration       `json:"check_interval,omitempty"`
+	Cooldown            badoption.Duration       `json:"cooldown,omitempty"`
+	MinimumProcessAge   badoption.Duration       `json:"minimum_process_age,omitempty"`
+	MinimumIdle         *byteformats.MemoryBytes `json:"minimum_idle,omitempty"`
+	MaximumHeapAlloc    *byteformats.MemoryBytes `json:"maximum_heap_alloc,omitempty"`
+	ConsecutiveEligible int                      `json:"consecutive_eligible,omitempty"`
 }
 
 type V2RayAPIOptions struct {
