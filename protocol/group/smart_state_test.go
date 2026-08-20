@@ -70,6 +70,24 @@ func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	}
 }
 
+func TestSmartConnectivity204RTTFeedsEWMAAndJitter(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Now()
+	store.observeDial(now, "network", "", "node", N.NetworkTCP, true, 100*time.Millisecond)
+	first := store.estimate(now, "network", "", "node", N.NetworkTCP, 3)
+	store.observeDial(now.Add(time.Second), "network", "", "node", N.NetworkTCP, true, 300*time.Millisecond)
+	second := store.estimate(now.Add(time.Second), "network", "", "node", N.NetworkTCP, 3)
+	if !first.HasConnect || first.ConnectMS != 100 {
+		t.Fatalf("first connectivity RTT was not recorded: %+v", first)
+	}
+	if second.ConnectMS <= first.ConnectMS || second.ConnectMS >= 300 {
+		t.Fatalf("connectivity RTT must be smoothed by EWMA: first=%f second=%f", first.ConnectMS, second.ConnectMS)
+	}
+	if second.JitterMS <= 0 {
+		t.Fatalf("connectivity RTT variation must update jitter: %+v", second)
+	}
+}
+
 func TestSmartBreakerHalfOpenAndRecovery(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(2000, 0)
