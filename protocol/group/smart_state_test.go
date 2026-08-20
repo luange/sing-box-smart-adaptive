@@ -3,15 +3,57 @@ package group
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/protocol/group/probe"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
+	leaf := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "leaf", []string{N.NetworkTCP}, nil)}
+	var access sync.Mutex
+	var links []string
+	registry := &smartProbeRegistry{
+		ctx:     context.Background(),
+		cancel:  func() {},
+		entries: make(map[string]*smartProbeEntry),
+		slots:   make(chan struct{}, 1),
+		probe: func(_ context.Context, link string, _ adapter.Outbound) (uint16, error) {
+			access.Lock()
+			links = append(links, link)
+			access.Unlock()
+			return 7, nil
+		},
+	}
+	smart := &Smart{
+		ctx:               context.Background(),
+		store:             newSmartStore(time.Hour, 3, time.Minute),
+		probeInterval:     time.Minute,
+		probeCycleTimeout: time.Second,
+		probeTimeout:      time.Second,
+		probeRegistry:     registry,
+		candidates:        []adapter.Outbound{leaf},
+		candidateProbeKey: map[string]string{"leaf": "endpoint-id"},
+	}
+	delays, err := smart.probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delays["leaf"] != 7 {
+		t.Fatalf("unexpected probe delay: %v", delays)
+	}
+	access.Lock()
+	defer access.Unlock()
+	if len(links) != 1 || links[0] != probe.GoogleConnectivityURL {
+		t.Fatalf("Smart must probe only the connectivity 204 target, got %v", links)
+	}
+}
 
 func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)

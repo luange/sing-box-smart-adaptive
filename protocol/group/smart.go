@@ -25,6 +25,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group/probe"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -218,7 +219,6 @@ type Smart struct {
 	status       adapter.SmartGroupStatus
 
 	store                  *smartStore
-	probeURL               string
 	probeInterval          time.Duration
 	probeCycleTimeout      time.Duration
 	probeTimeout           time.Duration
@@ -412,7 +412,6 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		halfOpen:          make(map[string]struct{}),
 		store:             store,
 
-		probeURL:             options.URL,
 		probeInterval:        probeInterval,
 		probeCycleTimeout:    probeCycleTimeout,
 		probeTimeout:         probeTimeout,
@@ -821,7 +820,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no service-reachable candidate")
+		return nil, E.New("smart group has no healthy candidate")
 	}
 	attempts := s.collectDialAttempts(ranks, networkKey, siteKey, transport)
 	if len(attempts) == 0 {
@@ -1015,7 +1014,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no service-reachable UDP candidate")
+		return nil, E.New("smart group has no healthy UDP candidate")
 	}
 	var attemptErrors []error
 	attemptCount := 0
@@ -1142,7 +1141,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					continue
 				}
 				identity := probeKeys[candidate.Tag()]
-				key := smartProbeKey(identity, s.probeURL, s.probeTimeout)
+				key := smartProbeKey(identity, probe.GoogleConnectivityURL, s.probeTimeout)
 				var delay uint16
 				var err error
 				if s.probeRegistry != nil {
@@ -1150,12 +1149,12 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					// another group. Apply the per-node timeout only after a slot is
 					// acquired inside the registry; otherwise a healthy node can be
 					// mislabeled merely because the shared queue took five seconds.
-					delay, err = s.probeRegistry.run(ctx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
+					delay, err = s.probeRegistry.run(ctx, key, probe.GoogleConnectivityURL, s.probeTimeout, s.probeInterval, candidate)
 				} else {
 					// Test/embedded constructors created before the shared registry
 					// contract retain the stock direct probe path.
 					testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
-					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
+					delay, err = urltest.URLTest(testCtx, probe.GoogleConnectivityURL, candidate)
 					cancel()
 				}
 				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
@@ -1244,7 +1243,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			s.access.RLock()
 			identity := s.candidateProbeKey[candidate.Tag()]
 			s.access.RUnlock()
-			sharedProbeFailed = s.probeRegistry.failed(smartProbeKey(identity, s.probeURL, s.probeTimeout), s.probeInterval)
+			sharedProbeFailed = s.probeRegistry.failed(smartProbeKey(identity, probe.GoogleConnectivityURL, s.probeTimeout), s.probeInterval)
 		}
 		if sharedProbeFailed {
 			estimate.State = "open"
@@ -1357,7 +1356,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 	}
 	if !hasEligibleSmartRank(ranks) {
-		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
+		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no healthy candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	bestScore := ranks[0].status.Score
