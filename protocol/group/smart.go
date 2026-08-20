@@ -1459,7 +1459,7 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 		s.access.RLock()
 		probeKey := s.candidateProbeKey[previous]
 		s.access.RUnlock()
-		forceAll = s.probeRegistry.dead(probeKey)
+		forceAll = s.probeRegistry.dead(smartProbeKey(probeKey, probe.GoogleConnectivityURL, s.probeTimeout))
 	}
 	if !forceAll {
 		forceAll = s.store.candidateDead(previous, time.Now())
