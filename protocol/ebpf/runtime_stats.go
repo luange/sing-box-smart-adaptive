@@ -9,13 +9,13 @@ import (
 
 	"github.com/sagernet/sing-box/common/dnsmux"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	ebpfv3 "github.com/sagernet/sing-box/protocol/ebpf/v3"
 )
 
 const (
 	runtimeStatsInitialInterval = 30 * time.Second
 	runtimeStatsInterval        = 5 * time.Minute
 )
-
 
 type udpNatRuntimeStats struct {
 	Sessions           uint64
@@ -58,6 +58,8 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 	var lastSharedStats ECommon.SharedNetworkRuntimeStats
 	var lastSpliceStats ECommon.SpliceStats
 	var lastVerdictStats ECommon.VerdictStats
+	var lastV3Snap ebpfv3.Snapshot
+	var haveV3Sample bool
 	var haveVerdictSample bool
 	var haveSpliceSample bool
 	var tcpWarningLevel int
@@ -97,10 +99,38 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 						sharedStats.RewriteFailures > lastSharedStats.RewriteFailures ||
 						sharedStats.SocketAssignFailures > lastSharedStats.SocketAssignFailures ||
 						sharedStats.FlowUpdateFailures > lastSharedStats.FlowUpdateFailures ||
-						sharedStats.FallbackOpen > lastSharedStats.FallbackOpen ||
 						sharedStats.OriginalDstLost > lastSharedStats.OriginalDstLost
 					i.logSharedRuntimeStatsValue(reason, sharedStats, warning)
 					lastSharedStats = sharedStats
+				}
+				if i.sharedNetwork.engineV3 {
+					raw, gen, bank := i.sharedNetwork.backend.V3Stats()
+					if raw != nil {
+						snap := ebpfv3.FromBackendStats(raw, gen, bank)
+						line := snap.Delta(lastV3Snap)
+						if !haveV3Sample {
+							i.logger.Info("eBPF v3 metrics: reason=initial ", line,
+								" generation=", gen, " bank=", bank,
+								" static_direct=", snap.StaticDirect,
+								" flow_direct=", snap.FlowDirect,
+								" dns_hint_direct=", snap.DNSHintDirect,
+								" fakeip_direct=", snap.FakeIPDirect,
+								" map_miss_proxy=", snap.MapMissProxy,
+								" sk_assign_ok=", snap.SocketAssignOK)
+							haveV3Sample = true
+						} else if line != "ebpf_v3 idle" {
+							warn := snap.SocketAssignFail > lastV3Snap.SocketAssignFail ||
+								snap.MapCapacityReject > lastV3Snap.MapCapacityReject
+							if warn {
+								i.logger.Warn("eBPF v3 metrics: reason=", reason, " ", line)
+							} else if reason == "initial" {
+								i.logger.Info("eBPF v3 metrics: reason=", reason, " ", line)
+							} else {
+								i.logger.Debug("eBPF v3 metrics: reason=", reason, " ", line)
+							}
+						}
+						lastV3Snap = snap
+					}
 				}
 			}
 			if spliceStats, ok := i.spliceRuntimeStats(); ok {

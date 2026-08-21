@@ -1753,8 +1753,8 @@ func dnsRuleRace(rule option.DNSRule) bool {
 	}
 }
 
-// notifyDNSAnswerObservers delivers A/AAAA to optional DNSAnswerObserver (eBPF dns_prefill).
-// Fail-open; cheap no-op when no observer is registered.
+// notifyDNSAnswerObservers delivers A/AAAA to optional DNSAnswerObserver
+// (eBPF dns_prefill + v3 FakeIP/DNS hint). Fail-open; cheap no-op when none registered.
 func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
 	if response == nil || len(response.Answer) == 0 || message == nil || len(message.Question) == 0 {
 		return
@@ -1763,9 +1763,7 @@ func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg,
 	if observer == nil {
 		return
 	}
-	if transport != nil && transport.Type() == C.DNSTypeFakeIP {
-		return
-	}
+	fromFakeIP := transport != nil && transport.Type() == C.DNSTypeFakeIP
 	addresses := make([]netip.Addr, 0, 4)
 	for _, answer := range response.Answer {
 		switch record := answer.(type) {
@@ -1782,7 +1780,7 @@ func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg,
 	if len(addresses) == 0 {
 		return
 	}
-	observer.OnDNSAnswer(FqdnToDomain(message.Question[0].Name), addresses, false)
+	observer.OnDNSAnswer(FqdnToDomain(message.Question[0].Name), addresses, fromFakeIP)
 }
 
 // notifyDNSLookupObservers covers dial-time Lookup paths that never surface a full DNS message.

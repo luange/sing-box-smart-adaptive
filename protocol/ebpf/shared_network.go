@@ -24,6 +24,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	ebpfv3 "github.com/sagernet/sing-box/protocol/ebpf/v3"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -32,6 +33,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	udpnat "github.com/sagernet/sing/common/udpnat2"
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -58,13 +60,16 @@ type sharedNetwork struct {
 	dropUDP443         bool
 	dataPlane          string
 	flowVerdict        bool
+	engineV3           bool
+	v3                 *ebpfv3.Lifecycle
 	transparentAccess  sync.Mutex
 	transparentWriters map[netip.AddrPort]*transparentWriterEntry
 	routingMark        uint32
 	routingTable       uint32
-	backend            *ECommon.SharedNetworkBackend
+	backend            ECommon.SharedDataplane
 	policyRoute        *sharedNetworkPolicyRoute
 	tc                 *sharedTCManager
+	staticDirect       []netip.Prefix
 	tcp4               *listener.Listener
 	tcp6               *listener.Listener
 	udp4               *listener.Listener
@@ -94,6 +99,12 @@ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (opt
 	if !options.Enabled {
 		return option.EBPFSharedNetworkOptions{}, nil
 	}
+	// v3 engine validation/defaults (empty engine stays v2).
+	var err error
+	options, err = ebpfv3.NormalizeSharedNetwork(options)
+	if err != nil {
+		return option.EBPFSharedNetworkOptions{}, err
+	}
 	switch options.DataPlane {
 	case "":
 		// socket_assign is the safe default: it preserves the original tuple
@@ -110,6 +121,9 @@ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (opt
 	}
 	if options.FlowVerdict && options.DataPlane != sharedNetworkDataPlaneSocketAssign {
 		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.flow_verdict requires data_plane=socket_assign")
+	}
+	if ebpfv3.IsV3(options) && options.DataPlane != sharedNetworkDataPlaneSocketAssign {
+		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.engine=v3 requires data_plane=socket_assign")
 	}
 	if options.DataPlane == sharedNetworkDataPlaneSocketAssign {
 		if options.RoutingMark == 0 {
@@ -173,9 +187,26 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 		tcPriority:   sharedNetworkResolveTCPriority(options),
 		dropUDP443:   sharedNetworkDropUDP443(options),
 		dataPlane:    options.DataPlane,
-		flowVerdict:  options.FlowVerdict,
+		flowVerdict:  options.FlowVerdict || (ebpfv3.IsV3(options) && options.PolicyOffload.ExactFlowLearning),
+		engineV3:     ebpfv3.IsV3(options),
 		routingMark:  options.RoutingMark,
 		routingTable: options.RoutingTable,
+	}
+	if shared.engineV3 {
+		// Control-plane always available. Kernel TC v3 object attach is Linux
+		// generate+load (common/ebpf/v3/kern); until then packet path stays v2
+		// socket_assign while learn/DNS models accumulate in Lifecycle.
+		lc, err := ebpfv3.NewLifecycle(options, 0)
+		if err != nil {
+			parent.logger.Warn("eBPF v3 lifecycle: ", err)
+		} else {
+			shared.v3 = lc
+			enableTCP := parent.enableTCP
+			enableUDP := parent.enableUDP
+			lc.ApplyControlFlags(true, true, enableTCP, enableUDP, parent.dnsMode == dnsModeHijack, options.RoutingMark)
+			parent.logger.Info("eBPF shared-network engine=v3 control-plane ready (policy_offload=",
+				options.PolicyOffload.Enabled, "); kernel tc.bpf attach uses generate on Linux")
+		}
 	}
 	udpTimeout := C.UDPTimeout
 	if parent.listenOptions.UDPTimeout != 0 {
@@ -224,23 +255,74 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 	if err := s.startListeners(); err != nil {
 		return E.Errors(err, s.closeListeners())
 	}
-	backend, err := ECommon.PrepareSharedNetwork(
-		parentBackend,
-		s.listenPort,
-		s.parent.enableTCP,
-		s.parent.enableUDP,
-		s.parent.redirectIPv4,
-		s.parent.redirectIPv6,
-		s.dropUDP443,
-		s.dataPlane == sharedNetworkDataPlaneSocketAssign,
-		s.routingMark,
-	)
-	if err != nil {
-		return E.Errors(err, s.closeListeners())
+	var backend ECommon.SharedDataplane
+	var err error
+	wantV3 := s.engineV3
+	if wantV3 {
+		po := s.parent.sharedOptions.PolicyOffload
+		// Default exact-flow on when policy_offload enabled and not explicitly sparse.
+		flowLearn := po.ExactFlowLearning || s.flowVerdict
+		staticRules := po.StaticRules
+		if po.Enabled && !po.ExactFlowLearning && !po.StaticRules && !s.flowVerdict {
+			// enabled with zero sub-flags → turn on the safe defaults from design §13.
+			staticRules = true
+			flowLearn = true
+		}
+		backend, err = ECommon.PrepareSharedNetworkV3(
+			s.parent.enableTCP,
+			s.parent.enableUDP,
+			s.parent.redirectIPv4.IsValid(),
+			s.parent.redirectIPv6.IsValid(),
+			s.parent.dnsMode == dnsModeHijack,
+			s.dropUDP443,
+			s.routingMark,
+			staticRules || po.Enabled,
+			flowLearn,
+			po.DNSIPHint == "safe" || po.DNSIPHint == "strong" || po.Enabled,
+			po.FakeIP || po.Enabled,
+			0,
+		)
+		if err != nil {
+			// Fail-open to v2 dataplane so canary hosts never lose PBR (design §15).
+			s.parent.logger.Warn("eBPF v3 kernel dataplane unavailable, falling back to v2: ", err)
+			s.engineV3 = false
+			backend = nil
+			err = nil
+		} else {
+			s.parent.logger.Info("eBPF shared-network engine=v3 kernel dataplane loaded")
+			// Single control plane: memory lifecycle + kernel maps stay in lockstep.
+			if s.v3 != nil {
+				s.v3.BindSink(v3KernelSink{dp: backend})
+			}
+		}
+	}
+	if backend == nil {
+		backend, err = ECommon.PrepareSharedNetwork(
+			parentBackend,
+			s.listenPort,
+			s.parent.enableTCP,
+			s.parent.enableUDP,
+			s.parent.redirectIPv4,
+			s.parent.redirectIPv6,
+			s.dropUDP443,
+			s.dataPlane == sharedNetworkDataPlaneSocketAssign,
+			s.routingMark,
+		)
+		if err != nil {
+			return E.Errors(err, s.closeListeners())
+		}
+		if wantV3 && !s.engineV3 {
+			s.parent.logger.Info("eBPF shared-network using v2 TC dataplane (v3 control-plane model still active when lifecycle present)")
+		}
 	}
 	s.backend = backend
-	if err = backend.SetFlowDirect(s.flowVerdict); err != nil {
+	if err = backend.SetFlowDirect(s.flowVerdict || s.engineV3); err != nil {
 		return E.Errors(E.Cause(err, "configure shared-network flow verdict"), s.Close())
+	}
+	if s.engineV3 {
+		if err = s.publishV3StaticFromParent(parentBackend); err != nil {
+			return E.Errors(E.Cause(err, "publish eBPF v3 static policy"), s.Close())
+		}
 	}
 	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		if err = s.registerListenerSockets(); err != nil {
@@ -262,7 +344,7 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 		interfaces:   s.interfaces,
 		priority:     s.tcPriority,
 		enableIPv4:   s.parent.redirectIPv4.IsValid(),
-		attachEgress: s.dataPlane != sharedNetworkDataPlaneSocketAssign,
+		attachEgress: s.dataPlane != sharedNetworkDataPlaneSocketAssign && !s.engineV3,
 		attachments:  make(map[string]*sharedTCAttachment),
 	}
 	if err = s.tc.Start(); err != nil {
@@ -404,7 +486,22 @@ func (s *sharedNetwork) registerListenerSockets() error {
 func (s *sharedNetwork) InterfaceUpdated() {
 	s.udpNat.Purge()
 	s.dnsMux.Purge()
-	if s.flowVerdict && s.backend != nil {
+	// One coherent invalidation path per engine:
+	// v3 republishStatic commits a new generation (flows/DNS miss until re-learn).
+	// v2 bumps flow generation only.
+	if s.engineV3 {
+		if parent := s.parent.backendInstance(); parent != nil {
+			if err := s.RefreshV3Static(parent); err != nil {
+				s.parent.logger.Debug("eBPF v3 static republish after interface update: ", err)
+			}
+		} else if s.v3 != nil {
+			if err := s.v3.InvalidateGeneration(); err != nil {
+				s.parent.logger.Debug("eBPF v3 generation invalidate: ", err)
+			}
+		} else if s.backend != nil {
+			_ = s.backend.InvalidateFlowDirect()
+		}
+	} else if s.flowVerdict && s.backend != nil {
 		if err := s.backend.InvalidateFlowDirect(); err != nil {
 			s.parent.logger.Debug("invalidate shared-network direct flow verdicts: ", err)
 		}
@@ -412,6 +509,170 @@ func (s *sharedNetwork) InterfaceUpdated() {
 	if s.tc != nil {
 		s.tc.Wake()
 	}
+}
+
+// v3KernelSink adapts SharedDataplane to the lifecycle DataplaneSink surface.
+type v3KernelSink struct {
+	dp ECommon.SharedDataplane
+}
+
+func (s v3KernelSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.PublishStaticDirect(prefixes, generation, bank)
+}
+func (s v3KernelSink) MergeStaticDirect(prefix netip.Prefix) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.MergeStaticDirect(prefix)
+}
+func (s v3KernelSink) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.PutDirectFlow(protocol, source, destination, ttl)
+}
+func (s v3KernelSink) DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.DeleteDirectFlow(protocol, source, destination)
+}
+func (s v3KernelSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.PublishDNSHint(addr, direct, evidence, generation, ttl)
+}
+func (s v3KernelSink) InvalidateFlowDirect() error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.InvalidateFlowDirect()
+}
+func (s v3KernelSink) PolicyGeneration() uint32 {
+	if s.dp == nil {
+		return 0
+	}
+	return s.dp.PolicyGeneration()
+}
+
+// shouldLearnExactFlow is true when the kernel exact-flow map is armed.
+func (s *sharedNetwork) shouldLearnExactFlow() bool {
+	if s == nil {
+		return false
+	}
+	if s.flowVerdict {
+		return true
+	}
+	// engine=v3: SetFlowDirect(true) whenever engine=v3; learn bare-DIRECT after
+	// userspace proves the leaf (gated by verdict.mode=learn on the caller).
+	return s.engineV3
+}
+
+// revokeExactFlow drops a learned tuple after real failure (design §9 revoke).
+func (s *sharedNetwork) revokeExactFlow(protocol uint8, client, dest netip.AddrPort) {
+	if s == nil || !client.IsValid() || !dest.IsValid() {
+		return
+	}
+	if s.v3 != nil {
+		if err := s.v3.RevokeFlow(client, dest, protocol); err != nil {
+			s.parent.logger.Debug("eBPF v3 flow revoke: ", err)
+		}
+		return
+	}
+	if s.backend != nil {
+		_ = s.backend.DeleteDirectFlow(protocol, client, dest)
+	}
+}
+
+// learnV3Flow records a bare-direct exact-flow into the unified v3 control plane.
+// When sink is bound, Lifecycle.LearnFlow also writes the kernel flow map — callers
+// must not double-PutDirectFlow for the same tuple.
+func (s *sharedNetwork) learnV3Flow(protocol uint8, client, dest netip.AddrPort) {
+	if s == nil || !client.IsValid() || !dest.IsValid() {
+		return
+	}
+	if s.v3 != nil {
+		if err := s.v3.LearnFlow(client, dest, protocol, true, time.Now()); err != nil {
+			s.parent.logger.Debug("eBPF v3 flow learn skipped: ", err)
+		}
+		return
+	}
+	// Fallback when lifecycle missing but kernel backend present.
+	if s.backend != nil {
+		if err := s.backend.PutDirectFlow(protocol, client, dest, 10*time.Minute); err != nil {
+			s.parent.logger.Debug("eBPF v3 flow learn (backend) skipped: ", err)
+		}
+	}
+}
+
+// observeV3DNS mirrors DNS/FakeIP evidence into the unified control plane.
+func (s *sharedNetwork) observeV3DNS(addr netip.Addr, direct bool, evidence uint8, ttl time.Duration) {
+	if s == nil || !s.engineV3 || !addr.IsValid() {
+		return
+	}
+	if s.v3 != nil {
+		s.v3.ObserveDNS(addr, direct, evidence, ttl, time.Now())
+		return
+	}
+	if s.backend != nil {
+		_ = s.backend.PublishDNSHint(addr, direct, evidence, 0, ttl)
+	}
+}
+
+// promoteV3Direct installs a destination /32|/128 for first-packet kernel DIRECT:
+// DNS strong hint + active-bank static merge (no generation bump).
+func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
+	if s == nil || !s.engineV3 || s.backend == nil || !addr.IsValid() {
+		return
+	}
+	addr = addr.Unmap()
+	bits := 32
+	if !addr.Is4() {
+		bits = 128
+	}
+	prefix := netip.PrefixFrom(addr, bits).Masked()
+	// Evidence strong: dns_prefill / route already proved stable DIRECT.
+	s.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
+	if err := s.backend.MergeStaticDirect(prefix); err != nil {
+		s.parent.logger.Debug("eBPF v3 merge static direct: ", err)
+	}
+}
+
+// publishV3StaticFromParent publishes the full static DIRECT snapshot:
+// bypass_rule_set (+ promotions) ∪ pure-IP route→DIRECT sinks (design §5/§7).
+// Always commits a new generation — even an empty snapshot — so stale entries miss.
+func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error {
+	if s == nil || s.backend == nil {
+		return nil
+	}
+	var routeRouter adapter.Router
+	if r, ok := s.parent.router.(adapter.Router); ok {
+		routeRouter = r
+	}
+	outbounds := service.FromContext[adapter.OutboundManager](s.parent.ctx)
+	prefixes := collectV3StaticPrefixes(parent, routeRouter, outbounds)
+	s.staticDirect = prefixes
+	if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
+		return err
+	}
+	// Keep memory model generation aligned when sink is bound via lifecycle.
+	if s.v3 != nil {
+		s.v3.SyncPolicyGeneration(s.backend.PolicyGeneration())
+	}
+	s.parent.logger.Info("eBPF v3 static policy published: prefixes=", len(prefixes))
+	return nil
+}
+
+// RefreshV3Static republishes bypass prefixes after rule-set reload.
+func (s *sharedNetwork) RefreshV3Static(parent *ECommon.Backend) error {
+	if s == nil || !s.engineV3 {
+		return nil
+	}
+	return s.publishV3StaticFromParent(parent)
 }
 
 func (s *sharedNetwork) Close() error {
@@ -423,11 +684,19 @@ func (s *sharedNetwork) Close() error {
 	s.udpNat.Purge()
 	s.dnsMux.Close()
 	s.closeTransparentWriters()
+	if s.v3 != nil {
+		_ = s.v3.Close()
+		s.v3 = nil
+	}
+	var tcErr error
 	if s.tc != nil {
-		if err := s.tc.Close(); err != nil {
-			return err
+		tcErr = s.tc.Close()
+		// A failed detach must not prevent the remaining routes, maps, sockets,
+		// and listeners from being released.  Keep the manager only when it
+		// still owns attachments so a later Close can retry those detachments.
+		if s.tc.IsClosed() {
+			s.tc = nil
 		}
-		s.tc = nil
 	}
 	var routeErr error
 	if s.policyRoute != nil {
@@ -443,7 +712,7 @@ func (s *sharedNetwork) Close() error {
 			s.backend = nil
 		}
 	}
-	return E.Errors(routeErr, backendErr, s.closeListeners())
+	return E.Errors(tcErr, routeErr, backendErr, s.closeListeners())
 }
 
 func (s *sharedNetwork) closeListeners() error {
@@ -734,7 +1003,7 @@ func (s *sharedNetwork) closeTransparentWriters() {
 }
 
 type sharedTCManager struct {
-	backend      *ECommon.SharedNetworkBackend
+	backend      ECommon.SharedDataplane
 	logger       interfaceLogger
 	interfaces   []string
 	priority     uint16
@@ -930,6 +1199,15 @@ func (m *sharedTCManager) Close() error {
 	return m.closeAttachments()
 }
 
+func (m *sharedTCManager) IsClosed() bool {
+	if m == nil {
+		return true
+	}
+	m.access.Lock()
+	defer m.access.Unlock()
+	return m.cancel == nil && len(m.attachments) == 0 && !m.enabled
+}
+
 func (m *sharedTCManager) closeAttachments() error {
 	m.access.Lock()
 	defer m.access.Unlock()
@@ -950,7 +1228,7 @@ func (m *sharedTCManager) closeAttachments() error {
 	return closeErr
 }
 
-func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool, attachEgress bool, priority uint16) (*sharedTCAttachment, error) {
+func attachSharedTC(link netlink.Link, backend ECommon.SharedDataplane, enableIPv4 bool, attachEgress bool, priority uint16) (*sharedTCAttachment, error) {
 	if priority == 0 {
 		priority = sharedNetworkTCPriorityDefault
 	}

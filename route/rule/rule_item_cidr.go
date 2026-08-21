@@ -99,3 +99,17 @@ func (r *IPCIDRItem) Match(metadata *adapter.InboundContext) bool {
 func (r *IPCIDRItem) String() string {
 	return r.description
 }
+
+// Prefixes returns destination CIDR prefixes (nil for source matchers).
+// Used by eBPF v3 static sink compilation (design §7.2).
+func (r *IPCIDRItem) Prefixes() []netip.Prefix {
+	if r == nil || r.isSource || r.ipSet == nil {
+		return nil
+	}
+	return r.ipSet.Prefixes()
+}
+
+// IsSource reports whether this item matches source addresses.
+func (r *IPCIDRItem) IsSource() bool {
+	return r != nil && r.isSource
+}

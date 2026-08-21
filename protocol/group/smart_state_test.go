@@ -33,13 +33,20 @@ func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
 	}
 	smart := &Smart{
 		ctx:               context.Background(),
+		control:           &smartControlState{},
 		store:             newSmartStore(time.Hour, 3, time.Minute),
+		probeURL:          probe.GoogleConnectivityURL,
 		probeInterval:     time.Minute,
 		probeCycleTimeout: time.Second,
 		probeTimeout:      time.Second,
 		probeRegistry:     registry,
 		candidates:        []adapter.Outbound{leaf},
+		candidateByTag:    map[string]adapter.Outbound{"leaf": leaf},
 		candidateProbeKey: map[string]string{"leaf": "endpoint-id"},
+		lastSelected:      make(map[string]string),
+		affinity:          make(map[string]smartAffinity),
+		switchChallenges:  make(map[string]smartSwitchChallenge),
+		halfOpen:          make(map[string]struct{}),
 	}
 	delays, err := smart.probe(context.Background())
 	if err != nil {

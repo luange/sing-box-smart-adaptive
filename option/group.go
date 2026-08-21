@@ -50,6 +50,7 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
+	URL                  string                      `json:"url,omitempty"`
 	ProbeInterval        badoption.Duration          `json:"probe_interval,omitempty"`
 	ProbeCycleTimeout    badoption.Duration          `json:"probe_cycle_timeout,omitempty"`
 	ProbeTimeout         badoption.Duration          `json:"probe_timeout,omitempty"`

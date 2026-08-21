@@ -27,11 +27,23 @@ route/conn.go         dial 后 learn/splice 钩子（自有增量）
 
 ## eBPF 数据面（PBR）
 
+### v2（默认，`shared_network.engine` 空或 `v2`）
+
 1. **TC 程序**挂在 `include_interface`（如 eth0、pa-*）  
 2. **bypass_rule_set** → LPM：命中则内核转发，进程不可见  
 3. 未命中 → **socket_assign** 进 userspace `PA-in`  
 4. 用户态路由：geoip DIRECT / 区域 smart→trojan 等  
 5. DNS hijack + **dns_prefill**：解析结果若稳定 DIRECT → promote TC  
+
+### v3（显式 `engine: v3`，见 `common/ebpf/v3/README.md`）
+
+控制面 / 数据面分离：
+
+1. **静态**可下沉规则 → 双 bank LPM，**首包 DIRECT**（不进 userspace）
+2. 复杂规则首包进 control plane → 叶子 bare direct 后写 **exact-flow**
+3. DNS/FakeIP：**强证据**才可 IP DIRECT；CDN 共 IP 冲突 → MUST_CONTROL
+4. miss / parse fail / generation 不一致 → **永远 NEED_USERSPACE**，禁止静默直连
+5. 默认 TC + `socket_assign`；不默认 drop QUIC；Smart 仍在用户态
 
 因此：**直连性能看 TC 命中率**；**代理性能看 smart + 日志 + 探测**，不是 DIRECT learn writes。
 

@@ -150,6 +150,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
+	// PA/PBR gateway default: no root-cgroup connect hijack (design + 117 canary).
+	options.CaptureLocal = defaultCaptureLocal(options.CaptureLocal, sharedOptions.Enabled)
 	offloadOptions, clampWarnings, err := normalizeOutboundOffloadOptions(options.OutboundOffload)
 	if err != nil {
 		return nil, err
@@ -298,6 +300,15 @@ func normalizeUDPNATCapacities(dataCapacity, dnsCapacity uint32) (uint32, uint32
 	}
 	return normalize(dataCapacity, defaultDataCapacity, minimumDataCapacity, "udp_session_capacity"),
 		normalize(dnsCapacity, defaultDNSCapacity, minimumDNSCapacity, "dns_session_capacity"), warnings
+}
+
+// defaultCaptureLocal: shared_network gateways default false; pure host proxy defaults true.
+func defaultCaptureLocal(explicit *bool, sharedNetworkEnabled bool) *bool {
+	if explicit != nil {
+		return explicit
+	}
+	v := !sharedNetworkEnabled
+	return &v
 }
 
 func validateLocalCaptureOptions(
@@ -546,6 +557,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 			", outbound_splice=", i.offloadOptions.Splice.Enabled,
 			", outbound_verdict=", i.offloadOptions.Verdict.Mode,
 			", flow_verdict=", i.sharedOptions.FlowVerdict,
+			", exact_flow_learn=", i.sharedNetwork != nil && i.sharedNetwork.shouldLearnExactFlow(),
 			", direct_offload=route+prefill+learn",
 			", programs=[", strings.Join(backend.AttachedPrograms(), ", "), "]",
 		)
@@ -890,7 +902,7 @@ func (i *Inbound) MaybeLearnTCP(
 	// userspace connection is proven DIRECT. The existing destination-level
 	// learner remains the compatibility path; this tuple path is opt-in through
 	// shared_network.flow_verdict and cannot bypass a proxy dialer.
-	if i.sharedNetwork == nil || !i.sharedNetwork.flowVerdict ||
+	if i.sharedNetwork == nil || !i.sharedNetwork.shouldLearnExactFlow() ||
 		!verdictIsEmptyDirect(dialer) || !remote.IsValid() {
 		return
 	}
@@ -905,6 +917,11 @@ func (i *Inbound) MaybeLearnTCP(
 	}
 	source := metadata.Source.AddrPort()
 	if !source.IsValid() || source.Port() == 0 {
+		return
+	}
+	if i.sharedNetwork.engineV3 {
+		// Unified path: lifecycle+sink owns kernel write (no double PutDirectFlow).
+		i.sharedNetwork.learnV3Flow(ECommon.ProtocolTCP, source, dest)
 		return
 	}
 	if err := i.sharedNetwork.backend.PutDirectFlow(ECommon.ProtocolTCP, source, dest, opts.ttl); err != nil {
@@ -927,7 +944,7 @@ func (i *Inbound) MaybeLearnUDP(
 	if i.outboundCoord != nil {
 		i.outboundCoord.MaybeLearnUDP(ctx, dialer, metadata, remote)
 	}
-	if i.sharedNetwork == nil || !i.sharedNetwork.flowVerdict || i.outboundCoord == nil {
+	if i.sharedNetwork == nil || !i.sharedNetwork.shouldLearnExactFlow() || i.outboundCoord == nil {
 		return
 	}
 	if !verdictIsEmptyDirect(dialer) || !remote.IsValid() || remote.Port() == 53 {
@@ -942,9 +959,21 @@ func (i *Inbound) MaybeLearnUDP(
 	if !source.IsValid() || source.Port() == 0 {
 		return
 	}
+	if i.sharedNetwork.engineV3 {
+		i.sharedNetwork.learnV3Flow(ECommon.ProtocolUDP, source, remote)
+		return
+	}
 	if err := i.sharedNetwork.backend.PutDirectFlow(ECommon.ProtocolUDP, source, remote, opts.ttl); err != nil {
 		i.logger.Debug("eBPF shared-network direct UDP learn skipped: ", err)
 	}
+}
+
+// RevokeExactFlow clears a learned exact-flow after a proven path failure.
+func (i *Inbound) RevokeExactFlow(protocol uint8, client, dest netip.AddrPort) {
+	if i == nil || i.sharedNetwork == nil {
+		return
+	}
+	i.sharedNetwork.revokeExactFlow(protocol, client, dest)
 }
 
 // TrySpliceTCP implements adapter.ConnectionSplicer.
@@ -1105,7 +1134,17 @@ func (i *Inbound) refreshBypassRuleSetsLocked(warnEmpty bool) (bool, error) {
 	if backend == nil {
 		return false, E.New("eBPF backend is not initialized")
 	}
-	return backend.UpdateBypassCIDR(prefixes)
+	updated, err := backend.UpdateBypassCIDR(prefixes)
+	if err != nil {
+		return false, err
+	}
+	// v3 static banks must track bypass_rule_set reloads (double-buffer commit).
+	if updated && i.sharedNetwork != nil {
+		if refreshErr := i.sharedNetwork.RefreshV3Static(backend); refreshErr != nil {
+			i.logger.Warn("refresh eBPF v3 static policy: ", refreshErr)
+		}
+	}
+	return updated, nil
 }
 
 func (i *Inbound) localInterfacePrefixes() []netip.Prefix {
@@ -1187,6 +1226,11 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool 
 		bits = 128
 	}
 	prefix := netip.PrefixFrom(addr, bits)
+	// engine=v3: feed the unified kernel policy surface (DNS hint + static merge).
+	// Parent bypass map remains for cgroup capture_local path when enabled.
+	if i.sharedNetwork != nil && i.sharedNetwork.engineV3 {
+		i.sharedNetwork.promoteV3Direct(addr, ttl)
+	}
 	backend := i.backendInstance()
 	if backend != nil {
 		if err := backend.AddBypassPrefix(prefix); err != nil {

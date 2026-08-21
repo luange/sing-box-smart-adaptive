@@ -25,7 +25,6 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/group/probe"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -219,6 +218,7 @@ type Smart struct {
 	status       adapter.SmartGroupStatus
 
 	store                  *smartStore
+	probeURL               string
 	probeInterval          time.Duration
 	probeCycleTimeout      time.Duration
 	probeTimeout           time.Duration
@@ -257,6 +257,7 @@ type Smart struct {
 	probeRegistry          *smartProbeRegistry
 	releaseProbeRegistry   func()
 	probeStartupDelay      time.Duration
+	probeNow               chan struct{}
 }
 
 type smartSwitchChallenge struct {
@@ -412,6 +413,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		halfOpen:          make(map[string]struct{}),
 		store:             store,
 
+		probeURL:             options.URL,
 		probeInterval:        probeInterval,
 		probeCycleTimeout:    probeCycleTimeout,
 		probeTimeout:         probeTimeout,
@@ -436,6 +438,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		probeRegistry:        probeRegistry,
 		releaseProbeRegistry: releaseProbeRegistry,
 		probeStartupDelay:    probeRegistry.startupDelay(),
+		probeNow:             make(chan struct{}, 1),
 	}
 	return smart, nil
 }
@@ -615,7 +618,21 @@ func (s *Smart) run(ctx context.Context) {
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			_, _ = s.probe(probeCtx)
 			cancel()
+		case <-s.probeNow:
+			if s.closing.Load() {
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
+			_, _ = s.probe(probeCtx)
+			cancel()
 		}
+	}
+}
+
+func (s *Smart) requestProbe() {
+	select {
+	case s.probeNow <- struct{}{}:
+	default:
 	}
 }
 
@@ -820,7 +837,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no healthy candidate")
+		return nil, E.New("smart group has no service-reachable candidate")
 	}
 	attempts := s.collectDialAttempts(ranks, networkKey, siteKey, transport)
 	if len(attempts) == 0 {
@@ -1014,7 +1031,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no healthy UDP candidate")
+		return nil, E.New("smart group has no service-reachable UDP candidate")
 	}
 	var attemptErrors []error
 	attemptCount := 0
@@ -1141,7 +1158,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					continue
 				}
 				identity := probeKeys[candidate.Tag()]
-				key := smartProbeKey(identity, probe.GoogleConnectivityURL, s.probeTimeout)
+				key := smartProbeKey(identity, s.probeURL, s.probeTimeout)
 				var delay uint16
 				var err error
 				if s.probeRegistry != nil {
@@ -1149,12 +1166,12 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 					// another group. Apply the per-node timeout only after a slot is
 					// acquired inside the registry; otherwise a healthy node can be
 					// mislabeled merely because the shared queue took five seconds.
-					delay, err = s.probeRegistry.run(ctx, key, probe.GoogleConnectivityURL, s.probeTimeout, s.probeInterval, candidate)
+					delay, err = s.probeRegistry.run(ctx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
 				} else {
 					// Test/embedded constructors created before the shared registry
 					// contract retain the stock direct probe path.
 					testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
-					delay, err = urltest.URLTest(testCtx, probe.GoogleConnectivityURL, candidate)
+					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
 					cancel()
 				}
 				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
@@ -1162,6 +1179,36 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 			}
 		}()
 	}
+	type probeSummary struct {
+		collected []probeResult
+		successes int
+	}
+	networkKey := s.networkFingerprint()
+	summaryDone := make(chan probeSummary, 1)
+	go func() {
+		summary := probeSummary{collected: make([]probeResult, 0, len(candidates))}
+		published := false
+		for probe := range results {
+			summary.collected = append(summary.collected, probe)
+			if probe.err != nil {
+				continue
+			}
+			summary.successes++
+			result[probe.candidate.Tag()] = probe.delay
+			if s.closing.Load() {
+				continue
+			}
+			s.store.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
+			if !published {
+				// The first successful basic probe makes a cold group usable while
+				// the remaining candidates continue to build profiles in parallel.
+				ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
+				ranking.Release()
+				published = true
+			}
+		}
+		summaryDone <- summary
+	}()
 	dispatching := true
 	for _, candidate := range candidates {
 		if common.Contains(candidate.Network(), N.NetworkTCP) {
@@ -1178,27 +1225,26 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	close(jobs)
 	waitGroup.Wait()
 	close(results)
-	if s.closing.Load() || ctx.Err() != nil {
-		// Shutdown: skip store mutations so Close can clear maps safely.
+	summary := <-summaryDone
+	if s.closing.Load() {
+		// Shutdown: skip store mutations so Close can clear maps safely.  A
+		// probe-cycle deadline is different: completed observations remain
+		// valuable and must be committed so inactive/large groups eventually
+		// build a baseline over multiple bounded cycles.
 		return result, ctx.Err()
 	}
-	collected := make([]probeResult, 0, len(candidates))
-	successes := 0
-	for probe := range results {
-		collected = append(collected, probe)
-		if probe.err == nil {
-			successes++
-			result[probe.candidate.Tag()] = probe.delay
-		}
-	}
-	networkKey := s.networkFingerprint()
-	commonFailure := len(collected) > 1 && successes == 0
-	for _, probe := range collected {
-		if probe.err == nil {
-			s.store.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
-		} else if probe.penalize && !commonFailure {
+	commonFailure := len(summary.collected) > 1 && summary.successes == 0
+	for _, probe := range summary.collected {
+		if probe.err != nil && probe.penalize && !commonFailure && (s.probeRegistry == nil || s.probeRegistry.dead(smartProbeKey(probeKeys[probe.candidate.Tag()], s.probeURL, s.probeTimeout))) {
 			s.store.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
 		}
+	}
+	if summary.successes > 0 {
+		// Publish the baseline immediately.  Ranking is otherwise refreshed only
+		// by a real dial, which makes traffic-idle groups look permanently warming
+		// even though their active probes have already populated the store.
+		ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
+		ranking.Release()
 	}
 	if commonFailure {
 		if s.logger != nil {
@@ -1206,7 +1252,10 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 		}
 		return result, E.New("all smart probes failed; candidate penalties suppressed")
 	}
-	return result, nil
+	// Preserve the deadline for callers while retaining every observation that
+	// completed before it.  Scheduled callers intentionally ignore this error;
+	// explicit URLTest callers can still distinguish a partial cycle.
+	return result, ctx.Err()
 }
 
 func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksaddr) ([]smartRank, string, string, string) {
@@ -1238,14 +1287,14 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			continue
 		}
 		estimate := s.store.estimate(now, networkKey, siteKey, candidate.Tag(), transport, s.minSamples)
-		sharedProbeFailed := false
+		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
 			s.access.RLock()
 			identity := s.candidateProbeKey[candidate.Tag()]
 			s.access.RUnlock()
-			sharedProbeFailed = s.probeRegistry.failed(smartProbeKey(identity, probe.GoogleConnectivityURL, s.probeTimeout), s.probeInterval)
+			sharedProbeDead = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 		}
-		if sharedProbeFailed {
+		if sharedProbeDead {
 			estimate.State = "open"
 		}
 		totalSamples += estimate.Samples
@@ -1356,7 +1405,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 	}
 	if !hasEligibleSmartRank(ranks) {
-		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no healthy candidates"))
+		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	bestScore := ranks[0].status.Score
@@ -1457,9 +1506,9 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 	forceAll := s.interruptMode == "all"
 	if !forceAll && s.probeRegistry != nil {
 		s.access.RLock()
-		probeKey := s.candidateProbeKey[previous]
+		identity := s.candidateProbeKey[previous]
 		s.access.RUnlock()
-		forceAll = s.probeRegistry.dead(smartProbeKey(probeKey, probe.GoogleConnectivityURL, s.probeTimeout))
+		forceAll = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 	}
 	if !forceAll {
 		forceAll = s.store.candidateDead(previous, time.Now())
@@ -1645,6 +1694,12 @@ func (s *Smart) onProviderUpdated(tag string) error {
 		return E.New("outbound provider not found: ", tag)
 	}
 	err := s.rebuildCandidates(tag)
+	if err == nil {
+		// Providers commonly publish after PostStart.  The cold-start probe may
+		// therefore have observed an empty catalog; do not leave a traffic-idle
+		// group unprofiled until the next periodic interval.
+		s.requestProbe()
+	}
 	if errors.Is(err, errSmartNoCandidates) {
 		s.setWarmingStatus("provider " + tag + " has no matching candidates")
 	}

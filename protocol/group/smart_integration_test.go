@@ -372,6 +372,117 @@ func TestSmartProbeCancellationDoesNotDeadlockDispatcher(t *testing.T) {
 	}
 }
 
+func TestSmartProbeDeadlineCommitsCompletedObservations(t *testing.T) {
+	fast := newSmartFakeOutbound("probe-fast", nil)
+	slow := newSmartFakeOutbound("probe-slow", nil)
+	smart := newTestSmart(fast, slow)
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	registry.probe = func(ctx context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
+		if candidate.Tag() == fast.Tag() {
+			return 12, nil
+		}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	smart.probeRegistry = registry
+	smart.candidateProbeKey = map[string]string{
+		fast.Tag(): fast.Tag(),
+		slow.Tag(): slow.Tag(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	result, err := smart.probe(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected partial-cycle deadline, got %v", err)
+	}
+	if result[fast.Tag()] != 12 {
+		t.Fatalf("completed probe missing from result: %v", result)
+	}
+	estimate := smart.store.estimate(time.Now(), smart.networkFingerprint(), "", fast.Tag(), N.NetworkTCP, smart.minSamples)
+	if estimate.State == "unknown" || estimate.Samples == 0 {
+		t.Fatalf("completed observation was discarded at deadline: %+v", estimate)
+	}
+	status := smart.SmartStatus()
+	if len(status.Candidates) == 0 || status.Candidates[0].Samples == 0 {
+		t.Fatalf("completed observation was not published without traffic: %+v", status)
+	}
+}
+
+func TestSmartRequestProbeCoalesces(t *testing.T) {
+	smart := &Smart{probeNow: make(chan struct{}, 1)}
+	smart.requestProbe()
+	smart.requestProbe()
+	if got := len(smart.probeNow); got != 1 {
+		t.Fatalf("queued probes=%d, want 1", got)
+	}
+}
+
+func TestSmartBasicProbeRequiresConfirmedFailure(t *testing.T) {
+	candidate := newSmartFakeOutbound("bootstrap-candidate", nil)
+	smart := newTestSmart(candidate)
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	smart.probeRegistry = registry
+	smart.candidateProbeKey = map[string]string{candidate.Tag(): candidate.Tag()}
+	key := smartProbeKey(candidate.Tag(), smart.probeURL, smart.probeTimeout)
+	registry.entries[key] = &smartProbeEntry{result: smartProbeResult{
+		success: false, failures: 1, nextProbeAt: time.Now().Add(time.Minute),
+	}}
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(ranks) != 1 || ranks[0].status.State == "open" {
+		t.Fatalf("one basic-probe failure must not remove the cold-start candidate: %+v", ranks)
+	}
+	registry.entries[key].result.failures = 3
+	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(ranks) != 1 || ranks[0].status.State != "open" {
+		t.Fatalf("three consecutive basic-probe failures must isolate the candidate: %+v", ranks)
+	}
+}
+
+func TestSmartProbePublishesFirstSuccessBeforeCycleCompletes(t *testing.T) {
+	fast := newSmartFakeOutbound("stream-fast", nil)
+	slow := newSmartFakeOutbound("stream-slow", nil)
+	smart := newTestSmart(fast, slow)
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	releaseSlow := make(chan struct{})
+	registry.probe = func(_ context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
+		if candidate.Tag() == fast.Tag() {
+			return 9, nil
+		}
+		<-releaseSlow
+		return 10, nil
+	}
+	smart.probeRegistry = registry
+	smart.candidateProbeKey = map[string]string{fast.Tag(): fast.Tag(), slow.Tag(): slow.Tag()}
+	done := make(chan struct{})
+	go func() {
+		_, _ = smart.probe(context.Background())
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := smart.SmartStatus()
+		if len(status.Candidates) > 0 && status.Candidates[0].Samples > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseSlow)
+			t.Fatal("first successful basic probe was not published while the cycle remained active")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("probe cycle completed before the blocked candidate was released")
+	default:
+	}
+	close(releaseSlow)
+	<-done
+}
+
 func TestSmartProbeCoversEveryCandidateRegardlessOfGroupSize(t *testing.T) {
 	candidates := make([]adapter.Outbound, 128)
 	fakes := make([]*smartFakeOutbound, len(candidates))

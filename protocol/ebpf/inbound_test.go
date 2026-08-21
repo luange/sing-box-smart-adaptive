@@ -143,6 +143,25 @@ func TestValidateLocalCaptureOptions(t *testing.T) {
 	}
 }
 
+func TestDefaultCaptureLocalPAGateway(t *testing.T) {
+	// shared_network on → default false (PBR gateway).
+	got := defaultCaptureLocal(nil, true)
+	if got == nil || *got {
+		t.Fatalf("PA gateway default capture_local want false got %v", got)
+	}
+	// shared_network off → default true (host transparent proxy).
+	got = defaultCaptureLocal(nil, false)
+	if got == nil || !*got {
+		t.Fatalf("host proxy default capture_local want true got %v", got)
+	}
+	// explicit wins
+	ex := true
+	got = defaultCaptureLocal(&ex, true)
+	if got == nil || !*got {
+		t.Fatal("explicit true must win")
+	}
+}
+
 func TestNormalizeDNSMode(t *testing.T) {
 	for _, test := range []struct {
 		input  string

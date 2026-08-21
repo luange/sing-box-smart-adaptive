@@ -195,6 +195,35 @@ int sb_ebpf_shared_network_prepare(
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime);
 
+/* eBPF shared-network engine=v3 runtime (independent maps/programs). */
+struct sb_ebpf_v3_runtime {
+	int control_map_fd;
+	int policy4_bank0_fd;
+	int policy4_bank1_fd;
+	int policy6_bank0_fd;
+	int policy6_bank1_fd;
+	int host4_map_fd;
+	int host6_map_fd;
+	int flow_map_fd;
+	int dns_hint_map_fd;
+	int source_mac_map_fd;
+	int redirect_map_fd;
+	int listener_map_fd;
+	int socket_identity_map_fd;
+	int stats_map_fd;
+	int ingress_prog_fd;
+	int egress_prog_fd;
+};
+
+int sb_ebpf_v3_prepare(
+	const uint8_t *object,
+	size_t object_size,
+	uint32_t policy_lpm_entries,
+	uint32_t flow_entries,
+	uint32_t dns_hint_entries,
+	struct sb_ebpf_v3_runtime *runtime);
+int sb_ebpf_v3_close(struct sb_ebpf_v3_runtime *runtime);
+
 int sb_ebpf_create_map(
     enum bpf_map_type type,
     uint32_t key_size,

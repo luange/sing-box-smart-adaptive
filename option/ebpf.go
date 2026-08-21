@@ -10,8 +10,10 @@ type EBPFInboundOptions struct {
 	ListenOptions
 	CgroupPath string `json:"cgroup_path,omitempty"`
 	// CaptureLocal controls cgroup interception for processes running on this host.
-	// It defaults to true. Router deployments using only shared_network can set it
-	// to false to keep management traffic out of the proxy data path.
+	// Default: true when shared_network is off (host transparent proxy).
+	// Default: false when shared_network.enabled (PA/PBR gateway) — cgroup capture
+	// on the root hierarchy otherwise hijacks management and outbound dials.
+	// Set true explicitly only when local-process capture is intentional.
 	CaptureLocal *bool       `json:"capture_local,omitempty"`
 	Network      NetworkList `json:"network,omitempty"`
 	DNSMode      string      `json:"dns_mode,omitempty" enum:"hijack,off"`
@@ -52,10 +54,15 @@ type EBPFDNSKernelDirectOptions struct {
 type EBPFSharedNetworkOptions struct {
 	Enabled          bool                       `json:"enabled,omitempty"`
 	IncludeInterface badoption.Listable[string] `json:"include_interface,omitempty"`
+	// Engine selects the shared-network data-plane implementation.
+	// Empty / "v2" keeps the current path. "v3" enables the split
+	// control/data plane (static first-packet + exact-flow). Opt-in only.
+	Engine string `json:"engine,omitempty" enum:"v2,v3"`
 	// DataPlane selects how packets from shared interfaces reach the transparent
 	// listener. Empty defaults to "socket_assign", which preserves the original
 	// tuple and uses TC socket assignment plus policy routing. "token" is kept
 	// as an explicit compatibility mode for legacy deployments.
+	// engine=v3 requires socket_assign.
 	DataPlane string `json:"data_plane,omitempty" enum:"token,socket_assign"`
 	// RoutingMark and RoutingTable are used only by socket_assign. Zero selects
 	// process-owned defaults.
@@ -69,12 +76,29 @@ type EBPFSharedNetworkOptions struct {
 	// tproxy nft bypass ("udp dport 443 drop") so clients fall back to TCP. Default false when omitted;
 	// enable only as an explicit compatibility policy because it disables QUIC/HTTP3.
 	DropUDP443 *bool `json:"drop_udp_443,omitempty"`
-	// FlowVerdict enables the dae-style exact-flow direct fast path. After a
+	// FlowVerdict enables the dae-style exact-flow direct fast path (v2). After a
 	// userspace route proves a flow is DIRECT, subsequent packets bypass the
 	// transparent listener in TC until the TTL or policy generation expires.
 	// It is valid only with data_plane=socket_assign because token mode cannot
 	// safely preserve the original route semantics for direct forwarding.
+	// Prefer policy_offload.exact_flow_learning under engine=v3.
 	FlowVerdict bool `json:"flow_verdict,omitempty"`
+	// PolicyOffload configures v3 static/exact-flow/DNS sinks. Ignored for v2.
+	PolicyOffload EBPFPolicyOffloadOptions `json:"policy_offload,omitempty"`
+	// FailureMode controls map-miss / assign-failure behavior for v3.
+	// Only "proxy" (NEED_USERSPACE) is supported — never silent DIRECT.
+	FailureMode string `json:"failure_mode,omitempty" enum:"proxy"`
+}
+
+// EBPFPolicyOffloadOptions is the v3 policy compiler surface (design §13).
+type EBPFPolicyOffloadOptions struct {
+	Enabled           bool `json:"enabled,omitempty"`
+	StaticRules       bool `json:"static_rules,omitempty"`
+	ExactFlowLearning bool `json:"exact_flow_learning,omitempty"`
+	// DNSIPHint: off | safe | strong. "safe" allows strong/FakeIP only; weak never first-packet DIRECT.
+	DNSIPHint       string `json:"dns_ip_hint,omitempty" enum:"off,safe,strong"`
+	FakeIP          bool   `json:"fakeip,omitempty"`
+	MACSourcePolicy bool   `json:"mac_source_policy,omitempty"`
 }
 
 // EBPFOutboundOffloadOptions is the inbound-attached outbound offload block.

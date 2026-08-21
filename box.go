@@ -683,10 +683,8 @@ func (s *Box) Close() error {
 		{"inbound", s.inbound},
 		{"certificate-provider", s.certificateProvider},
 		{"endpoint", s.endpoint},
-		// Providers own dynamically registered outbounds.  Remove those children
-		// while the outbound manager is still live; closing the manager first
-		// clears its ordered slice and makes the provider's later Remove calls
-		// observe an inconsistent map/slice pair.
+		// Providers own dynamically registered outbounds. Remove those children
+		// while the outbound manager is still live so close/reload is idempotent.
 		{"provider", s.provider},
 		{"outbound", s.outbound},
 		{"router", s.router},

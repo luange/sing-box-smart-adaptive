@@ -95,35 +95,35 @@ const (
 )
 
 type Backend struct {
-	access             sync.RWMutex
-	runtime            *C.struct_sb_ebpf_inbound_runtime
-	tcpRedirectMap     int
-	udpRedirectMap     int
-	udpTokenMap        int
-	statsMap           int
-	cookieMap          int
-	bypassIPv4CIDRMap     int
-	bypassIPv6CIDRMap     int
-	dnsDirectIPv4CIDRMap  int
-	dnsDirectIPv6CIDRMap  int
-	outVerdictMap         int
-	outVerdictControl     int
-	outVerdictStats       int
-	selfListenPortMap     int
-	bypassIPv4CIDR        []netip.Prefix
-	bypassIPv6CIDR        []netip.Prefix
-	dnsDirectIPv4CIDR     []netip.Prefix
-	dnsDirectIPv6CIDR     []netip.Prefix
-	cgroupPath            string
-	enableUDP          bool
-	captureLocal       bool
-	hijackDNS          bool
-	enableFlowVerdict  bool
-	listenPort         uint16
-	lookupMisses       atomic.Uint64
-	tcpRedirectDeletes atomic.Uint64
-	udpRedirectDeletes atomic.Uint64
-	protectHits        atomic.Uint64 // Module C.1: ProtectFunc success counter
+	access               sync.RWMutex
+	runtime              *C.struct_sb_ebpf_inbound_runtime
+	tcpRedirectMap       int
+	udpRedirectMap       int
+	udpTokenMap          int
+	statsMap             int
+	cookieMap            int
+	bypassIPv4CIDRMap    int
+	bypassIPv6CIDRMap    int
+	dnsDirectIPv4CIDRMap int
+	dnsDirectIPv6CIDRMap int
+	outVerdictMap        int
+	outVerdictControl    int
+	outVerdictStats      int
+	selfListenPortMap    int
+	bypassIPv4CIDR       []netip.Prefix
+	bypassIPv6CIDR       []netip.Prefix
+	dnsDirectIPv4CIDR    []netip.Prefix
+	dnsDirectIPv6CIDR    []netip.Prefix
+	cgroupPath           string
+	enableUDP            bool
+	captureLocal         bool
+	hijackDNS            bool
+	enableFlowVerdict    bool
+	listenPort           uint16
+	lookupMisses         atomic.Uint64
+	tcpRedirectDeletes   atomic.Uint64
+	udpRedirectDeletes   atomic.Uint64
+	protectHits          atomic.Uint64 // Module C.1: ProtectFunc success counter
 }
 
 type mapElementAttr struct {
@@ -249,12 +249,12 @@ func Prepare(
 		return nil, eBPFOperationError("prepare eBPF inbound", prepareErr)
 	}
 	backend := &Backend{
-		runtime:           runtimeState,
-		tcpRedirectMap:    int(runtimeState.tcp_redirect_map_fd),
-		udpRedirectMap:    int(runtimeState.udp_redirect_map_fd),
-		udpTokenMap:       int(runtimeState.udp_token_map_fd),
-		statsMap:          int(runtimeState.stats_map_fd),
-		cookieMap:         int(runtimeState.bypass_socket_cookie_map_fd),
+		runtime:              runtimeState,
+		tcpRedirectMap:       int(runtimeState.tcp_redirect_map_fd),
+		udpRedirectMap:       int(runtimeState.udp_redirect_map_fd),
+		udpTokenMap:          int(runtimeState.udp_token_map_fd),
+		statsMap:             int(runtimeState.stats_map_fd),
+		cookieMap:            int(runtimeState.bypass_socket_cookie_map_fd),
 		bypassIPv4CIDRMap:    int(runtimeState.bypass_ipv4_cidr_map_fd),
 		bypassIPv6CIDRMap:    int(runtimeState.bypass_ipv6_cidr_map_fd),
 		dnsDirectIPv4CIDRMap: int(runtimeState.dns_direct_ipv4_cidr_map_fd),
@@ -564,6 +564,19 @@ func (b *Backend) BypassCIDRCount() (int, int) {
 	return len(b.bypassIPv4CIDR), len(b.bypassIPv6CIDR)
 }
 
+// ListBypassCIDR returns a copy of installed bypass prefixes (IPv4 then IPv6).
+func (b *Backend) ListBypassCIDR() []netip.Prefix {
+	if b == nil {
+		return nil
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	out := make([]netip.Prefix, 0, len(b.bypassIPv4CIDR)+len(b.bypassIPv6CIDR))
+	out = append(out, b.bypassIPv4CIDR...)
+	out = append(out, b.bypassIPv6CIDR...)
+	return out
+}
+
 // BypassContains reports whether addr is covered by the installed bypass LPM
 // policy (Go-side mirror of the eBPF map). Used for userspace miss sampling:
 // if true but the flow still entered userspace, TC did not honor the map.
@@ -757,7 +770,6 @@ func (b *Backend) DeleteBypassPrefix(prefix netip.Prefix) error {
 	}
 	return nil
 }
-
 
 func replaceBypassCIDRPolicyMap(
 	mapFD int,

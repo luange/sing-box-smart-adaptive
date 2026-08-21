@@ -4,6 +4,51 @@
 
 ---
 
+## 1.14.0-beta.17-official-smart-ebpf-v3-profilefix.6 — 2026-08-21
+
+### Smart cold-start availability
+
+- Commit completed probe observations even when a bounded probe cycle reaches its deadline.
+- Trigger one coalesced probe immediately after a provider publishes candidates; idle groups no longer wait for the periodic interval to build profiles.
+- Publish the first successful basic probe while the rest of the group continues in the background, removing the cold-start request stall.
+- Keep a candidate eligible after one or two basic-probe failures; isolate it only after three consecutive failures. Real traffic failures still feed the shared profile immediately.
+- Publish probe-only profiles to the Clash API even when a region has no business traffic.
+- Fix the confirmed-dead lookup to use the complete shared probe key before interrupting existing connections.
+
+### Lifecycle and observability
+
+- Make provider-owned outbound removal idempotent and remove the remaining invalid-index panic path.
+- Close providers before the outbound manager so provider children can unregister safely.
+- Treat normal fail-open proxy handoff as informational rather than an eBPF warning.
+
+### Validation
+
+- `go test`, `go test -race`, and `go vet` pass for the affected Smart/eBPF/outbound packages.
+- VM115 cold-start gate: Google 204, Google Search, YouTube, and Cloudflare 204 succeeded from the macOS PBR path.
+
+---
+
+## eBPF data-plane v3 polish — 2026-08-21
+
+Design: `docs/ports/EBPF-DATAPLANE-V3-DESIGN.md`. QA: Codex outputs `EBPF-V3-117-CANARY-QA-*.md`.
+
+### Architecture (control plane = one sink)
+
+- **Unified publisher**: `Lifecycle` + `DataplaneSink` dual-write memory model and kernel maps (no silent dual-brain).
+- **DNS/prefill → v3**: `promoteLearnedBypass` also `PublishDNSHint` + `MergeStaticDirect` (active bank, no gen bump).
+- **Static snapshot**: full `PublishStaticDirect` deletes removed LPM keys on inactive bank before commit.
+- **Flow keys**: reverse published with `direction=0` + swapped 5-tuple (matches TC lookup).
+- **Fragments**: never first-packet DIRECT; NEED_USERSPACE / parse-fail path.
+- **PA default**: `capture_local` defaults **false** when `shared_network.enabled` (explicit true still allowed).
+- **Interface reload**: one generation commit via static republish (no triple-bump).
+
+### Canary
+
+- 117: kernel `sb_v3_ingress` load OK after verifier fixes; soak with `capture_local=false`.
+- 117 validated the isolated canary before staged VM115 deployment.
+
+---
+
 ## 1.14.0-beta.17-official-smart-ebpf-perf — 2026-08-18
 
 ### 性能 / PBR 网关

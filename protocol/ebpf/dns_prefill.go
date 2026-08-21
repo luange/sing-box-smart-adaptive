@@ -35,11 +35,23 @@ func dnsPrefillOptionsFrom(opts option.EBPFDNSPrefillOptions) dnsPrefillOptions 
 
 // OnDNSAnswer implements adapter.DNSAnswerObserver.
 // Hot path: filter + schedule; rule walk / promote off Exchange goroutine.
+//
+// Paths:
+//   - fromFakeIP: v3 authoritative FakeIP hint (policy_offload.fakeip), no prefill required
+//   - real DNS:   dns_prefill promote and/or v3 DNS strong hint when policy_offload.dns_ip_hint
 func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool) {
-	if i == nil || fromFakeIP || len(addresses) == 0 || !i.dnsPrefill.enabled {
+	if i == nil || len(addresses) == 0 {
 		return
 	}
 	if i.dnsPrefillClosed.Load() {
+		return
+	}
+	if fromFakeIP {
+		i.onFakeIPAnswer(addresses)
+		return
+	}
+	v3DNS := i.v3DNSHintEnabled()
+	if !i.dnsPrefill.enabled && !v3DNS {
 		return
 	}
 	// Cheap public-IP filter + dedupe before spawning work.
@@ -48,14 +60,66 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 		return
 	}
 	ttl := i.dnsPrefill.ttl
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
 	tag := i.Tag()
 	routeRouter := i.dnsPrefillRouter
 	outbounds := i.dnsPrefillOutbounds
 	if routeRouter == nil || outbounds == nil {
+		// Lazy bind if v3 DNS path started without wireDNSPrefill.
+		if rr, ok := i.router.(adapter.Router); ok {
+			routeRouter = rr
+		}
+		outbounds = service.FromContext[adapter.OutboundManager](i.ctx)
+	}
+	if routeRouter == nil || outbounds == nil {
 		return
 	}
-	// Copy domain for async (caller may reuse buffers — domain is already string).
 	go i.dnsPrefillApply(tag, domain, addrs, ttl, routeRouter, outbounds)
+}
+
+func (i *Inbound) v3DNSHintEnabled() bool {
+	if i == nil || i.sharedNetwork == nil || !i.sharedNetwork.engineV3 {
+		return false
+	}
+	po := i.sharedOptions.PolicyOffload
+	if !po.Enabled {
+		return false
+	}
+	switch po.DNSIPHint {
+	case "safe", "strong":
+		return true
+	default:
+		return po.FakeIP
+	}
+}
+
+func (i *Inbound) v3FakeIPEnabled() bool {
+	if i == nil || i.sharedNetwork == nil || !i.sharedNetwork.engineV3 {
+		return false
+	}
+	po := i.sharedOptions.PolicyOffload
+	return po.Enabled && po.FakeIP
+}
+
+// onFakeIPAnswer publishes authoritative FakeIP → kernel DNS hint (design §8.1).
+func (i *Inbound) onFakeIPAnswer(addresses []netip.Addr) {
+	if !i.v3FakeIPEnabled() || i.sharedNetwork == nil {
+		return
+	}
+	ttl := i.dnsPrefill.ttl
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	for _, addr := range addresses {
+		if !addr.IsValid() {
+			continue
+		}
+		addr = addr.Unmap()
+		// FakeIP ranges are typically 198.18/15 or similar — do not require public filter.
+		i.sharedNetwork.observeV3DNS(addr, true, 1 /* DNSEvidenceFakeIP */, ttl)
+	}
 }
 
 func (i *Inbound) dnsPrefillApply(
@@ -73,36 +137,66 @@ func (i *Inbound) dnsPrefillApply(
 			return
 		}
 		if !dnsPrefillIsStableDirect(routeRouter, outbounds, inboundTag, domain, addr) {
+			// Still record proxy evidence for v3 conflict isolation when hint on.
+			if i.v3DNSHintEnabled() && i.sharedNetwork != nil {
+				i.sharedNetwork.observeV3DNS(addr, false, 2 /* strong observed but not direct */, ttl)
+			}
 			continue
 		}
-		if i.promoteLearnedBypass(addr, ttl) {
-			i.dnsPrefillPromotes.Add(1)
-			// Debug: promote volume follows DNS QPS; keep metrics in runtime_stats.
-			if i.logger != nil {
-				i.logger.Debug("eBPF dns_prefill promote ", addr.String(), " domain=", domain)
+		if i.dnsPrefill.enabled {
+			if i.promoteLearnedBypass(addr, ttl) {
+				i.dnsPrefillPromotes.Add(1)
+				if i.logger != nil {
+					i.logger.Debug("eBPF dns_prefill promote ", addr.String(), " domain=", domain)
+				}
+			} else if i.logger != nil {
+				i.logger.Debug("eBPF dns_prefill refresh ", addr.String(), " domain=", domain)
 			}
-		} else if i.logger != nil {
-			i.logger.Debug("eBPF dns_prefill refresh ", addr.String(), " domain=", domain)
+		} else if i.v3DNSHintEnabled() && i.sharedNetwork != nil {
+			// policy_offload DNS path without legacy dns_prefill module.
+			i.sharedNetwork.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
+			if i.sharedNetwork.backend != nil {
+				p := netip.PrefixFrom(addr.Unmap(), prefixBits(addr)).Masked()
+				if err := i.sharedNetwork.backend.MergeStaticDirect(p); err != nil && i.logger != nil {
+					i.logger.Debug("eBPF v3 dns hint merge: ", err)
+				}
+			}
 		}
 	}
 }
 
+func prefixBits(addr netip.Addr) int {
+	if addr.Is4() {
+		return 32
+	}
+	return 128
+}
+
 // wireDNSPrefill caches Router/OutboundManager and registers the observer.
 // Call once from Start after backend is up.
+// Registers for dns_prefill and/or engine=v3 policy_offload DNS/FakeIP hints.
 func (i *Inbound) wireDNSPrefill() {
-	if i == nil || !i.dnsPrefill.enabled {
+	if i == nil {
+		return
+	}
+	needObserver := i.dnsPrefill.enabled || i.v3DNSHintEnabled() || i.v3FakeIPEnabled()
+	if !needObserver {
 		return
 	}
 	routeRouter, ok := i.router.(adapter.Router)
 	if !ok || routeRouter == nil {
-		i.logger.Warn("eBPF dns_prefill disabled: router does not implement adapter.Router")
-		i.dnsPrefill.enabled = false
+		if i.dnsPrefill.enabled {
+			i.logger.Warn("eBPF dns_prefill disabled: router does not implement adapter.Router")
+			i.dnsPrefill.enabled = false
+		}
 		return
 	}
 	outbounds := service.FromContext[adapter.OutboundManager](i.ctx)
 	if outbounds == nil {
-		i.logger.Warn("eBPF dns_prefill disabled: missing outbound manager")
-		i.dnsPrefill.enabled = false
+		if i.dnsPrefill.enabled {
+			i.logger.Warn("eBPF dns_prefill disabled: missing outbound manager")
+			i.dnsPrefill.enabled = false
+		}
 		return
 	}
 	i.dnsPrefillRouter = routeRouter
@@ -114,7 +208,13 @@ func (i *Inbound) wireDNSPrefill() {
 		// Fallback for tests / partial contexts without hub.
 		service.MustRegister[adapter.DNSAnswerObserver](i.ctx, i)
 	}
-	i.logger.Info("eBPF dns_prefill enabled ttl=", i.dnsPrefill.ttl)
+	if i.dnsPrefill.enabled {
+		i.logger.Info("eBPF dns_prefill enabled ttl=", i.dnsPrefill.ttl)
+	}
+	if i.v3DNSHintEnabled() || i.v3FakeIPEnabled() {
+		i.logger.Info("eBPF v3 DNS/FakeIP hint observer enabled dns_ip_hint=",
+			i.sharedOptions.PolicyOffload.DNSIPHint, " fakeip=", i.sharedOptions.PolicyOffload.FakeIP)
+	}
 }
 
 func (i *Inbound) stopDNSPrefill() {

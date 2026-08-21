@@ -235,7 +235,10 @@ func OverrideContext(ctx context.Context) context.Context {
 // RouteMatchInputs is a bitset of rule condition classes evaluated for a flow.
 type RouteMatchInputs uint32
 
-const RouteMatchUnknown RouteMatchInputs = 0
+// RouteMatchUnknown must be a real bit.  Zero means that no rule-input class
+// was recorded (legacy callers); using zero for Unknown made OR accumulation a
+// no-op and accidentally allowed unknown rules into the DIRECT offload path.
+const RouteMatchUnknown RouteMatchInputs = 1 << 31
 
 const (
 	RouteMatchIP RouteMatchInputs = 1 << iota // ip_cidr / geoip / ip_is_private / ip_version

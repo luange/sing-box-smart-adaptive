@@ -35,6 +35,8 @@ func (b *Backend) DeleteBypassPrefix(netip.Prefix) error {
 	return E.New("ebpf unavailable")
 }
 
+func (b *Backend) ListBypassCIDR() []netip.Prefix { return nil }
+
 func (b *Backend) UpdateBypassCIDR([]netip.Prefix) (bool, error) {
 	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
 }

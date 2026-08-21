@@ -221,14 +221,18 @@ func (m *Manager) Remove(tag string) error {
 	if !found {
 		return os.ErrInvalid
 	}
+	delete(m.outboundByTag, tag)
 	index := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 		return it == outbound
 	})
 	if index == -1 {
-		return E.New("outbound index missing: ", tag)
+		// Provider close can race an earlier removal of the same runtime
+		// outbound.  The tag map still needs to be cleaned, but shutdown must be
+		// idempotent and must never turn a stale slice entry into a process panic.
+		m.logger.Warn("outbound ", tag, " already absent from ordered list during removal")
+	} else {
+		m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
 	}
-	delete(m.outboundByTag, tag)
-	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
 	started := m.started
 	if m.defaultOutbound == outbound {
 		if len(m.outbounds) > 0 {
