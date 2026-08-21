@@ -75,7 +75,9 @@ jobs:
           set -euo pipefail
           ver="${{ inputs.version }}"
           if [[ -z "$ver" ]]; then
-            ver="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+            # eBPF generation may refresh embedded objects in the worktree.
+            # Release identity must describe the checked-out commit, not generated-file dirtiness.
+            ver="$(git describe --tags --always 2>/dev/null || echo dev)"
             ver="${ver#v}"
           fi
           tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf"
