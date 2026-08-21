@@ -4,6 +4,36 @@
 
 ---
 
+## 1.14.0-rc.1-official-smart-ebpf-v3.1 — 2026-08-21
+
+### Official baseline
+
+- Rebased the complete first-party Smart/eBPF/provider stack onto SagerNet
+  official `testing` commit `712046a26` (`1.14.0-rc.1` snapshot).
+- Adapted custom network listeners to the official asynchronous
+  `InterfaceUpdated(context.Context)` lifecycle.
+
+### Reproducibility and teardown
+
+- Added the previously builder-only eBPF v3 control plane, TC program, runtime,
+  static-rule sink, tests, and design document to Git; a clean clone is now
+  sufficient to build v3.
+- Continue route, backend and listener cleanup even when a TC detach reports an
+  error; retained attachments remain retryable on a later close.
+- Serialize live kernel generation synchronization with v3 flow/DNS/reload and
+  close operations.
+- Make `RouteMatchUnknown` a real bit so unknown rule classes fail closed rather
+  than disappearing during bitwise accumulation.
+- Preserve the outbound manager map/list invariant on failed removal.
+
+### Build and validation
+
+- GitHub release workflow builds four eBPF binaries: amd64/arm64 × glibc/musl.
+- Linux `with_ebpf` tests, race, vet, and five repeated kernel data-path/load/
+  policy-route collision gates pass before release.
+
+---
+
 ## 1.14.0-beta.17-official-smart-ebpf-v3-profilefix.6 — 2026-08-21
 
 ### Smart cold-start availability

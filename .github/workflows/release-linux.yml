@@ -1,13 +1,12 @@
 name: Release Linux Binaries
 
-# Portable static (CGO=0, no eBPF) + gateway eBPF (CGO=1, with_ebpf) for amd64/arm64.
+# Gateway eBPF builds for amd64/arm64 on glibc and musl.
 # Trigger: tag v* or manual dispatch.
 
 on:
   push:
     tags:
-      - "v1.14.0-beta.17-official-smart-ebpf*"
-      - "v1.14.0-beta.17-official-*"
+      - "v1.14.0-rc.1-official-smart-ebpf*"
   workflow_dispatch:
     inputs:
       version:
@@ -31,67 +30,14 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
-  static:
-    name: static linux/${{ matrix.goarch }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        goarch: [amd64, arm64]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build static (CGO=0, no with_ebpf)
-        env:
-          CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          set -euo pipefail
-          ver="${{ inputs.version }}"
-          if [[ -z "$ver" ]]; then
-            ver="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-            ver="${ver#v}"
-          fi
-          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
-          # ensure no with_ebpf in static build
-          tags="${tags//with_ebpf,/}"
-          tags="${tags//,with_ebpf/}"
-          ldflags="$(tr -d '\n' < release/LDFLAGS)"
-          mkdir -p dist
-          out="dist/sing-box-linux-${GOARCH}-static"
-          go build -trimpath -tags "$tags" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid= -extldflags '-static'" \
-            -o "$out" ./cmd/sing-box
-          chmod +x "$out"
-          file "$out" | tee "dist/sing-box-linux-${GOARCH}-static.file"
-          # static check (may still say dynamically linked if Go runtime; try ldd)
-          (ldd "$out" 2>&1 || true) | tee "dist/sing-box-linux-${GOARCH}-static.ldd" || true
-          sha256sum "$out" | tee "dist/sing-box-linux-${GOARCH}-static.sha256"
-          if [[ "$GOARCH" == "amd64" ]]; then
-            "$out" version | tee dist/version-static.txt
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: static-linux-${{ matrix.goarch }}
-          path: dist/*
-          if-no-files-found: error
-
   ebpf:
-    name: ebpf linux/${{ matrix.goarch }}
+    name: ebpf linux/${{ matrix.goarch }}/${{ matrix.libc }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         goarch: [amd64, arm64]
+        libc: [glibc, musl]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,6 +56,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - uses: mlugg/setup-zig@v2
+        if: matrix.libc == 'musl'
 
       - name: Generate eBPF objects
         run: |
@@ -131,21 +80,31 @@ jobs:
           fi
           tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf"
           ldflags="$(tr -d '\n' < release/LDFLAGS)"
-          if [[ "$GOARCH" == "arm64" ]]; then
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            target="x86_64-linux-musl"
+            if [[ "$GOARCH" == "arm64" ]]; then target="aarch64-linux-musl"; fi
+            printf '#!/bin/sh\nexec zig cc -target %s "$@"\n' "$target" > /tmp/zig-musl-cc
+            chmod +x /tmp/zig-musl-cc
+            export CC=/tmp/zig-musl-cc
+            tags="${tags},with_musl"
+            extra_ldflags="-extldflags '-static'"
+          elif [[ "$GOARCH" == "arm64" ]]; then
             export CC=aarch64-linux-gnu-gcc
+            extra_ldflags=""
           else
             export CC=gcc
+            extra_ldflags=""
           fi
           mkdir -p dist
-          out="dist/sing-box-linux-${GOARCH}-ebpf"
+          out="dist/sing-box-linux-${GOARCH}-${{ matrix.libc }}-ebpf"
           go build -trimpath -tags "$tags" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid=" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid= ${extra_ldflags}" \
             -o "$out" ./cmd/sing-box
           chmod +x "$out"
           file "$out" | tee "dist/sing-box-linux-${GOARCH}-ebpf.file"
           (ldd "$out" 2>&1 || true) | tee "dist/sing-box-linux-${GOARCH}-ebpf.ldd" || true
-          sha256sum "$out" | tee "dist/sing-box-linux-${GOARCH}-ebpf.sha256"
-          if [[ "$GOARCH" == "amd64" ]]; then
+          sha256sum "$out" | tee "${out}.sha256"
+          if [[ "$GOARCH" == "amd64" && "${{ matrix.libc }}" == "glibc" ]]; then
             "$out" version | tee dist/version-ebpf.txt
             cat > /tmp/ebpf-check.json <<'EOF'
           {
@@ -167,13 +126,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ebpf-linux-${{ matrix.goarch }}
+          name: ebpf-linux-${{ matrix.goarch }}-${{ matrix.libc }}
           path: dist/*
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    needs: [static, ebpf]
+    needs: [ebpf]
     if: ${{ github.event_name == 'push' || inputs.publish_release }}
     runs-on: ubuntu-latest
     steps:
@@ -218,20 +177,20 @@ jobs:
           notes="$(cat <<EOF
           ## sing-box adaptive ${ver}
 
-          Pure **SagerNet v1.14.0-beta.17** base + first-party smart / eBPF / provider / connection_history.
+          Pure **SagerNet 1.14.0-rc.1 snapshot** base + first-party Smart / eBPF v3 / provider / connection_history.
 
           ### Assets
 
           | Artifact | Notes |
           |----------|--------|
-          | \`sing-box-linux-*-static\` | **Fully static** (\`CGO_ENABLED=0\`). No \`with_ebpf\` (TC gateway needs eBPF build). |
-          | \`sing-box-linux-*-ebpf\` | Gateway build with \`with_ebpf\` + history. **Dynamically linked to glibc** (not fully static). |
+          | \`sing-box-linux-*-glibc-ebpf\` | Gateway build with eBPF v3 for glibc systems. |
+          | \`sing-box-linux-*-musl-ebpf\` | Statically linked gateway build for musl systems. |
 
           See \`CHANGELOG.adaptive.md\` and \`README.md\`.
 
           ### Tags baked in
-          - static: \`release/DEFAULT_BUILD_TAGS_OTHERS\`
-          - ebpf: above + \`with_ebpf\`
+          - glibc: \`release/DEFAULT_BUILD_TAGS_OTHERS\` + \`with_ebpf\`
+          - musl: above + \`with_musl\`
           EOF
           )"
           if gh release view "$tag" >/dev/null 2>&1; then
