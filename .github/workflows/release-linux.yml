@@ -101,9 +101,12 @@ jobs:
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid= ${extra_ldflags}" \
             -o "$out" ./cmd/sing-box
           chmod +x "$out"
-          file "$out" | tee "dist/sing-box-linux-${GOARCH}-ebpf.file"
-          (ldd "$out" 2>&1 || true) | tee "dist/sing-box-linux-${GOARCH}-ebpf.ldd" || true
-          sha256sum "$out" | tee "${out}.sha256"
+          file "$out" | tee "${out}.file"
+          (ldd "$out" 2>&1 || true) | tee "${out}.ldd" || true
+          (
+            cd dist
+            sha256sum "$(basename "$out")" > "$(basename "$out").sha256"
+          )
           if [[ "$GOARCH" == "amd64" && "${{ matrix.libc }}" == "glibc" ]]; then
             "$out" version | tee dist/version-ebpf.txt
             cat > /tmp/ebpf-check.json <<'EOF'
