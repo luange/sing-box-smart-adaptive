@@ -1317,7 +1317,7 @@ func (i *Inbound) logBypassCIDRUpdate() {
 	i.logger.Debug("refreshed eBPF bypass CIDR policy: ipv4=", ipv4Count, ", ipv6=", ipv6Count)
 }
 
-func (i *Inbound) InterfaceUpdated() {
+func (i *Inbound) InterfaceUpdated(_ context.Context) {
 	i.udpNat.Purge()
 	i.dnsMux.Purge()
 	i.bypassRuleSetAccess.Lock()

@@ -198,7 +198,7 @@ func (s *LoadBalance) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
 }
 
-func (s *LoadBalance) InterfaceUpdated() {
+func (s *LoadBalance) InterfaceUpdated(_ context.Context) {
 	group := s.group
 	if group == nil {
 		return
