@@ -115,10 +115,11 @@ type smartDialAttempt struct {
 }
 
 type smartDialResult struct {
-	attempt smartDialAttempt
-	conn    net.Conn
-	err     error
-	elapsed time.Duration
+	attempt         smartDialAttempt
+	conn            net.Conn
+	err             error
+	elapsed         time.Duration
+	hadPriorFailure bool
 }
 
 var smartRankPool = sync.Pool{New: func() any {
@@ -881,7 +882,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
 		adapter.NoteRealOutbound(ctx, candidate)
-		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex)
+		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
 			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
@@ -1032,6 +1033,7 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				continue
 			}
 			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+			result.hadPriorFailure = len(attemptErrors) > 0
 			cancelAll()
 			return result.conn, result, attemptErrors, true
 		}
@@ -1103,7 +1105,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		adapter.NoteRealOutbound(ctx, candidate)
-		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex)
+		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex, attemptIndex > 0)
 		observed := newSmartObservedPacketConn(conn, startedAt, smartUDPExpectsResponse(destination), func(flowElapsed time.Duration) {
 			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
@@ -1483,7 +1485,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	return ranking, networkKey, siteKey, siteDisplay
 }
 
-func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int) {
+func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
 	affinityKey := networkKey + "\x00" + siteKey + "\x00" + transport
@@ -1492,7 +1494,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	previous := s.lastSelected[key]
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
-	failureSwitch := attemptIndex > 0 || (previousFound && previousRank.status.State == "open")
+	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
 	if previous != "" && previous != candidate.Tag() && !failureSwitch {

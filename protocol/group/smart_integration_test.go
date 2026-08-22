@@ -634,7 +634,7 @@ func TestSmartSiteAffinityPreventsMinorOscillation(t *testing.T) {
 		smart.store.observeDial(now, networkKey, siteKey, "second", N.NetworkTCP, true, 95*time.Millisecond)
 	}
 	initialRanks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.ParseSocksaddr("video.example:443"))
-	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, initialRanks, 0)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, initialRanks, 0, false)
 	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.ParseSocksaddr("video.example:443"))
 	if ranks[0].outbound.Tag() != "first" {
 		t.Fatalf("expected affinity to retain first, got %s", ranks[0].outbound.Tag())
@@ -656,7 +656,7 @@ func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testin
 		smart.store.observeDial(now, networkKey, siteKey, first.Tag(), N.NetworkTCP, true, 200*time.Millisecond)
 		smart.store.observeDial(now, networkKey, siteKey, second.Tag(), N.NetworkTCP, true, 20*time.Millisecond)
 	}
-	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
 	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
 	if ranks[0].outbound.Tag() != first.Tag() {
 		t.Fatalf("healthy current candidate switched immediately to %s", ranks[0].outbound.Tag())
@@ -679,7 +679,7 @@ func TestSmartDialFailureBypassesLazySwitchConfirmation(t *testing.T) {
 	destination := M.ParseSocksaddr("search.example:443")
 	networkKey := smart.networkFingerprint()
 	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
-	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
 	first.dialError = errors.New("node unavailable")
 	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
 	if err != nil {
@@ -692,6 +692,30 @@ func TestSmartDialFailureBypassesLazySwitchConfirmation(t *testing.T) {
 	}
 }
 
+func TestSmartHedgeWinnerDoesNotMasqueradeAsFailureFailover(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	first.dialDelay = 400 * time.Millisecond
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.attemptTimeout = 900 * time.Millisecond
+	destination := M.ParseSocksaddr("search.example:443")
+	networkKey := smart.networkFingerprint()
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer (<-second.peers).Close()
+	if smart.failureFailovers.Load() != 0 {
+		t.Fatalf("hedged success was counted as failure failover: %d", smart.failureFailovers.Load())
+	}
+	if smart.Now() != first.Tag() {
+		t.Fatalf("late hedge winner replaced healthy selection: %s", smart.Now())
+	}
+}
+
 func TestSmartPerformanceSwitchKeepsEstablishedConnection(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)
@@ -699,12 +723,12 @@ func TestSmartPerformanceSwitchKeepsEstablishedConnection(t *testing.T) {
 	smart.interruptMode = "selective"
 	networkKey := "network"
 	siteKey := "site"
-	smart.markSelected(first, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0)
+	smart.markSelected(first, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0, false)
 	left, right := net.Pipe()
 	defer right.Close()
 	wrapped := smart.interruptGroup.NewConnWithKey(left, true, false, smartConnectionKey(networkKey, siteKey, N.NetworkTCP, first.Tag()))
 	defer wrapped.Close()
-	smart.markSelected(second, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0)
+	smart.markSelected(second, networkKey, siteKey, "example.com", N.NetworkTCP, nil, 0, false)
 	_ = right.SetWriteDeadline(time.Now().Add(time.Second))
 	_ = wrapped.SetReadDeadline(time.Now().Add(time.Second))
 	go func() { _, _ = right.Write([]byte{1}) }()
