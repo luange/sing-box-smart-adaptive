@@ -1490,8 +1490,28 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
+	previousRank, previousFound := smartRankByTag(ranks, previous)
+	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
+	failureSwitch := attemptIndex > 0 || (previousFound && previousRank.status.State == "open")
+	// Several requests can rank concurrently and finish in a different order.
+	// Do not let a late healthy completion undo a just-committed selection.
+	if previous != "" && previous != candidate.Tag() && !failureSwitch {
+		coolingDown := s.performanceCooldown[key].After(now)
+		materiallyBetter := previousFound && currentFound && smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin)
+		if coolingDown || !materiallyBetter {
+			s.access.Unlock()
+			s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "late healthy result retained current candidate")
+			return
+		}
+	}
 	s.lastSelected[key] = candidate.Tag()
 	delete(s.switchChallenges, key)
+	if previous != "" && previous != candidate.Tag() && !failureSwitch {
+		if s.performanceCooldown == nil {
+			s.performanceCooldown = make(map[string]time.Time)
+		}
+		s.performanceCooldown[key] = now.Add(s.switchCooldown)
+	}
 	if siteKey != "" {
 		s.affinity[affinityKey] = smartAffinity{Candidate: candidate.Tag(), ExpiresAt: now.Add(s.siteStickiness)}
 	}
@@ -1499,27 +1519,19 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	s.latest.Store(candidate)
 	reason := "selected best candidate"
 	category := "cold_start"
-	previousRank, previousFound := smartRankByTag(ranks, previous)
-	currentRank, _ := smartRankByTag(ranks, candidate.Tag())
 	if attemptIndex > 0 {
 		reason = "failover attempt " + itoaSmall(attemptIndex+1)
 	}
 	if previous == "" {
 		s.coldStarts.Add(1)
 	} else if previous != candidate.Tag() {
-		if attemptIndex > 0 || (previousFound && previousRank.status.State == "open") {
+		if failureSwitch {
 			category = "failure_failover"
 			s.failureFailovers.Add(1)
 			reason = "failed candidate bypassed confirmation"
 		} else {
 			category = "performance_switch"
 			s.performanceSwitches.Add(1)
-			s.access.Lock()
-			if s.performanceCooldown == nil {
-				s.performanceCooldown = make(map[string]time.Time)
-			}
-			s.performanceCooldown[key] = now.Add(s.switchCooldown)
-			s.access.Unlock()
 		}
 		s.appendSwitchAudit(adapter.SmartSwitchAudit{
 			Network: networkKey, Site: siteDisplay, Transport: transport,
