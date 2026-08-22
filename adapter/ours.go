@@ -75,11 +75,30 @@ type SmartGroupStatus struct {
 	OverrideRemainingSeconds  int64                  `json:"override_remaining_seconds,omitempty"`
 	OverrideReason            string                 `json:"override_reason,omitempty"`
 	SwitchesTotal             uint64                 `json:"switches_total,omitempty"`
+	PerformanceSwitches       uint64                 `json:"performance_switches,omitempty"`
+	FailureFailovers          uint64                 `json:"failure_failovers,omitempty"`
+	ColdStarts                uint64                 `json:"cold_starts,omitempty"`
+	RecentSwitches            []SmartSwitchAudit     `json:"recent_switches,omitempty"`
 	SwitchesForceAll          uint64                 `json:"switches_force_all,omitempty"`
 	SwitchesSelective         uint64                 `json:"switches_selective,omitempty"`
 	ConnectionsInterrupted    uint64                 `json:"connections_interrupted,omitempty"`
 	ConnectionsKept           uint64                 `json:"connections_kept,omitempty"`
 	Candidates                []SmartCandidateStatus `json:"candidates"`
+}
+
+type SmartSwitchAudit struct {
+	Network       string    `json:"network,omitempty"`
+	Site          string    `json:"site,omitempty"`
+	Transport     string    `json:"transport,omitempty"`
+	Previous      string    `json:"previous,omitempty"`
+	Current       string    `json:"current"`
+	Category      string    `json:"category"`
+	Reason        string    `json:"reason"`
+	PreviousState string    `json:"previous_state,omitempty"`
+	CurrentState  string    `json:"current_state,omitempty"`
+	PreviousScore float64   `json:"previous_score,omitempty"`
+	CurrentScore  float64   `json:"current_score,omitempty"`
+	OccurredAt    time.Time `json:"occurred_at"`
 }
 
 // LoadBalanceGroup is implemented by protocol/group loadbalance outbound.

@@ -58,6 +58,8 @@ type SmartOutboundOptions struct {
 	AttemptTimeout       badoption.Duration          `json:"attempt_timeout,omitempty"`
 	SiteStickiness       badoption.Duration          `json:"site_stickiness,omitempty"`
 	SwitchConfirm        badoption.Duration          `json:"switch_confirm,omitempty"`
+	SwitchConfirmSamples int                         `json:"switch_confirm_samples,omitempty"`
+	SwitchCooldown       badoption.Duration          `json:"switch_cooldown,omitempty"`
 	SwitchMargin         *float64                    `json:"switch_margin,omitempty"`
 	Exploration          *float64                    `json:"exploration,omitempty"`
 	MinSamples           int                         `json:"min_samples,omitempty"`

@@ -147,26 +147,29 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		candidateByTag[candidate.Tag()] = candidate
 	}
 	return &Smart{
-		Adapter:           outbound.NewAdapter(C.TypeSmart, "smart-test", []string{N.NetworkTCP, N.NetworkUDP}, nil),
-		ctx:               context.Background(),
-		candidates:        candidates,
-		candidateByTag:    candidateByTag,
-		control:           &smartControlState{},
-		lastSelected:      make(map[string]string),
-		affinity:          make(map[string]smartAffinity),
-		switchChallenges:  make(map[string]smartSwitchChallenge),
-		halfOpen:          make(map[string]struct{}),
-		store:             newSmartStore(time.Hour, 1, time.Minute),
-		maxAttempts:       3,
-		attemptTimeout:    time.Second,
-		probeTimeout:      100 * time.Millisecond,
-		siteStickiness:    time.Minute,
-		switchConfirm:     30 * time.Second,
-		switchMargin:      0.10,
-		exploration:       0,
-		minSamples:        3,
-		maxHistoryEntries: 50000,
-		interruptGroup:    interruptGroupForTest(),
+		Adapter:              outbound.NewAdapter(C.TypeSmart, "smart-test", []string{N.NetworkTCP, N.NetworkUDP}, nil),
+		ctx:                  context.Background(),
+		candidates:           candidates,
+		candidateByTag:       candidateByTag,
+		control:              &smartControlState{},
+		lastSelected:         make(map[string]string),
+		affinity:             make(map[string]smartAffinity),
+		switchChallenges:     make(map[string]smartSwitchChallenge),
+		performanceCooldown:  make(map[string]time.Time),
+		halfOpen:             make(map[string]struct{}),
+		store:                newSmartStore(time.Hour, 1, time.Minute),
+		maxAttempts:          3,
+		attemptTimeout:       time.Second,
+		probeTimeout:         100 * time.Millisecond,
+		siteStickiness:       time.Minute,
+		switchConfirm:        30 * time.Second,
+		switchConfirmSamples: 3,
+		switchCooldown:       10 * time.Minute,
+		switchMargin:         0.10,
+		exploration:          0,
+		minSamples:           3,
+		maxHistoryEntries:    50000,
+		interruptGroup:       interruptGroupForTest(),
 	}
 }
 
@@ -643,6 +646,7 @@ func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testin
 	second := newSmartFakeOutbound("second", nil)
 	smart := newTestSmart(first, second)
 	smart.switchConfirm = 20 * time.Millisecond
+	smart.switchConfirmSamples = 3
 	smart.switchMargin = 0
 	now := time.Now()
 	networkKey := smart.networkFingerprint()
@@ -658,6 +662,10 @@ func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testin
 		t.Fatalf("healthy current candidate switched immediately to %s", ranks[0].outbound.Tag())
 	}
 	time.Sleep(25 * time.Millisecond)
+	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, destination)
+	if ranks[0].outbound.Tag() != first.Tag() {
+		t.Fatalf("candidate switched without enough confirmations: %s", ranks[0].outbound.Tag())
+	}
 	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, destination)
 	if ranks[0].outbound.Tag() != second.Tag() {
 		t.Fatalf("sustained better candidate was not selected: %s", ranks[0].outbound.Tag())

@@ -38,22 +38,25 @@ import (
 )
 
 const (
-	defaultSmartProbeInterval     = 10 * time.Minute
-	defaultSmartProbeCycleTimeout = 30 * time.Second
-	defaultSmartProbeTimeout      = 5 * time.Second
-	defaultSmartAttemptTimeout    = 4 * time.Second
-	defaultSmartSiteStickiness    = 10 * time.Minute
-	defaultSmartSwitchConfirm     = 30 * time.Second
-	defaultSmartHedgeDelay        = 450 * time.Millisecond
-	minSmartHedgeDelay            = 250 * time.Millisecond
-	maxSmartHedgeDelay            = 750 * time.Millisecond
-	defaultSmartSwitchMargin      = 0.08
-	defaultSmartExploration       = 0.08
-	defaultSmartMinSamples        = 3
-	defaultSmartMaxAttempts       = 3
-	defaultSmartBreakerFailures   = 3
-	defaultSmartBreakerCooldown   = 2 * time.Minute
-	defaultSmartHalfLife          = 30 * time.Minute
+	defaultSmartProbeInterval        = 10 * time.Minute
+	defaultSmartProbeCycleTimeout    = 30 * time.Second
+	defaultSmartProbeTimeout         = 5 * time.Second
+	defaultSmartAttemptTimeout       = 4 * time.Second
+	defaultSmartSiteStickiness       = 30 * time.Minute
+	defaultSmartSwitchConfirm        = 2 * time.Minute
+	defaultSmartSwitchConfirmSamples = 3
+	defaultSmartSwitchCooldown       = 10 * time.Minute
+	defaultSmartHedgeDelay           = 450 * time.Millisecond
+	minSmartHedgeDelay               = 250 * time.Millisecond
+	maxSmartHedgeDelay               = 750 * time.Millisecond
+	defaultSmartSwitchMargin         = 0.15
+	smartSwitchAuditLimit            = 128
+	defaultSmartExploration          = 0.08
+	defaultSmartMinSamples           = 3
+	defaultSmartMaxAttempts          = 3
+	defaultSmartBreakerFailures      = 3
+	defaultSmartBreakerCooldown      = 2 * time.Minute
+	defaultSmartHalfLife             = 30 * time.Minute
 	// Homelab/router default: 48h + 4k is enough for site stickiness without
 	// multi-hundred-MB metric maps (5 groups × 50k was a common RSS blow-up).
 	defaultSmartHistoryRetention  = 48 * time.Hour
@@ -201,18 +204,19 @@ type Smart struct {
 	nodeWeights     *nodeweight.Matcher
 	useAllProviders bool
 
-	access            sync.RWMutex
-	candidates        []adapter.Outbound
-	candidateByTag    map[string]adapter.Outbound
-	candidateProbeKey map[string]string
-	control           *smartControlState
-	lastSelected      map[string]string
-	affinity          map[string]smartAffinity
-	switchChallenges  map[string]smartSwitchChallenge
-	halfOpen          map[string]struct{}
-	latest            common.TypedValue[adapter.Outbound]
-	fingerprint       atomic.Pointer[smartFingerprintCache]
-	fingerprintLock   sync.Mutex
+	access              sync.RWMutex
+	candidates          []adapter.Outbound
+	candidateByTag      map[string]adapter.Outbound
+	candidateProbeKey   map[string]string
+	control             *smartControlState
+	lastSelected        map[string]string
+	affinity            map[string]smartAffinity
+	switchChallenges    map[string]smartSwitchChallenge
+	performanceCooldown map[string]time.Time
+	halfOpen            map[string]struct{}
+	latest              common.TypedValue[adapter.Outbound]
+	fingerprint         atomic.Pointer[smartFingerprintCache]
+	fingerprintLock     sync.Mutex
 
 	statusAccess sync.RWMutex
 	status       adapter.SmartGroupStatus
@@ -226,6 +230,8 @@ type Smart struct {
 	attemptTimeout         time.Duration
 	siteStickiness         time.Duration
 	switchConfirm          time.Duration
+	switchConfirmSamples   int
+	switchCooldown         time.Duration
 	switchMargin           float64
 	exploration            float64
 	minSamples             int
@@ -241,6 +247,11 @@ type Smart struct {
 	interruptLongAge       time.Duration
 	interruptGrace         time.Duration
 	switchesTotal          atomic.Uint64
+	performanceSwitches    atomic.Uint64
+	failureFailovers       atomic.Uint64
+	coldStarts             atomic.Uint64
+	switchAuditAccess      sync.Mutex
+	switchAudit            []adapter.SmartSwitchAudit
 	switchesForceAll       atomic.Uint64
 	switchesSelective      atomic.Uint64
 	connectionsInterrupted atomic.Uint64
@@ -263,6 +274,7 @@ type Smart struct {
 type smartSwitchChallenge struct {
 	Candidate string
 	Since     time.Time
+	Count     int
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -312,9 +324,20 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if switchConfirm < 5*time.Second {
 		return nil, E.New("smart switch_confirm must be at least 5s")
 	}
+	switchConfirmSamples := options.SwitchConfirmSamples
+	if switchConfirmSamples <= 0 {
+		switchConfirmSamples = defaultSmartSwitchConfirmSamples
+	}
+	switchCooldown := time.Duration(options.SwitchCooldown)
+	if switchCooldown <= 0 {
+		switchCooldown = defaultSmartSwitchCooldown
+	}
 	switchMargin := defaultSmartSwitchMargin
 	if options.SwitchMargin != nil {
 		switchMargin = max(0, *options.SwitchMargin)
+	}
+	if switchMargin >= 1 {
+		return nil, E.New("smart switch_margin must be less than 1")
 	}
 	exploration := defaultSmartExploration
 	if options.Exploration != nil {
@@ -404,14 +427,15 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		nodeWeights:     nodeWeights,
 		useAllProviders: options.UseAllProviders,
 
-		candidateByTag:    make(map[string]adapter.Outbound),
-		candidateProbeKey: make(map[string]string),
-		control:           &smartControlState{},
-		lastSelected:      make(map[string]string),
-		affinity:          make(map[string]smartAffinity),
-		switchChallenges:  make(map[string]smartSwitchChallenge),
-		halfOpen:          make(map[string]struct{}),
-		store:             store,
+		candidateByTag:      make(map[string]adapter.Outbound),
+		candidateProbeKey:   make(map[string]string),
+		control:             &smartControlState{},
+		lastSelected:        make(map[string]string),
+		affinity:            make(map[string]smartAffinity),
+		switchChallenges:    make(map[string]smartSwitchChallenge),
+		performanceCooldown: make(map[string]time.Time),
+		halfOpen:            make(map[string]struct{}),
+		store:               store,
 
 		probeURL:             options.URL,
 		probeInterval:        probeInterval,
@@ -421,6 +445,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		attemptTimeout:       attemptTimeout,
 		siteStickiness:       siteStickiness,
 		switchConfirm:        switchConfirm,
+		switchConfirmSamples: switchConfirmSamples,
+		switchCooldown:       switchCooldown,
 		switchMargin:         switchMargin,
 		exploration:          exploration,
 		minSamples:           minSamples,
@@ -527,6 +553,7 @@ func (s *Smart) Close() error {
 	clear(s.lastSelected)
 	clear(s.affinity)
 	clear(s.switchChallenges)
+	clear(s.performanceCooldown)
 	clear(s.halfOpen)
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
@@ -534,6 +561,7 @@ func (s *Smart) Close() error {
 	s.lastSelected = make(map[string]string)
 	s.affinity = make(map[string]smartAffinity)
 	s.switchChallenges = make(map[string]smartSwitchChallenge)
+	s.performanceCooldown = make(map[string]time.Time)
 	s.halfOpen = make(map[string]struct{})
 	s.access.Unlock()
 	s.providerAccess.Lock()
@@ -715,10 +743,16 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.Candidates = append([]adapter.SmartCandidateStatus(nil), status.Candidates...)
 	status.StateCounts = cloneSmartStateCounts(status.StateCounts)
 	status.SwitchesTotal = s.switchesTotal.Load()
+	status.PerformanceSwitches = s.performanceSwitches.Load()
+	status.FailureFailovers = s.failureFailovers.Load()
+	status.ColdStarts = s.coldStarts.Load()
 	status.SwitchesForceAll = s.switchesForceAll.Load()
 	status.SwitchesSelective = s.switchesSelective.Load()
 	status.ConnectionsInterrupted = s.connectionsInterrupted.Load()
 	status.ConnectionsKept = s.connectionsKept.Load()
+	s.switchAuditAccess.Lock()
+	status.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), s.switchAudit...)
+	s.switchAuditAccess.Unlock()
 	return status
 }
 
@@ -1424,8 +1458,12 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			switch {
 			case current == bestCandidate:
 				s.clearSwitchChallenge(selectionKey)
-			case currentScore <= bestScore+s.switchMargin:
+			case !smartRelativeImprovement(bestScore, currentScore, s.switchMargin):
 				s.clearSwitchChallenge(selectionKey)
+			case s.performanceSwitchCoolingDown(selectionKey, now):
+				s.clearSwitchChallenge(selectionKey)
+				switchReason = "better candidate retained during switch cooldown"
+				switchStatusReason = "healthy current candidate retained during switch cooldown"
 			case s.confirmSwitchChallenge(selectionKey, bestCandidate, now):
 				switchConfirmed = true
 			default:
@@ -1460,14 +1498,78 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	s.access.Unlock()
 	s.latest.Store(candidate)
 	reason := "selected best candidate"
+	category := "cold_start"
+	previousRank, previousFound := smartRankByTag(ranks, previous)
+	currentRank, _ := smartRankByTag(ranks, candidate.Tag())
 	if attemptIndex > 0 {
 		reason = "failover attempt " + itoaSmall(attemptIndex+1)
+	}
+	if previous == "" {
+		s.coldStarts.Add(1)
+	} else if previous != candidate.Tag() {
+		if attemptIndex > 0 || (previousFound && previousRank.status.State == "open") {
+			category = "failure_failover"
+			s.failureFailovers.Add(1)
+			reason = "failed candidate bypassed confirmation"
+		} else {
+			category = "performance_switch"
+			s.performanceSwitches.Add(1)
+			s.access.Lock()
+			if s.performanceCooldown == nil {
+				s.performanceCooldown = make(map[string]time.Time)
+			}
+			s.performanceCooldown[key] = now.Add(s.switchCooldown)
+			s.access.Unlock()
+		}
+		s.appendSwitchAudit(adapter.SmartSwitchAudit{
+			Network: networkKey, Site: siteDisplay, Transport: transport,
+			Previous: previous, Current: candidate.Tag(), Category: category, Reason: reason,
+			PreviousState: previousRank.status.State, CurrentState: currentRank.status.State,
+			PreviousScore: previousRank.status.Score, CurrentScore: currentRank.status.Score,
+			OccurredAt: now,
+		})
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, candidate.Tag(), reason)
 	if previous != "" && previous != candidate.Tag() {
 		s.switchesTotal.Add(1)
 		s.interruptPreviousCandidate(networkKey, siteKey, transport, previous, candidate.Tag())
 	}
+}
+
+func smartRankByTag(ranks []smartRank, tag string) (smartRank, bool) {
+	for _, rank := range ranks {
+		if rank.outbound.Tag() == tag {
+			return rank, true
+		}
+	}
+	return smartRank{}, false
+}
+
+func smartRelativeImprovement(bestScore, currentScore, margin float64) bool {
+	if bestScore >= currentScore {
+		return false
+	}
+	if margin <= 0 {
+		return true
+	}
+	return currentScore > bestScore/(1-margin)
+}
+
+func (s *Smart) performanceSwitchCoolingDown(key string, now time.Time) bool {
+	s.access.RLock()
+	until := s.performanceCooldown[key]
+	s.access.RUnlock()
+	return until.After(now)
+}
+
+func (s *Smart) appendSwitchAudit(event adapter.SmartSwitchAudit) {
+	s.switchAuditAccess.Lock()
+	if len(s.switchAudit) >= smartSwitchAuditLimit {
+		copy(s.switchAudit, s.switchAudit[len(s.switchAudit)-smartSwitchAuditLimit+1:])
+		s.switchAudit = s.switchAudit[:smartSwitchAuditLimit-1]
+	}
+	s.switchAudit = append(s.switchAudit, event)
+	s.switchAuditAccess.Unlock()
 }
 
 func (s *Smart) clearSwitchChallenge(key string) {
@@ -1481,10 +1583,12 @@ func (s *Smart) confirmSwitchChallenge(key, candidate string, now time.Time) boo
 	defer s.access.Unlock()
 	challenge := s.switchChallenges[key]
 	if challenge.Candidate != candidate || challenge.Since.IsZero() {
-		s.switchChallenges[key] = smartSwitchChallenge{Candidate: candidate, Since: now}
+		s.switchChallenges[key] = smartSwitchChallenge{Candidate: candidate, Since: now, Count: 1}
 		return false
 	}
-	if now.Sub(challenge.Since) < s.switchConfirm {
+	challenge.Count++
+	s.switchChallenges[key] = challenge
+	if challenge.Count < s.switchConfirmSamples || now.Sub(challenge.Since) < s.switchConfirm {
 		return false
 	}
 	delete(s.switchChallenges, key)
