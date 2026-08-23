@@ -641,6 +641,40 @@ func TestSmartSiteAffinityPreventsMinorOscillation(t *testing.T) {
 	}
 }
 
+func TestSmartEquivalentSubscriptionLineRemainsFixedWhileHealthy(t *testing.T) {
+	primary := newSmartFakeOutbound("airport/香港-广东专线 NeaRoute", nil)
+	duplicate := newSmartFakeOutbound("airport/香港-广东专线 NeaRoute #deadbeef", nil)
+	smart := newTestSmart(primary, duplicate)
+	now := time.Now()
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("video.example:443")
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	for range 10 {
+		smart.store.observeDial(now, networkKey, siteKey, primary.Tag(), N.NetworkTCP, true, 200*time.Millisecond)
+		smart.store.observeDial(now, networkKey, siteKey, duplicate.Tag(), N.NetworkTCP, true, 20*time.Millisecond)
+	}
+	smart.markSelected(primary, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
+	if ranks[0].outbound.Tag() != primary.Tag() {
+		t.Fatalf("healthy equivalent line oscillated to duplicate: %s", ranks[0].outbound.Tag())
+	}
+	if ranks[0].status.Reason != "equivalent subscription line retained" {
+		t.Fatalf("unexpected equivalent-line reason: %q", ranks[0].status.Reason)
+	}
+}
+
+func TestSmartLineFamilyOnlyStripsGeneratedDuplicateSuffixes(t *testing.T) {
+	base := "airport/香港-广东专线 NeaRoute"
+	for _, duplicate := range []string{base + " #deadbeef", base + " (2)"} {
+		if !smartEquivalentLine(base, duplicate) {
+			t.Fatalf("generated duplicate suffix was not grouped: %q", duplicate)
+		}
+	}
+	if smartEquivalentLine("airport/香港-广东专线 BGP 1", "airport/香港-广东专线 BGP 2") {
+		t.Fatal("real numbered lines were incorrectly grouped")
+	}
+}
+
 func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)
