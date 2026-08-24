@@ -6,7 +6,6 @@ import (
 	"errors"
 	"hash/fnv"
 	"io"
-	"math"
 	"net"
 	"net/netip"
 	"regexp"
@@ -1399,45 +1398,17 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.ClearTemporarySelection()
 	}
 	if pinned != "" {
-		if index := smartRankIndex(ranks, pinned); index >= 0 && ranks[index].status.State != "open" {
-			// S1: bypass pin when half-dead — enough samples and score much worse
-			// than best other (lower score is better).
-			pinRank := ranks[index]
-			bestOther := math.Inf(1)
-			for i, r := range ranks {
-				if i == index || r.status.State == "open" {
-					continue
-				}
-				if r.status.Score < bestOther {
-					bestOther = r.status.Score
-				}
-			}
-			bypassPin := false
-			if !math.IsInf(bestOther, 1) && pinRank.status.Samples >= float64(s.minSamples) {
-				threshold := bestOther
-				if s.switchMargin < 1 {
-					// pin worse than bestOther by more than switch_margin relative gap
-					threshold = bestOther / (1 - s.switchMargin)
-				}
-				if pinRank.status.Score > threshold {
-					bypassPin = true
-				}
-			}
-			if !bypassPin {
-				ranks[index].eligible = true
-				ranks[index].status.Reason = "manual pin"
-				moveSmartRankFirst(ranks, index)
-				s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
-				return ranking, networkKey, siteKey, siteDisplay
-			}
-			manualPinUnavailable = true
-			if s.logger != nil {
-				s.logger.Info("smart pin bypassed: score pin=", pinRank.status.Score,
-					" best_other=", bestOther, " samples=", pinRank.status.Samples,
-					" tag=", pinned)
-			}
+		if index := smartRankIndex(ranks, pinned); index >= 0 && ranks[index].status.State != "open" && ranks[index].status.State != "half_open" {
+			// A permanent manual selection is authoritative while its circuit is
+			// usable. RTT and score changes must never silently overrule a human.
+			ranks[index].eligible = true
+			ranks[index].status.Reason = "manual pin"
+			moveSmartRankFirst(ranks, index)
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
+			return ranking, networkKey, siteKey, siteDisplay
 		} else {
 			manualPinUnavailable = true
+			s.releaseConfirmedBrokenPin(pinned, "candidate circuit opened")
 		}
 	}
 	if !hasEligibleSmartRank(ranks) {
@@ -1825,9 +1796,6 @@ func (s *Smart) pruneAffinityLocked(now time.Time) {
 }
 
 func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string) {
-	_ = networkKey
-	_ = siteKey
-	_ = transport
 	temporaryCleared := false
 	s.control.access.Lock()
 	if s.control.temporary == candidate {
@@ -1838,14 +1806,30 @@ func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string)
 	if temporaryCleared && s.logger != nil {
 		s.logger.Warn("smart temporary override cleared after connection failure: ", candidate)
 	}
-	if s.logger != nil {
-		s.control.access.Lock()
-		pinned := s.control.pinned == candidate
-		s.control.access.Unlock()
-		if pinned {
-			s.logger.Warn("smart permanent pin unavailable after connection failure; keeping manual pin: ", candidate)
-		}
+	estimate := s.store.estimate(time.Now(), networkKey, siteKey, candidate, transport, s.minSamples)
+	if estimate.State == "open" || estimate.State == "half_open" {
+		s.releaseConfirmedBrokenPin(candidate, "confirmed connection failure threshold reached")
 	}
+}
+
+// releaseConfirmedBrokenPin turns a failed manual choice back into normal Smart
+// operation. The pin is intentionally not restored after recovery: a new pin
+// requires a new explicit user selection.
+func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
+	if candidate == "" {
+		return false
+	}
+	s.control.access.Lock()
+	if s.control.pinned != candidate {
+		s.control.access.Unlock()
+		return false
+	}
+	s.control.pinned = ""
+	s.control.access.Unlock()
+	if s.logger != nil {
+		s.logger.Warn("smart manual pin released: ", reason, " tag=", candidate)
+	}
+	return true
 }
 
 func (s *Smart) onProviderUpdated(tag string) error {

@@ -578,7 +578,7 @@ func TestSmartUDPResponseAndOneWayTrafficDoNotFail(t *testing.T) {
 	}
 }
 
-func TestSmartBrokenPermanentPinIsRetained(t *testing.T) {
+func TestSmartPermanentPinSurvivesTransientFailureThenReleasesAtThreshold(t *testing.T) {
 	first := newSmartFakeOutbound("first", errors.New("dial failed"))
 	second := newSmartFakeOutbound("second", nil)
 	smart := newTestSmart(first, second)
@@ -586,16 +586,43 @@ func TestSmartBrokenPermanentPinIsRetained(t *testing.T) {
 		t.Fatal("failed to pin first")
 	}
 
-	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
-	if err != nil {
-		t.Fatal(err)
+	destination := M.ParseSocksaddr("example.com:443")
+	for attempt := 1; attempt <= smart.breakerFailures; attempt++ {
+		conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		peer := <-second.peers
+		peer.Close()
+		status := smart.SmartStatus()
+		if attempt < smart.breakerFailures && status.Pinned != "first" {
+			t.Fatalf("transient failure %d prematurely cleared pin: %q", attempt, status.Pinned)
+		}
+		if attempt == smart.breakerFailures && status.Pinned != "" {
+			t.Fatalf("confirmed failure did not release pin: %q", status.Pinned)
+		}
 	}
-	conn.Close()
-	peer := <-second.peers
-	peer.Close()
-	status := smart.SmartStatus()
-	if status.Pinned != "first" {
-		t.Fatalf("expected permanent pin retained, got %q", status.Pinned)
+}
+
+func TestSmartManualPinIgnoresPerformanceScore(t *testing.T) {
+	first := newSmartFakeOutbound("manual-slow", nil)
+	second := newSmartFakeOutbound("automatic-fast", nil)
+	smart := newTestSmart(first, second)
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+	now := time.Now()
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("example.com:443")
+	_, siteKey := smartSiteIdentity(nil, destination)
+	for range 10 {
+		smart.store.observeDial(now, networkKey, siteKey, first.Tag(), N.NetworkTCP, true, 900*time.Millisecond)
+		smart.store.observeDial(now, networkKey, siteKey, second.Tag(), N.NetworkTCP, true, 10*time.Millisecond)
+	}
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
+	if got := ranks[0].outbound.Tag(); got != first.Tag() {
+		t.Fatalf("performance score overruled manual pin: got %q", got)
 	}
 }
 
