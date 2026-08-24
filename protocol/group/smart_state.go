@@ -16,6 +16,19 @@ type smartMetricKey struct {
 	Transport string
 }
 
+type smartCandidateKey struct {
+	Network   string
+	Candidate string
+	Transport string
+}
+
+type smartFailureBurst struct {
+	First time.Time
+	Last  time.Time
+	Total int
+	Sites map[string]struct{}
+}
+
 type smartMetric struct {
 	Network             string    `json:"network"`
 	Site                string    `json:"site,omitempty"`
@@ -65,6 +78,7 @@ type smartStore struct {
 	breakerCooldown time.Duration
 	retention       time.Duration
 	maxEntries      int
+	failureBursts   map[smartCandidateKey]*smartFailureBurst
 }
 
 func (s *smartStore) clear() {
@@ -76,6 +90,7 @@ func (s *smartStore) clear() {
 	// A real connection may finish after the group is retired. Keep a small,
 	// writable map for that late observation while releasing the old buckets.
 	s.metrics = make(map[smartMetricKey]*smartMetric)
+	clear(s.failureBursts)
 	s.access.Unlock()
 }
 
@@ -91,6 +106,7 @@ func newSmartStore(halfLife time.Duration, breakerFailures int, breakerCooldown 
 	}
 	return &smartStore{
 		metrics:         make(map[smartMetricKey]*smartMetric),
+		failureBursts:   make(map[smartCandidateKey]*smartFailureBurst),
 		halfLife:        halfLife,
 		breakerFailures: breakerFailures,
 		breakerCooldown: breakerCooldown,
@@ -164,14 +180,53 @@ func (s *smartStore) removeOldestLocked() {
 func (s *smartStore) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	candidateKey := smartCandidateKey{Network: network, Candidate: candidate, Transport: transport}
+	globalKey := smartMetricKey{Network: network, Candidate: candidate, Transport: transport}
+	globalMetric := s.metrics[globalKey]
+	wasCircuitOpen := globalMetric != nil && !globalMetric.CircuitUntil.IsZero()
 	globalWeight := 1.0
 	if !success && site != "" {
 		globalWeight = 0.25
 	}
-	s.observeDialLocked(now, smartMetricKey{Network: network, Candidate: candidate, Transport: transport}, success, elapsed, globalWeight, site == "")
+	s.observeDialLocked(now, globalKey, success, elapsed, globalWeight, site == "")
 	if site != "" {
 		s.observeDialLocked(now, smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport}, success, elapsed, 1, true)
+		if success {
+			if wasCircuitOpen {
+				delete(s.failureBursts, candidateKey)
+			}
+		} else {
+			s.observeCrossSiteFailureLocked(now, candidateKey, site)
+		}
+	} else if success {
+		delete(s.failureBursts, candidateKey)
 	}
+}
+
+func (s *smartStore) observeCrossSiteFailureLocked(now time.Time, key smartCandidateKey, site string) {
+	window := s.breakerCooldown
+	if window < 30*time.Second {
+		window = 30 * time.Second
+	}
+	burst := s.failureBursts[key]
+	if burst == nil || now.Sub(burst.First) > window {
+		burst = &smartFailureBurst{First: now, Sites: make(map[string]struct{})}
+		s.failureBursts[key] = burst
+	}
+	burst.Last = now
+	burst.Total++
+	burst.Sites[site] = struct{}{}
+	// A single incompatible service must remain a site-local failure. Promote
+	// only repeated real failures spanning multiple independent destinations.
+	if burst.Total < s.breakerFailures || len(burst.Sites) < 2 {
+		return
+	}
+	metric := s.metric(smartMetricKey{Network: key.Network, Candidate: key.Candidate, Transport: key.Transport}, now)
+	if metric.ConsecutiveFailures < s.breakerFailures {
+		metric.ConsecutiveFailures = s.breakerFailures
+	}
+	metric.CircuitUntil = now.Add(s.breakerCooldown)
+	metric.LastUpdated = now
 }
 
 func (s *smartStore) candidateDead(candidate string, now time.Time) bool {

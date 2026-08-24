@@ -165,6 +165,49 @@ func TestSmartSiteFailuresDoNotOpenGlobalCircuit(t *testing.T) {
 	}
 }
 
+func TestSmartCrossSiteFailureBurstOpensGlobalCircuit(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, 2*time.Minute)
+	now := time.Unix(5000, 0)
+	store.observeDial(now, "wifi", "api-a.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(20*time.Second), "wifi", "api-a.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(40*time.Second), "wifi", "api-b.example", "node-a", "tcp", false, time.Second)
+	global := store.estimate(now.Add(40*time.Second), "wifi", "", "node-a", "tcp", 3)
+	if global.State != "open" {
+		t.Fatalf("cross-site real failures did not open global circuit: %+v", global)
+	}
+}
+
+func TestSmartCrossSiteFailureBurstExpires(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Unix(6000, 0)
+	store.observeDial(now, "wifi", "api-a.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(10*time.Second), "wifi", "api-b.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(2*time.Minute), "wifi", "api-c.example", "node-a", "tcp", false, time.Second)
+	global := store.estimate(now.Add(2*time.Minute), "wifi", "", "node-a", "tcp", 3)
+	if global.State == "open" {
+		t.Fatalf("expired cross-site failures opened global circuit: %+v", global)
+	}
+}
+
+func TestSmartCrossSiteFailureBurstClearsAfterRecovery(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, 2*time.Minute)
+	now := time.Unix(7000, 0)
+	store.observeDial(now, "wifi", "api-a.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(time.Second), "wifi", "api-a.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(2*time.Second), "wifi", "api-b.example", "node-a", "tcp", false, time.Second)
+	store.observeDial(now.Add(3*time.Second), "wifi", "api-b.example", "node-a", "tcp", true, 10*time.Millisecond)
+	global := store.estimate(now.Add(3*time.Second), "wifi", "", "node-a", "tcp", 3)
+	if global.State == "open" || global.State == "half_open" {
+		t.Fatalf("successful recovery did not close global circuit: %+v", global)
+	}
+	store.access.RLock()
+	bursts := len(store.failureBursts)
+	store.access.RUnlock()
+	if bursts != 0 {
+		t.Fatalf("successful recovery retained failure burst: %d", bursts)
+	}
+}
+
 func TestSmartCandidateDeadRequiresRecentGlobalConsecutiveFailures(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Now()
