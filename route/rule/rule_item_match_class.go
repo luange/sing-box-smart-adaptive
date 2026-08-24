@@ -19,6 +19,7 @@ var (
 	_ RuleItemClass = (*NetworkIsExpensiveItem)(nil)
 	_ RuleItemClass = (*NetworkIsConstrainedItem)(nil)
 	_ RuleItemClass = (*InboundItem)(nil)
+	_ RuleItemClass = (*InboundInterfaceItem)(nil)
 	_ RuleItemClass = (*DomainItem)(nil)
 	_ RuleItemClass = (*DomainKeywordItem)(nil)
 	_ RuleItemClass = (*DomainRegexItem)(nil)
@@ -63,7 +64,10 @@ func (r *NetworkIsExpensiveItem) MatchClass() adapter.RouteMatchInputs {
 func (r *NetworkIsConstrainedItem) MatchClass() adapter.RouteMatchInputs {
 	return adapter.RouteMatchNetwork
 }
-func (r *InboundItem) MatchClass() adapter.RouteMatchInputs        { return adapter.RouteMatchNetwork }
+func (r *InboundItem) MatchClass() adapter.RouteMatchInputs { return adapter.RouteMatchNetwork }
+func (r *InboundInterfaceItem) MatchClass() adapter.RouteMatchInputs {
+	return adapter.RouteMatchNetwork
+}
 func (r *DomainItem) MatchClass() adapter.RouteMatchInputs         { return adapter.RouteMatchDomain }
 func (r *DomainKeywordItem) MatchClass() adapter.RouteMatchInputs  { return adapter.RouteMatchDomain }
 func (r *DomainRegexItem) MatchClass() adapter.RouteMatchInputs    { return adapter.RouteMatchDomain }

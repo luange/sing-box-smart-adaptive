@@ -4,6 +4,13 @@
 
 ---
 
+## 1.14.0-rc.1-official-smart-ebpf-v3.9-ingress-route — 2026-08-24
+
+- Added `route.rules[].inbound_interface` so transparent PBR gateways route by
+  the actual eBPF ingress interface instead of the unchanged client source IP.
+- This permits a direct `eth0/pa-us/pa-jp/pa-sg/pa-other` to
+  `HK/US/JP/SG/OT` mapping without SNAT or duplicated client subnets.
+
 ## 1.14.0-rc.1-official-smart-ebpf-v3.1 — 2026-08-21
 
 ### Official baseline
