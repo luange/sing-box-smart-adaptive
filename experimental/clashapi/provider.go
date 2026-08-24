@@ -20,6 +20,8 @@ func proxyProviderRouter(server *Server) http.Handler {
 		r.Use(parseProviderName, findProviderByName(server))
 		r.Get("/", getProvider(server))
 		r.Put("/", updateProvider)
+		r.Patch("/", patchProvider)
+		r.Delete("/", deleteProvider(server))
 		r.Get("/healthcheck", healthCheckProvider)
 		r.Route("/{proxyName}", func(r chi.Router) {
 			r.Use(parseProviderProxyName, findProviderProxyByName)
@@ -63,10 +65,69 @@ func providerInfo(server *Server, p adapter.Provider) *badjson.JSONObject {
 	info.Put("name", p.Tag())
 	info.Put("proxies", proxies)
 	info.Put("updatedAt", p.UpdatedAt())
+	if controller, ok := p.(adapter.ProviderLifecycleController); ok {
+		info.Put("paused", controller.ProviderPaused())
+		info.Put("consumers", controller.ProviderConsumers())
+		info.Put("supportsPause", true)
+	} else {
+		info.Put("paused", false)
+		info.Put("consumers", 0)
+		info.Put("supportsPause", false)
+	}
 	if p, ok := p.(adapter.ProviderSubscriptionInfo); ok {
 		info.Put("subscriptionInfo", p.SubscriptionInfo())
 	}
 	return &info
+}
+
+type providerPatchRequest struct {
+	Paused *bool `json:"paused"`
+}
+
+func patchProvider(w http.ResponseWriter, r *http.Request) {
+	provider := r.Context().Value(CtxKeyProvider).(adapter.Provider)
+	controller, supported := provider.(adapter.ProviderLifecycleController)
+	if !supported {
+		render.Status(r, http.StatusNotImplemented)
+		render.JSON(w, r, newError("provider does not support runtime pause"))
+		return
+	}
+	var request providerPatchRequest
+	if err := render.DecodeJSON(r.Body, &request); err != nil || request.Paused == nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("paused is required"))
+		return
+	}
+	controller.SetProviderPaused(*request.Paused)
+	render.NoContent(w, r)
+}
+
+func deleteProvider(server *Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provider := r.Context().Value(CtxKeyProvider).(adapter.Provider)
+		controller, controllable := provider.(adapter.ProviderLifecycleController)
+		if r.URL.Query().Get("permanent") != "true" {
+			if !controllable {
+				render.Status(r, http.StatusNotImplemented)
+				render.JSON(w, r, newError("provider does not support recoverable deletion"))
+				return
+			}
+			controller.SetProviderPaused(true)
+			render.NoContent(w, r)
+			return
+		}
+		if controllable && controller.ProviderConsumers() > 0 {
+			render.Status(r, http.StatusConflict)
+			render.JSON(w, r, newError("provider is still referenced by runtime consumers; pause it or remove those references first"))
+			return
+		}
+		if err := server.provider.Remove(provider.Tag()); err != nil {
+			render.Status(r, http.StatusServiceUnavailable)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		render.NoContent(w, r)
+	}
 }
 
 func updateProvider(w http.ResponseWriter, r *http.Request) {

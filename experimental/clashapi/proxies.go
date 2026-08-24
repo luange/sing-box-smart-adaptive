@@ -82,14 +82,22 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	}
 	if smartGroup, isSmart := detour.(adapter.SmartGroup); isSmart {
 		status := smartGroup.SmartStatus()
-		info.Put("type", "Selector")
+		info.Put("type", "Smart")
 		info.Put("all", append([]string{"♻️ 智能选择"}, smartGroup.All()...))
 		if status.TemporaryOverride != "" {
 			info.Put("now", status.TemporaryOverride)
+			info.Put("fixed", status.TemporaryOverride)
+			info.Put("smart_mode", "temporary")
 		} else if status.Pinned != "" {
 			info.Put("now", status.Pinned)
+			info.Put("fixed", status.Pinned)
+			info.Put("smart_mode", "pinned")
+		} else if status.Selected != "" {
+			info.Put("now", status.Selected)
+			info.Put("smart_mode", "auto")
 		} else {
 			info.Put("now", "♻️ 智能选择")
+			info.Put("smart_mode", "warming")
 		}
 		info.Put("smart", status)
 	}

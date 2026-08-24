@@ -38,6 +38,7 @@ type Adapter struct {
 	endpointsByTag  map[string]adapter.Outbound
 	ticker          *time.Ticker
 	checking        atomic.Bool
+	paused          atomic.Bool
 	history         *urltest.HistoryStorage
 	callbackAccess  sync.Mutex
 	callbacks       list.List[adapter.ProviderUpdateCallback]
@@ -305,15 +306,33 @@ func (a *Adapter) Close() error {
 }
 
 func (a *Adapter) loopCheck() {
-	a.healthcheck(a.ctx)
+	if !a.paused.Load() {
+		a.healthcheck(a.ctx)
+	}
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-a.ticker.C:
-			a.healthcheck(a.ctx)
+			if !a.paused.Load() {
+				a.healthcheck(a.ctx)
+			}
 		}
 	}
+}
+
+func (a *Adapter) SetProviderPaused(paused bool) {
+	a.paused.Store(paused)
+}
+
+func (a *Adapter) ProviderPaused() bool {
+	return a.paused.Load()
+}
+
+func (a *Adapter) ProviderConsumers() int {
+	a.callbackAccess.Lock()
+	defer a.callbackAccess.Unlock()
+	return a.callbacks.Len()
 }
 
 func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {

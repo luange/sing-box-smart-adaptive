@@ -49,6 +49,16 @@ type ProviderUpdater interface {
 	Update() error
 }
 
+// ProviderLifecycleController exposes optional runtime provider management to
+// API clients. Pausing is deliberately non-destructive: existing outbounds stay
+// available to consumers while scheduled downloads and health checks stop.
+// This makes the operation reversible without rewriting the configuration.
+type ProviderLifecycleController interface {
+	SetProviderPaused(paused bool)
+	ProviderPaused() bool
+	ProviderConsumers() int
+}
+
 type ProviderSubscriptionInfo interface {
 	SubscriptionInfo() SubscriptionInfo
 }

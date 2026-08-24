@@ -137,6 +137,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Get("/logs", getLogs(s.ctx, logFactory))
 		r.Get("/traffic", traffic(s.ctx, trafficManager))
 		r.Get("/version", version)
+		r.Get("/capabilities", capabilities)
 		r.Mount("/configs", configRouter(s, logFactory))
 		r.Mount("/proxies", proxyRouter(s, s.router))
 		r.Mount("/rules", ruleRouter(s.router))
@@ -165,6 +166,29 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		})
 	}
 	return s, nil
+}
+
+func capabilities(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, r, render.M{
+		"apiVersion": 1,
+		"core":       "sing-box",
+		"features": render.M{
+			"maintenance": render.M{
+				"dnsFlush":    true,
+				"fakeIPFlush": true,
+			},
+			"providers": render.M{
+				"list":            true,
+				"update":          true,
+				"healthcheck":     true,
+				"pauseRestore":    true,
+				"permanentDelete": true,
+			},
+			"smart": render.M{
+				"nativeGroup": true,
+			},
+		},
+	})
 }
 
 func (s *Server) Name() string {

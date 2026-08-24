@@ -254,6 +254,9 @@ func (s *ProviderRemote) resolveTransport() (adapter.HTTPTransport, error) {
 }
 
 func (s *ProviderRemote) updateOnce() {
+	if s.ProviderPaused() {
+		return
+	}
 	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
 	if err := s.fetch(ctx, false); err != nil {
 		s.logger.Error("update outbound provider: ", err)
