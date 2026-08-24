@@ -82,7 +82,10 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	}
 	if smartGroup, isSmart := detour.(adapter.SmartGroup); isSmart {
 		status := smartGroup.SmartStatus()
-		info.Put("type", "Smart")
+		// Keep the standard Clash schema consumable by dashboards that do not
+		// know the Smart extension. Smart-aware clients detect smart_mode/smart
+		// and can render richer semantics without requiring a second API.
+		info.Put("type", "Selector")
 		info.Put("all", append([]string{"♻️ 智能选择"}, smartGroup.All()...))
 		if status.TemporaryOverride != "" {
 			info.Put("now", status.TemporaryOverride)
