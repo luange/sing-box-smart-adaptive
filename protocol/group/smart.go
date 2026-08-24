@@ -63,6 +63,14 @@ const (
 	defaultSmartMaxHistoryEntries = 4096
 	smartStatusCandidateLimit     = 32
 	smartNetworkFingerprintTTL    = 2 * time.Second
+	// Background profiling follows traffic demand. A cold/idle group only
+	// samples a small rotating subset; real traffic wakes a larger bounded
+	// cycle. This keeps large catch-all groups from consuming the same probe
+	// budget as an actively routed regional group.
+	defaultSmartActivityWindow    = 15 * time.Minute
+	defaultSmartIdleProbeInterval = 30 * time.Minute
+	defaultSmartColdProbeBudget   = 4
+	defaultSmartActiveProbeBudget = 16
 )
 
 func sniffOrDomain(metadata *adapter.InboundContext) string {
@@ -259,6 +267,7 @@ type Smart struct {
 	connectionsKept        atomic.Uint64
 	probing                atomic.Bool
 	probeCursor            atomic.Uint64
+	lastActivityUnixNano   atomic.Int64
 	closing                atomic.Bool
 	cancel                 context.CancelFunc
 	worker                 sync.WaitGroup
@@ -614,8 +623,6 @@ func (s *Smart) unregisterProviderCallbacks() {
 
 func (s *Smart) run(ctx context.Context) {
 	defer s.worker.Done()
-	probeTicker := time.NewTicker(s.probeInterval)
-	defer probeTicker.Stop()
 	if s.probeStartupDelay > 0 {
 		timer := time.NewTimer(s.probeStartupDelay)
 		select {
@@ -636,27 +643,72 @@ func (s *Smart) run(ctx context.Context) {
 		cold = s.probeCycleTimeout
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, cold)
-	_, _ = s.probe(probeCtx)
+	_, _ = s.probeWithBudget(probeCtx, defaultSmartColdProbeBudget)
 	cancel()
+	nextInterval := s.nextProbeInterval(time.Now())
+	probeTimer := time.NewTimer(nextInterval)
+	defer probeTimer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-probeTicker.C:
+		case <-probeTimer.C:
 			if s.closing.Load() {
 				return
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
-			_, _ = s.probe(probeCtx)
+			_, _ = s.probeWithBudget(probeCtx, s.scheduledProbeBudget(time.Now()))
 			cancel()
+			probeTimer.Reset(s.nextProbeInterval(time.Now()))
 		case <-s.probeNow:
 			if s.closing.Load() {
 				return
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
-			_, _ = s.probe(probeCtx)
+			_, _ = s.probeWithBudget(probeCtx, s.requestedProbeBudget(time.Now()))
 			cancel()
+			if !probeTimer.Stop() {
+				select {
+				case <-probeTimer.C:
+				default:
+				}
+			}
+			probeTimer.Reset(s.nextProbeInterval(time.Now()))
 		}
+	}
+}
+
+func (s *Smart) activeAt(now time.Time) bool {
+	last := s.lastActivityUnixNano.Load()
+	return last > 0 && now.Sub(time.Unix(0, last)) <= defaultSmartActivityWindow
+}
+
+func (s *Smart) nextProbeInterval(now time.Time) time.Duration {
+	if s.activeAt(now) {
+		return s.probeInterval
+	}
+	return max(s.probeInterval, defaultSmartIdleProbeInterval)
+}
+
+func (s *Smart) scheduledProbeBudget(now time.Time) int {
+	if s.activeAt(now) {
+		return defaultSmartActiveProbeBudget
+	}
+	return 1
+}
+
+func (s *Smart) requestedProbeBudget(now time.Time) int {
+	if s.activeAt(now) {
+		return defaultSmartActiveProbeBudget
+	}
+	return defaultSmartColdProbeBudget
+}
+
+func (s *Smart) noteTrafficActivity() {
+	now := time.Now()
+	previous := s.lastActivityUnixNano.Swap(now.UnixNano())
+	if previous == 0 || now.Sub(time.Unix(0, previous)) > defaultSmartActivityWindow {
+		s.requestProbe()
 	}
 }
 
@@ -866,6 +918,7 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 }
 
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	s.noteTrafficActivity()
 	transport := N.NetworkName(network)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer ranking.Release()
@@ -1061,6 +1114,7 @@ func (s *Smart) smartHedgeDelay() time.Duration {
 }
 
 func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	s.noteTrafficActivity()
 	transport := N.NetworkUDP
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer ranking.Release()
@@ -1154,6 +1208,10 @@ func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
+	return s.probeWithBudget(ctx, 0)
+}
+
+func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uint16, error) {
 	result := make(map[string]uint16)
 	if ctx.Err() != nil || s.closing.Load() {
 		return result, ctx.Err()
@@ -1173,8 +1231,15 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 		return result, nil
 	}
 	if len(candidates) > 1 {
-		start := int(s.probeCursor.Add(1)-1) % len(candidates)
+		advance := 1
+		if budget > 0 && budget < len(candidates) {
+			advance = budget
+		}
+		start := int(s.probeCursor.Add(uint64(advance))-uint64(advance)) % len(candidates)
 		candidates = append(candidates[start:], candidates[:start]...)
+	}
+	if budget > 0 && len(candidates) > budget {
+		candidates = candidates[:budget]
 	}
 	type probeResult struct {
 		candidate adapter.Outbound

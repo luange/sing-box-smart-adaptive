@@ -62,6 +62,117 @@ func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
 	}
 }
 
+func TestSmartProbeScheduleFollowsTrafficActivity(t *testing.T) {
+	smart := &Smart{
+		probeInterval: 10 * time.Minute,
+		probeNow:      make(chan struct{}, 1),
+	}
+	now := time.Now()
+	if smart.activeAt(now) {
+		t.Fatal("new Smart group must start idle")
+	}
+	if interval := smart.nextProbeInterval(now); interval != defaultSmartIdleProbeInterval {
+		t.Fatalf("idle interval = %v, want %v", interval, defaultSmartIdleProbeInterval)
+	}
+	if budget := smart.scheduledProbeBudget(now); budget != 1 {
+		t.Fatalf("idle scheduled budget = %d, want 1", budget)
+	}
+	if budget := smart.requestedProbeBudget(now); budget != defaultSmartColdProbeBudget {
+		t.Fatalf("cold requested budget = %d, want %d", budget, defaultSmartColdProbeBudget)
+	}
+
+	smart.noteTrafficActivity()
+	now = time.Now()
+	if !smart.activeAt(now) {
+		t.Fatal("real traffic did not wake Smart profiling")
+	}
+	if interval := smart.nextProbeInterval(now); interval != smart.probeInterval {
+		t.Fatalf("active interval = %v, want %v", interval, smart.probeInterval)
+	}
+	if budget := smart.scheduledProbeBudget(now); budget != defaultSmartActiveProbeBudget {
+		t.Fatalf("active scheduled budget = %d, want %d", budget, defaultSmartActiveProbeBudget)
+	}
+	select {
+	case <-smart.probeNow:
+	default:
+		t.Fatal("first real traffic did not request an immediate profile cycle")
+	}
+
+	// Additional traffic inside the activity window must not enqueue a probe
+	// per connection; that would turn a busy group into a probe storm.
+	smart.noteTrafficActivity()
+	select {
+	case <-smart.probeNow:
+		t.Fatal("active traffic enqueued a duplicate immediate probe")
+	default:
+	}
+
+	smart.lastActivityUnixNano.Store(time.Now().Add(-defaultSmartActivityWindow - time.Second).UnixNano())
+	smart.noteTrafficActivity()
+	select {
+	case <-smart.probeNow:
+	default:
+		t.Fatal("traffic after idle did not wake Smart profiling")
+	}
+}
+
+func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
+	registry := &smartProbeRegistry{
+		ctx:     context.Background(),
+		cancel:  func() {},
+		entries: make(map[string]*smartProbeEntry),
+		slots:   make(chan struct{}, 5),
+		probe: func(_ context.Context, _ string, _ adapter.Outbound) (uint16, error) {
+			return 10, nil
+		},
+	}
+	candidates := make([]adapter.Outbound, 10)
+	byTag := make(map[string]adapter.Outbound, len(candidates))
+	probeKeys := make(map[string]string, len(candidates))
+	for index := range candidates {
+		tag := "node-" + itoaSmall(index)
+		leaf := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, tag, []string{N.NetworkTCP}, nil)}
+		candidates[index] = leaf
+		byTag[tag] = leaf
+		probeKeys[tag] = tag
+	}
+	smart := &Smart{
+		ctx:               context.Background(),
+		control:           &smartControlState{},
+		store:             newSmartStore(time.Hour, 3, time.Minute),
+		probeURL:          probe.GoogleConnectivityURL,
+		probeInterval:     time.Minute,
+		probeTimeout:      time.Second,
+		probeRegistry:     registry,
+		candidates:        candidates,
+		candidateByTag:    byTag,
+		candidateProbeKey: probeKeys,
+		lastSelected:      make(map[string]string),
+		affinity:          make(map[string]smartAffinity),
+		switchChallenges:  make(map[string]smartSwitchChallenge),
+		halfOpen:          make(map[string]struct{}),
+	}
+	first, err := smart.probeWithBudget(context.Background(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := smart.probeWithBudget(context.Background(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 4 || len(second) != 4 {
+		t.Fatalf("unexpected budget result sizes: first=%d second=%d", len(first), len(second))
+	}
+	for tag := range first {
+		if _, exists := second[tag]; exists {
+			t.Fatalf("consecutive rotating windows overlapped on %s", tag)
+		}
+	}
+	if cursor := smart.probeCursor.Load(); cursor != 8 {
+		t.Fatalf("probe cursor = %d, want 8", cursor)
+	}
+}
+
 func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(1000, 0)
