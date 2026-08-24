@@ -33,8 +33,6 @@ func TestServiceResolverBindsYouTubeCrossDomainSession(t *testing.T) {
 }
 
 func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
-	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
-	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000")}
 	tests := map[string]string{
 		"accounts.google.com": "google_account", "payments.google.com": "google_account",
 		"appleid.apple.com": "apple_account", "smp-device-content.g.aaplimg.com": "apple_account",
@@ -42,6 +40,8 @@ func TestServiceResolverSecurityAndMessagingFamilies(t *testing.T) {
 		"challenges.cloudflare.com": "cloudflare_challenge", "web.whatsapp.com": "whatsapp", "mmg.whatsapp.net": "whatsapp",
 	}
 	for host, expected := range tests {
+		resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+		client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.10:1000")}
 		if got := resolver.Resolve(client, M.ParseSocksaddr(host+":443"), N.NetworkTCP); got.ID != expected || got.Mode != ModeStrictAffinity {
 			t.Fatalf("service family mismatch host=%s got=%+v", host, got)
 		}
@@ -63,7 +63,6 @@ func TestServiceResolverIsolatesProductAffinitySpines(t *testing.T) {
 		{"accounts.google.com", "google_account"},
 		{"appleid.apple.com", "apple_account"},
 		{"login.microsoftonline.com", "microsoft_account"},
-		{"challenges.cloudflare.com", "cloudflare_challenge"},
 		{"api.openai.com", "openai_api"},
 	}
 	sessions := make(map[string]SessionKey)
@@ -87,6 +86,16 @@ func TestServiceResolverIsolatesProductAffinitySpines(t *testing.T) {
 	cdn := resolver.Resolve(client, M.ParseSocksaddr("auth.openai.com.cdn.cloudflare.net:443"), N.NetworkTCP)
 	if cdn.ID != "chatgpt_web" || cdn.Session != sessions["chatgpt_web"] {
 		t.Fatalf("chatgpt CDN host lost product spine: %+v", cdn)
+	}
+}
+
+func TestServiceResolverChallengeInheritsProductSpine(t *testing.T) {
+	resolver := NewServiceResolver(testIdentityHasher(t), ModeAdaptive)
+	client := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.2:1000")}
+	product := resolver.Resolve(client, M.ParseSocksaddr("chatgpt.com:443"), N.NetworkTCP)
+	challenge := resolver.Resolve(client, M.ParseSocksaddr("challenges.cloudflare.com:443"), N.NetworkTCP)
+	if challenge.ID != product.ID || challenge.Session != product.Session {
+		t.Fatalf("challenge did not inherit product spine: product=%+v challenge=%+v", product, challenge)
 	}
 }
 

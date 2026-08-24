@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/nodefilter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -170,6 +171,7 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		minSamples:           3,
 		maxHistoryEntries:    50000,
 		interruptGroup:       interruptGroupForTest(),
+		families:             trafficfamily.NewResolver(),
 	}
 }
 
@@ -812,7 +814,7 @@ func TestSmartSiteIdentityUsesSniffHostForIPDestination(t *testing.T) {
 
 func TestSmartGoogleServiceFamilySharesAffinityIdentity(t *testing.T) {
 	hosts := []string{
-		"www.google.com", "accounts.google.com", "www.googleapis.com",
+		"www.google.com", "www.googleapis.com",
 		"ssl.gstatic.com", "lh3.googleusercontent.com", "mtalk.google.com", "mail.google.com",
 	}
 	var expectedKey string
@@ -826,6 +828,23 @@ func TestSmartGoogleServiceFamilySharesAffinityIdentity(t *testing.T) {
 		} else if key != expectedKey {
 			t.Fatalf("Google host %s split affinity: %s != %s", host, key, expectedKey)
 		}
+	}
+}
+
+func TestSmartAccountAndChallengeFamiliesStayStable(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	smart := newTestSmart(first)
+	metadata := &adapter.InboundContext{Inbound: "US-in", Source: M.ParseSocksaddr("192.168.0.2:1000"), Domain: "chatgpt.com"}
+	product, productKey := smart.resolveSmartSiteIdentity(metadata, M.ParseSocksaddr("198.18.0.1:443"))
+	metadata.Domain = "challenges.cloudflare.com"
+	challenge, challengeKey := smart.resolveSmartSiteIdentity(metadata, M.ParseSocksaddr("198.18.0.2:443"))
+	if product != "service:chatgpt_web" || challenge != product || challengeKey != productKey {
+		t.Fatalf("Smart challenge lost parent family: product=%q challenge=%q", product, challenge)
+	}
+	metadata.Domain = "accounts.google.com"
+	account, _ := smart.resolveSmartSiteIdentity(metadata, M.ParseSocksaddr("198.18.0.3:443"))
+	if account != "service:google_account" {
+		t.Fatalf("Google account merged into generic Google family: %q", account)
 	}
 }
 

@@ -10,10 +10,9 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	"golang.org/x/net/publicsuffix"
 )
 
 type PolicyMode string
@@ -51,6 +50,7 @@ type ServiceResolver struct {
 	defaultMode PolicyMode
 	access      sync.RWMutex
 	overrides   map[string]ServiceOverride
+	families    *trafficfamily.Resolver
 }
 
 type ServiceOverride struct {
@@ -63,15 +63,12 @@ func NewServiceResolver(hasher *IdentityHasher, defaultMode PolicyMode) *Service
 	if defaultMode == "" {
 		defaultMode = ModeAdaptive
 	}
-	return &ServiceResolver{hasher: hasher, defaultMode: defaultMode, overrides: make(map[string]ServiceOverride)}
+	return &ServiceResolver{hasher: hasher, defaultMode: defaultMode, overrides: make(map[string]ServiceOverride), families: trafficfamily.NewResolver()}
 }
 
 func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination M.Socksaddr, transport string) ServiceContext {
 	host := destinationHost(metadata, destination)
-	serviceID, mode := resolveServiceFamily(host, r.defaultMode)
-	if override, loaded := r.override(serviceID, time.Now()); loaded {
-		mode = override.Mode
-	}
+	now := time.Now()
 	clientScope := "default"
 	if metadata != nil {
 		var processID uint32
@@ -84,6 +81,15 @@ func (r *ServiceResolver) Resolve(metadata *adapter.InboundContext, destination 
 			metadata.User,
 			strconv.FormatUint(uint64(processID), 10),
 		}, "\x00")
+	}
+	match := r.families.Resolve(host, clientScope, now)
+	serviceID := match.ID
+	mode := r.defaultMode
+	if match.StrictAffinity {
+		mode = ModeStrictAffinity
+	}
+	if override, loaded := r.override(serviceID, now); loaded {
+		mode = override.Mode
 	}
 	return ServiceContext{
 		ID:                serviceID,
@@ -366,42 +372,6 @@ func (r *ServiceResolver) override(serviceID string, now time.Time) (ServiceOver
 	return override, loaded && override.ExpiresAt.After(now)
 }
 
-func resolveServiceFamily(host string, defaultMode PolicyMode) (string, PolicyMode) {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	switch {
-	case domainMatches(host, "youtube.com", "youtu.be", "ytimg.com", "ggpht.com", "googlevideo.com", "youtube-nocookie.com"):
-		return "youtube", ModeStrictAffinity
-	case domainMatches(host, "gemini.google.com", "bard.google.com", "generativelanguage.googleapis.com"):
-		return "gemini", ModeStrictAffinity
-	case host == "api.openai.com" || domainMatches(host, "platform.openai.com"):
-		return "openai_api", ModeStrictAffinity
-	case domainMatches(host, "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com", "openai.com.cdn.cloudflare.net", "oaistatic.com.cdn.cloudflare.net", "chatgpt.com.cdn.cloudflare.net"):
-		return "chatgpt_web", ModeStrictAffinity
-	case domainMatches(host, "claude.ai", "anthropic.com"):
-		return "claude", ModeStrictAffinity
-	case domainMatches(host, "telegram.org", "t.me", "telegram.me", "telegram.dog"):
-		return "telegram", ModeStrictAffinity
-	case domainMatches(host, "accounts.google.com", "oauth2.googleapis.com", "securetoken.googleapis.com", "pay.google.com", "payments.google.com", "payments.googleusercontent.com"):
-		return "google_account", ModeStrictAffinity
-	case domainMatches(host, "appleid.apple.com", "idmsa.apple.com", "appleid.cdn-apple.com", "aaplimg.com"):
-		return "apple_account", ModeStrictAffinity
-	case domainMatches(host, "login.microsoftonline.com", "login.live.com", "account.live.com", "msauth.net", "msftauth.net"):
-		return "microsoft_account", ModeStrictAffinity
-	case domainMatches(host, "challenges.cloudflare.com", "turnstile.cloudflare.com"):
-		return "cloudflare_challenge", ModeStrictAffinity
-	case domainMatches(host, "whatsapp.com", "whatsapp.net", "wa.me"):
-		return "whatsapp", ModeStrictAffinity
-	}
-	if host == "" {
-		return "unknown", defaultMode
-	}
-	identity, err := publicsuffix.EffectiveTLDPlusOne(host)
-	if err != nil {
-		identity = host
-	}
-	return "site:" + identity, defaultMode
-}
-
 func destinationHost(metadata *adapter.InboundContext, destination M.Socksaddr) string {
 	if metadata != nil {
 		// A FakeIP reverse mapping represents the original requested domain and
@@ -431,13 +401,4 @@ func destinationHost(metadata *adapter.InboundContext, destination M.Socksaddr) 
 		return destination.Addr.String()
 	}
 	return ""
-}
-
-func domainMatches(host string, domains ...string) bool {
-	for _, domain := range domains {
-		if host == domain || strings.HasSuffix(host, "."+domain) {
-			return true
-		}
-	}
-	return false
 }

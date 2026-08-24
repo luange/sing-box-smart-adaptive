@@ -24,6 +24,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -269,6 +270,7 @@ type Smart struct {
 	releaseProbeRegistry   func()
 	probeStartupDelay      time.Duration
 	probeNow               chan struct{}
+	families               *trafficfamily.Resolver
 }
 
 type smartSwitchChallenge struct {
@@ -465,6 +467,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		releaseProbeRegistry: releaseProbeRegistry,
 		probeStartupDelay:    probeRegistry.startupDelay(),
 		probeNow:             make(chan struct{}, 1),
+		families:             trafficfamily.NewResolver(),
 	}
 	return smart, nil
 }
@@ -1304,7 +1307,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	now := time.Now()
 	pinned, temporary, _, _ := s.controlSnapshot(now)
 	networkKey := s.networkFingerprint()
-	siteDisplay, siteKey := smartSiteIdentity(adapter.ContextFrom(ctx), destination)
+	siteDisplay, siteKey := s.resolveSmartSiteIdentity(adapter.ContextFrom(ctx), destination)
 	s.access.RLock()
 	ranking := acquireSmartRanking(len(s.candidates))
 	ranking.candidates = append(ranking.candidates, s.candidates...)
@@ -2040,6 +2043,17 @@ func smartNetworkFingerprint(networkInterface *adapter.NetworkInterface, wifi ad
 }
 
 func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr) (string, string) {
+	return resolveSmartSiteIdentity(nil, metadata, destination)
+}
+
+func (s *Smart) resolveSmartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr) (string, string) {
+	if s == nil {
+		return smartSiteIdentity(metadata, destination)
+	}
+	return resolveSmartSiteIdentity(s.families, metadata, destination)
+}
+
+func resolveSmartSiteIdentity(families *trafficfamily.Resolver, metadata *adapter.InboundContext, destination M.Socksaddr) (string, string) {
 	host := ""
 	if metadata != nil {
 		host = sniffOrDomain(metadata)
@@ -2049,11 +2063,19 @@ func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr
 	}
 	if host != "" {
 		if net.ParseIP(host) == nil {
-			if family := smartServiceFamily(host); family != "" {
+			family := ""
+			if families != nil {
+				family = families.Resolve(host, smartFamilyClientScope(metadata), time.Now()).ID
+			} else {
+				family = trafficfamily.Classify(host).ID
+			}
+			if family != "" && family != "unknown" && !strings.HasPrefix(family, "site:") {
 				display := "service:" + family
 				return display, "site-" + hashSmartIdentity(display)
 			}
-			if etld, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+			if strings.HasPrefix(family, "site:") {
+				host = strings.TrimPrefix(family, "site:")
+			} else if etld, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
 				host = etld
 			}
 		}
@@ -2072,29 +2094,11 @@ func smartSiteIdentity(metadata *adapter.InboundContext, destination M.Socksaddr
 	return "", ""
 }
 
-func smartServiceFamily(host string) string {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	switch {
-	case smartDomainMatches(host, "youtube.com", "youtu.be", "ytimg.com", "ggpht.com", "googlevideo.com", "youtube-nocookie.com"):
-		return "youtube"
-	case smartDomainMatches(host, "gemini.google.com", "bard.google.com", "generativelanguage.googleapis.com"):
-		return "gemini"
-	case smartDomainMatches(host,
-		"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
-		"gmail.com", "googlemail.com", "1e100.net"):
-		return "google"
-	default:
-		return ""
+func smartFamilyClientScope(metadata *adapter.InboundContext) string {
+	if metadata == nil {
+		return "default"
 	}
-}
-
-func smartDomainMatches(host string, suffixes ...string) bool {
-	for _, suffix := range suffixes {
-		if host == suffix || strings.HasSuffix(host, "."+suffix) {
-			return true
-		}
-	}
-	return false
+	return metadata.Inbound + "\x00" + metadata.Source.Addr.String() + "\x00" + metadata.User
 }
 
 func smartEstimateReason(estimate smartEstimate) string {
