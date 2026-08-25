@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,9 +20,10 @@ import (
 )
 
 const (
-	segmentMagic       = "SBH2"
-	defaultSegmentSize = int64(8 << 20)
-	defaultMaxDiskSize = int64(256 << 20)
+	segmentMagic        = "SBH2"
+	defaultSegmentSize  = int64(8 << 20)
+	defaultMaxDiskSize  = int64(256 << 20)
+	maxHistoryFrameSize = uint32(64 << 20)
 )
 
 type aggregate struct {
@@ -311,46 +313,104 @@ func (d *database) readBlocks(kind string, reverse bool, callback func(segmentBl
 		if file.kind != kind {
 			continue
 		}
-		data, readErr := os.ReadFile(file.path)
+		segment, readErr := os.Open(file.path)
 		if readErr != nil {
 			return readErr
 		}
-		blocks := make([]segmentBlock, 0, 8)
-		for offset := 0; offset+8 <= len(data); {
-			if string(data[offset:offset+4]) != segmentMagic {
-				break
+		frames, scanErr := scanSegmentFrames(segment)
+		if scanErr != nil {
+			segment.Close()
+			return fmt.Errorf("scan history segment %s: %w", filepath.Base(file.path), scanErr)
+		}
+		var compressed []byte
+		var plain []byte
+		readFrame := func(frame segmentFrame) (bool, error) {
+			if cap(compressed) < int(frame.length) {
+				compressed = make([]byte, frame.length)
+			} else {
+				compressed = compressed[:frame.length]
 			}
-			length := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
-			offset += 8
-			if length < 0 || offset+length > len(data) {
-				break
+			if _, frameErr := segment.ReadAt(compressed, frame.offset); frameErr != nil {
+				return false, frameErr
 			}
-			plain, decodeErr := d.decoder.DecodeAll(data[offset:offset+length], nil)
+			decoded, decodeErr := d.decoder.DecodeAll(compressed, plain[:0])
 			if decodeErr != nil {
-				return decodeErr
+				return false, decodeErr
 			}
+			plain = decoded
 			var block segmentBlock
 			if jsonErr := json.Unmarshal(plain, &block); jsonErr != nil {
-				return jsonErr
+				return false, jsonErr
 			}
-			blocks = append(blocks, block)
-			offset += length
+			return callback(block), nil
 		}
 		if reverse {
-			for index := len(blocks) - 1; index >= 0; index-- {
-				if !callback(blocks[index]) {
+			for index := len(frames) - 1; index >= 0; index-- {
+				keepGoing, frameErr := readFrame(frames[index])
+				if frameErr != nil {
+					segment.Close()
+					return frameErr
+				}
+				if !keepGoing {
+					segment.Close()
 					return nil
 				}
 			}
 		} else {
-			for _, block := range blocks {
-				if !callback(block) {
+			for _, frame := range frames {
+				keepGoing, frameErr := readFrame(frame)
+				if frameErr != nil {
+					segment.Close()
+					return frameErr
+				}
+				if !keepGoing {
+					segment.Close()
 					return nil
 				}
 			}
 		}
+		if closeErr := segment.Close(); closeErr != nil {
+			return closeErr
+		}
 	}
 	return nil
+}
+
+type segmentFrame struct {
+	offset int64
+	length uint32
+}
+
+// scanSegmentFrames reads only 8-byte headers. It intentionally tolerates a
+// short final header/body left by a crash, while rejecting corrupt interior
+// frames and unreasonable allocation requests.
+func scanSegmentFrames(segment *os.File) ([]segmentFrame, error) {
+	info, err := segment.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	frames := make([]segmentFrame, 0, max(1, int(size/(64<<10))))
+	var header [8]byte
+	for offset := int64(0); offset+8 <= size; {
+		if _, err = segment.ReadAt(header[:], offset); err != nil {
+			return nil, err
+		}
+		if string(header[:4]) != segmentMagic {
+			return nil, errors.New("invalid frame magic")
+		}
+		length := binary.BigEndian.Uint32(header[4:])
+		if length == 0 || length > maxHistoryFrameSize {
+			return nil, fmt.Errorf("invalid frame size %d", length)
+		}
+		bodyOffset := offset + 8
+		if bodyOffset+int64(length) > size {
+			break
+		}
+		frames = append(frames, segmentFrame{offset: bodyOffset, length: length})
+		offset = bodyOffset + int64(length)
+	}
+	return frames, nil
 }
 
 func (d *database) Connections(query Query) (ConnectionPage, error) {
