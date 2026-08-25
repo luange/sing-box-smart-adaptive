@@ -67,13 +67,20 @@ Smart/selector/urltest/loadbalance implement `PreMatchOutboundGroup`.
     "connection_history": {
       "enabled": true,
       "path": "/var/lib/sing-box/connection-history.db",
-      "retention": "168h"
+	  "detail_retention": "6h",
+	  "aggregate_retention": "720h",
+	  "segment_size": "8M",
+	  "max_disk_size": "256M"
     },
     "clash_api": { "external_controller": "127.0.0.1:9090" }
   }
 }
 ```
 API: `GET /history` (status), `/history/summary|trend|connections|domains|...`
+
+The path is a compatibility anchor. SBH2 data lives in `<path>.segments`; a
+legacy BoltDB at `<path>` is reported as `legacyDatabaseSize` but is never mmaped.
+Expiry unlinks immutable segments, so deleted history immediately returns disk space.
 
 ### eBPF splice (proxy zero-copy)
 Requires kernel sockmap. Config on eBPF inbound `outbound_offload.splice`.

@@ -5,6 +5,7 @@ package connectionhistory
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,12 +34,16 @@ type counterState struct {
 }
 
 type Manager struct {
-	ctx       context.Context
-	logger    log.ContextLogger
-	traffic   *trafficcontrol.Manager
-	path      string
-	uiPath    string
-	retention time.Duration
+	ctx                context.Context
+	logger             log.ContextLogger
+	traffic            *trafficcontrol.Manager
+	path               string
+	uiPath             string
+	retention          time.Duration
+	detailRetention    time.Duration
+	aggregateRetention time.Duration
+	segmentSize        int64
+	maxDiskSize        int64
 
 	database     *database
 	closeQueue   chan trafficcontrol.TrackerMetadata
@@ -66,24 +71,44 @@ func New(ctx context.Context, logger log.ContextLogger, traffic *trafficcontrol.
 	if retention <= 0 {
 		retention = 30 * 24 * time.Hour
 	}
+	detailRetention := time.Duration(options.DetailRetention)
+	if detailRetention <= 0 {
+		detailRetention = 6 * time.Hour
+	}
+	aggregateRetention := time.Duration(options.AggregateRetention)
+	if aggregateRetention <= 0 {
+		aggregateRetention = retention
+	}
+	segmentSize := defaultSegmentSize
+	if options.SegmentSize != nil {
+		segmentSize = int64(options.SegmentSize.Value())
+	}
+	maxDiskSize := defaultMaxDiskSize
+	if options.MaxDiskSize != nil {
+		maxDiskSize = int64(options.MaxDiskSize.Value())
+	}
 	var uiPath string
 	if options.ExternalUI != "" {
 		uiPath = filemanager.BasePath(ctx, options.ExternalUI)
 	}
 	return &Manager{
-		ctx:            ctx,
-		logger:         logger,
-		traffic:        traffic,
-		path:           filemanager.BasePath(ctx, path),
-		uiPath:         uiPath,
-		retention:      retention,
-		closeQueue:     make(chan trafficcontrol.TrackerMetadata, closeQueueSize),
-		openQueue:      make(chan trafficcontrol.TrackerMetadata, openQueueSize),
-		done:           make(chan struct{}),
-		loopDone:       make(chan struct{}),
-		states:         make(map[string]*counterState),
-		closed:         make(map[string]time.Time),
-		pendingTraffic: make(map[aggregateKey]aggregate),
+		ctx:                ctx,
+		logger:             logger,
+		traffic:            traffic,
+		path:               filemanager.BasePath(ctx, path),
+		uiPath:             uiPath,
+		retention:          retention,
+		detailRetention:    detailRetention,
+		aggregateRetention: aggregateRetention,
+		segmentSize:        segmentSize,
+		maxDiskSize:        maxDiskSize,
+		closeQueue:         make(chan trafficcontrol.TrackerMetadata, closeQueueSize),
+		openQueue:          make(chan trafficcontrol.TrackerMetadata, openQueueSize),
+		done:               make(chan struct{}),
+		loopDone:           make(chan struct{}),
+		states:             make(map[string]*counterState),
+		closed:             make(map[string]time.Time),
+		pendingTraffic:     make(map[aggregateKey]aggregate),
 	}, nil
 }
 
@@ -95,7 +120,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateInitialize || m.started.Load() {
 		return nil
 	}
-	database, err := openDatabase(m.ctx, m.path)
+	database, err := openSegmentDatabase(m.path, m.detailRetention, m.aggregateRetention, m.segmentSize, m.maxDiskSize)
 	if err != nil {
 		return err
 	}
@@ -174,21 +199,28 @@ func (m *Manager) Dimensions(name string, query Query) (DimensionPage, error) {
 
 func (m *Manager) Status() Status {
 	var databaseSize int64
+	var segmentCount int
 	if m.database != nil {
 		databaseSize = m.database.Size()
+		segmentCount = m.database.SegmentCount()
+	}
+	var legacyDatabaseSize int64
+	if info, err := os.Stat(m.path); err == nil {
+		legacyDatabaseSize = info.Size()
 	}
 	return Status{
-		DatabaseSize: databaseSize,
-		Queued:       len(m.closeQueue) + len(m.openQueue),
-		DroppedOpen:  m.droppedOpen.Load(),
-		DroppedClose: m.droppedClose.Load(),
+		DatabaseSize: databaseSize, LegacyDatabaseSize: legacyDatabaseSize,
+		MaxDiskSize: m.maxDiskSize, SegmentCount: segmentCount, StorageFormat: "sbh2-zstd-segments",
+		Queued: len(m.closeQueue) + len(m.openQueue), DroppedOpen: m.droppedOpen.Load(), DroppedClose: m.droppedClose.Load(),
 	}
 }
 
 func (m *Manager) loop() {
 	defer close(m.loopDone)
 	flushTicker := time.NewTicker(time.Second)
-	sampleTicker := time.NewTicker(5 * time.Second)
+	// Long-lived flows are checkpointed once per minute. Open/close events remain
+	// immediate, removing the old 5-second full-connection scan and its write amplification.
+	sampleTicker := time.NewTicker(time.Minute)
 	pruneTicker := time.NewTicker(time.Hour)
 	defer flushTicker.Stop()
 	defer sampleTicker.Stop()

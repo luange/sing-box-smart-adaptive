@@ -14,10 +14,14 @@ type ExperimentalOptions struct {
 }
 
 type ConnectionHistoryOptions struct {
-	Enabled    bool               `json:"enabled,omitempty"`
-	Path       string             `json:"path,omitempty"`
-	ExternalUI string             `json:"external_ui,omitempty"`
-	Retention  badoption.Duration `json:"retention,omitempty"`
+	Enabled            bool                     `json:"enabled,omitempty"`
+	Path               string                   `json:"path,omitempty"`
+	ExternalUI         string                   `json:"external_ui,omitempty"`
+	Retention          badoption.Duration       `json:"retention,omitempty"`
+	DetailRetention    badoption.Duration       `json:"detail_retention,omitempty"`
+	AggregateRetention badoption.Duration       `json:"aggregate_retention,omitempty"`
+	SegmentSize        *byteformats.MemoryBytes `json:"segment_size,omitempty"`
+	MaxDiskSize        *byteformats.MemoryBytes `json:"max_disk_size,omitempty"`
 }
 
 type CacheFileOptions struct {
@@ -53,7 +57,6 @@ type ClashAPIOptions struct {
 	// Deprecated: migrated to global cache file
 	StoreFakeIP bool `json:"store_fakeip,omitempty" schema:"omit"`
 }
-
 
 // MemoryReclaimOptions controls conservative return of unused Go heap pages to
 // the operating system. It never discards live objects or connection state.

@@ -71,10 +71,14 @@ type DimensionPage struct {
 }
 
 type Status struct {
-	DatabaseSize int64  `json:"databaseSize"`
-	Queued       int    `json:"queued"`
-	DroppedOpen  uint64 `json:"droppedOpen"`
-	DroppedClose uint64 `json:"droppedClose"`
+	DatabaseSize       int64  `json:"databaseSize"`
+	LegacyDatabaseSize int64  `json:"legacyDatabaseSize,omitempty"`
+	MaxDiskSize        int64  `json:"maxDiskSize"`
+	SegmentCount       int    `json:"segmentCount"`
+	StorageFormat      string `json:"storageFormat"`
+	Queued             int    `json:"queued"`
+	DroppedOpen        uint64 `json:"droppedOpen"`
+	DroppedClose       uint64 `json:"droppedClose"`
 }
 
 type Service interface {

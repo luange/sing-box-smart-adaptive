@@ -3,26 +3,29 @@
 package connectionhistory
 
 import (
-	"bytes"
-	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/bbolt"
-	"github.com/sagernet/sing/service/filemanager"
+	"github.com/klauspost/compress/zstd"
 )
 
-var (
-	bucketConnections = []byte("connections")
-	bucketMinutes     = []byte("minutes")
-	bucketHours       = []byte("hours")
+const (
+	segmentMagic       = "SBH2"
+	defaultSegmentSize = int64(8 << 20)
+	defaultMaxDiskSize = int64(256 << 20)
 )
 
 type aggregate struct {
+	Hour        bool   `json:"h,omitempty"`
 	Bucket      int64  `json:"t"`
 	Domain      string `json:"d,omitempty"`
 	IP          string `json:"i,omitempty"`
@@ -44,136 +47,322 @@ type aggregateKey struct {
 	Rule     string
 }
 
-type database struct {
-	path string
-	db   *bbolt.DB
+type segmentBlock struct {
+	Records    []Record    `json:"r,omitempty"`
+	Aggregates []aggregate `json:"a,omitempty"`
 }
 
-func openDatabase(ctx context.Context, path string) (*database, error) {
-	const fileMode = 0o666
-	file, err := filemanager.OpenFile(ctx, path, os.O_RDWR|os.O_CREATE, fileMode)
+type segmentWriter struct {
+	kind    string
+	file    *os.File
+	path    string
+	created int64
+	size    int64
+}
+
+// database is an append-only immutable-segment store. It avoids mmap and
+// copy-on-write page churn; expiry unlinks complete files in O(1).
+type database struct {
+	access             sync.RWMutex
+	dir                string
+	segmentSize        int64
+	maxDiskSize        int64
+	detailRetention    time.Duration
+	aggregateRetention time.Duration
+	pruneCutoff        atomic.Int64
+	sequence           uint64
+	detail             segmentWriter
+	aggregate          segmentWriter
+	encoder            *zstd.Encoder
+	decoder            *zstd.Decoder
+}
+
+func openDatabase(_ any, path string) (*database, error) {
+	return openSegmentDatabase(path, 6*time.Hour, 30*24*time.Hour, defaultSegmentSize, defaultMaxDiskSize)
+}
+
+func openSegmentDatabase(path string, detailRetention, aggregateRetention time.Duration, segmentSize, maxDiskSize int64) (*database, error) {
+	if detailRetention <= 0 {
+		detailRetention = 6 * time.Hour
+	}
+	if aggregateRetention <= 0 {
+		aggregateRetention = 30 * 24 * time.Hour
+	}
+	if segmentSize <= 0 {
+		segmentSize = defaultSegmentSize
+	}
+	if maxDiskSize <= 0 {
+		maxDiskSize = defaultMaxDiskSize
+	}
+	dir := path + ".segments"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
 	if err != nil {
 		return nil, err
 	}
-	if err = file.Close(); err != nil {
-		return nil, err
-	}
-	db, err := bbolt.Open(path, fileMode, &bbolt.Options{Timeout: time.Second})
+	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 	if err != nil {
+		encoder.Close()
 		return nil, err
 	}
-	if err = filemanager.Chown(ctx, path); err != nil {
-		db.Close()
-		return nil, err
-	}
-	storage := &database{path: path, db: db}
-	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{bucketConnections, bucketMinutes, bucketHours} {
-			if _, createErr := tx.CreateBucketIfNotExists(name); createErr != nil {
-				return createErr
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	return storage, nil
+	return &database{
+		dir: dir, segmentSize: segmentSize, maxDiskSize: maxDiskSize,
+		detailRetention: detailRetention, aggregateRetention: aggregateRetention,
+		encoder: encoder, decoder: decoder,
+	}, nil
 }
 
 func (d *database) Close() error {
-	return d.db.Close()
+	d.access.Lock()
+	defer d.access.Unlock()
+	var result error
+	for _, writer := range []*segmentWriter{&d.detail, &d.aggregate} {
+		if writer.file != nil {
+			result = errors.Join(result, writer.file.Sync(), writer.file.Close())
+			writer.file = nil
+		}
+	}
+	d.encoder.Close()
+	d.decoder.Close()
+	return result
 }
 
 func (d *database) Size() int64 {
-	info, err := os.Stat(d.path)
-	if err != nil {
-		return 0
+	d.access.RLock()
+	defer d.access.RUnlock()
+	files, _ := os.ReadDir(d.dir)
+	var size int64
+	for _, entry := range files {
+		if info, err := entry.Info(); err == nil {
+			size += info.Size()
+		}
 	}
-	return info.Size()
+	return size
 }
 
-func (d *database) Write(records []Record, aggregates map[aggregateKey]aggregate) error {
-	return d.db.Update(func(tx *bbolt.Tx) error {
-		connections := tx.Bucket(bucketConnections)
-		for _, record := range records {
-			value, err := json.Marshal(record)
-			if err != nil {
-				return err
-			}
-			if err = connections.Put(connectionKey(record), value); err != nil {
-				return err
-			}
+func (d *database) SegmentCount() int {
+	d.access.RLock()
+	defer d.access.RUnlock()
+	files, _ := d.segmentFilesLocked()
+	return len(files)
+}
+
+func (d *database) Write(records []Record, updates map[aggregateKey]aggregate) error {
+	d.access.Lock()
+	defer d.access.Unlock()
+	if len(records) > 0 {
+		if err := d.appendBlock(&d.detail, segmentBlock{Records: append([]Record(nil), records...)}); err != nil {
+			return err
 		}
-		for key, update := range aggregates {
-			bucketName := bucketMinutes
-			if key.Hour {
-				bucketName = bucketHours
-			}
-			bucket := tx.Bucket(bucketName)
-			storageKey := dimensionKey(key)
-			if current := bucket.Get(storageKey); current != nil {
-				var existing aggregate
-				if err := json.Unmarshal(current, &existing); err != nil {
-					return err
-				}
-				update.Upload += existing.Upload
-				update.Download += existing.Download
-				update.Connections += existing.Connections
-			}
-			value, err := json.Marshal(update)
-			if err != nil {
-				return err
-			}
-			if err = bucket.Put(storageKey, value); err != nil {
-				return err
-			}
+	}
+	if len(updates) > 0 {
+		aggregates := make([]aggregate, 0, len(updates))
+		for _, item := range updates {
+			aggregates = append(aggregates, item)
 		}
-		return nil
-	})
+		if err := d.appendBlock(&d.aggregate, segmentBlock{Aggregates: aggregates}); err != nil {
+			return err
+		}
+	}
+	return d.enforceLimitLocked()
+}
+
+func (d *database) appendBlock(writer *segmentWriter, block segmentBlock) error {
+	payload, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	compressed := d.encoder.EncodeAll(payload, nil)
+	frameSize := int64(8 + len(compressed))
+	if writer.file == nil || writer.size+frameSize > d.segmentSize {
+		if err = d.rotate(writer); err != nil {
+			return err
+		}
+	}
+	frame := make([]byte, 8+len(compressed))
+	copy(frame[:4], segmentMagic)
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(compressed)))
+	copy(frame[8:], compressed)
+	n, err := writer.file.Write(frame)
+	writer.size += int64(n)
+	return err
+}
+
+func (d *database) rotate(writer *segmentWriter) error {
+	if writer.file != nil {
+		if err := errors.Join(writer.file.Sync(), writer.file.Close()); err != nil {
+			return err
+		}
+	}
+	d.sequence++
+	created := time.Now().UnixNano()
+	kind := writer.kind
+	if kind == "" {
+		if writer == &d.detail {
+			kind = "detail"
+		} else {
+			kind = "aggregate"
+		}
+	}
+	path := filepath.Join(d.dir, kind+"-"+strconv.FormatInt(created, 10)+"-"+strconv.FormatUint(d.sequence, 10)+".sbh")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	*writer = segmentWriter{kind: kind, file: file, path: path, created: created}
+	return nil
 }
 
 func (d *database) Prune(cutoff time.Time) error {
-	return d.db.Update(func(tx *bbolt.Tx) error {
-		cutoffUnix := cutoff.Unix()
-		for _, name := range [][]byte{bucketConnections, bucketMinutes, bucketHours} {
-			bucket := tx.Bucket(name)
-			cursor := bucket.Cursor()
-			for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
-				if len(key) < 8 || int64(binary.BigEndian.Uint64(key[:8])) >= cutoffUnix {
-					break
+	d.access.Lock()
+	defer d.access.Unlock()
+	d.pruneCutoff.Store(cutoff.UnixNano())
+	now := time.Now()
+	files, err := d.segmentFilesLocked()
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		retention := d.aggregateRetention
+		if file.kind == "detail" {
+			retention = d.detailRetention
+		}
+		if now.Sub(time.Unix(0, file.created)) > retention && !d.isActivePath(file.path) {
+			_ = os.Remove(file.path)
+		}
+	}
+	return d.enforceLimitLocked()
+}
+
+type segmentFile struct {
+	path    string
+	kind    string
+	created int64
+	size    int64
+}
+
+func (d *database) segmentFilesLocked() ([]segmentFile, error) {
+	entries, err := os.ReadDir(d.dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]segmentFile, 0, len(entries))
+	for _, entry := range entries {
+		parts := strings.Split(entry.Name(), "-")
+		if len(parts) < 3 || (parts[0] != "detail" && parts[0] != "aggregate") {
+			continue
+		}
+		created, parseErr := strconv.ParseInt(parts[1], 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		info, statErr := entry.Info()
+		if statErr != nil {
+			continue
+		}
+		files = append(files, segmentFile{filepath.Join(d.dir, entry.Name()), parts[0], created, info.Size()})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].created < files[j].created })
+	return files, nil
+}
+
+func (d *database) isActivePath(path string) bool {
+	return path == d.detail.path || path == d.aggregate.path
+}
+
+func (d *database) enforceLimitLocked() error {
+	files, err := d.segmentFilesLocked()
+	if err != nil {
+		return err
+	}
+	var total int64
+	for _, file := range files {
+		total += file.size
+	}
+	for _, kind := range []string{"detail", "aggregate"} {
+		for _, file := range files {
+			if total <= d.maxDiskSize {
+				return nil
+			}
+			if file.kind != kind || d.isActivePath(file.path) {
+				continue
+			}
+			if err = os.Remove(file.path); err == nil {
+				total -= file.size
+			}
+		}
+	}
+	return nil
+}
+
+func (d *database) readBlocks(kind string, reverse bool, callback func(segmentBlock) bool) error {
+	d.access.Lock()
+	defer d.access.Unlock()
+	files, err := d.segmentFilesLocked()
+	if err != nil {
+		return err
+	}
+	if reverse {
+		sort.Slice(files, func(i, j int) bool { return files[i].created > files[j].created })
+	}
+	for _, file := range files {
+		if file.kind != kind {
+			continue
+		}
+		data, readErr := os.ReadFile(file.path)
+		if readErr != nil {
+			return readErr
+		}
+		blocks := make([]segmentBlock, 0, 8)
+		for offset := 0; offset+8 <= len(data); {
+			if string(data[offset:offset+4]) != segmentMagic {
+				break
+			}
+			length := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
+			offset += 8
+			if length < 0 || offset+length > len(data) {
+				break
+			}
+			plain, decodeErr := d.decoder.DecodeAll(data[offset:offset+length], nil)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			var block segmentBlock
+			if jsonErr := json.Unmarshal(plain, &block); jsonErr != nil {
+				return jsonErr
+			}
+			blocks = append(blocks, block)
+			offset += length
+		}
+		if reverse {
+			for index := len(blocks) - 1; index >= 0; index-- {
+				if !callback(blocks[index]) {
+					return nil
 				}
-				if err := cursor.Delete(); err != nil {
-					return err
+			}
+		} else {
+			for _, block := range blocks {
+				if !callback(block) {
+					return nil
 				}
 			}
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (d *database) Connections(query Query) (ConnectionPage, error) {
 	query = normalizeQuery(query)
+	if cutoff := d.pruneCutoff.Load(); cutoff > 0 && query.Start.Before(time.Unix(0, cutoff)) {
+		query.Start = time.Unix(0, cutoff)
+	}
 	var page ConnectionPage
-	err := d.db.View(func(tx *bbolt.Tx) error {
-		cursor := tx.Bucket(bucketConnections).Cursor()
-		for key, value := cursor.Last(); key != nil; key, value = cursor.Prev() {
-			if len(key) < 8 {
-				continue
-			}
-			closedAt := time.Unix(int64(binary.BigEndian.Uint64(key[:8])), 0)
-			if closedAt.After(query.End) {
-				continue
-			}
-			if closedAt.Before(query.Start) {
-				break
-			}
-			var record Record
-			if err := json.Unmarshal(value, &record); err != nil {
-				return err
-			}
-			if !recordMatches(record, query.Search) {
+	err := d.readBlocks("detail", true, func(block segmentBlock) bool {
+		for index := len(block.Records) - 1; index >= 0; index-- {
+			record := block.Records[index]
+			if record.ClosedAt.After(query.End) || record.ClosedAt.Before(query.Start) || !recordMatches(record, query.Search) {
 				continue
 			}
 			if page.Total >= query.Offset && len(page.Data) < query.Limit {
@@ -181,13 +370,30 @@ func (d *database) Connections(query Query) (ConnectionPage, error) {
 			}
 			page.Total++
 		}
-		return nil
+		return true
 	})
 	return page, err
 }
 
-func (d *database) Summary(query Query) (Summary, error) {
+func (d *database) scanAggregates(query Query, callback func(aggregate)) error {
 	query = normalizeQuery(query)
+	if cutoff := d.pruneCutoff.Load(); cutoff > 0 && query.Start.Before(time.Unix(0, cutoff)) {
+		query.Start = time.Unix(0, cutoff)
+	}
+	useHours := query.End.Sub(query.Start) > 48*time.Hour
+	return d.readBlocks("aggregate", false, func(block segmentBlock) bool {
+		for _, item := range block.Aggregates {
+			itemTime := time.Unix(item.Bucket, 0)
+			if item.Hour != useHours || itemTime.Before(query.Start) || itemTime.After(query.End) {
+				continue
+			}
+			callback(item)
+		}
+		return true
+	})
+}
+
+func (d *database) Summary(query Query) (Summary, error) {
 	var summary Summary
 	err := d.scanAggregates(query, func(item aggregate) {
 		summary.Upload += item.Upload
@@ -198,7 +404,6 @@ func (d *database) Summary(query Query) (Summary, error) {
 }
 
 func (d *database) Trend(query Query) ([]TrafficPoint, error) {
-	query = normalizeQuery(query)
 	points := make(map[int64]*TrafficPoint)
 	err := d.scanAggregates(query, func(item aggregate) {
 		point := points[item.Bucket]
@@ -210,15 +415,12 @@ func (d *database) Trend(query Query) ([]TrafficPoint, error) {
 		point.Download += item.Download
 		point.Connections += item.Connections
 	})
-	if err != nil {
-		return nil, err
-	}
 	result := make([]TrafficPoint, 0, len(points))
 	for _, point := range points {
 		result = append(result, *point)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Time.Before(result[j].Time) })
-	return result, nil
+	return result, err
 }
 
 func (d *database) Dimensions(name string, query Query) (DimensionPage, error) {
@@ -238,49 +440,22 @@ func (d *database) Dimensions(name string, query Query) (DimensionPage, error) {
 		dimension.Download += item.Download
 		dimension.Connections += item.Connections
 	})
-	if err != nil {
-		return DimensionPage{}, err
-	}
 	all := make([]Dimension, 0, len(values))
 	for _, value := range values {
 		all = append(all, *value)
 	}
 	sort.Slice(all, func(i, j int) bool {
-		left := all[i].Upload + all[i].Download
-		right := all[j].Upload + all[j].Download
+		left, right := all[i].Upload+all[i].Download, all[j].Upload+all[j].Download
 		if left == right {
 			return all[i].Value < all[j].Value
 		}
 		return left > right
 	})
 	page := DimensionPage{Total: len(all)}
-	if query.Offset >= len(all) {
-		return page, nil
+	if query.Offset < len(all) {
+		page.Data = all[query.Offset:min(query.Offset+query.Limit, len(all))]
 	}
-	end := min(query.Offset+query.Limit, len(all))
-	page.Data = all[query.Offset:end]
-	return page, nil
-}
-
-func (d *database) scanAggregates(query Query, callback func(item aggregate)) error {
-	bucketName := bucketMinutes
-	if query.End.Sub(query.Start) > 48*time.Hour {
-		bucketName = bucketHours
-	}
-	return d.db.View(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucketName).ForEach(func(_, value []byte) error {
-			var item aggregate
-			if err := json.Unmarshal(value, &item); err != nil {
-				return err
-			}
-			itemTime := time.Unix(item.Bucket, 0)
-			if itemTime.Before(query.Start) || itemTime.After(query.End) {
-				return nil
-			}
-			callback(item)
-			return nil
-		})
-	})
+	return page, err
 }
 
 func normalizeQuery(query Query) Query {
@@ -306,12 +481,7 @@ func recordMatches(record Record, search string) bool {
 		return true
 	}
 	search = strings.ToLower(search)
-	return strings.Contains(strings.ToLower(record.Domain), search) ||
-		strings.Contains(strings.ToLower(record.DestinationIP), search) ||
-		strings.Contains(strings.ToLower(record.SourceIP), search) ||
-		strings.Contains(strings.ToLower(record.Outbound), search) ||
-		strings.Contains(strings.ToLower(record.Rule), search) ||
-		strings.Contains(strings.ToLower(record.Process), search)
+	return strings.Contains(strings.ToLower(record.Domain), search) || strings.Contains(strings.ToLower(record.DestinationIP), search) || strings.Contains(strings.ToLower(record.SourceIP), search) || strings.Contains(strings.ToLower(record.Outbound), search) || strings.Contains(strings.ToLower(record.Rule), search) || strings.Contains(strings.ToLower(record.Process), search)
 }
 
 func aggregateDimension(item aggregate, name string) string {
@@ -331,33 +501,11 @@ func aggregateDimension(item aggregate, name string) string {
 	}
 }
 
-func connectionKey(record Record) []byte {
-	key := make([]byte, 8, 8+len(record.ID))
-	binary.BigEndian.PutUint64(key, uint64(record.ClosedAt.Unix()))
-	return append(key, record.ID...)
-}
-
-func dimensionKey(key aggregateKey) []byte {
-	prefix := make([]byte, 8)
-	binary.BigEndian.PutUint64(prefix, uint64(key.Bucket))
-	return bytes.Join([][]byte{
-		prefix,
-		[]byte(key.Domain),
-		[]byte(key.IP),
-		[]byte(key.Source),
-		[]byte(key.Outbound),
-		[]byte(key.Rule),
-	}, []byte{0})
-}
-
-func mergeAggregate(target map[aggregateKey]aggregate, key aggregateKey, upload int64, download int64, connections int64) {
+func mergeAggregate(target map[aggregateKey]aggregate, key aggregateKey, upload, download, connections int64) {
 	item := target[key]
-	item.Bucket = key.Bucket
-	item.Domain = key.Domain
-	item.IP = key.IP
-	item.Source = key.Source
-	item.Outbound = key.Outbound
-	item.Rule = key.Rule
+	item.Hour = key.Hour
+	item.Bucket, item.Domain, item.IP = key.Bucket, key.Domain, key.IP
+	item.Source, item.Outbound, item.Rule = key.Source, key.Outbound, key.Rule
 	item.Upload += upload
 	item.Download += download
 	item.Connections += connections

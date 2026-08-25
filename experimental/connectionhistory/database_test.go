@@ -4,8 +4,11 @@ package connectionhistory
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -92,6 +95,50 @@ func TestConnectionDeltaAndCloseRecord(t *testing.T) {
 	outbounds, err := database.Dimensions("outbounds", query)
 	require.NoError(t, err)
 	require.Equal(t, "proxy-a > selector", outbounds.Data[0].Value)
+}
+
+func TestSegmentCompressionCapacityAndTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.db")
+	database, err := openSegmentDatabase(path, time.Hour, 24*time.Hour, 1024, 8*1024)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	for batch := 0; batch < 80; batch++ {
+		records := make([]Record, 0, 16)
+		for index := 0; index < 16; index++ {
+			records = append(records, Record{
+				ID: fmt.Sprintf("%08d-%08d", batch, index), Network: "tcp",
+				Domain: "repeated-service.example.com", Outbound: "repeated-long-outbound-name",
+				Rule:     "inbound=PA-in inbound_interface=pa-hk => route(HK)",
+				ClosedAt: now.Add(time.Duration(batch) * time.Second),
+			})
+		}
+		require.NoError(t, database.Write(records, nil))
+	}
+	require.LessOrEqual(t, database.Size(), int64(10*1024), "hard cap may exceed by at most active segment size")
+	files, err := os.ReadDir(path + ".segments")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	require.NoError(t, database.Close())
+
+	// A crash-torn final frame must not make earlier complete frames unreadable.
+	var lastPath string
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "detail-") {
+			lastPath = filepath.Join(path+".segments", file.Name())
+		}
+	}
+	require.NotEmpty(t, lastPath)
+	file, err := os.OpenFile(lastPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = file.Write([]byte("SBH2\x00\x00"))
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	database, err = openSegmentDatabase(path, time.Hour, 24*time.Hour, 1024, 8*1024)
+	require.NoError(t, err)
+	defer database.Close()
+	_, err = database.Connections(Query{Start: now.Add(-time.Minute), End: now.Add(time.Hour), Limit: 10})
+	require.NoError(t, err)
 }
 
 func TestDatabasePrune(t *testing.T) {
