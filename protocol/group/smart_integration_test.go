@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -1002,7 +1003,7 @@ func TestSmartObservedConnKeepsExtendedCounters(t *testing.T) {
 		firstByte.Add(1)
 	}, func(bytes int64, _ time.Duration) {
 		closedBytes.Store(bytes)
-	})
+	}, nil)
 	if _, loaded := observed.(N.ExtendedConn); !loaded {
 		t.Fatal("observed connection lost ExtendedConn support")
 	}
@@ -1034,6 +1035,43 @@ func TestSmartObservedConnKeepsExtendedCounters(t *testing.T) {
 	}
 	if closedBytes.Load() != 12 {
 		t.Fatalf("unexpected observed byte count: %d", closedBytes.Load())
+	}
+}
+
+func TestSmartObservedConnWakesOnceOnEstablishedTimeout(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConn(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	})
+	if err := observed.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 1)
+	for range 2 {
+		if _, err := observed.Read(buffer); err == nil {
+			t.Fatal("expected read timeout")
+		}
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("expected one coalesced recovery wake, got %d", failures.Load())
+	}
+}
+
+func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
+	local, peer := net.Pipe()
+	var failures atomic.Int32
+	observed := newSmartObservedConn(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	})
+	_ = peer.Close()
+	buffer := make([]byte, 1)
+	if _, err := observed.Read(buffer); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF, got %v", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("normal EOF woke recovery %d times", failures.Load())
 	}
 }
 

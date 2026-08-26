@@ -4,6 +4,15 @@
 
 ---
 
+## 1.14.0-rc.1-official-smart-ebpf-v3.13-stream-recovery — 2026-08-26
+
+- Wake the existing shared 204 recovery probe when an established Smart TCP
+  stream reports a timeout, reset, broken pipe, or network-unreachable error.
+- Do not directly penalize a node from a single stream error; ordinary EOF,
+  local close, and cancellation remain neutral.
+- Coalesce repeated errors from the same stream and add focused race-tested
+  regression coverage.
+
 ## 1.14.0-rc.1-official-smart-ebpf-v3.12-recovery — 2026-08-26
 
 - Wake one coalesced background recovery probe immediately after a real TCP

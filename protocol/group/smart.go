@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -943,6 +944,12 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
 		}, func(bytes int64, duration time.Duration) {
 			s.store.observeThroughput(time.Now(), networkKey, siteKey, candidate.Tag(), transport, bytes, duration)
+		}, func() {
+			// A stream can become unusable after DialContext succeeds (for
+			// example a stale multiplex session or a reset upstream socket).
+			// Wake the control-plane probe, but do not directly penalize the
+			// candidate: the shared 204 probe remains the source of truth.
+			s.requestProbe()
 		}), nil
 	} else {
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
@@ -2236,28 +2243,33 @@ type smartObservedConn struct {
 	writeBytes  atomic.Int64
 	firstRead   sync.Once
 	closeOnce   sync.Once
+	failureOnce sync.Once
 	onFirstByte func(time.Duration)
 	onClose     func(int64, time.Duration)
+	onFailure   func()
 }
 
-func newSmartObservedConn(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration)) net.Conn {
+func newSmartObservedConn(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onFailure func()) net.Conn {
 	return &smartObservedConn{
 		ExtendedConn: bufio.NewExtendedConn(conn),
 		startedAt:    startedAt,
 		onFirstByte:  onFirstByte,
 		onClose:      onClose,
+		onFailure:    onFailure,
 	}
 }
 
 func (c *smartObservedConn) Read(buffer []byte) (int, error) {
 	n, err := c.ExtendedConn.Read(buffer)
 	c.observeRead(int64(n))
+	c.observeFailure(err)
 	return n, err
 }
 
 func (c *smartObservedConn) Write(buffer []byte) (int, error) {
 	n, err := c.ExtendedConn.Write(buffer)
 	c.observeWrite(int64(n))
+	c.observeFailure(err)
 	return n, err
 }
 
@@ -2266,6 +2278,7 @@ func (c *smartObservedConn) ReadBuffer(buffer *buf.Buffer) error {
 	err := c.ExtendedConn.ReadBuffer(buffer)
 	readBytes := buffer.Len() - before
 	c.observeRead(int64(readBytes))
+	c.observeFailure(err)
 	return err
 }
 
@@ -2275,6 +2288,7 @@ func (c *smartObservedConn) WriteBuffer(buffer *buf.Buffer) error {
 	if err == nil && writeBytes > 0 {
 		c.observeWrite(int64(writeBytes))
 	}
+	c.observeFailure(err)
 	return err
 }
 
@@ -2315,6 +2329,33 @@ func (c *smartObservedConn) observeWrite(n int64) {
 	if n > 0 {
 		c.writeBytes.Add(n)
 	}
+}
+
+func (c *smartObservedConn) observeFailure(err error) {
+	if !isSmartStreamFailure(err) {
+		return
+	}
+	c.failureOnce.Do(func() {
+		if c.onFailure != nil {
+			c.onFailure()
+		}
+	})
+}
+
+func isSmartStreamFailure(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH)
 }
 
 // smartObservedPacketConn turns real transactional UDP blackholes into Smart
