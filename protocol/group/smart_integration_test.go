@@ -199,6 +199,37 @@ func TestSmartDialFailsOverWithinSameRequest(t *testing.T) {
 	}
 }
 
+func TestSmartDialFailureRequestsBackgroundRecovery(t *testing.T) {
+	first := newSmartFakeOutbound("first", errors.New("dial failed"))
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.probeNow = make(chan struct{}, 1)
+
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer (<-second.peers).Close()
+	select {
+	case <-smart.probeNow:
+	default:
+		t.Fatal("real dial failure did not request a background recovery probe")
+	}
+}
+
+func TestSmartConcurrentDialFailuresCoalesceRecoveryWake(t *testing.T) {
+	first := newSmartFakeOutbound("first", errors.New("dial failed"))
+	second := newSmartFakeOutbound("second", errors.New("dial failed"))
+	smart := newTestSmart(first, second)
+	smart.probeNow = make(chan struct{}, 1)
+
+	_, _ = smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if got := len(smart.probeNow); got != 1 {
+		t.Fatalf("failure burst queued %d recovery probes, want 1", got)
+	}
+}
+
 func TestSmartDialHedgesSlowCandidateWithinSameRequest(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	first.dialDelay = 400 * time.Millisecond

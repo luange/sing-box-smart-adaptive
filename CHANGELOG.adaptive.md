@@ -4,6 +4,15 @@
 
 ---
 
+## 1.14.0-rc.1-official-smart-ebpf-v3.12-recovery — 2026-08-26
+
+- Wake one coalesced background recovery probe immediately after a real TCP
+  dial failure, UDP setup failure, or response-expected UDP flow timeout.
+- Keep same-request candidate failover on the data plane; recovery no longer
+  depends on opening a dashboard or manually running a latency test.
+- Add focused and race-tested regression coverage for failure wake-up and
+  burst coalescing.
+
 ## 1.14.0-rc.1-official-smart-ebpf-v3.9-ingress-route — 2026-08-24
 
 - Added `route.rules[].inbound_interface` so transparent PBR gateways route by

@@ -1078,6 +1078,12 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			if result.err != nil {
 				s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, result.elapsed)
 				s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+				// A real data-plane failure must wake recovery itself.  Dashboard
+				// latency tests may also refresh the shared profile, but production
+				// failover must never depend on a user opening the proxy page.  The
+				// buffered request channel coalesces concurrent failures and the
+				// shared probe registry single-flights work per endpoint.
+				s.requestProbe()
 				attemptErrors = append(attemptErrors, E.Cause(result.err, "smart candidate ", candidate.Tag()))
 				if started < len(attempts) {
 					startAttempt(attempts[started])
@@ -1156,6 +1162,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		if err != nil {
 			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, elapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+			s.requestProbe()
 			attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
 			continue
 		}
@@ -1165,6 +1172,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		observed := newSmartObservedPacketConn(conn, startedAt, smartUDPExpectsResponse(destination), func(flowElapsed time.Duration) {
 			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+			s.requestProbe()
 		})
 		return s.interruptGroup.NewPacketConnWithKey(observed, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
 	}
