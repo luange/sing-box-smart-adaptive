@@ -83,6 +83,7 @@ type SmartGroupStatus struct {
 	SwitchesSelective         uint64                 `json:"switches_selective,omitempty"`
 	ConnectionsInterrupted    uint64                 `json:"connections_interrupted,omitempty"`
 	ConnectionsKept           uint64                 `json:"connections_kept,omitempty"`
+	StreamFailureWakes        uint64                 `json:"stream_failure_wakes,omitempty"`
 	Candidates                []SmartCandidateStatus `json:"candidates"`
 }
 

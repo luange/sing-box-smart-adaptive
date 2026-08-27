@@ -266,6 +266,7 @@ type Smart struct {
 	switchesSelective      atomic.Uint64
 	connectionsInterrupted atomic.Uint64
 	connectionsKept        atomic.Uint64
+	streamFailureWakes     atomic.Uint64
 	probing                atomic.Bool
 	probeCursor            atomic.Uint64
 	lastActivityUnixNano   atomic.Int64
@@ -806,6 +807,7 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.SwitchesSelective = s.switchesSelective.Load()
 	status.ConnectionsInterrupted = s.connectionsInterrupted.Load()
 	status.ConnectionsKept = s.connectionsKept.Load()
+	status.StreamFailureWakes = s.streamFailureWakes.Load()
 	s.switchAuditAccess.Lock()
 	status.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), s.switchAudit...)
 	s.switchAuditAccess.Unlock()
@@ -949,6 +951,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			// example a stale multiplex session or a reset upstream socket).
 			// Wake the control-plane probe, but do not directly penalize the
 			// candidate: the shared 204 probe remains the source of truth.
+			s.streamFailureWakes.Add(1)
 			s.requestProbe()
 		}), nil
 	} else {
