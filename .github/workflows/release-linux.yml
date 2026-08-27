@@ -60,6 +60,15 @@ jobs:
       - uses: mlugg/setup-zig@v2
         if: matrix.libc == 'musl'
 
+      - name: Validate committed v2 eBPF provenance
+        run: |
+          set -euo pipefail
+          # This runs before generation and verifies the object embedded by
+          # go:embed was produced from the checked-in v2 sources.  It avoids
+          # the stale-object gap without requiring byte identity across the
+          # different Clang toolchains used for release targets.
+          make -C common/ebpf check-v2-source
+
       - name: Generate eBPF objects
         run: |
           set -euo pipefail
