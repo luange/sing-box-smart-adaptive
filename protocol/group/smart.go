@@ -1059,6 +1059,18 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			return
 		}
 		delay := s.smartHedgeDelay()
+		// A well-sampled, highly reliable current candidate should get a
+		// little more first-byte time.  The first dial is still started
+		// immediately; this only delays a competing dial, avoiding needless
+		// Safari/Google connection races.  If the dial actually fails, the
+		// normal error path starts the next candidate without waiting.
+		if started == 1 && attempts[0].rank.status.State == "healthy" &&
+			attempts[0].rank.status.Reliability >= 0.9 && attempts[0].rank.status.Samples >= 10 {
+			delay += 250 * time.Millisecond
+			if delay > 1200*time.Millisecond {
+				delay = 1200 * time.Millisecond
+			}
+		}
 		if delay <= 0 {
 			hedgeC = nil
 			return
