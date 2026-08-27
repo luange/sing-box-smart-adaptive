@@ -50,15 +50,19 @@ const (
 	defaultSmartSwitchCooldown       = 10 * time.Minute
 	defaultSmartHedgeDelay           = 450 * time.Millisecond
 	minSmartHedgeDelay               = 250 * time.Millisecond
-	maxSmartHedgeDelay               = 750 * time.Millisecond
-	defaultSmartSwitchMargin         = 0.15
-	smartSwitchAuditLimit            = 128
-	defaultSmartExploration          = 0.08
-	defaultSmartMinSamples           = 3
-	defaultSmartMaxAttempts          = 3
-	defaultSmartBreakerFailures      = 3
-	defaultSmartBreakerCooldown      = 2 * time.Minute
-	defaultSmartHalfLife             = 30 * time.Minute
+	// Give a healthy, already-established path a little more time for its
+	// first byte before starting a competing dial.  This reduces Safari/Google
+	// asset bursts that otherwise create needless hedges; hard dial failures
+	// still advance immediately through the normal retry path.
+	maxSmartHedgeDelay          = 900 * time.Millisecond
+	defaultSmartSwitchMargin    = 0.15
+	smartSwitchAuditLimit       = 128
+	defaultSmartExploration     = 0.08
+	defaultSmartMinSamples      = 3
+	defaultSmartMaxAttempts     = 3
+	defaultSmartBreakerFailures = 3
+	defaultSmartBreakerCooldown = 2 * time.Minute
+	defaultSmartHalfLife        = 30 * time.Minute
 	// Homelab/router default: 48h + 4k is enough for site stickiness without
 	// multi-hundred-MB metric maps (5 groups × 50k was a common RSS blow-up).
 	defaultSmartHistoryRetention  = 48 * time.Hour
