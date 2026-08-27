@@ -77,6 +77,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			for _, candidate := range status.Candidates {
 				if candidate.ConnectMS > 0 && candidate.ConnectMS < 65535 {
 					result[candidate.Tag] = uint16(candidate.ConnectMS)
+					server.urlTestHistory.StoreURLTestHistory(candidate.Tag, &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(candidate.ConnectMS)})
 				}
 			}
 			render.JSON(w, r, result)
@@ -88,6 +89,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			for _, candidate := range status.Candidates {
 				if candidate.LastProbeDelay > 0 && candidate.LastProbeDelay < 65535 {
 					result[candidate.Tag] = uint16(candidate.LastProbeDelay)
+					server.urlTestHistory.StoreURLTestHistory(candidate.Tag, &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(candidate.LastProbeDelay)})
 				}
 			}
 			render.JSON(w, r, result)
