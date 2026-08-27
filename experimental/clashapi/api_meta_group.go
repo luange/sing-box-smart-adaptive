@@ -65,37 +65,6 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			render.JSON(w, r, ErrNotFound)
 			return
 		}
-		// Smart/AdaptivePool already maintain a bounded, shared health portrait.
-		// Do not fan out a second full probe from the dashboard: with many
-		// candidates that can exhaust the request deadline and report a false
-		// group failure even when the selected node is healthy.  Return the
-		// latest cached observations instead; the dedicated scheduler remains
-		// responsible for refreshing them.
-		if smart, ok := proxy.(adapter.SmartGroup); ok {
-			status := smart.SmartStatus()
-			result := make(map[string]uint16, len(status.Candidates))
-			for _, candidate := range status.Candidates {
-				if candidate.ConnectMS > 0 && candidate.ConnectMS < 65535 {
-					result[candidate.Tag] = uint16(candidate.ConnectMS)
-					server.urlTestHistory.StoreURLTestHistory(candidate.Tag, &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(candidate.ConnectMS)})
-				}
-			}
-			render.JSON(w, r, result)
-			return
-		}
-		if adaptive, ok := proxy.(adapter.AdaptivePoolGroup); ok {
-			status := adaptive.AdaptiveStatus()
-			result := make(map[string]uint16, len(status.Candidates))
-			for _, candidate := range status.Candidates {
-				if candidate.LastProbeDelay > 0 && candidate.LastProbeDelay < 65535 {
-					result[candidate.Tag] = uint16(candidate.LastProbeDelay)
-					server.urlTestHistory.StoreURLTestHistory(candidate.Tag, &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(candidate.LastProbeDelay)})
-				}
-			}
-			render.JSON(w, r, result)
-			return
-		}
-
 		query := r.URL.Query()
 		url := query.Get("url")
 		if strings.HasPrefix(url, "http://") {
