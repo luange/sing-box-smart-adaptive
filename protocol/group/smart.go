@@ -42,6 +42,7 @@ const (
 	defaultSmartProbeInterval        = 10 * time.Minute
 	defaultSmartProbeCycleTimeout    = 30 * time.Second
 	defaultSmartProbeTimeout         = 5 * time.Second
+	defaultSmartProbeConcurrency     = 2
 	defaultSmartAttemptTimeout       = 4 * time.Second
 	defaultSmartSiteStickiness       = 30 * time.Minute
 	defaultSmartSwitchConfirm        = 2 * time.Minute
@@ -236,6 +237,7 @@ type Smart struct {
 	probeInterval          time.Duration
 	probeCycleTimeout      time.Duration
 	probeTimeout           time.Duration
+	probeConcurrency       int
 	maxAttempts            int
 	attemptTimeout         time.Duration
 	siteStickiness         time.Duration
@@ -314,6 +316,13 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	probeTimeout := time.Duration(options.ProbeTimeout)
 	if probeTimeout <= 0 {
 		probeTimeout = defaultSmartProbeTimeout
+	}
+	probeConcurrency := options.ProbeConcurrency
+	if probeConcurrency <= 0 {
+		probeConcurrency = defaultSmartProbeConcurrency
+	}
+	if probeConcurrency > 4 {
+		probeConcurrency = 4
 	}
 	if probeCycleTimeout < probeTimeout {
 		probeCycleTimeout = probeTimeout
@@ -454,6 +463,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		probeInterval:        probeInterval,
 		probeCycleTimeout:    probeCycleTimeout,
 		probeTimeout:         probeTimeout,
+		probeConcurrency:     probeConcurrency,
 		maxAttempts:          maxAttempts,
 		attemptTimeout:       attemptTimeout,
 		siteStickiness:       siteStickiness,
@@ -1268,7 +1278,10 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	results := make(chan probeResult, len(candidates))
 	jobs := make(chan adapter.Outbound)
 	var waitGroup sync.WaitGroup
-	workerCount := min(5, len(candidates))
+	// Keep exploration from competing with real browser traffic.  The old
+	// fixed five workers caused Safari's parallel Google asset requests to
+	// fan out across many candidates and briefly starve the selected path.
+	workerCount := min(s.probeConcurrency, len(candidates))
 	for range workerCount {
 		waitGroup.Add(1)
 		go func() {

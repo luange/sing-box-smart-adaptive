@@ -54,6 +54,7 @@ type SmartOutboundOptions struct {
 	ProbeInterval        badoption.Duration          `json:"probe_interval,omitempty"`
 	ProbeCycleTimeout    badoption.Duration          `json:"probe_cycle_timeout,omitempty"`
 	ProbeTimeout         badoption.Duration          `json:"probe_timeout,omitempty"`
+	ProbeConcurrency     int                         `json:"probe_concurrency,omitempty"`
 	MaxAttempts          int                         `json:"max_attempts,omitempty"`
 	AttemptTimeout       badoption.Duration          `json:"attempt_timeout,omitempty"`
 	SiteStickiness       badoption.Duration          `json:"site_stickiness,omitempty"`
