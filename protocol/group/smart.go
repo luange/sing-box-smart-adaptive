@@ -1297,7 +1297,14 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	// Keep exploration from competing with real browser traffic.  The old
 	// fixed five workers caused Safari's parallel Google asset requests to
 	// fan out across many candidates and briefly starve the selected path.
-	workerCount := min(s.probeConcurrency, len(candidates))
+	probeConcurrency := s.probeConcurrency
+	// Test/embedded constructors may not pass through NewSmart. Preserve the
+	// bounded default there as well; a zero value must never silently create a
+	// probe cycle with no workers.
+	if probeConcurrency <= 0 {
+		probeConcurrency = defaultSmartProbeConcurrency
+	}
+	workerCount := min(probeConcurrency, len(candidates))
 	for range workerCount {
 		waitGroup.Add(1)
 		go func() {
@@ -2041,13 +2048,6 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.control.access.Unlock()
 	s.setCandidatesReadyStatus(candidates)
 	return nil
-}
-
-func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
-	// Provider runtime tags are unique within one Box and the same outbound
-	// object/tag is shared by every Smart group subscribing to that provider.
-	// Credential variants receive distinct provider tags and must not share.
-	return candidate.Type() + "\x00" + candidate.Tag()
 }
 
 func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {

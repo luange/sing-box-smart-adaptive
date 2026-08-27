@@ -2,6 +2,16 @@
 
 只记录相对 **SagerNet 官方 tag** 的本仓库变更。上游 changelog 见 `docs/changelog.md`。
 
+## Unreleased — Smart probe/profile stability
+
+- Share Smart probe admission across credential variants that describe the
+  same provider endpoint; credentials remain excluded from the identity while
+  endpoint address, port, TLS and transport stay part of the profile key.
+- Preserve a bounded probe worker default for embedded/test constructors so a
+  zero-value concurrency setting cannot silently disable all health checks.
+- Add regression coverage for endpoint identity separation and credential
+  rotation.
+
 ---
 
 ## 1.14.0-rc.1-official-smart-ebpf-v3.13-stream-recovery — 2026-08-26
