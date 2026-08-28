@@ -87,3 +87,22 @@ func TestEndpointProfileCadenceIsIndependentPerTrack(t *testing.T) {
 		t.Fatalf("DNS profile cadence mismatch: %+v ok=%v", dns, ok)
 	}
 }
+
+func TestEndpointProfileDeferredDoesNotChangeCadence(t *testing.T) {
+	registry := NewEndpointProfileRegistry()
+	endpoint := NodeID{43}
+	now := time.Unix(1_700_000_000, 0)
+	registry.RecordResult(endpoint, TrackTCP4, ProbeResult{Outcome: OutcomeSuccess, Delay: time.Millisecond}, now)
+	before, ok := registry.Snapshot(endpoint, TrackTCP4)
+	if !ok {
+		t.Fatal("success result did not create endpoint profile")
+	}
+	registry.RecordResult(endpoint, TrackTCP4, ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}, now.Add(time.Second))
+	after, ok := registry.Snapshot(endpoint, TrackTCP4)
+	if !ok {
+		t.Fatal("deferred result removed endpoint profile")
+	}
+	if after != before {
+		t.Fatalf("deferred result changed endpoint cadence: before=%+v after=%+v", before, after)
+	}
+}

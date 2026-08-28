@@ -300,6 +300,7 @@ func (b *V3Backend) WriteControlV3(enabled bool, flags uint32, activeBank, gener
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previous := b.control
 	if generation == 0 {
 		generation = 1
 	}
@@ -309,7 +310,11 @@ func (b *V3Backend) WriteControlV3(enabled bool, flags uint32, activeBank, gener
 	if routingMark != 0 {
 		b.control.RoutingMark = routingMark
 	}
-	return b.writeControl(enabled)
+	if err := b.writeControl(enabled); err != nil {
+		b.control = previous
+		return err
+	}
+	return nil
 }
 
 func (b *V3Backend) RegisterListenerSocket(key uint32, fd int) error {
@@ -334,13 +339,20 @@ func (b *V3Backend) SetFlowDirect(enabled bool) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previousControl := b.control
+	previousFlowEnabled := b.flowEnabled
 	b.flowEnabled = enabled
 	if enabled {
 		b.control.Flags |= v3FlagExactFlow
 	} else {
 		b.control.Flags &^= v3FlagExactFlow
 	}
-	return b.writeControl(b.control.Enabled != 0)
+	if err := b.writeControl(b.control.Enabled != 0); err != nil {
+		b.control = previousControl
+		b.flowEnabled = previousFlowEnabled
+		return err
+	}
+	return nil
 }
 
 func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
@@ -451,17 +463,27 @@ func (b *V3Backend) InvalidateFlowDirect() error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previous := b.control
 	b.control.PolicyGeneration++
 	if b.control.PolicyGeneration == 0 {
 		b.control.PolicyGeneration = 1
 	}
-	// Also bump reload counter for soak observability.
+	if err := b.writeControl(b.control.Enabled != 0); err != nil {
+		// A failed control-map write leaves the kernel on the old generation;
+		// restore the in-process mirror so later publishes cannot skip a
+		// generation that was never committed.
+		b.control = previous
+		return err
+	}
+	// Also bump reload counter for soak observability after the generation was
+	// accepted by the kernel.  Counter failure is best-effort and does not
+	// invalidate the already committed control update.
 	idx := uint32(25) // SB_V3_STAT_RELOAD_GENERATION
 	var cur uint64
 	_ = lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&cur))
 	cur++
 	_ = updateMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&cur))
-	return b.writeControl(b.control.Enabled != 0)
+	return nil
 }
 
 func (b *V3Backend) PolicyGeneration() uint32 {
@@ -709,6 +731,8 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previousControl := b.control
+	previousStatic := append([]netip.Prefix(nil), b.lastStatic...)
 	if generation == 0 {
 		generation = b.control.PolicyGeneration + 1
 		if generation == 0 {
@@ -744,10 +768,18 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 			return err
 		}
 	}
-	b.lastStatic = next
 	b.control.ActiveBank = inactive
 	b.control.PolicyGeneration = generation
-	return b.writeControl(b.control.Enabled != 0)
+	if err := b.writeControl(b.control.Enabled != 0); err != nil {
+		// The inactive bank may contain the newly compiled entries, but it is not
+		// reachable until the control commit succeeds. Restore both mirrors so a
+		// retry computes its delta from the last committed snapshot.
+		b.control = previousControl
+		b.lastStatic = previousStatic
+		return err
+	}
+	b.lastStatic = next
+	return nil
 }
 
 // MergeStaticDirect installs one DIRECT prefix into the *active* bank using the

@@ -316,6 +316,7 @@ func (b *SharedNetworkBackend) SetFlowDirect(enabled bool) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previous := b.control
 	if b.control.FlowGeneration == 0 {
 		b.control.FlowGeneration = 1
 	}
@@ -324,7 +325,13 @@ func (b *SharedNetworkBackend) SetFlowDirect(enabled bool) error {
 	} else {
 		b.control.Flags &^= 1 << 7
 	}
-	return b.updateControl(b.control.Enabled != 0)
+	if err := b.updateControl(b.control.Enabled != 0); err != nil {
+		// The kernel control map is authoritative.  Do not leave the Go-side
+		// mirror claiming that flow-direct changed when the write was rejected.
+		b.control = previous
+		return err
+	}
+	return nil
 }
 
 func makeSharedNetworkFlowKey(protocol uint8, source, destination netip.AddrPort) (sharedNetworkFlowKey, error) {
@@ -389,11 +396,16 @@ func (b *SharedNetworkBackend) InvalidateFlowDirect() error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previous := b.control
 	b.control.FlowGeneration++
 	if b.control.FlowGeneration == 0 {
 		b.control.FlowGeneration = 1
 	}
-	return b.updateControl(b.control.Enabled != 0)
+	if err := b.updateControl(b.control.Enabled != 0); err != nil {
+		b.control = previous
+		return err
+	}
+	return nil
 }
 
 func (b *SharedNetworkBackend) updateControl(enabled bool) error {

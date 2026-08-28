@@ -45,6 +45,22 @@ type EndpointProfileRegistry struct {
 	maxEntries int
 }
 
+// RecordResult commits only a settled probe outcome to the shared endpoint
+// profile. Deferred outcomes describe scheduling or identity churn (for
+// example a retired catalog revision), not a node failure, so they must not
+// advance the failure backoff or erase a healthy profile.
+func (r *EndpointProfileRegistry) RecordResult(endpointID NodeID, track EndpointProbeTrack, result ProbeResult, now time.Time) {
+	if r == nil {
+		return
+	}
+	switch result.Outcome {
+	case OutcomeSuccess:
+		r.Record(endpointID, track, true, result.Delay, now)
+	case OutcomeFailure:
+		r.Record(endpointID, track, false, result.Delay, now)
+	}
+}
+
 var globalEndpointProfiles = NewEndpointProfileRegistry()
 
 func NewEndpointProfileRegistry() *EndpointProfileRegistry {

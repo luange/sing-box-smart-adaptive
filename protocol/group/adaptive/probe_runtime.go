@@ -355,7 +355,7 @@ func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidat
 				}
 			}
 			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
-			globalEndpointProfiles.Record(candidate.EndpointID, TrackTCP4, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
+			globalEndpointProfiles.RecordResult(candidate.EndpointID, TrackTCP4, result, time.Now())
 			return result
 		},
 	}
@@ -398,7 +398,7 @@ func (p *AdaptivePool) dnsHealthProbeTask(snapshot *ExecutionSnapshot, candidate
 				}
 			}
 			result := p.runDNSHealthProbe(ctx, snapshot, candidate, family)
-			globalEndpointProfiles.Record(candidate.EndpointID, track, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
+			globalEndpointProfiles.RecordResult(candidate.EndpointID, track, result, time.Now())
 			return result
 		},
 	}
