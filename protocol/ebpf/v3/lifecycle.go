@@ -1,6 +1,7 @@
 package v3
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"sync"
@@ -212,7 +213,13 @@ func (l *Lifecycle) LearnFlow(client, dest netip.AddrPort, protocol uint8, bareD
 		return err
 	}
 	if l.sink != nil {
-		return l.sink.PutDirectFlow(protocol, client, dest, l.flowTTL)
+		if err := l.sink.PutDirectFlow(protocol, client, dest, l.flowTTL); err != nil {
+			// Keep the audit mirror truthful when the live kernel rejects the
+			// publish.  A stale mirror would make later policy decisions believe
+			// a DIRECT flow exists even though TC never installed it.
+			rollbackErr := l.backend.RevokeFlow(client, dest, protocol)
+			return errors.Join(err, rollbackErr)
+		}
 	}
 	return nil
 }
@@ -224,11 +231,11 @@ func (l *Lifecycle) RevokeFlow(client, dest netip.AddrPort, protocol uint8) erro
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_ = l.backend.RevokeFlow(client, dest, protocol)
+	backendErr := l.backend.RevokeFlow(client, dest, protocol)
 	if l.sink != nil {
-		return l.sink.DeleteDirectFlow(protocol, client, dest)
+		return errors.Join(backendErr, l.sink.DeleteDirectFlow(protocol, client, dest))
 	}
-	return nil
+	return backendErr
 }
 
 // ObserveDNS records DNS/FakeIP evidence with conflict isolation and mirrors
@@ -259,10 +266,16 @@ func (l *Lifecycle) ObserveDNS(addr netip.Addr, direct bool, evidence uint8, ttl
 	}
 	key := ebpfv3.DNSIPKey{Family: family, Addr: raw}
 	expire := uint64(now.Add(ttl).UnixNano())
-	l.backend.DNS.Observe(key, direct, evidence, 0, l.backend.Control.PolicyGeneration, expire, uint64(now.UnixNano()))
 	if l.sink != nil {
-		_ = l.sink.PublishDNSHint(addr, direct, evidence, 0, ttl)
+		// Do not advance the mirror when the live sink rejects the hint.  The
+		// method is intentionally best-effort for existing callers, so the
+		// error is omitted here but the failed publish remains observable in
+		// the sink's own counters/logs.
+		if err := l.sink.PublishDNSHint(addr, direct, evidence, 0, ttl); err != nil {
+			return
+		}
 	}
+	l.backend.DNS.Observe(key, direct, evidence, 0, l.backend.Control.PolicyGeneration, expire, uint64(now.UnixNano()))
 }
 
 // InvalidateGeneration bumps policy generation on memory + kernel sinks so

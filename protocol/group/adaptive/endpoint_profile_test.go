@@ -66,3 +66,24 @@ func TestEndpointProfileCadence(t *testing.T) {
 		t.Fatalf("first failure cadence: %+v", profile)
 	}
 }
+
+func TestEndpointProfileCadenceIsIndependentPerTrack(t *testing.T) {
+	registry := NewEndpointProfileRegistry()
+	endpoint := NodeID{42}
+	now := time.Unix(1_700_000_000, 0)
+	registry.Record(endpoint, TrackTCP4, true, 10*time.Millisecond, now)
+
+	tcp, ok := registry.Snapshot(endpoint, TrackTCP4)
+	if !ok || !tcp.NextProbeAt.After(now) {
+		t.Fatalf("TCP profile did not publish a future cadence: %+v ok=%v", tcp, ok)
+	}
+	if _, ok := registry.Snapshot(endpoint, TrackDNSUDP4); ok {
+		t.Fatal("TCP record leaked into independent DNS track")
+	}
+
+	registry.Record(endpoint, TrackDNSUDP4, false, 0, now)
+	dns, ok := registry.Snapshot(endpoint, TrackDNSUDP4)
+	if !ok || dns.NextProbeAt.Sub(now) != 30*time.Second {
+		t.Fatalf("DNS profile cadence mismatch: %+v ok=%v", dns, ok)
+	}
+}

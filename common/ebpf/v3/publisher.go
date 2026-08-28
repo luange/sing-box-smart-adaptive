@@ -177,11 +177,10 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	// Clear inactive bank then fill — never touch active.
 	b.Policy4[inactive] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[inactive] = make(map[LPM6Key]PolicyValue)
-	// generation for entries is commit generation (current+1)
-	nextGen := b.Publisher.Generation() + 1
-	if nextGen == 0 {
-		nextGen = 1
-	}
+	// Generation for entries is the same serial value Commit will publish.
+	// Reuse the central wrap-safe helper so the mirror cannot diverge at
+	// uint32 rollover.
+	nextGen := nextGeneration(b.Publisher.Generation())
 	for _, p := range policies {
 		p.Value.Generation = nextGen
 		addr := p.Prefix.Addr().Unmap()

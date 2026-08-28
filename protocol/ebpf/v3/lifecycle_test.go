@@ -98,12 +98,24 @@ type rejectingStaticSink struct{ memSink }
 
 type rejectingInvalidateSink struct{ memSink }
 
+type rejectingFlowSink struct{ memSink }
+
+type rejectingDNSSink struct{ memSink }
+
 func (s *rejectingStaticSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
 	return errors.New("injected static publish failure")
 }
 
 func (s *rejectingInvalidateSink) InvalidateFlowDirect() error {
 	return errors.New("injected invalidate failure")
+}
+
+func (s *rejectingFlowSink) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
+	return errors.New("injected flow publish failure")
+}
+
+func (s *rejectingDNSSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
+	return errors.New("injected DNS hint publish failure")
 }
 
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
@@ -202,6 +214,49 @@ func TestLifecycleStaticSinkFailureDoesNotAdvanceMirror(t *testing.T) {
 	after := lc.Backend().Control
 	if after != before {
 		t.Fatalf("mirror advanced after sink failure: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestLifecycleFlowSinkFailureRollsBackMirror(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, ExactFlowLearning: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	lc.BindSink(&rejectingFlowSink{memSink: memSink{gen: 1}})
+	client := netip.MustParseAddrPort("10.0.0.2:1111")
+	dest := netip.MustParseAddrPort("8.8.8.8:443")
+	if err := lc.LearnFlow(client, dest, ebpfv3.ProtocolTCP, true, time.Now()); err == nil {
+		t.Fatal("expected flow sink failure")
+	}
+	if flow := lc.Backend().LookupFlow(ebpfv3.FlowKey{}); flow != nil {
+		t.Fatal("failed live flow publish left a mirror entry")
+	}
+	if len(lc.Backend().Flows) != 0 {
+		t.Fatalf("failed live flow publish left %d mirror entries", len(lc.Backend().Flows))
+	}
+}
+
+func TestLifecycleDNSSinkFailureDoesNotAdvanceMirror(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, DNSIPHint: "safe"},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	lc.BindSink(&rejectingDNSSink{memSink: memSink{gen: 1}})
+	addr := netip.MustParseAddr("9.9.9.9")
+	lc.ObserveDNS(addr, true, ebpfv3.DNSEvidenceStrong, time.Minute, time.Now())
+	key := ebpfv3.DNSIPKey{Family: ebpfv3.AFInet, Addr: [16]byte{9, 9, 9, 9}}
+	if _, ok := lc.Backend().DNS.Lookup(key); ok {
+		t.Fatal("failed live DNS publish left a mirror hint")
 	}
 }
 

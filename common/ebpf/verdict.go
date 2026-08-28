@@ -101,8 +101,8 @@ func (v *VerdictBackend) PutDIRECT(protocol uint8, destination netip.AddrPort, t
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	v.access.RLock()
-	defer v.access.RUnlock()
+	v.access.Lock()
+	defer v.access.Unlock()
 	if v.verdictMap < 0 || !v.enabled {
 		return osErrClosed
 	}

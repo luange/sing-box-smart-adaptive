@@ -161,3 +161,27 @@ func TestPublishStaticRejectsOverCapacityWithoutCommit(t *testing.T) {
 		t.Fatalf("failed static update changed active control: %+v", b.Control)
 	}
 }
+
+func TestPublishStaticGenerationWrapMatchesPublisher(t *testing.T) {
+	b := NewMemoryBackend()
+	b.Publisher.generation.Store(^uint32(0))
+	b.Control.PolicyGeneration = ^uint32(0)
+	compiled, rejected, err := CompileStatic([]CompileInput{{
+		Destination: netip.MustParsePrefix("192.0.2.1/32"),
+		Verdict:     VerdictDirect,
+		Kind:        RuleKindStatic,
+	}}, ^uint32(0))
+	if err != nil || len(rejected) != 0 || len(compiled) != 1 {
+		t.Fatalf("compile err=%v rejected=%d compiled=%d", err, len(rejected), len(compiled))
+	}
+	if err := b.PublishStatic(compiled); err != nil {
+		t.Fatal(err)
+	}
+	if b.Publisher.Generation() != 1 || b.Control.PolicyGeneration != 1 {
+		t.Fatalf("wrapped generation publisher=%d control=%d", b.Publisher.Generation(), b.Control.PolicyGeneration)
+	}
+	v := b.LookupStatic(netip.MustParseAddr("192.0.2.1"), ProtocolTCP, 443)
+	if v == nil || v.Generation != 1 {
+		t.Fatalf("wrapped policy generation=%+v", v)
+	}
+}

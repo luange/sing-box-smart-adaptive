@@ -849,8 +849,8 @@ func (b *Backend) ProtectFunc() control.Func {
 	}
 	return func(network string, address string, rawConn syscall.RawConn) error {
 		return control.Raw(rawConn, func(fd uintptr) error {
-			b.access.RLock()
-			defer b.access.RUnlock()
+			b.access.Lock()
+			defer b.access.Unlock()
 			if b.runtime == nil {
 				return osErrClosed
 			}
@@ -884,8 +884,8 @@ func (b *Backend) RegisterSelfListenPort(port uint16) error {
 	if b == nil {
 		return osErrClosed
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil || b.selfListenPortMap < 0 {
 		return osErrClosed
 	}
@@ -934,8 +934,14 @@ func (b *Backend) lookupOriginal(
 	if b == nil {
 		return OriginalDestination{}, osErrClosed
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	if deleteAfterLookup {
+		// Lookup+delete must be atomic with respect to concurrent acceptors.
+		b.access.Lock()
+		defer b.access.Unlock()
+	} else {
+		b.access.RLock()
+		defer b.access.RUnlock()
+	}
 	if b.runtime == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -986,8 +992,8 @@ func (b *Backend) DeleteRedirect(protocol uint8, redirect netip.AddrPort) error 
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}

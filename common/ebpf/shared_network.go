@@ -290,8 +290,8 @@ func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error 
 	if b == nil || key >= 4 || fd < 0 {
 		return E.New("invalid shared-network listener socket")
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -366,8 +366,8 @@ func (b *SharedNetworkBackend) PutDirectFlow(protocol uint8, source, destination
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil || b.control.Flags&(1<<7) == 0 {
 		return osErrClosed
 	}
@@ -585,8 +585,15 @@ func (b *SharedNetworkBackend) lookupOriginal(
 	if err != nil {
 		return OriginalDestination{}, err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	if deleteAfterLookup {
+		// Lookup+consume must be one critical section.  A read lock would let
+		// concurrent acceptors observe the same redirect before either delete.
+		b.access.Lock()
+		defer b.access.Unlock()
+	} else {
+		b.access.RLock()
+		defer b.access.RUnlock()
+	}
 	if b.runtime == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -659,8 +666,8 @@ func (b *SharedNetworkBackend) DeleteRedirect(
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}

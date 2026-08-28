@@ -316,8 +316,8 @@ func (b *V3Backend) RegisterListenerSocket(key uint32, fd int) error {
 	if b == nil || key >= 4 || fd < 0 {
 		return E.New("invalid v3 listener socket")
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -358,8 +358,8 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil || !b.flowEnabled {
 		return osErrClosed
 	}
@@ -375,7 +375,18 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 		return E.Cause(err, "update v3 flow forward")
 	}
 	if err = updateMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev), unsafe.Pointer(&value)); err != nil {
-		return E.Cause(err, "update v3 flow reverse")
+		// A flow is only valid when both directions are present.  Roll back the
+		// forward half if the second kernel update fails so a one-way DIRECT
+		// entry cannot survive and misclassify subsequent packets.
+		rollbackErr := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd))
+		if errors.Is(rollbackErr, unix.ENOENT) {
+			rollbackErr = nil
+		}
+		rollbackCause := error(nil)
+		if rollbackErr != nil {
+			rollbackCause = E.Cause(rollbackErr, "rollback v3 flow forward")
+		}
+		return E.Errors(E.Cause(err, "update v3 flow reverse"), rollbackCause)
 	}
 	return nil
 }
@@ -388,14 +399,19 @@ func (b *V3Backend) DeleteDirectFlow(protocol uint8, source, destination netip.A
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	_ = deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd))
-	_ = deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev))
-	return nil
+	var result error
+	if err := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd)); err != nil && !errors.Is(err, unix.ENOENT) {
+		result = E.Cause(err, "delete v3 flow forward")
+	}
+	if err := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev)); err != nil && !errors.Is(err, unix.ENOENT) {
+		result = E.Errors(result, E.Cause(err, "delete v3 flow reverse"))
+	}
+	return result
 }
 
 // makeV3FlowPair builds forward + reverse keys both with direction=0.
@@ -580,8 +596,15 @@ func (b *V3Backend) lookupOriginal(protocol uint8, client, redirect netip.AddrPo
 	if err != nil {
 		return OriginalDestination{}, err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	if del {
+		// Consume is a read-modify-delete operation.  Serialize it with other
+		// consumers so one original-destination record cannot be returned twice.
+		b.access.Lock()
+		defer b.access.Unlock()
+	} else {
+		b.access.RLock()
+		defer b.access.RUnlock()
+	}
 	if b.runtime == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -640,8 +663,8 @@ func (b *V3Backend) DeleteRedirect(protocol uint8, client, redirect netip.AddrPo
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	b.access.Lock()
+	defer b.access.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}

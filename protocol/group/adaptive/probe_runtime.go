@@ -343,6 +343,17 @@ func (p *AdaptivePool) probeTask(snapshot *ExecutionSnapshot, candidate Candidat
 				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint probe wait canceled"}
 			}
 			defer globalEndpointProfiles.Release(candidate.EndpointID, TrackTCP4)
+			// Re-check after acquiring the endpoint lock. A different
+			// Smart/AdaptivePool may have just completed this track while this
+			// task was waiting; probing before the quiet-window deadline would
+			// defeat cross-pool cadence sharing.
+			if interval > 0 {
+				profile, ok := globalEndpointProfiles.Snapshot(candidate.EndpointID, TrackTCP4)
+				if ok &&
+					!profile.NextProbeAt.IsZero() && time.Now().Before(profile.NextProbeAt) {
+					return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint probe cadence not due"}
+				}
+			}
 			result, _ := p.runGenericProbe(ctx, snapshot, candidate)
 			globalEndpointProfiles.Record(candidate.EndpointID, TrackTCP4, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
 			return result
@@ -379,6 +390,13 @@ func (p *AdaptivePool) dnsHealthProbeTask(snapshot *ExecutionSnapshot, candidate
 				return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint DNS probe wait canceled"}
 			}
 			defer globalEndpointProfiles.Release(candidate.EndpointID, track)
+			if interval > 0 {
+				profile, ok := globalEndpointProfiles.Snapshot(candidate.EndpointID, track)
+				if ok &&
+					!profile.NextProbeAt.IsZero() && time.Now().Before(profile.NextProbeAt) {
+					return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint DNS probe cadence not due"}
+				}
+			}
 			result := p.runDNSHealthProbe(ctx, snapshot, candidate, family)
 			globalEndpointProfiles.Record(candidate.EndpointID, track, result.Outcome == OutcomeSuccess, result.Delay, time.Now())
 			return result
