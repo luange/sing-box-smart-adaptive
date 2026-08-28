@@ -99,7 +99,7 @@ test "hard-open incumbent fails over without confirmation" {
     const fallback = Candidate{ .id = 2, .reliability = 0.30, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .throughput_bps = 0, .samples = 1, .weight = 1, .state = 1, .eligible = 1 };
     const initial = [_]Candidate{incumbent};
     _ = policy.chooseProfile(&engine.state, engine.config, &engine.observations, initial[0..], 0, .bulk);
-    const opened = [_]Candidate{.{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 4, .eligible = 1 }, fallback};
+    const opened = [_]Candidate{ .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 4, .eligible = 1 }, fallback };
     const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, opened[0..], 1, .bulk);
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
@@ -112,6 +112,27 @@ test "bounded observations do not grow after reset" {
     try std.testing.expectEqual(metrics.max_entries, engine.observations.count);
     engine.reset();
     try std.testing.expectEqual(@as(usize, 0), engine.observations.count);
+}
+
+test "hashed observations evict the oldest entry and remain addressable" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 });
+    var id: u64 = 1;
+    while (id <= metrics.max_entries) : (id += 1) engine.observe(id, true, 1, id);
+    // The first entry is the oldest and must be replaced on the next insert.
+    engine.observe(metrics.max_entries + 1, true, 2, metrics.max_entries + 1);
+    try std.testing.expect(engine.observations.get(1) == null);
+    try std.testing.expect(engine.observations.get(2048) != null);
+    try std.testing.expect(engine.observations.get(metrics.max_entries + 1) != null);
+    try std.testing.expectEqual(metrics.max_entries, engine.observations.count);
+
+    // Cross the tombstone rebuild threshold and verify that reusing a metric
+    // slot never leaves the evicted id pointing at the replacement entry.
+    var churn: u64 = 0;
+    while (churn < 2100) : (churn += 1) {
+        engine.observe(metrics.max_entries + 2 + churn, true, 3, metrics.max_entries + 2 + churn);
+    }
+    try std.testing.expect(engine.observations.get(2) == null);
+    try std.testing.expect(engine.observations.get(metrics.max_entries + 2101) != null);
 }
 
 test "observations fill missing candidate evidence" {

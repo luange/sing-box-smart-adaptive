@@ -23,9 +23,16 @@ type smartPolicyBackendConfig struct {
 }
 
 type zigSmartPolicyBackend struct {
-	access  sync.Mutex
-	config  C.smart_engine_config
-	engines map[string]*zigSmartPolicyEngine
+	config C.smart_engine_config
+	shards [smartPolicyShardCount]zigSmartPolicyShard
+}
+
+const smartPolicyShardCount = 16
+
+type zigSmartPolicyShard struct {
+	access          sync.Mutex
+	engines         map[string]*zigSmartPolicyEngine
+	candidateBuffer []C.smart_candidate
 }
 
 type zigSmartPolicyEngine struct {
@@ -44,7 +51,11 @@ func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 	if C.smart_engine_abi_version() != 1 {
 		return nil
 	}
-	return &zigSmartPolicyBackend{config: cfg, engines: make(map[string]*zigSmartPolicyEngine)}
+	backend := &zigSmartPolicyBackend{config: cfg}
+	for index := range backend.shards {
+		backend.shards[index].engines = make(map[string]*zigSmartPolicyEngine)
+	}
+	return backend
 }
 
 func maxInt64(value int64) int64 {
@@ -65,13 +76,23 @@ func (b *zigSmartPolicyBackend) Choose(key string, candidates []smartPolicyCandi
 	if b == nil || key == "" || len(candidates) == 0 || len(candidates) > 8192 {
 		return smartPolicyDecision{Score: 100, Reason: 3}
 	}
-	b.access.Lock()
-	defer b.access.Unlock()
-	engine := b.engineForLocked(key, now)
+	shard := b.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	engine := b.engineForLocked(shard, key, now)
 	if engine == nil {
 		return smartPolicyDecision{Score: 100, Reason: 3}
 	}
-	converted := make([]C.smart_candidate, len(candidates))
+	if cap(shard.candidateBuffer) < len(candidates) {
+		shard.candidateBuffer = make([]C.smart_candidate, len(candidates))
+	} else {
+		shard.candidateBuffer = shard.candidateBuffer[:len(candidates)]
+	}
+	// Choose is a batch ABI call. The shard lock makes this scratch buffer safe
+	// to reuse across all contexts in the shard while allowing other shards to
+	// rank concurrently. It also avoids retaining one large candidate slice per
+	// policy context.
+	converted := shard.candidateBuffer
 	for i, candidate := range candidates {
 		converted[i] = C.smart_candidate{
 			id: C.uint64_t(candidate.ID), reliability: C.double(candidate.Reliability),
@@ -87,38 +108,44 @@ func (b *zigSmartPolicyBackend) Choose(key string, candidates []smartPolicyCandi
 	} else if profile == smartProfileUDP {
 		profileID = 2
 	}
-	decision := C.smart_engine_choose_profile(engine, &converted[0], C.uintptr_t(len(converted)), C.uint64_t(smartMillis(now)), profileID)
+	decision := C.smart_engine_choose_profile(engine.engine, &converted[0], C.uintptr_t(len(converted)), C.uint64_t(smartMillis(now)), profileID)
 	return smartPolicyDecision{SelectedID: uint64(decision.selected_id), Score: float64(decision.score), Switched: decision.switched != 0, Reason: uint8(decision.reason)}
 }
 
-func (b *zigSmartPolicyBackend) engineForLocked(key string, now time.Time) *C.smart_engine {
-	if current := b.engines[key]; current != nil {
+func (b *zigSmartPolicyBackend) shardFor(key string) *zigSmartPolicyShard {
+	index := smartPolicyID(key) & (smartPolicyShardCount - 1)
+	return &b.shards[index]
+}
+
+func (b *zigSmartPolicyBackend) engineForLocked(shard *zigSmartPolicyShard, key string, now time.Time) *zigSmartPolicyEngine {
+	if current := shard.engines[key]; current != nil {
 		current.lastUse = now
-		return current.engine
+		return current
 	}
 	// Keep context sharding bounded. Each policy engine owns a fixed 4096-slot
 	// observation table, so unbounded site/network churn would defeat the
 	// memory bound even though every individual engine is bounded.
-	const maxContexts = 64
-	if len(b.engines) >= maxContexts {
+	const maxContextsPerShard = 4
+	if len(shard.engines) >= maxContextsPerShard {
 		var oldestKey string
 		var oldest time.Time
-		for candidateKey, candidate := range b.engines {
+		for candidateKey, candidate := range shard.engines {
 			if oldestKey == "" || candidate.lastUse.Before(oldest) {
 				oldestKey, oldest = candidateKey, candidate.lastUse
 			}
 		}
-		if evicted := b.engines[oldestKey]; evicted != nil {
+		if evicted := shard.engines[oldestKey]; evicted != nil {
 			C.smart_engine_destroy(evicted.engine)
-			delete(b.engines, oldestKey)
+			delete(shard.engines, oldestKey)
 		}
 	}
 	engine := C.smart_engine_create(b.config)
 	if engine == nil {
 		return nil
 	}
-	b.engines[key] = &zigSmartPolicyEngine{engine: engine, lastUse: now}
-	return engine
+	state := &zigSmartPolicyEngine{engine: engine, lastUse: now}
+	shard.engines[key] = state
+	return state
 }
 
 func boolByte(value bool) uint8 {
@@ -132,9 +159,10 @@ func (b *zigSmartPolicyBackend) Observe(key string, id uint64, success bool, ela
 	if b == nil || key == "" || id == 0 {
 		return
 	}
-	b.access.Lock()
-	defer b.access.Unlock()
-	engine := b.engineForLocked(key, now)
+	shard := b.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	engine := b.engineForLocked(shard, key, now)
 	if engine == nil {
 		return
 	}
@@ -142,26 +170,32 @@ func (b *zigSmartPolicyBackend) Observe(key string, id uint64, success bool, ela
 	if ms < 0 {
 		ms = 0
 	}
-	C.smart_engine_observe(engine, C.uint64_t(id), C.uint8_t(boolByte(success)), C.double(ms), C.uint64_t(smartMillis(now)))
+	C.smart_engine_observe(engine.engine, C.uint64_t(id), C.uint8_t(boolByte(success)), C.double(ms), C.uint64_t(smartMillis(now)))
 }
 
 func (b *zigSmartPolicyBackend) Reset() {
 	if b != nil {
-		b.access.Lock()
-		defer b.access.Unlock()
-		for _, engine := range b.engines {
-			C.smart_engine_reset(engine.engine)
+		for index := range b.shards {
+			shard := &b.shards[index]
+			shard.access.Lock()
+			for _, engine := range shard.engines {
+				C.smart_engine_reset(engine.engine)
+			}
+			shard.access.Unlock()
 		}
 	}
 }
 
 func (b *zigSmartPolicyBackend) Close() {
 	if b != nil {
-		b.access.Lock()
-		defer b.access.Unlock()
-		for key, engine := range b.engines {
-			C.smart_engine_destroy(engine.engine)
-			delete(b.engines, key)
+		for index := range b.shards {
+			shard := &b.shards[index]
+			shard.access.Lock()
+			for key, engine := range shard.engines {
+				C.smart_engine_destroy(engine.engine)
+				delete(shard.engines, key)
+			}
+			shard.access.Unlock()
 		}
 	}
 }

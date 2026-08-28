@@ -21,8 +21,8 @@ hosts; unknown profile values fall back to interactive scoring.
 
 - `model.zig`: ABI-safe data types and state constants.
 - `metrics.zig`: fixed-capacity, allocation-free observation table. Entries are
-  evicted by oldest update when the limit is reached; reset releases no hidden
-  map capacity because storage is inline and bounded.
+  evicted by oldest update when the limit is reached; an open-addressing index
+  makes normal lookup expected O(1), and reset releases no hidden map capacity.
 - `scoring.zig`: pure reliability/latency/jitter/weight scoring functions.
 - `policy.zig`: incumbent retention, margin, confirmation and cooldown state
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
@@ -32,6 +32,11 @@ The Go implementation remains the zero-dependency reference backend. Linux
 release builds select the in-process Zig adapter with the `smart_zig` build
 tag after the same conformance gate; provider, routing, and API code are
 unchanged.
+
+The Go adapter sends candidates through the existing batch ABI entry point and
+reuses one conversion buffer per lock shard (16 shards, four bounded contexts
+each). Different service contexts can rank concurrently without retaining a
+large candidate buffer per context.
 
 ## Passive bulk throughput gate
 

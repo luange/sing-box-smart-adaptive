@@ -8,9 +8,10 @@ Rust, mihomo, or another host core.
 The core owns only bounded metrics, score calculation, switch margin,
 confirmation samples/time, cooldown, and deterministic state transitions. The
 implementation is split into `model.zig`, `metrics.zig`, `scoring.zig`, and
-`policy.zig`; `lib.zig` is only the C ABI facade. The observation store is an
-inline fixed-capacity table, so reset cannot retain a large hash-map backing
-allocation.
+`policy.zig`; `lib.zig` is only the C ABI facade. The observation store keeps a
+fixed 4096-entry metric payload behind an 8192-slot open-addressing index, so
+normal observe/get operations are expected O(1), eviction is bounded, and reset
+cannot retain a large hash-map backing allocation.
 
 `smart_engine_choose_profile` exposes interactive, bulk and UDP weighting; the
 original choose function remains an interactive-compatible entry point.
@@ -22,8 +23,11 @@ same library for each Linux architecture/libc pair before building sing-box.
 
 The host owns node discovery, EndpointProfile/health evidence, dialing,
 persistence, logging, and API compatibility. This prevents the policy engine
-from opening sockets or reimplementing Provider logic. The default developer
-build keeps the reference Go policy for zero-dependency development.
+from opening sockets or reimplementing Provider logic. The Go adapter reuses a
+candidate batch buffer per lock shard (16 shards, four bounded contexts each),
+so cgo conversion allocations are amortized without retaining a large buffer
+per context. The default developer build keeps the reference Go policy for
+zero-dependency development.
 
 Build and test with Zig 0.14+:
 
