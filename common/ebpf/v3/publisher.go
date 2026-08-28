@@ -174,6 +174,18 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	// Clear inactive bank then fill — never touch active.
 	b.Policy4[inactive] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[inactive] = make(map[LPM6Key]PolicyValue)
+	var count4, count6 int
+	for _, p := range policies {
+		if p.Prefix.Addr().Unmap().Is4() {
+			count4++
+		} else {
+			count6++
+		}
+	}
+	if count4 > MaxPolicyLPM || count6 > MaxPolicyLPM {
+		b.Publisher.AbortCompile()
+		return fmt.Errorf("static policy capacity exceeded: ipv4=%d ipv6=%d max=%d", count4, count6, MaxPolicyLPM)
+	}
 	// generation for entries is commit generation (current+1)
 	nextGen := b.Publisher.Generation() + 1
 	if nextGen == 0 {

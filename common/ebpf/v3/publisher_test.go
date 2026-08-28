@@ -142,3 +142,22 @@ func TestFlowMirrorExpiresAndStaysBounded(t *testing.T) {
 		t.Fatal("expired flow mirror entry was returned")
 	}
 }
+
+func TestPublishStaticRejectsOverCapacityWithoutCommit(t *testing.T) {
+	b := NewMemoryBackend()
+	policies := make([]CompiledPolicy, MaxPolicyLPM+1)
+	for i := range policies {
+		policies[i] = CompiledPolicy{
+			Prefix: netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1}), 32),
+			Value:  PolicyValue{Verdict: uint8(VerdictDirect)},
+		}
+	}
+	previousGeneration := b.Control.PolicyGeneration
+	previousBank := b.Control.ActiveBank
+	if err := b.PublishStatic(policies); err == nil {
+		t.Fatal("over-capacity static policy update unexpectedly committed")
+	}
+	if b.Control.PolicyGeneration != previousGeneration || b.Control.ActiveBank != previousBank {
+		t.Fatalf("failed static update changed active control: %+v", b.Control)
+	}
+}
