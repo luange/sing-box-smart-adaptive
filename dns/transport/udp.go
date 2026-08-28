@@ -22,6 +22,16 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
+const (
+	defaultUDPReadSize = 2048
+	// Keep EDNS advertised sizes bounded. A peer can legally advertise a
+	// 64KiB UDP buffer, but allocating that size for a shared resolver socket
+	// is an easy way to turn a malformed or hostile query into a memory spike.
+	// Responses larger than this are expected to use the DNS TC bit and follow
+	// the existing TCP retry path.
+	maxUDPReadSize = 4096
+)
+
 var _ adapter.DNSTransport = (*UDPTransport)(nil)
 
 func RegisterUDP(registry *dns.TransportRegistry) {
@@ -61,7 +71,7 @@ func NewUDPRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialer
 		dialer:           dialerInstance,
 		serverAddr:       serverAddr,
 	}
-	t.udpSize.Store(2048)
+	t.udpSize.Store(defaultUDPReadSize)
 	t.multiplexer = newQueryMultiplexer(queryMultiplexerOptions{
 		dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := t.dialer.DialContext(ctx, N.NetworkUDP, t.serverAddr)
@@ -124,6 +134,9 @@ func (t *UDPTransport) updateUDPSize(message *mDNS.Msg) {
 		return
 	}
 	udpSize := int32(edns0Opt.UDPSize())
+	if udpSize > maxUDPReadSize {
+		udpSize = maxUDPReadSize
+	}
 	for {
 		current := t.udpSize.Load()
 		if udpSize <= current {

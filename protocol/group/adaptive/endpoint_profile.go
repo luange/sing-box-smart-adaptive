@@ -35,15 +35,35 @@ type EndpointTrackProfile struct {
 // AdaptivePool consumers. Health evidence remains in each pool's HealthStore;
 // this registry only owns endpoint-level probe admission and cadence state.
 type EndpointProfileRegistry struct {
-	mu       sync.Mutex
-	active   map[endpointProbeKey]chan struct{}
-	profiles map[endpointProbeKey]EndpointTrackProfile
+	mu sync.Mutex
+	// Admission is serialized per endpoint, not per track. Running TCP and
+	// DNS probes against the same server concurrently adds load without
+	// producing independent endpoint evidence during catalog churn.
+	active     map[NodeID]chan struct{}
+	profiles   map[endpointProbeKey]EndpointTrackProfile
+	retention  time.Duration
+	maxEntries int
 }
 
 var globalEndpointProfiles = NewEndpointProfileRegistry()
 
 func NewEndpointProfileRegistry() *EndpointProfileRegistry {
-	return &EndpointProfileRegistry{active: make(map[endpointProbeKey]chan struct{}), profiles: make(map[endpointProbeKey]EndpointTrackProfile)}
+	return NewEndpointProfileRegistryWithBounds(time.Hour, 8192)
+}
+
+func NewEndpointProfileRegistryWithBounds(retention time.Duration, maxEntries int) *EndpointProfileRegistry {
+	if retention <= 0 {
+		retention = time.Hour
+	}
+	if maxEntries <= 0 {
+		maxEntries = 8192
+	}
+	return &EndpointProfileRegistry{
+		active:     make(map[NodeID]chan struct{}),
+		profiles:   make(map[endpointProbeKey]EndpointTrackProfile),
+		retention:  retention,
+		maxEntries: maxEntries,
+	}
 }
 
 func (r *EndpointProfileRegistry) TryAcquire(endpointID NodeID, track EndpointProbeTrack) bool {
@@ -52,11 +72,10 @@ func (r *EndpointProfileRegistry) TryAcquire(endpointID NodeID, track EndpointPr
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := endpointProbeKey{endpoint: endpointID, track: track}
-	if _, ok := r.active[key]; ok {
+	if _, ok := r.active[endpointID]; ok {
 		return false
 	}
-	r.active[key] = make(chan struct{})
+	r.active[endpointID] = make(chan struct{})
 	return true
 }
 
@@ -64,12 +83,11 @@ func (r *EndpointProfileRegistry) Acquire(ctx context.Context, endpointID NodeID
 	if r == nil || endpointID == (NodeID{}) {
 		return true
 	}
-	key := endpointProbeKey{endpoint: endpointID, track: track}
 	for {
 		r.mu.Lock()
-		done := r.active[key]
+		done := r.active[endpointID]
 		if done == nil {
-			r.active[key] = make(chan struct{})
+			r.active[endpointID] = make(chan struct{})
 			r.mu.Unlock()
 			return true
 		}
@@ -86,10 +104,9 @@ func (r *EndpointProfileRegistry) Release(endpointID NodeID, track EndpointProbe
 	if r == nil || endpointID == (NodeID{}) {
 		return
 	}
-	key := endpointProbeKey{endpoint: endpointID, track: track}
 	r.mu.Lock()
-	if done := r.active[key]; done != nil {
-		delete(r.active, key)
+	if done := r.active[endpointID]; done != nil {
+		delete(r.active, endpointID)
 		close(done)
 	}
 	r.mu.Unlock()
@@ -101,6 +118,7 @@ func (r *EndpointProfileRegistry) Record(endpointID NodeID, track EndpointProbeT
 	}
 	key := endpointProbeKey{endpoint: endpointID, track: track}
 	r.mu.Lock()
+	r.pruneLocked(now)
 	profile := r.profiles[key]
 	profile.Healthy, profile.Delay, profile.UpdatedAt = success, delay, now
 	if success {
@@ -114,6 +132,31 @@ func (r *EndpointProfileRegistry) Record(endpointID NodeID, track EndpointProbeT
 	}
 	r.profiles[key] = profile
 	r.mu.Unlock()
+}
+
+func (r *EndpointProfileRegistry) pruneLocked(now time.Time) {
+	for key, profile := range r.profiles {
+		if !profile.UpdatedAt.IsZero() && now.Sub(profile.UpdatedAt) > r.retention {
+			delete(r.profiles, key)
+		}
+	}
+	for len(r.profiles) >= r.maxEntries {
+		var oldestKey endpointProbeKey
+		var oldest time.Time
+		found := false
+		for key, profile := range r.profiles {
+			if _, active := r.active[key.endpoint]; active {
+				continue
+			}
+			if !found || profile.UpdatedAt.Before(oldest) {
+				oldestKey, oldest, found = key, profile.UpdatedAt, true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(r.profiles, oldestKey)
+	}
 }
 
 func smartProfileCadence(success bool, streak uint8) time.Duration {

@@ -11,9 +11,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/nodeidentity"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -35,19 +35,15 @@ func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
 		if !loaded || outboundOptions.Type == "" || outboundOptions.Options == nil {
 			continue
 		}
-		// Options are normally typed structs. Normalize through JSON first so the
-		// credential filter also applies to nested typed fields.
-		rawOptions, err := json.Marshal(outboundOptions.Options)
+		// Normalize typed options once; the shared helper also applies the
+		// credential filter to nested fields.
+		normalizedOptions, err := nodeidentity.CanonicalEndpointOptions(outboundOptions.Options)
 		if err != nil {
-			continue
-		}
-		var normalizedOptions any
-		if err = json.Unmarshal(rawOptions, &normalizedOptions); err != nil {
 			continue
 		}
 		payload := map[string]any{
 			"type":    outboundOptions.Type,
-			"options": stripSmartEndpointCredentials(normalizedOptions),
+			"options": normalizedOptions,
 		}
 		raw, err := json.Marshal(payload)
 		if err != nil {
@@ -62,28 +58,4 @@ func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
 	// get a stable identity; retaining the tag avoids accidental cross-node
 	// coalescing when there is no trustworthy endpoint description.
 	return candidate.Type() + "\x00" + candidate.Tag()
-}
-
-func stripSmartEndpointCredentials(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		result := make(map[string]any, len(typed))
-		for key, item := range typed {
-			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), " ", "_"))
-			switch normalized {
-			case "password", "uuid", "psk", "token", "secret", "private_key", "privatekey", "auth", "authorization", "headers":
-				continue
-			}
-			result[key] = stripSmartEndpointCredentials(item)
-		}
-		return result
-	case []any:
-		result := make([]any, len(typed))
-		for index, item := range typed {
-			result[index] = stripSmartEndpointCredentials(item)
-		}
-		return result
-	default:
-		return value
-	}
 }

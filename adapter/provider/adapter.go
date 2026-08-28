@@ -4,8 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"encoding/json"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,12 +43,17 @@ type Adapter struct {
 	history         *urltest.HistoryStorage
 	callbackAccess  sync.Mutex
 	callbacks       list.List[adapter.ProviderUpdateCallback]
+	deltaAccess     sync.RWMutex
+	deltaRevision   uint64
+	deltaHistory    []adapter.ProviderDelta
 
 	link     string
 	enabled  bool
 	timeout  time.Duration
 	interval time.Duration
 }
+
+const providerDeltaHistoryLimit = 16
 
 func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, endpoint adapter.EndpointManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions) Adapter {
 	timeout := time.Duration(options.Timeout)
@@ -171,7 +177,22 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 // across provider reloads (order-independent). Avoids " (2)" churn that breaks
 // smart pins/filters when the subscription list reorders.
 func providerOutboundIdentity(opt option.Outbound) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%#v", opt.Type, opt.Tag, opt.Options)))
+	return providerOptionFingerprint(opt.Type, opt.Tag, opt.Options)
+}
+
+// providerOptionFingerprint uses encoding/json instead of fmt's structural
+// formatting. JSON sorts map keys and therefore keeps duplicate suffixes
+// stable when a provider refresh changes map iteration order.
+func providerOptionFingerprint(kind, tag string, options any) string {
+	payload, err := json.Marshal(struct {
+		Kind    string `json:"kind"`
+		Tag     string `json:"tag"`
+		Options any    `json:"options"`
+	}{Kind: kind, Tag: tag, Options: options})
+	if err != nil {
+		payload = []byte(F.ToString(kind, "\x00", tag))
+	}
+	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:4])
 }
 
@@ -204,11 +225,13 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 		oldOptByTag[opt.Tag] = opt
 	}
 	activeTags := a.activeOutboundTags()
+	previousOutbounds := a.activeOutboundSnapshot()
 	a.removeUseless(newTags)
 	for i, opt := range newOpts {
 		tag := newTags[i]
 		outbound, exist := a.outbound.Outbound(tag)
 		_, active := activeTags[tag]
+		previousOutbound := outbound
 		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
 			opt = stripTCPFastOpenForAnyTLS(opt)
 			err := a.outbound.Create(
@@ -223,14 +246,23 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 			)
 			if err != nil {
 				a.logger.Warn(err, " in ", tag, ", skip create this outbound")
-				if active {
-					if closeErr := a.outbound.Remove(tag); closeErr != nil {
-						a.logger.Error(closeErr, "close outbound [", tag, "]")
-					}
+				// Keep the currently active instance on refresh failure. Removing it
+				// here turns a transient parse/start error into an avoidable outage.
+				if active && previousOutbound != nil {
+					outbounds = append(outbounds, previousOutbound)
+					outboundsByTag[tag] = previousOutbound
 				}
 				continue
 			}
 			outbound, _ = a.outbound.Outbound(tag)
+		}
+		if outbound == nil {
+			a.logger.Warn("outbound ", tag, " was not registered after create, keeping previous snapshot")
+			if active && previousOutbound != nil {
+				outbounds = append(outbounds, previousOutbound)
+				outboundsByTag[tag] = previousOutbound
+			}
+			continue
 		}
 		outbounds = append(outbounds, outbound)
 		outboundsByTag[tag] = outbound
@@ -239,9 +271,99 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
 	a.outboundsAccess.Unlock()
+	a.recordOutboundDelta(previousOutbounds, outboundsByTag)
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)
 	}
+}
+
+func (a *Adapter) activeOutboundSnapshot() map[string]adapter.Outbound {
+	a.outboundsAccess.RLock()
+	defer a.outboundsAccess.RUnlock()
+	snapshot := make(map[string]adapter.Outbound, len(a.outbounds))
+	for _, outbound := range a.outbounds {
+		if outbound != nil {
+			snapshot[outbound.Tag()] = outbound
+		}
+	}
+	return snapshot
+}
+
+func (a *Adapter) recordOutboundDelta(previous, current map[string]adapter.Outbound) {
+	upserts := make([]string, 0)
+	removes := make([]string, 0)
+	for tag, oldOutbound := range previous {
+		if next, loaded := current[tag]; !loaded || next == nil {
+			removes = append(removes, tag)
+		} else if next != oldOutbound {
+			upserts = append(upserts, tag)
+		}
+	}
+	for tag, next := range current {
+		if _, loaded := previous[tag]; !loaded && next != nil {
+			upserts = append(upserts, tag)
+		}
+	}
+	if len(upserts) == 0 && len(removes) == 0 {
+		return
+	}
+	slices.Sort(upserts)
+	slices.Sort(removes)
+	a.deltaAccess.Lock()
+	base := a.deltaRevision
+	a.deltaRevision++
+	a.deltaHistory = append(a.deltaHistory, adapter.ProviderDelta{
+		BaseRevision: base,
+		Revision:     a.deltaRevision,
+		Upserts:      upserts,
+		Removes:      removes,
+	})
+	if len(a.deltaHistory) > providerDeltaHistoryLimit {
+		a.deltaHistory = a.deltaHistory[len(a.deltaHistory)-providerDeltaHistoryLimit:]
+	}
+	a.deltaAccess.Unlock()
+}
+
+func (a *Adapter) OutboundDeltaRevision() uint64 {
+	a.deltaAccess.RLock()
+	defer a.deltaAccess.RUnlock()
+	return a.deltaRevision
+}
+
+func (a *Adapter) OutboundDelta(afterRevision uint64) (adapter.ProviderDelta, bool) {
+	a.deltaAccess.RLock()
+	defer a.deltaAccess.RUnlock()
+	if afterRevision == a.deltaRevision {
+		return adapter.ProviderDelta{BaseRevision: afterRevision, Revision: afterRevision}, true
+	}
+	if afterRevision > a.deltaRevision || len(a.deltaHistory) == 0 {
+		return adapter.ProviderDelta{}, false
+	}
+	start := -1
+	for index, delta := range a.deltaHistory {
+		if delta.BaseRevision == afterRevision {
+			start = index
+			break
+		}
+	}
+	if start < 0 {
+		return adapter.ProviderDelta{}, false
+	}
+	result := adapter.ProviderDelta{BaseRevision: afterRevision, Revision: afterRevision}
+	for index := start; index < len(a.deltaHistory); index++ {
+		delta := a.deltaHistory[index]
+		if delta.BaseRevision != result.Revision {
+			return adapter.ProviderDelta{}, false
+		}
+		result.Revision = delta.Revision
+		result.Upserts = append(result.Upserts, delta.Upserts...)
+		result.Removes = append(result.Removes, delta.Removes...)
+	}
+	// Return owned slices so consumers cannot mutate the bounded history kept
+	// by the provider and corrupt a later delta request.
+	result.Upserts = slices.Clone(result.Upserts)
+	result.Removes = slices.Clone(result.Removes)
+	return result, true
 }
 
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
@@ -279,6 +401,10 @@ func (a *Adapter) Close() error {
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
+	a.deltaAccess.Lock()
+	a.deltaHistory = nil
+	a.deltaRevision = 0
+	a.deltaAccess.Unlock()
 	a.outboundsAccess.Lock()
 	outbounds := a.outbounds
 	endpoints := a.endpoints
@@ -337,6 +463,12 @@ func (a *Adapter) ProviderConsumers() int {
 
 func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 	result := make(map[string]uint16)
+	if ctx == nil {
+		ctx = a.ctx
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if a.checking.Swap(true) {
 		return result, nil
 	}
@@ -352,9 +484,9 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 		}
 		checked[tag] = true
 		b.Go(tag, func() (any, error) {
-			ctx, cancel := context.WithTimeout(a.ctx, a.timeout)
+			probeCtx, cancel := context.WithTimeout(ctx, a.timeout)
 			defer cancel()
-			t, err := urltest.URLTest(ctx, a.link, detour)
+			t, err := urltest.URLTest(probeCtx, a.link, detour)
 			if err != nil {
 				a.logger.Debug("outbound ", tag, " unavailable: ", err)
 				a.history.DeleteURLTestHistory(tag)
@@ -435,8 +567,7 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 		} else {
 			baseTag = F.ToString(a.providerTag, "/endpoint-", i)
 		}
-		identitySum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%#v", opt.Type, opt.Tag, opt.Options)))
-		identity := hex.EncodeToString(identitySum[:4])
+		identity := providerOptionFingerprint(opt.Type, opt.Tag, opt.Options)
 		tag := uniqueProviderTag(baseTag, identity, seen)
 		if tag != baseTag {
 			a.logger.Warn("duplicate endpoint tag ", baseTag, " in provider, renamed to ", tag)
@@ -463,6 +594,7 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 		tag := newTags[i]
 		ep, exist := a.endpoint.Get(tag)
 		_, active := activeTags[tag]
+		previousEndpoint := ep
 		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
 			err := a.endpoint.Create(
 				adapter.WithContext(a.ctx, &adapter.InboundContext{
@@ -476,14 +608,21 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 			)
 			if err != nil {
 				a.logger.Warn(err, " in ", tag, ", skip create this endpoint")
-				if active {
-					if closeErr := a.endpoint.Remove(tag); closeErr != nil {
-						a.logger.Error(closeErr, "close endpoint [", tag, "]")
-					}
+				if active && previousEndpoint != nil {
+					endpoints = append(endpoints, previousEndpoint)
+					endpointsByTag[tag] = previousEndpoint
 				}
 				continue
 			}
 			ep, _ = a.endpoint.Get(tag)
+		}
+		if ep == nil {
+			a.logger.Warn("endpoint ", tag, " was not registered after create, keeping previous snapshot")
+			if active && previousEndpoint != nil {
+				endpoints = append(endpoints, previousEndpoint)
+				endpointsByTag[tag] = previousEndpoint
+			}
+			continue
 		}
 		endpoints = append(endpoints, ep)
 		endpointsByTag[tag] = ep

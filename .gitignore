@@ -18,6 +18,8 @@
 .DS_Store
 /config.d/
 /venv/
+smart-engine/zig-out/
+smart-engine/.zig-cache/
 CLAUDE.md
 AGENTS.md
 /.claude/

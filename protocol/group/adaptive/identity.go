@@ -7,7 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
-	"strings"
+
+	"github.com/sagernet/sing-box/common/nodeidentity"
 )
 
 const identityVersion = 1
@@ -81,39 +82,7 @@ func (h *IdentityHasher) FromEndpointOptions(outboundType string, options any) (
 }
 
 func canonicalEndpointValue(input any) (any, error) {
-	raw, err := json.Marshal(input)
-	if err != nil {
-		return nil, err
-	}
-	var value any
-	if err = json.Unmarshal(raw, &value); err != nil {
-		return nil, err
-	}
-	return stripEndpointCredentials(value), nil
-}
-
-func stripEndpointCredentials(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		result := make(map[string]any, len(typed))
-		for key, item := range typed {
-			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), " ", "_"))
-			switch normalized {
-			case "password", "uuid", "psk", "token", "secret", "private_key", "privatekey", "auth", "authorization", "headers":
-				continue
-			}
-			result[key] = stripEndpointCredentials(item)
-		}
-		return result
-	case []any:
-		result := make([]any, len(typed))
-		for index, item := range typed {
-			result[index] = stripEndpointCredentials(item)
-		}
-		return result
-	default:
-		return value
-	}
+	return nodeidentity.CanonicalEndpointOptions(input)
 }
 
 func (h *IdentityHasher) FromRuntimeDescriptor(candidateType, tag string, networks, dependencies []string) NodeID {

@@ -2021,8 +2021,9 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	}
 	var candidates []adapter.Outbound
 	seen := make(map[string]bool)
+	stack := make(map[string]bool)
 	for _, root := range roots {
-		s.flattenCandidate(root, make(map[string]bool), seen, &candidates)
+		s.flattenCandidate(root, stack, seen, &candidates)
 	}
 	if len(candidates) == 0 {
 		return errSmartNoCandidates
