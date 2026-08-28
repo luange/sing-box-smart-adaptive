@@ -77,9 +77,6 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), time.Millisecond*time.Duration(timeout))
-		defer cancel()
-
 		var result map[string]uint16
 		_, isSmartGroup := proxy.(adapter.SmartGroup)
 		_, isAdaptivePool := proxy.(adapter.AdaptivePoolGroup)
@@ -88,8 +85,16 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		// Calling URLTestGroup here would run the scheduler's full-cycle
 		// deadline and turn a large group into an all-or-nothing 504.
 		if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup && !isSmartGroup && !isAdaptivePool {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Millisecond*time.Duration(timeout))
+			defer cancel()
 			result, err = urlTestGroup.URLTest(ctx)
 		} else {
+			// Clash's timeout parameter is a per-proxy probe timeout. Sharing one
+			// deadline across the whole batch made the result depend on group size:
+			// early probes consumed the deadline and slower, otherwise healthy
+			// nodes were reported as failed. Keep the request context as the
+			// cancellation boundary and give every probe its own full timeout.
+			ctx := r.Context()
 			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
 				itOutbound, _ := server.outbound.Outbound(it)
 				return itOutbound
@@ -110,7 +115,9 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 					continue
 				}
 				b.Go(realTag, func() (any, error) {
-					t, err := urltest.URLTest(ctx, url, p)
+					probeCtx, probeCancel := context.WithTimeout(ctx, time.Millisecond*time.Duration(timeout))
+					t, err := urltest.URLTest(probeCtx, url, p)
+					probeCancel()
 					if err != nil {
 						server.logger.Debug("outbound ", tag, " unavailable: ", err)
 						server.urlTestHistory.DeleteURLTestHistory(realTag)
