@@ -60,6 +60,14 @@ jobs:
       - name: Go/Zig conformance
         working-directory: smart-engine
         run: CGO_ENABLED=1 go test -tags smart_zig ./conformance
+      - name: Compile production Smart Zig backend
+        run: |
+          set -euo pipefail
+          cd smart-engine
+          zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
+          test -s zig-out/lib/libsmart_engine.a
+          cd ..
+          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
       - name: Cross-build Linux libraries
         working-directory: smart-engine
         run: |

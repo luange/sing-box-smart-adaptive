@@ -58,7 +58,8 @@ jobs:
           cache: true
 
       - uses: mlugg/setup-zig@v2
-        if: matrix.libc == 'musl'
+        with:
+          version: 0.14.1
 
       - name: Validate committed v2 eBPF provenance
         run: |
@@ -75,6 +76,21 @@ jobs:
           make -C common/ebpf generate
           ls -la common/ebpf/native/*.o
 
+      - name: Build Zig Smart policy library
+        working-directory: smart-engine
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            zig_target="x86_64-linux-musl"
+            if [[ "${{ matrix.goarch }}" == "arm64" ]]; then zig_target="aarch64-linux-musl"; fi
+          else
+            zig_target="x86_64-linux-gnu"
+            if [[ "${{ matrix.goarch }}" == "arm64" ]]; then zig_target="aarch64-linux-gnu"; fi
+          fi
+          zig build -Dtarget="$zig_target" -Doptimize=ReleaseFast
+          test -s zig-out/lib/libsmart_engine.a
+          file zig-out/lib/libsmart_engine.a
+
       - name: Build eBPF (CGO=1)
         env:
           GOOS: linux
@@ -89,7 +105,7 @@ jobs:
             ver="$(git describe --tags --always 2>/dev/null || echo dev)"
             ver="${ver#v}"
           fi
-          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf"
+          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf,smart_zig"
           ldflags="$(tr -d '\n' < release/LDFLAGS)"
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             target="x86_64-linux-musl"

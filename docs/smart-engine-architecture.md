@@ -28,10 +28,10 @@ hosts; unknown profile values fall back to interactive scoring.
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
 - `lib.zig`: thin lifecycle and C ABI facade.
 
-The Go implementation remains the reference backend until conformance tests
-compare score, incumbent retention, confirmation, cooldown and failure
-recovery against the Zig backend. A future `smart_zig` build tag may then
-select the adapter without changing provider or routing code.
+The Go implementation remains the zero-dependency reference backend. Linux
+release builds select the in-process Zig adapter with the `smart_zig` build
+tag after the same conformance gate; provider, routing, and API code are
+unchanged.
 
 ## Invariants and evolution
 
@@ -63,7 +63,7 @@ integration must add deterministic parity tests before production enablement.
    cross-builds amd64 and arm64 libraries.
 2. A Go reference adapter feeds identical snapshots and compares every
    decision/reason transition, including empty and over-limit inputs.
-3. A canary host enables `smart_zig` with Go fallback and records switch
-   audits, RSS and latency for at least 72 hours.
-4. Only after parity and canary evidence is clean may the default backend be
-   changed. Provider refresh, DNS and routing behavior must remain unchanged.
+3. A canary host enables the release binary's `smart_zig` backend and records
+   switch audits, RSS and latency for at least 72 hours.
+4. ABI mismatch or allocation failure falls back to Go with an explicit log;
+   provider refresh, DNS and routing behavior remain unchanged.

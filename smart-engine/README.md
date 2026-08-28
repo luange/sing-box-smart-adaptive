@@ -15,14 +15,15 @@ allocation.
 `smart_engine_choose_profile` exposes interactive, bulk and UDP weighting; the
 original choose function remains an interactive-compatible entry point.
 
-The optional `conformance/` package is only built by Linux CI with the
-`smart_zig` tag. It links the produced library through the C ABI and compares
-the transition sequence with a Go reference; it is not part of sing-box's
-default build.
+The optional `conformance/` package is built by Linux CI with the `smart_zig`
+tag. It links the produced library through the C ABI and compares the
+transition sequence with a Go reference. Production release jobs compile the
+same library for each Linux architecture/libc pair before building sing-box.
 
 The host owns node discovery, EndpointProfile/health evidence, dialing,
 persistence, logging, and API compatibility. This prevents the policy engine
-from opening sockets or reimplementing Provider logic.
+from opening sockets or reimplementing Provider logic. The default developer
+build keeps the reference Go policy for zero-dependency development.
 
 Build and test with Zig 0.14+:
 
@@ -31,8 +32,7 @@ zig build test
 zig build -Doptimize=ReleaseFast
 ```
 
-Production remains on the Go backend. A Go adapter and `smart_zig` build tag
-are intentionally not enabled yet: first run the Linux CI job, then add a
-reference-vs-Zig conformance suite for score, margin, confirmation, cooldown,
-and failure recovery. Only after that gate passes should the host select Zig
-explicitly, with an immediate Go fallback for unsupported ABI versions.
+Linux release builds select Zig with `smart_zig` and link the matching static
+library. ABI mismatch or allocation failure safely falls back to the reference
+Go policy and emits a warning; manual pins, EndpointProfile, failure wakeups,
+and switch auditing remain host-owned in either mode.

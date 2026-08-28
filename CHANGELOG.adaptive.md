@@ -2,6 +2,19 @@
 
 只记录相对 **SagerNet 官方 tag** 的本仓库变更。上游 changelog 见 `docs/changelog.md`。
 
+## Unreleased — Zig Smart production backend
+
+- Connect the bounded Zig policy kernel to production `protocol/group/Smart`
+  behind the `smart_zig` build tag; release Linux binaries now run Zig for
+  scoring, confirmation, and cooldown instead of executing two state machines.
+- Feed TCP/UDP dial and flow observations into Zig using canonical endpoint
+  identities, so duplicate provider display names share policy evidence.
+- Keep manual pin, provider refresh, EndpointProfile/status, failure wakeups,
+  and switch audit ownership in the Go host with a safe Go fallback for ABI or
+  allocation failure.
+- Add Linux CI compile coverage for the production adapter and build the Zig
+  static library per architecture/libc target before linking sing-box.
+
 ## Unreleased — Smart probe/profile stability
 
 - Share Smart probe admission across credential variants that describe the
