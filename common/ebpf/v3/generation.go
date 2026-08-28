@@ -87,3 +87,21 @@ func (p *BankPublisher) Snapshot() (bank uint32, generation uint32) {
 	b := p.active.Load()
 	return b, g
 }
+
+// SyncGeneration raises the publisher generation to a live kernel generation
+// observed by a caller. It is intentionally monotonic: a stale observation
+// must never make a subsequent userspace commit reuse an older generation.
+func (p *BankPublisher) SyncGeneration(generation uint32) {
+	if p == nil || generation == 0 {
+		return
+	}
+	for {
+		current := p.generation.Load()
+		if current >= generation {
+			return
+		}
+		if p.generation.CompareAndSwap(current, generation) {
+			return
+		}
+	}
+}

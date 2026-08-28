@@ -71,6 +71,7 @@ func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.backend != nil {
+		l.backend.Publisher.SyncGeneration(generation)
 		l.backend.Control.PolicyGeneration = generation
 	}
 }
