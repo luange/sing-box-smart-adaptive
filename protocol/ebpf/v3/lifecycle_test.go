@@ -1,6 +1,7 @@
 package v3
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -93,6 +94,12 @@ type memSink struct {
 	gen     uint32
 }
 
+type rejectingStaticSink struct{ memSink }
+
+func (s *rejectingStaticSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
+	return errors.New("injected static publish failure")
+}
+
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
 	m.static += len(prefixes)
 	if generation == 0 {
@@ -164,6 +171,31 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 	if err := lc.InvalidateGeneration(); err != nil || sink.invalid != 1 {
 		t.Fatalf("invalidate=%d err=%v", sink.invalid, err)
+	}
+}
+
+func TestLifecycleStaticSinkFailureDoesNotAdvanceMirror(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &rejectingStaticSink{memSink: memSink{gen: 1}}
+	lc.BindSink(sink)
+	before := lc.Backend().Control
+	if _, _, err := lc.PublishStaticRules([]ebpfv3.CompileInput{{
+		Destination: netip.MustParsePrefix("1.1.1.1/32"),
+		Verdict:     ebpfv3.VerdictDirect, Kind: ebpfv3.RuleKindStatic,
+	}}); err == nil {
+		t.Fatal("expected sink failure")
+	}
+	after := lc.Backend().Control
+	if after != before {
+		t.Fatalf("mirror advanced after sink failure: before=%+v after=%+v", before, after)
 	}
 }
 

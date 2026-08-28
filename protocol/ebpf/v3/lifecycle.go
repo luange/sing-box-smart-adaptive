@@ -160,7 +160,10 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := l.backend.PublishStatic(compiled); err != nil {
+	// Validate without mutating the userspace mirror before committing the
+	// kernel bank. This keeps generation/bank state aligned when a sink rejects
+	// the update (for example because a map write or control update failed).
+	if err := l.backend.ValidateStatic(compiled); err != nil {
 		return 0, 0, err
 	}
 	if l.sink != nil {
@@ -173,6 +176,9 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 		if err := l.sink.PublishStaticDirect(direct, 0, 0); err != nil {
 			return len(compiled), len(rej), err
 		}
+	}
+	if err := l.backend.PublishStatic(compiled); err != nil {
+		return 0, 0, err
 	}
 	return len(compiled), len(rej), nil
 }

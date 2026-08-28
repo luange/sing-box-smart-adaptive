@@ -167,7 +167,8 @@ func (s *smartStore) removeOldestLocked() {
 		loaded    bool
 	)
 	for key, metric := range s.metrics {
-		if !loaded || metric.LastUpdated.Before(oldest) {
+		if !loaded || metric.LastUpdated.Before(oldest) ||
+			(metric.LastUpdated.Equal(oldest) && smartMetricKeyLess(oldestKey, key)) {
 			oldestKey = key
 			oldest = metric.LastUpdated
 			loaded = true
@@ -356,12 +357,32 @@ func (s *smartStore) snapshot(now time.Time, retention time.Duration, maxEntries
 	}
 	s.access.Unlock()
 	sort.Slice(metrics, func(i, j int) bool {
-		return metrics[i].LastUpdated.After(metrics[j].LastUpdated)
+		if !metrics[i].LastUpdated.Equal(metrics[j].LastUpdated) {
+			return metrics[i].LastUpdated.After(metrics[j].LastUpdated)
+		}
+		return smartMetricKeyLess(metricKey(metrics[i]), metricKey(metrics[j]))
 	})
 	if maxEntries > 0 && len(metrics) > maxEntries {
 		metrics = metrics[:maxEntries]
 	}
 	return smartStoreSnapshot{Version: smartStateVersion, Metrics: metrics}
+}
+
+func metricKey(metric smartMetric) smartMetricKey {
+	return smartMetricKey{Network: metric.Network, Site: metric.Site, Candidate: metric.Candidate, Transport: metric.Transport}
+}
+
+func smartMetricKeyLess(left, right smartMetricKey) bool {
+	if left.Network != right.Network {
+		return left.Network < right.Network
+	}
+	if left.Site != right.Site {
+		return left.Site < right.Site
+	}
+	if left.Candidate != right.Candidate {
+		return left.Candidate < right.Candidate
+	}
+	return left.Transport < right.Transport
 }
 
 func (s *smartStore) pruneLocked(now time.Time, retention time.Duration, maxEntries int) {

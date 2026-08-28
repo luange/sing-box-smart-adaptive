@@ -643,6 +643,21 @@ func TestSmartHistorySnapshotHonorsRetentionAndLimit(t *testing.T) {
 	}
 }
 
+func TestSmartStoreEvictionIsDeterministicForEqualTimestamps(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	store.setBounds(time.Hour, 1)
+	now := time.Unix(100, 0)
+	store.observeDial(now, "wifi", "", "z-node", "tcp", true, time.Millisecond)
+	store.observeDial(now, "wifi", "", "a-node", "tcp", true, time.Millisecond)
+	store.access.RLock()
+	_, hasA := store.metrics[smartMetricKey{Network: "wifi", Candidate: "a-node", Transport: "tcp"}]
+	_, hasZ := store.metrics[smartMetricKey{Network: "wifi", Candidate: "z-node", Transport: "tcp"}]
+	store.access.RUnlock()
+	if !hasA || hasZ {
+		t.Fatalf("equal-time eviction was not deterministic: hasA=%v hasZ=%v", hasA, hasZ)
+	}
+}
+
 func TestSmartWorkerStartsOnPostStart(t *testing.T) {
 	smart := &Smart{
 		ctx:               context.Background(),

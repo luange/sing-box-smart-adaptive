@@ -167,6 +167,9 @@ func NewMemoryBackend() *MemoryBackend {
 
 // PublishStatic performs inactive-bank fill + atomic commit.
 func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
+	if err := b.ValidateStatic(policies); err != nil {
+		return err
+	}
 	inactive, ok := b.Publisher.BeginCompile()
 	if !ok {
 		return fmt.Errorf("compile already in progress")
@@ -174,18 +177,6 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	// Clear inactive bank then fill — never touch active.
 	b.Policy4[inactive] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[inactive] = make(map[LPM6Key]PolicyValue)
-	var count4, count6 int
-	for _, p := range policies {
-		if p.Prefix.Addr().Unmap().Is4() {
-			count4++
-		} else {
-			count6++
-		}
-	}
-	if count4 > MaxPolicyLPM || count6 > MaxPolicyLPM {
-		b.Publisher.AbortCompile()
-		return fmt.Errorf("static policy capacity exceeded: ipv4=%d ipv6=%d max=%d", count4, count6, MaxPolicyLPM)
-	}
 	// generation for entries is commit generation (current+1)
 	nextGen := b.Publisher.Generation() + 1
 	if nextGen == 0 {
@@ -214,6 +205,41 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
+	return nil
+}
+
+// ValidateStatic checks every policy that PublishStatic would write without
+// changing the active bank or generation. Lifecycle uses this before touching
+// the kernel sink so a rejected update cannot advance only the userspace
+// mirror (or leave a partially converted policy set behind).
+func (b *MemoryBackend) ValidateStatic(policies []CompiledPolicy) error {
+	var count4, count6 int
+	for _, p := range policies {
+		addr := p.Prefix.Addr().Unmap()
+		if !addr.IsValid() {
+			return fmt.Errorf("invalid static policy prefix: %v", p.Prefix)
+		}
+		if addr.Is4() {
+			count4++
+		} else if addr.Is6() {
+			count6++
+		} else {
+			return fmt.Errorf("unsupported static policy family: %v", p.Prefix)
+		}
+	}
+	if count4 > MaxPolicyLPM || count6 > MaxPolicyLPM {
+		return fmt.Errorf("static policy capacity exceeded: ipv4=%d ipv6=%d max=%d", count4, count6, MaxPolicyLPM)
+	}
+	for _, p := range policies {
+		addr := p.Prefix.Addr().Unmap()
+		if addr.Is4() {
+			if _, err := PrefixToLPM4(p.Prefix); err != nil {
+				return err
+			}
+		} else if _, err := PrefixToLPM6(p.Prefix); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
