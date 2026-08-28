@@ -229,8 +229,10 @@ type Smart struct {
 	candidates          []adapter.Outbound
 	candidateByTag      map[string]adapter.Outbound
 	candidateProbeKey   map[string]string
+	candidateHealthKey  map[string]string
 	control             *smartControlState
 	lastSelected        map[string]string
+	selectionUpdated    map[string]time.Time
 	affinity            map[string]smartAffinity
 	switchChallenges    map[string]smartSwitchChallenge
 	performanceCooldown map[string]time.Time
@@ -485,8 +487,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 
 		candidateByTag:      make(map[string]adapter.Outbound),
 		candidateProbeKey:   make(map[string]string),
+		candidateHealthKey:  make(map[string]string),
 		control:             &smartControlState{},
 		lastSelected:        make(map[string]string),
+		selectionUpdated:    make(map[string]time.Time),
 		affinity:            make(map[string]smartAffinity),
 		switchChallenges:    make(map[string]smartSwitchChallenge),
 		performanceCooldown: make(map[string]time.Time),
@@ -612,6 +616,7 @@ func (s *Smart) Close() error {
 	s.access.Lock()
 	clear(s.candidateByTag)
 	clear(s.lastSelected)
+	clear(s.selectionUpdated)
 	clear(s.affinity)
 	clear(s.switchChallenges)
 	clear(s.performanceCooldown)
@@ -619,7 +624,9 @@ func (s *Smart) Close() error {
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
 	s.candidateProbeKey = make(map[string]string)
+	s.candidateHealthKey = make(map[string]string)
 	s.lastSelected = make(map[string]string)
+	s.selectionUpdated = make(map[string]time.Time)
 	s.affinity = make(map[string]smartAffinity)
 	s.switchChallenges = make(map[string]smartSwitchChallenge)
 	s.performanceCooldown = make(map[string]time.Time)
@@ -1309,9 +1316,13 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	defer s.probing.Store(false)
 	s.access.RLock()
 	candidates := append([]adapter.Outbound(nil), s.candidates...)
-	probeKeys := make(map[string]string, len(s.candidateProbeKey))
+	probeKeys := make(map[string]string, len(s.candidateHealthKey))
 	for tag, key := range s.candidateProbeKey {
-		probeKeys[tag] = key
+		probeKeys[tag] = s.candidateHealthKey[tag]
+		if probeKeys[tag] == "" {
+			// Test/legacy constructors may only populate the endpoint map.
+			probeKeys[tag] = key
+		}
 	}
 	s.access.RUnlock()
 	if len(candidates) == 0 || s.closing.Load() {
@@ -1486,12 +1497,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	pinned, temporary, _, _ := s.controlSnapshot(now)
 	networkKey := s.networkFingerprint()
 	siteDisplay, siteKey := s.resolveSmartSiteIdentity(adapter.ContextFrom(ctx), destination)
-	s.access.RLock()
+	// Selection/challenge maps are keyed by the resolved site and can otherwise
+	// grow with every unique destination for the lifetime of a process. Prune
+	// them at the same bounded cadence as the metrics store.
+	s.access.Lock()
+	s.pruneControlStateLocked(now)
 	ranking := acquireSmartRanking(len(s.candidates))
 	ranking.candidates = append(ranking.candidates, s.candidates...)
 	lastSelected := s.lastSelected[smartSelectionKey(networkKey, siteKey, transport)]
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
-	s.access.RUnlock()
+	s.access.Unlock()
 
 	totalSamples := 0.0
 	policyCandidates := make([]smartPolicyCandidate, 0, len(ranking.candidates))
@@ -1500,6 +1515,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if transport == N.NetworkUDP {
 		profile = smartProfileUDP
 	}
+	profileCandidate := lastSelected
+	if affinity.ExpiresAt.After(now) && affinity.Candidate != "" {
+		profileCandidate = affinity.Candidate
+	}
+	var profileThroughputSamples float64
 	for _, candidate := range ranking.candidates {
 		if !common.Contains(candidate.Network(), transport) {
 			continue
@@ -1508,7 +1528,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
 			s.access.RLock()
-			identity := s.candidateProbeKey[candidate.Tag()]
+			identity := s.candidateHealthKey[candidate.Tag()]
+			if identity == "" {
+				identity = s.candidateProbeKey[candidate.Tag()]
+			}
 			s.access.RUnlock()
 			sharedProbeDead = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 		}
@@ -1521,12 +1544,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.access.RUnlock()
 		policyID := smartPolicyID(identity)
 		totalSamples += estimate.Samples
-		profileThroughputSamples := estimate.ThroughputSamples
-		if siteKey != "" {
-			profileThroughputSamples = estimate.LocalThroughputSamples
-		}
-		if profile == smartProfileInteractive && profileThroughputSamples >= 2 {
-			profile = smartProfileBulk
+		if candidate.Tag() == profileCandidate {
+			profileThroughputSamples = estimate.ThroughputSamples
+			if siteKey != "" {
+				profileThroughputSamples = estimate.LocalThroughputSamples
+			}
 		}
 		ranking.ranks = append(ranking.ranks, smartRank{
 			outbound: candidate,
@@ -1562,6 +1584,9 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				policyCandidates = append(policyCandidates, merged)
 			}
 		}
+	}
+	if profile == smartProfileInteractive && profileThroughputSamples >= 2 {
+		profile = smartProfileBulk
 	}
 	// Apply the passive bulk gate only after the traffic profile is known. This
 	// changes eligibility for future dials; it never interrupts an existing
@@ -1658,7 +1683,21 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	if s.policyBackend != nil {
-		decision := s.policyBackend.Choose(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
+		selectionKey := smartSelectionKey(networkKey, siteKey, transport)
+		// Keep the configured site-affinity lease effective when the Zig policy
+		// backend is active. Previously affinity was only consumed by the Go
+		// fallback, so production builds silently ignored site_stickiness.
+		if affinity.Candidate != "" && affinity.ExpiresAt.After(now) {
+			s.access.RLock()
+			identity := s.candidateProbeKey[affinity.Candidate]
+			s.access.RUnlock()
+			if identity != "" {
+				if index := smartRankIndex(ranks, affinity.Candidate); index >= 0 && ranks[index].status.State != "open" {
+					s.policyBackend.Stick(selectionKey, smartPolicyID(identity), now, affinity.ExpiresAt)
+				}
+			}
+		}
+		decision := s.policyBackend.Choose(selectionKey, policyCandidates, profile, now)
 		if decision.SelectedID != 0 {
 			for index := range ranks {
 				identity := ""
@@ -1735,12 +1774,26 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
 	affinityKey := networkKey + "\x00" + siteKey + "\x00" + transport
+	policySelectedID := uint64(0)
+	if s.policyBackend != nil {
+		policySelectedID = s.policyBackend.Selected(key)
+	}
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
+	if policySelectedID != 0 && previous != "" && previous != candidate.Tag() && !failureSwitch {
+		candidateID := smartPolicyID(s.candidateProbeKey[candidate.Tag()])
+		if candidateID != policySelectedID {
+			// A slower completion from an older hedge must not overwrite the
+			// selection already committed by the Zig policy engine.
+			s.access.Unlock()
+			s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "late healthy result retained policy candidate")
+			return
+		}
+	}
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
 	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
@@ -1753,6 +1806,10 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 		}
 	}
 	s.lastSelected[key] = candidate.Tag()
+	if s.selectionUpdated == nil {
+		s.selectionUpdated = make(map[string]time.Time)
+	}
+	s.selectionUpdated[key] = now
 	delete(s.switchChallenges, key)
 	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		if s.performanceCooldown == nil {
@@ -1916,7 +1973,10 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 	forceAll := s.interruptMode == "all"
 	if !forceAll && s.probeRegistry != nil {
 		s.access.RLock()
-		identity := s.candidateProbeKey[previous]
+		identity := s.candidateHealthKey[previous]
+		if identity == "" {
+			identity = s.candidateProbeKey[previous]
+		}
 		s.access.RUnlock()
 		forceAll = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 	}
@@ -2066,6 +2126,42 @@ func (s *Smart) pruneAffinityLocked(now time.Time) {
 	}
 }
 
+func (s *Smart) pruneControlStateLocked(now time.Time) {
+	limit := min(10000, max(1024, s.maxHistoryEntries))
+	retention := s.historyRetention
+	if retention <= 0 {
+		retention = defaultSmartHistoryRetention
+	}
+	for key, updated := range s.selectionUpdated {
+		if now.Sub(updated) > retention {
+			delete(s.selectionUpdated, key)
+			delete(s.lastSelected, key)
+		}
+	}
+	if len(s.selectionUpdated) > limit {
+		for key := range s.selectionUpdated {
+			if len(s.selectionUpdated) <= limit {
+				break
+			}
+			delete(s.selectionUpdated, key)
+			delete(s.lastSelected, key)
+		}
+	}
+	for key, challenge := range s.switchChallenges {
+		if challenge.Since.IsZero() || now.Sub(challenge.Since) > max(retention, s.switchConfirm*2) {
+			delete(s.switchChallenges, key)
+		}
+	}
+	for key, until := range s.performanceCooldown {
+		if !until.After(now) {
+			delete(s.performanceCooldown, key)
+		}
+	}
+	// Affinity has its own expiry and size policy, but pruning it here avoids
+	// waiting for the next successful dial to reclaim stale entries.
+	s.pruneAffinityLocked(now)
+}
+
 func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string) {
 	temporaryCleared := false
 	s.control.access.Lock()
@@ -2116,7 +2212,10 @@ func (s *Smart) onProviderUpdated(tag string) error {
 	if retired {
 		return nil
 	}
-	if _, loaded := s.providers[tag]; !loaded {
+	s.providerAccess.Lock()
+	_, loaded := s.providers[tag]
+	s.providerAccess.Unlock()
+	if !loaded {
 		return E.New("outbound provider not found: ", tag)
 	}
 	err := s.rebuildCandidates(tag)
@@ -2182,14 +2281,17 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	}
 	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
 	candidateProbeKey := make(map[string]string, len(candidates))
+	candidateHealthKey := make(map[string]string, len(candidates))
 	for _, candidate := range candidates {
 		candidateByTag[candidate.Tag()] = candidate
 		candidateProbeKey[candidate.Tag()] = s.probeIdentityLocked(candidate)
+		candidateHealthKey[candidate.Tag()] = s.probeHealthIdentityLocked(candidate)
 	}
 	s.access.Lock()
 	s.candidates = candidates
 	s.candidateByTag = candidateByTag
 	s.candidateProbeKey = candidateProbeKey
+	s.candidateHealthKey = candidateHealthKey
 	s.access.Unlock()
 	if latest := s.latest.Load(); latest != nil && candidateByTag[latest.Tag()] == nil {
 		s.latest.Store(nil)

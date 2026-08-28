@@ -33,6 +33,20 @@
 - Add regression coverage for endpoint identity separation and credential
   rotation.
 
+## 1.14.0-rc.1-official-smart-ebpf-v3.14-smart-stability — 2026-08-28
+
+- Make Zig Smart site-stickiness leases effective in production and prevent
+  late concurrent hedge completions from overwriting the committed choice.
+- Keep duplicate subscription lines merged for policy scoring while isolating
+  credential-specific health outcomes; preserve routing `Host` headers in the
+  endpoint identity.
+- Bound and prune selection, challenge, cooldown, and affinity state so
+  destination churn cannot grow control maps indefinitely.
+- Use configured breaker thresholds and honor active exponential-backoff
+  circuits until recovery; add regression coverage for long-lived open circuits.
+- Exercise Zig policy, C ABI, Go conformance, and production backend builds in
+  Linux CI.
+
 ---
 
 ## 1.14.0-rc.1-official-smart-ebpf-v3.13-stream-recovery — 2026-08-26

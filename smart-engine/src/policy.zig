@@ -12,6 +12,15 @@ pub const State = struct {
     pub fn reset(self: *State) void {
         self.* = .{};
     }
+
+    pub fn stick(self: *State, id: u64, until_ms: u64) void {
+        if (id == 0) return;
+        self.selected_id = id;
+        self.challenge_id = 0;
+        self.challenge_count = 0;
+        self.challenge_since = 0;
+        self.cooldown_until = until_ms;
+    }
 };
 
 pub fn choose(state: *State, config: model.Config, observations: *const metrics.Store, candidates: []const model.Candidate, now_ms: u64) model.Decision {

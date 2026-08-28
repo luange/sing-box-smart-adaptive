@@ -12,6 +12,11 @@ import (
 type smartPolicyBackend interface {
 	Choose(key string, candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) smartPolicyDecision
 	Observe(key string, id uint64, success bool, elapsed time.Duration, now time.Time)
+	Selected(key string) uint64
+	// Stick makes the host's site-affinity lease authoritative in the policy
+	// kernel. It is deliberately a lease, not a permanent selection: once the
+	// expiry passes normal policy scoring resumes.
+	Stick(key string, id uint64, now, until time.Time)
 	Reset()
 	Close()
 }

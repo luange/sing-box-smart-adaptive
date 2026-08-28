@@ -237,10 +237,23 @@ func (s *smartStore) candidateDead(candidate string, now time.Time) bool {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	for key, metric := range s.metrics {
-		if key.Candidate != candidate || key.Site != "" || now.Sub(metric.LastUpdated) > 30*time.Second {
+		if key.Candidate != candidate || key.Site != "" {
 			continue
 		}
-		if metric.ConsecutiveFailures >= 3 {
+		// Use the configured breaker threshold and circuit state. The old
+		// hard-coded 3/30s check made manual-pin recovery disagree with the
+		// actual breaker settings (especially when breaker_failures was 1).
+		recentWindow := s.breakerCooldown
+		if recentWindow < 30*time.Second {
+			recentWindow = 30 * time.Second
+		}
+		// An open circuit is authoritative until its configured recovery time;
+		// it must not be hidden merely because the original failure is older than
+		// the observation window (exponential backoff can outlive that window).
+		if metric.CircuitUntil.After(now) {
+			return true
+		}
+		if !metric.LastUpdated.IsZero() && now.Sub(metric.LastUpdated) < recentWindow && metric.ConsecutiveFailures >= s.breakerFailures {
 			return true
 		}
 	}

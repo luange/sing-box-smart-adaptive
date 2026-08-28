@@ -49,6 +49,10 @@ void smart_engine_observe(smart_engine *engine, uint64_t id, uint8_t success, do
 smart_decision smart_engine_choose(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms);
 /* profile: 0 interactive, 1 bulk, 2 UDP; unknown values use interactive. */
 smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms, uint8_t profile);
+/* Make an existing selection sticky until until_ms (process-relative monotonic milliseconds). */
+void smart_engine_stick(smart_engine *engine, uint64_t id, uint64_t until_ms);
+/* Return the engine's current selection, or zero when none exists. */
+uint64_t smart_engine_selected(smart_engine *engine);
 void smart_engine_reset(smart_engine *engine);
 
 /* Host-neutral AdaptivePool decision kernel.  The host still owns health

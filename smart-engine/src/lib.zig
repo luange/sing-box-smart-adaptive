@@ -79,6 +79,15 @@ export fn smart_engine_choose_profile(engine: ?*Engine, candidates: ?[*]const Ca
     return .{ .selected_id = 0, .score = 100.0, .switched = 0, .reason = 3 };
 }
 
+export fn smart_engine_stick(engine: ?*Engine, id: u64, until_ms: u64) void {
+    if (engine) |value| policy.State.stick(&value.state, id, until_ms);
+}
+
+export fn smart_engine_selected(engine: ?*Engine) u64 {
+    if (engine) |value| return value.state.selected_id;
+    return 0;
+}
+
 export fn smart_engine_reset(engine: ?*Engine) void {
     if (engine) |value| value.reset();
 }
@@ -164,6 +173,24 @@ test "retains incumbent until confirmation" {
     try std.testing.expectEqual(@as(u64, 1), policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..1], 0).selected_id);
     try std.testing.expectEqual(@as(u8, 0), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 1000).switched);
     try std.testing.expectEqual(@as(u8, 1), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 2000).switched);
+}
+
+test "smart site stick lease is honored and then expires" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 });
+    const candidates = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.50, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    _ = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 0);
+    engine.state.stick(2, 100);
+    const retained = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 50);
+    try std.testing.expectEqual(@as(u64, 2), retained.selected_id);
+    // Lease expiry re-enters the normal confirmation path; the first
+    // observation starts a challenge and the next one commits the switch.
+    const expired_pending = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 101);
+    try std.testing.expectEqual(@as(u64, 2), expired_pending.selected_id);
+    const expired = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 102);
+    try std.testing.expectEqual(@as(u64, 1), expired.selected_id);
 }
 
 test "hard-open incumbent fails over without confirmation" {

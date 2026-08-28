@@ -32,7 +32,7 @@ func StripEndpointCredentials(value any) any {
 		for key, item := range typed {
 			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), " ", "_"))
 			switch normalized {
-			case "password", "uuid", "psk", "token", "secret", "private_key", "privatekey", "auth", "authorization", "headers":
+			case "password", "uuid", "psk", "token", "secret", "private_key", "privatekey", "auth", "authorization":
 				continue
 			}
 			result[key] = StripEndpointCredentials(item)

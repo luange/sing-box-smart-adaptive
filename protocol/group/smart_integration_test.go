@@ -155,6 +155,7 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		candidateByTag:       candidateByTag,
 		control:              &smartControlState{},
 		lastSelected:         make(map[string]string),
+		selectionUpdated:     make(map[string]time.Time),
 		affinity:             make(map[string]smartAffinity),
 		switchChallenges:     make(map[string]smartSwitchChallenge),
 		performanceCooldown:  make(map[string]time.Time),
@@ -942,6 +943,10 @@ func TestSmartBulkSitePrefersSustainedThroughput(t *testing.T) {
 		smart.store.observeThroughput(now, networkKey, siteKey, lowLatency.Tag(), N.NetworkTCP, 512*1024, 2*time.Second)
 		smart.store.observeThroughput(now, networkKey, siteKey, highThroughput.Tag(), N.NetworkTCP, 64*1024*1024, 2*time.Second)
 	}
+	// Bulk profiling follows the active site/candidate. Establish the incumbent
+	// explicitly so throughput from a competing line cannot change the profile.
+	smart.lastSelected[smartSelectionKey(networkKey, siteKey, N.NetworkTCP)] = highThroughput.Tag()
+	smart.selectionUpdated[smartSelectionKey(networkKey, siteKey, N.NetworkTCP)] = now
 	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
 	if ranks[0].profile != smartProfileBulk {
 		t.Fatalf("expected bulk profile, got %s", ranks[0].profile)

@@ -33,4 +33,20 @@ func TestSmartProbeIdentitySharesCredentialVariants(t *testing.T) {
 	if gotA, gotC := smart.probeIdentityLocked(a), smart.probeIdentityLocked(c); gotA == gotC {
 		t.Fatalf("different endpoints must not share identity: %q", gotA)
 	}
+	if gotA, gotB := smart.probeHealthIdentityLocked(a), smart.probeHealthIdentityLocked(b); gotA == gotB {
+		t.Fatalf("credential variants must not share authentication health: %q", gotA)
+	}
+}
+
+func TestSmartProbeIdentityPreservesRoutingHeaders(t *testing.T) {
+	provider := &smartIdentityProvider{options: map[string]option.Outbound{
+		"node-1": {Type: "vless", Options: map[string]any{"server": "edge.example", "server_port": 443, "tls": map[string]any{"server_name": "edge.example"}, "transport": map[string]any{"headers": map[string]any{"Host": "a.example"}}}},
+		"node-2": {Type: "vless", Options: map[string]any{"server": "edge.example", "server_port": 443, "tls": map[string]any{"server_name": "edge.example"}, "transport": map[string]any{"headers": map[string]any{"Host": "b.example"}}}},
+	}}
+	smart := &Smart{providers: map[string]adapter.Provider{"p": provider}}
+	a := newSmartFakeOutbound("node-1", nil)
+	b := newSmartFakeOutbound("node-2", nil)
+	if smart.probeIdentityLocked(a) == smart.probeIdentityLocked(b) {
+		t.Fatal("different routing Host headers must not share endpoint identity")
+	}
 }

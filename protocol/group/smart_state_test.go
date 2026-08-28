@@ -344,6 +344,43 @@ func TestSmartCandidateDeadRequiresRecentGlobalConsecutiveFailures(t *testing.T)
 	}
 }
 
+func TestSmartCandidateDeadKeepsLongCircuitOpenBeyondFailureWindow(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Now()
+	for range 7 {
+		store.observeDial(now, "ethernet", "", "node-a", "tcp", false, time.Second)
+	}
+	if !store.candidateDead("node-a", now.Add(5*time.Minute)) {
+		t.Fatal("active exponential-backoff circuit must remain dead beyond one cooldown window")
+	}
+}
+
+func TestSmartControlStatePrunesExpiredSelectionMetadata(t *testing.T) {
+	smart := &Smart{
+		lastSelected:     map[string]string{"old": "node-a", "new": "node-b"},
+		selectionUpdated: map[string]time.Time{"old": time.Unix(0, 0), "new": time.Now()},
+		affinity:         make(map[string]smartAffinity),
+		switchChallenges: map[string]smartSwitchChallenge{"old": {Since: time.Unix(0, 0)}},
+		performanceCooldown: map[string]time.Time{
+			"old": time.Unix(0, 0),
+		},
+		historyRetention:  time.Minute,
+		maxHistoryEntries: 16,
+	}
+	smart.access.Lock()
+	smart.pruneControlStateLocked(time.Now())
+	smart.access.Unlock()
+	if _, ok := smart.lastSelected["old"]; ok {
+		t.Fatal("expired selection was retained")
+	}
+	if _, ok := smart.switchChallenges["old"]; ok {
+		t.Fatal("expired challenge was retained")
+	}
+	if _, ok := smart.performanceCooldown["old"]; ok {
+		t.Fatal("expired cooldown was retained")
+	}
+}
+
 func TestSmartTCPAndUDPStateAreIndependent(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(5000, 0)

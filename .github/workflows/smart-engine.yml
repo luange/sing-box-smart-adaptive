@@ -50,6 +50,8 @@ jobs:
             smart_candidate candidates[2] = {incumbent, better};
             smart_decision pending = smart_engine_choose(engine, candidates, 2, 1);
             smart_decision switched = smart_engine_choose(engine, candidates, 2, 2);
+            smart_engine_stick(engine, 1, 100);
+            if (smart_engine_selected(engine) != 1) return 7;
             smart_engine_destroy(engine);
             if (!(first.selected_id == 1 && pending.selected_id == 1 &&
                   switched.selected_id == 2 && switched.switched == 1)) return 3;
@@ -58,13 +60,13 @@ jobs:
             adaptive_engine_config adaptive_cfg = {0, 0, 2, 0, 1, 0};
             adaptive_engine *adaptive = adaptive_engine_create(adaptive_cfg);
             if (!adaptive) return 5;
-            adaptive_candidate incumbent = {1, 0, 0, 0, 20, 0, 0, 1, 1, 0, 0};
-            adaptive_candidate challenger = {2, 0, 0, 0, 5, 0, 0, 1, 1, 0, 0};
-            adaptive_decision a_first = adaptive_engine_choose(adaptive, &incumbent, 1, 0);
-            adaptive_candidate pair[2] = {incumbent, challenger};
+            adaptive_candidate adaptive_incumbent = {1, 0, 0, 0, 20, 0, 0, 1, 1, 0, 0};
+            adaptive_candidate adaptive_challenger = {2, 0, 0, 0, 5, 0, 0, 1, 1, 0, 0};
+            adaptive_decision a_first = adaptive_engine_choose(adaptive, &adaptive_incumbent, 1, 0);
+            adaptive_candidate pair[2] = {adaptive_incumbent, adaptive_challenger};
             adaptive_decision a_pending = adaptive_engine_choose(adaptive, pair, 2, 1);
             adaptive_engine_forget(adaptive);
-            adaptive_decision a_after_forget = adaptive_engine_choose(adaptive, &challenger, 1, 2);
+            adaptive_decision a_after_forget = adaptive_engine_choose(adaptive, &adaptive_challenger, 1, 2);
             adaptive_engine_destroy(adaptive);
             return a_first.selected_id == 1 && a_pending.selected_id == 1 &&
                    a_after_forget.selected_id == 2 ? 0 : 6;
@@ -82,7 +84,7 @@ jobs:
           zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
           test -s zig-out/lib/libsmart_engine.a
           cd ..
-          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
+          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^TestZigSmartBackend'
       - name: Cross-build Linux libraries
         working-directory: smart-engine
         run: |
