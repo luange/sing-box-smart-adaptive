@@ -3,6 +3,7 @@ package v3
 import (
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestPublishStaticAtomicAndGeneration(t *testing.T) {
@@ -115,5 +116,29 @@ func TestIPv4IPv6FlowSymmetric(t *testing.T) {
 		if err := b.PublishFlow(req, 1); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestFlowMirrorExpiresAndStaysBounded(t *testing.T) {
+	b := NewMemoryBackend()
+	now := uint64(time.Now().UnixNano())
+	// Seed a full mirror to model a long-lived gateway before the next learn.
+	for i := 0; i < DefaultFlowEntries; i++ {
+		key := FlowKey{Family: AFInet, Protocol: ProtocolTCP, SPort: uint16(i), DPort: 443, SAddr: [16]byte{10, 0, byte(i >> 8), byte(i)}}
+		b.Flows[key] = FlowValue{Generation: b.Control.PolicyGeneration, ExpiresNs: now + uint64(time.Hour)}
+	}
+	if err := b.PublishFlow(FlowPublishRequest{
+		Client: netip.MustParseAddrPort("10.10.0.2:12345"), Destination: netip.MustParseAddrPort("8.8.8.8:443"),
+		Protocol: ProtocolTCP, Verdict: VerdictDirect, LeafIsBareDirect: true,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Flows) > DefaultFlowEntries {
+		t.Fatalf("flow mirror exceeded bound: %d", len(b.Flows))
+	}
+	key := FlowKey{Family: AFInet, Protocol: ProtocolTCP, SPort: 12345, DPort: 443, SAddr: [16]byte{10, 10, 0, 2}, DAddr: [16]byte{8, 8, 8, 8}}
+	b.Flows[key] = FlowValue{Generation: b.Control.PolicyGeneration, ExpiresNs: now - 1}
+	if b.LookupFlow(key) != nil {
+		t.Fatal("expired flow mirror entry was returned")
 	}
 }

@@ -209,13 +209,81 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 func (b *MemoryBackend) PublishFlow(req FlowPublishRequest, nowNs uint64) error {
 	ttl := DefaultFlowTTL(req.Protocol, req.TimeoutClass, req.TTL)
 	expire := nowNs + uint64(ttl)
+	if expire < nowNs {
+		expire = ^uint64(0)
+	}
 	pair, err := BuildFlowPair(req, b.Control.PolicyGeneration, expire)
 	if err != nil {
 		return err
 	}
+	b.pruneFlows(nowNs)
+	needed := 0
+	if _, ok := b.Flows[pair.Forward]; !ok {
+		needed++
+	}
+	if _, ok := b.Flows[pair.Reverse]; !ok {
+		needed++
+	}
+	for len(b.Flows)+needed > DefaultFlowEntries {
+		if !b.evictOldestFlow() {
+			break
+		}
+	}
 	b.Flows[pair.Forward] = pair.Value
 	b.Flows[pair.Reverse] = pair.Value
 	return nil
+}
+
+func (b *MemoryBackend) pruneFlows(nowNs uint64) {
+	for key, value := range b.Flows {
+		if value.ExpiresNs != 0 && value.ExpiresNs <= nowNs {
+			delete(b.Flows, key)
+		}
+	}
+}
+
+func (b *MemoryBackend) evictOldestFlow() bool {
+	var oldestKey FlowKey
+	var oldest uint64
+	loaded := false
+	for key, value := range b.Flows {
+		if !loaded || value.ExpiresNs < oldest || (value.ExpiresNs == oldest && flowKeyLess(key, oldestKey)) {
+			oldestKey, oldest, loaded = key, value.ExpiresNs, true
+		}
+	}
+	if !loaded {
+		return false
+	}
+	delete(b.Flows, oldestKey)
+	return true
+}
+
+func flowKeyLess(left, right FlowKey) bool {
+	if left.Family != right.Family {
+		return left.Family < right.Family
+	}
+	if left.Protocol != right.Protocol {
+		return left.Protocol < right.Protocol
+	}
+	if left.SPort != right.SPort {
+		return left.SPort < right.SPort
+	}
+	if left.DPort != right.DPort {
+		return left.DPort < right.DPort
+	}
+	if left.SAddr != right.SAddr {
+		for index := range left.SAddr {
+			if left.SAddr[index] != right.SAddr[index] {
+				return left.SAddr[index] < right.SAddr[index]
+			}
+		}
+	}
+	for index := range left.DAddr {
+		if left.DAddr[index] != right.DAddr[index] {
+			return left.DAddr[index] < right.DAddr[index]
+		}
+	}
+	return false
 }
 
 // RevokeFlow removes both directions after a real proxy/route failure.
@@ -266,7 +334,7 @@ func (b *MemoryBackend) LookupStatic(dest netip.Addr, protocol uint8, dport uint
 // LookupFlow returns active generation flow.
 func (b *MemoryBackend) LookupFlow(key FlowKey) *FlowValue {
 	v, ok := b.Flows[key]
-	if !ok || v.Generation != b.Control.PolicyGeneration {
+	if !ok || v.Generation != b.Control.PolicyGeneration || v.ExpiresNs != 0 && v.ExpiresNs <= uint64(time.Now().UnixNano()) {
 		return nil
 	}
 	return &v
