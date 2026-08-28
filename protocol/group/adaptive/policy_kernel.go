@@ -10,7 +10,7 @@ import (
 // refresh, dialing, and leases remain host-owned; the kernel receives a
 // bounded snapshot and returns only the preferred node identity/reason.
 type policyKernel interface {
-	Configure(margin float64, cooldown time.Duration, manualFailure string)
+	Configure(margin float64, cooldown, confirm time.Duration, confirmSamples int, manualFailure string)
 	Choose(key string, candidates []policyKernelCandidate, mode PolicyMode, now time.Time) policyKernelDecision
 	SetBulkSequence(key string, sequence uint64)
 	Remember(key string, id NodeID, now time.Time, cooldown time.Duration)
@@ -75,6 +75,8 @@ func kernelDecisionReason(reason uint8) DecisionReason {
 		return ReasonStickyMargin
 	case 8:
 		return ReasonSwitchCooldown
+	case 9:
+		return ReasonSwitchConfirmed
 	case 2:
 		return ReasonLease
 	case 3:

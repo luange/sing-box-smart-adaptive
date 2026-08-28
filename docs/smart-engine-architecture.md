@@ -28,15 +28,23 @@ hosts; unknown profile values fall back to interactive scoring.
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
 - `lib.zig`: thin lifecycle and C ABI facade.
 
+Confirmation and cooldown timestamps cross the ABI as process-relative
+monotonic milliseconds. The Go adapters convert their `time.Time` input from
+one process origin, so an NTP step cannot trigger an early switch or extend a
+cooldown unexpectedly. If a provider refresh removes the incumbent, the
+kernel immediately adopts the best eligible candidate; it never returns an
+ID that is absent from the current snapshot while waiting for confirmation.
+
 The Go implementation remains the zero-dependency reference backend. Linux
 release builds select the in-process Zig adapter with the `smart_zig` build
 tag after the same conformance gate; provider, routing, and API code are
 unchanged.
 
-The Go adapter sends candidates through the existing batch ABI entry point and
-reuses one conversion buffer per lock shard (16 shards, four bounded contexts
-each). Different service contexts can rank concurrently without retaining a
-large candidate buffer per context.
+The Go adapters send candidates through the existing batch ABI entry point and
+reuse one conversion buffer per lock shard. Smart bounds each shard to four
+contexts; AdaptivePool bounds each shard to eight (128 total). Different
+service contexts can rank concurrently without retaining a large candidate
+buffer per context.
 
 ## Passive bulk throughput gate
 

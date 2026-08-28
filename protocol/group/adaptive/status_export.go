@@ -11,8 +11,35 @@ import (
 )
 
 func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
-	snapshot := p.catalog.load()
-	status := adapter.AdaptivePoolStatus{Shadow: p.shadow, UpdatedAt: time.Now()}
+	// Runtime epoch publication swaps health/lease/control pointers under the
+	// pool lifecycle lock. Snapshot those pointers once so a Clash API poll
+	// cannot observe a mixed epoch or race a pointer replacement.
+	p.lifecycleAccess.Lock()
+	shadow := p.shadow
+	defaultMode := p.defaultMode
+	aiIPv6Policy := p.aiIPv6Policy
+	health := p.health
+	leases := p.leases
+	control := p.control
+	resolver := p.resolver
+	nodeWeights := p.nodeWeights
+	switchMargin := p.switchMargin
+	switchCooldown := p.switchCooldown
+	affinityMode := p.affinityMode
+	switchAudit := p.switchAudit
+	scheduler := p.scheduler
+	capabilityControllers := cloneCapabilityControllers(p.capabilityControllers)
+	capabilityEnabled := p.capabilityProvider != nil
+	capabilityProvider := p.capabilityProvider
+	schedulerOwner := p.schedulerOwner
+	exitIdentityStore := p.exitIdentityStore
+	p.lifecycleAccess.Unlock()
+
+	var snapshot *ExecutionSnapshot
+	if p.catalog != nil {
+		snapshot = p.catalog.load()
+	}
+	status := adapter.AdaptivePoolStatus{Shadow: shadow, UpdatedAt: time.Now()}
 	status.MissedObservations = p.missedObservations.Load()
 	status.ObservationStaleTotal = p.observationStale.Load()
 	status.ObservationDuplicateTotal = p.observationDuplicate.Load()
@@ -23,29 +50,33 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	status.ObservationPermitBusyTotal = p.observationPermitBusy.Load()
 	status.BusinessTLSFailuresTotal = p.businessTLSFailures.Load()
 	status.TransportFailuresTotal = p.transportFailures.Load()
-	status.AIIPv6Policy = p.aiIPv6Policy
+	status.AIIPv6Policy = aiIPv6Policy
 	status.AIIPv6BlockedTotal = p.aiIPv6Blocked.Load()
-	status.RecentSwitches, status.SelectionSwitchesTotal = p.switchAudit.Snapshot()
+	if switchAudit != nil {
+		status.RecentSwitches, status.SelectionSwitchesTotal = switchAudit.Snapshot()
+	}
 	status.DeltaAppliedTotal = p.deltaAppliedTotal.Load()
 	status.DeltaFallbackTotal = p.deltaFallbackTotal.Load()
-	if p.control == nil {
-		p.control = new(ControlState)
+	if control == nil {
+		control = new(ControlState)
 	}
-	p.control.access.RLock()
-	status.Pinned = p.control.pinnedTag
-	if p.shadow {
+	control.access.RLock()
+	status.Pinned = control.pinnedTag
+	if shadow {
 		status.Mode = "shadow"
-	} else if p.control.pinned != (NodeID{}) {
+	} else if control.pinned != (NodeID{}) {
 		status.Mode = string(ModeManual)
 	} else {
-		status.Mode = string(p.defaultMode)
+		status.Mode = string(defaultMode)
 	}
-	p.control.access.RUnlock()
-	status.ActiveLeases, status.LeaseEvictions = p.leases.Stats()
-	status.BulkSequence = p.control.bulkSequence.Load()
-	status.ControlRevision = p.control.revision.Load()
-	if p.resolver != nil {
-		status.ServiceOverrideCount = len(p.resolver.Overrides(time.Now()))
+	control.access.RUnlock()
+	if leases != nil {
+		status.ActiveLeases, status.LeaseEvictions = leases.Stats()
+	}
+	status.BulkSequence = control.bulkSequence.Load()
+	status.ControlRevision = control.revision.Load()
+	if resolver != nil {
+		status.ServiceOverrideCount = len(resolver.Overrides(time.Now()))
 	}
 	if p.catalog != nil {
 		bindings := p.catalog.BindingStats()
@@ -55,7 +86,10 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	if snapshot == nil {
 		return status
 	}
-	leaseSnapshot := p.leases.PersistenceSnapshot(time.Now())
+	var leaseSnapshot []SessionLease
+	if leases != nil {
+		leaseSnapshot = leases.PersistenceSnapshot(time.Now())
+	}
 	slices.SortFunc(leaseSnapshot, func(left, right SessionLease) int {
 		if left.ServiceID != right.ServiceID {
 			return bytes.Compare([]byte(left.ServiceID), []byte(right.ServiceID))
@@ -84,16 +118,18 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 			status.EndpointConflictCount++
 		}
 	}
-	// Live health under RLock-friendly snapshot. Bind the same switch stability
-	// knobs as the dial path so status scores are not a parallel fictional policy.
-	healthView := p.health.ReadOnlySnapshot()
-	policyView := NewPolicyEngine(healthView, p.policyMaxAttempts, p.manualFailure).
-		BindNodeWeights(p.nodeWeights).
-		BindSwitchStability(p.switchMargin, p.switchCooldown).
-		BindAffinityMode(p.affinityMode)
-	// Copy sticky prefs from the live engine so margin/cooldown explain matches dial.
-	if p.policy != nil {
-		policyView.importStickyFrom(p.policy)
+	// Live health under RLock-friendly snapshot. Status only needs the pure
+	// candidateScore helper; constructing a full PolicyEngine here would create
+	// a native Zig kernel for every Clash API poll and retain native allocations
+	// until process exit. Keep this view deliberately kernel-free.
+	if health == nil {
+		return status
+	}
+	healthView := health.ReadOnlySnapshot()
+	policyView := &PolicyEngine{
+		health: healthView, nodeWeights: nodeWeights,
+		switchMargin: switchMargin, switchCooldown: switchCooldown,
+		affinityMode: affinityMode,
 	}
 	throughput := healthView.ThroughputByHandle()
 	for _, candidate := range snapshot.Candidates {
@@ -115,7 +151,7 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 		if health.Breaker != BreakerClosed {
 			state = string(health.Breaker)
 		}
-		weightMatch := p.nodeWeights.Explain(candidate.PrimaryTag)
+		weightMatch := nodeWeights.Explain(candidate.PrimaryTag)
 		pathStatuses := make([]adapter.AdaptivePathStatus, 0, len(observableHealthPaths))
 		for _, path := range observableHealthPaths {
 			pathHealth := healthView.StatusHandle(candidate.Handle, DomainTransport, path, "")
@@ -203,17 +239,12 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	}
 	status.StateEntries, status.StateEvictions = healthView.Stats()
 	status.StatePersistenceFailures = p.statePersistenceFailures.Load()
-	p.lifecycleAccess.Lock()
-	scheduler := p.scheduler
-	// D3/C1: capabilityControllers map is the single status source.
-	capabilityControllers := cloneCapabilityControllers(p.capabilityControllers)
-	capabilityEnabled := p.capabilityProvider != nil
-	capabilityProvider := p.capabilityProvider
-	p.lifecycleAccess.Unlock()
 	status.CapabilityEnabled = capabilityEnabled
 	status.CapabilityInitFailures = p.capabilityInitFailures.Load()
-	status.ExitIdentityBaselines, status.ExitIdentityChangesTotal, status.ExitIdentitySaturatedNodes = p.exitIdentityStore.Stats()
-	status.ExitIdentityIPv4Baselines, status.ExitIdentityIPv6Baselines, status.ExitIdentityDualStackNodes = p.exitIdentityStore.FamilyStats()
+	if exitIdentityStore != nil {
+		status.ExitIdentityBaselines, status.ExitIdentityChangesTotal, status.ExitIdentitySaturatedNodes = exitIdentityStore.Stats()
+		status.ExitIdentityIPv4Baselines, status.ExitIdentityIPv6Baselines, status.ExitIdentityDualStackNodes = exitIdentityStore.FamilyStats()
+	}
 	for _, serviceID := range sortedCapabilityControllerIDs(capabilityControllers) {
 		capabilityStatus := capabilityControllers[serviceID].Status()
 		status.CapabilityRunning = status.CapabilityRunning || capabilityStatus.Running
@@ -234,8 +265,8 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	if scheduler != nil {
 		status.ProbeQueueDepth, _, _ = scheduler.Stats()
 	}
-	if p.schedulerOwner != nil {
-		owner, generation, accepted, coalesced, deferred, rejected, completed, stalled := p.schedulerOwner.Stats()
+	if schedulerOwner != nil {
+		owner, generation, accepted, coalesced, deferred, rejected, completed, stalled := schedulerOwner.Stats()
 		status.ProbeOwnerEpoch = uint64(owner)
 		status.ProbeOwnerGeneration = generation
 		status.ProbeAcceptedTotal = accepted

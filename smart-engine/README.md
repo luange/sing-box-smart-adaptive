@@ -27,8 +27,9 @@ persistence, logging, and API compatibility. This prevents the policy engine
 from opening sockets or reimplementing Provider logic. AdaptivePool uses the
 same boundary: pin/lease/failure evidence is supplied by Go, while adaptive,
 strict-affinity, latency, and bulk ordering/rotation are decided by Zig. The
-Go adapter reuses a
-candidate batch buffer per lock shard (16 shards, four bounded contexts each),
+Go adapters reuse a
+candidate batch buffer per lock shard (Smart: 16 shards × 4 contexts;
+AdaptivePool: 16 shards × 8 contexts),
 so cgo conversion allocations are amortized without retaining a large buffer
 per context. The default developer build keeps the reference Go policy for
 zero-dependency development.
@@ -45,4 +46,6 @@ library. ABI mismatch or allocation failure safely falls back to the reference
 Go policy and emits a warning; manual pins, EndpointProfile, failure wakeups,
 and switch auditing remain host-owned in either mode. Adaptive ABI changes are
 versioned (`ADAPTIVE_ENGINE_ABI_VERSION`) and old libraries are rejected before
-use.
+use. Confirmation and cooldown clocks are process-relative monotonic values;
+provider refreshes that remove the incumbent fail over immediately rather than
+returning a stale candidate ID.

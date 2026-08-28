@@ -19,6 +19,8 @@ pub const Candidate = extern struct {
 pub const Config = extern struct {
     switch_margin: f64,
     switch_cooldown_ms: u64,
+    switch_confirm_samples: u32 = 0,
+    switch_confirm_ms: u64 = 0,
     mode: u8, // 0 strict-affinity, 1 adaptive, 2 latency, 3 bulk, 4 manual
     manual_failure: u8, // 0 fallback, 1 fail-closed
 };
@@ -28,6 +30,9 @@ pub const State = extern struct {
     sticky_id: u64 = 0,
     sticky_until: u64 = 0,
     bulk_sequence: u64 = 0,
+    challenge_id: u64 = 0,
+    challenge_count: u32 = 0,
+    challenge_since: u64 = 0,
     // Reused ordering scratch for bulk rotation.  It is bounded by the same
     // candidate limit as the ABI, so a hostile catalog cannot grow kernel
     // state or allocate on every decision.
@@ -41,7 +46,7 @@ pub const State = extern struct {
 pub const Decision = extern struct {
     selected_id: u64,
     switched: u8,
-    reason: u8, // 0 ranked, 1 retained, 2 lease, 3 manual, 4 fallback, 5 no candidate
+    reason: u8, // 0 ranked, 1 retained, 2 lease, 3 manual, 4 fallback, 5 no candidate, 6/7 bulk, 8 cooldown, 9 confirmed
     score: f64,
 };
 
@@ -71,20 +76,24 @@ fn findByID(candidates: []const Candidate, id: u64) ?Candidate {
     return null;
 }
 
+const OrderContext = struct {
+    candidates: []const Candidate,
+    mode: u8,
+};
+
+fn lessOrder(context: OrderContext, left: u32, right: u32) bool {
+    return better(context.candidates[left], context.candidates[right], context.mode);
+}
+
 fn buildOrder(state: *State, candidates: []const Candidate, mode: u8) usize {
     var length: usize = 0;
     for (candidates, 0..) |candidate, index| {
         if (candidate.eligible == 0) continue;
-        var position = length;
-        while (position > 0) {
-            const previous_index = state.bulk_order[position - 1];
-            if (!better(candidate, candidates[previous_index], mode)) break;
-            state.bulk_order[position] = previous_index;
-            position -= 1;
-        }
-        state.bulk_order[position] = @intCast(index);
+        state.bulk_order[length] = @intCast(index);
         length += 1;
     }
+    const context = OrderContext{ .candidates = candidates, .mode = mode };
+    std.sort.heap(u32, state.bulk_order[0..length], context, lessOrder);
     return length;
 }
 
@@ -156,8 +165,9 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
     }
     if (selected == null) return .{ .selected_id = 0, .switched = 0, .reason = 5, .score = 0 };
 
-    // Keep the incumbent during cooldown or until the challenger is clearly
-    // better. A hard-unavailable incumbent is never retained.
+    // Keep the incumbent during cooldown, confirmation, or until the
+    // challenger is clearly better. A hard-unavailable incumbent is never
+    // retained.
     if ((config.mode == 0 or config.mode == 1) and reason == 0 and state.sticky_id != 0) {
         if (findByID(candidates, state.sticky_id)) |incumbent| {
             if (incumbent.eligible != 0 and incumbent.pinned == 0 and incumbent.leased == 0) {
@@ -174,9 +184,43 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
                     if (keep) {
                         selected = incumbent;
                         reason = if (cooldown) 8 else 1;
+                    } else if (challenger.id != incumbent.id) {
+                        if (state.challenge_id != challenger.id or state.challenge_since == 0) {
+                            state.challenge_id = challenger.id;
+                            state.challenge_count = 1;
+                            state.challenge_since = now_ms;
+                            selected = incumbent;
+                            reason = 1;
+                        } else {
+                            state.challenge_count +|= 1;
+                            const enough_samples = state.challenge_count >= @max(config.switch_confirm_samples, 1);
+                            const enough_time = now_ms -| state.challenge_since >= config.switch_confirm_ms;
+                            if (!enough_samples or !enough_time) {
+                                selected = incumbent;
+                                reason = 1;
+                            } else {
+                                state.challenge_id = 0;
+                                state.challenge_count = 0;
+                                state.challenge_since = 0;
+                                reason = 9;
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+
+    if (selected.?.id == state.sticky_id and reason != 2 and reason != 3) {
+        // A retained incumbent or a non-material challenger invalidates any
+        // stale confirmation sequence. This prevents an old challenger from
+        // inheriting samples after a catalog refresh.
+        if (reason == 1) {
+            // Keep the active challenge only when it is the current candidate.
+        } else {
+            state.challenge_id = 0;
+            state.challenge_count = 0;
+            state.challenge_since = 0;
         }
     }
 
@@ -186,6 +230,9 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
     if (state.sticky_id != selected.?.id) {
         state.sticky_id = selected.?.id;
         state.sticky_until = if (config.switch_cooldown_ms > 0) now_ms +| config.switch_cooldown_ms else 0;
+        state.challenge_id = 0;
+        state.challenge_count = 0;
+        state.challenge_since = 0;
     }
     const score = @as(f64, @floatFromInt(@max(selected.?.health_priority, 0))) * 1_000_000_000_000.0 + @max(selected.?.weighted_delay_ms, 0);
     return .{ .selected_id = selected.?.id, .switched = switched, .reason = reason, .score = score };
@@ -214,4 +261,20 @@ test "adaptive kernel keeps sticky incumbent within margin" {
         .{ .id = 2, .health_priority = 0, .weighted_delay_ms = 90, .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 },
     };
     try std.testing.expectEqual(@as(u64, 1), choose(&state, config, close[0..], 1).selected_id);
+}
+
+test "adaptive kernel requires sustained confirmation before switching" {
+    var state = State{};
+    const config = Config{ .switch_margin = 0, .switch_cooldown_ms = 0, .switch_confirm_samples = 3, .switch_confirm_ms = 1000, .mode = 1, .manual_failure = 0 };
+    const incumbent = Candidate{ .id = 1, .health_priority = 0, .weighted_delay_ms = 100, .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 };
+    const challenger = Candidate{ .id = 2, .health_priority = 0, .weighted_delay_ms = 10, .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 };
+    const initial = [_]Candidate{incumbent};
+    _ = choose(&state, config, initial[0..], 0);
+    const pair = [_]Candidate{ incumbent, challenger };
+    try std.testing.expectEqual(@as(u64, 1), choose(&state, config, pair[0..], 100).selected_id);
+    try std.testing.expectEqual(@as(u64, 1), choose(&state, config, pair[0..], 500).selected_id);
+    const confirmed = choose(&state, config, pair[0..], 1100);
+    try std.testing.expectEqual(@as(u64, 2), confirmed.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), confirmed.switched);
+    try std.testing.expectEqual(@as(u8, 9), confirmed.reason);
 }

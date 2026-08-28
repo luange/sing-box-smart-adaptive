@@ -4,6 +4,14 @@
 
 ## Unreleased — Zig Smart production backend
 
+- Bound AdaptivePool native contexts by sharded LRU and reuse conversion
+  buffers; status/API polling now uses a kernel-free health view, eliminating
+  one native engine allocation per poll.
+- Use process-relative monotonic timestamps for native confirmation/cooldown
+  and immediately fail over when a provider refresh removes the incumbent;
+  manual remember/forget operations clear stale challenge state.
+- Snapshot AdaptivePool runtime pointers atomically for status reads and add
+  ABI, confirmation, duplicate-endpoint, and stale-selection regression gates.
 - Connect the bounded Zig policy kernel to production `protocol/group/Smart`
   behind the `smart_zig` build tag; release Linux binaries now run Zig for
   scoring, confirmation, and cooldown instead of executing two state machines.

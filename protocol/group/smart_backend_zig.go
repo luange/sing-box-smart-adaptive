@@ -40,6 +40,11 @@ type zigSmartPolicyEngine struct {
 	lastUse time.Time
 }
 
+// Keep policy confirmation/cooldown timestamps monotonic across wall-clock
+// adjustments. The host still supplies explicit times for deterministic tests;
+// only their elapsed duration from process start crosses the C ABI.
+var smartKernelClockOrigin = time.Now()
+
 func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 	cfg := C.smart_engine_config{
 		exploration:            C.double(config.Exploration),
@@ -69,7 +74,11 @@ func smartMillis(now time.Time) uint64 {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	return uint64(maxInt64(now.UnixMilli()))
+	elapsed := now.Sub(smartKernelClockOrigin)
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint64(elapsed.Milliseconds())
 }
 
 func (b *zigSmartPolicyBackend) Choose(key string, candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) smartPolicyDecision {

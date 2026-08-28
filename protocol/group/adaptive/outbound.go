@@ -96,6 +96,8 @@ type AdaptivePool struct {
 	manualFailure              string
 	switchMargin               float64
 	switchCooldown             time.Duration
+	switchConfirm              time.Duration
+	switchConfirmSamples       int
 	affinityMode               string
 	runner                     *AttemptRunner
 	defaultMode                PolicyMode
@@ -143,8 +145,8 @@ type AdaptivePool struct {
 	schedulerGen            uint64
 	capabilityProvider      RefreshableProbeTargetProvider
 	capabilityServiceIDs    []string
-	capabilityRunner      *CapabilityProbeRunner
-	capabilityControllers map[string]*CapabilityProbeController
+	capabilityRunner        *CapabilityProbeRunner
+	capabilityControllers   map[string]*CapabilityProbeController
 	capabilityRefresh       time.Duration
 	capabilityTimeout       time.Duration
 	capabilityQuorum        int
@@ -154,6 +156,17 @@ type AdaptivePool struct {
 	aiIPv6Blocked           atomic.Uint64
 	capabilityInitFailures  atomic.Uint64
 	closing                 atomic.Bool
+}
+
+// policySnapshot returns the current policy without exposing the pool's
+// mutable pointer to callers. PolicyEngine has its own lifetime read lock, so
+// a concurrent epoch publish can safely close the previous native kernel after
+// in-flight plans drain.
+func (p *AdaptivePool) policySnapshot() *PolicyEngine {
+	p.lifecycleAccess.Lock()
+	policy := p.policy
+	p.lifecycleAccess.Unlock()
+	return policy
 }
 
 func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.AdaptivePoolOutboundOptions) (adapter.Outbound, error) {
@@ -297,6 +310,17 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 	if options.Policy.SwitchCooldown == 0 {
 		switchCooldown = defaultSwitchCooldown
 	}
+	switchConfirm := time.Duration(options.Policy.SwitchConfirm)
+	if switchConfirm <= 0 {
+		switchConfirm = defaultSwitchConfirm
+	}
+	if switchConfirm < 5*time.Second {
+		return nil, E.New("adaptive switch_confirm must be at least 5s")
+	}
+	switchConfirmSamples := options.Policy.SwitchConfirmSamples
+	if switchConfirmSamples <= 0 {
+		switchConfirmSamples = defaultSwitchConfirmSamples
+	}
 	affinityMode := options.Policy.AffinityMode
 	switch affinityMode {
 	case "", "service", "disabled":
@@ -399,20 +423,23 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 		policy: NewPolicyEngine(health, maxAttempts, manualFailure).
 			BindNodeWeights(nodeWeights).
 			BindSwitchStability(switchMargin, switchCooldown).
+			BindSwitchConfirmation(switchConfirm, switchConfirmSamples).
 			BindAffinityMode(affinityMode),
-		policyMaxAttempts: maxAttempts,
-		manualFailure:     manualFailure,
-		switchMargin:      switchMargin,
-		switchCooldown:    switchCooldown,
-		affinityMode:      affinityMode,
-		runner:                  NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
-		defaultMode:             defaultMode,
-		strictLeaseTTL:          strictLeaseTTL,
-		adaptiveLeaseTTL:        adaptiveLeaseTTL,
-		control:                 new(ControlState),
-		switchAudit:             NewSwitchAuditStore(),
-		selectionMemory:         make(map[selectionMemoryKey]selectionMemoryEntry),
-		observationIngestor:     NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
+		policyMaxAttempts:    maxAttempts,
+		manualFailure:        manualFailure,
+		switchMargin:         switchMargin,
+		switchCooldown:       switchCooldown,
+		switchConfirm:        switchConfirm,
+		switchConfirmSamples: switchConfirmSamples,
+		affinityMode:         affinityMode,
+		runner:               NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
+		defaultMode:          defaultMode,
+		strictLeaseTTL:       strictLeaseTTL,
+		adaptiveLeaseTTL:     adaptiveLeaseTTL,
+		control:              new(ControlState),
+		switchAudit:          NewSwitchAuditStore(),
+		selectionMemory:      make(map[selectionMemoryKey]selectionMemoryEntry),
+		observationIngestor:  NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
 	pool.loadPersistentState()
@@ -475,18 +502,24 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 		return err
 	}
 	p.runtimeIdentity = identity
+	var oldPolicy *PolicyEngine
 	p.lifecycleAccess.Lock()
 	if p.publishPhase == publishPhasePublishing {
 		p.health = shared.health
 		p.leases = shared.leases
 		p.control = shared.control
+		oldPolicy = p.policy
 		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).
 			BindNodeWeights(p.nodeWeights).
 			BindSwitchStability(p.switchMargin, p.switchCooldown).
+			BindSwitchConfirmation(p.switchConfirm, p.switchConfirmSamples).
 			BindAffinityMode(p.affinityMode).
 			BindBulkSequence(&p.control.bulkSequence)
 	}
 	p.lifecycleAccess.Unlock()
+	if oldPolicy != nil {
+		oldPolicy.Close()
+	}
 	if err = p.persistStateDurable(); err != nil {
 		_ = preparedIdentity.Rollback()
 		p.runtimeIdentity = RuntimeIdentity{}
@@ -568,8 +601,8 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	}
 	// Drop bounded selection/audit views on retire. Observation transactions
 	// remain alive until epoch leases drain so late real failures are not lost.
-	if p.policy != nil {
-		p.policy.Clear()
+	if policy := p.policySnapshot(); policy != nil {
+		policy.Clear()
 	}
 	if p.switchAudit != nil {
 		p.switchAudit.Clear()
@@ -582,8 +615,8 @@ func (p *AdaptivePool) Close() error {
 		return nil
 	}
 	p.OnRuntimeEpochRetire()
-	if p.policy != nil {
-		p.policy.Close()
+	if policy := p.policySnapshot(); policy != nil {
+		policy.Close()
 	}
 	if p.source != nil {
 		_ = p.source.Close()
@@ -764,7 +797,14 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		leasePointer = &lease
 	}
 	pinned := p.pinnedNodeID()
-	plan, err := p.policy.Plan(snapshot, serviceContext, leasePointer, pinned)
+	policy := p.policySnapshot()
+	if policy == nil {
+		if reservation != nil {
+			reservation.Abort()
+		}
+		return nil, errors.New("adaptive policy is unavailable")
+	}
+	plan, err := policy.Plan(snapshot, serviceContext, leasePointer, pinned)
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()
@@ -948,7 +988,8 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 			}
 		}
 		status := p.health.StatusHandle(evidence.Handle, DomainTransport, path, "")
-		earlyFailure := p.policy != nil && p.policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
+		policy := p.policySnapshot()
+		earlyFailure := policy != nil && policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
 		// Invalidate lease on breaker open OR quality-escalated unreachable (timeout blackhole).
 		pathDead := status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable
 		if modeUsesLease(service.Mode) && (earlyFailure || pathDead) {
@@ -1021,7 +1062,14 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	if modeUsesLease(serviceContext.Mode) && reservation == nil {
 		leasePointer = &lease
 	}
-	plan, err := p.policy.Plan(snapshot, serviceContext, leasePointer, p.pinnedNodeID())
+	policy := p.policySnapshot()
+	if policy == nil {
+		if reservation != nil {
+			reservation.Abort()
+		}
+		return nil, errors.New("adaptive policy is unavailable")
+	}
+	plan, err := policy.Plan(snapshot, serviceContext, leasePointer, p.pinnedNodeID())
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()

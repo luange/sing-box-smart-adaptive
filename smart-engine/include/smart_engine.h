@@ -12,7 +12,7 @@ typedef struct smart_engine smart_engine;
 /* Increment only when field order or enum semantics change. */
 #define SMART_ENGINE_ABI_VERSION 1u
 #define SMART_ENGINE_MAX_CANDIDATES 8192u
-#define ADAPTIVE_ENGINE_ABI_VERSION 2u
+#define ADAPTIVE_ENGINE_ABI_VERSION 3u
 
 typedef struct {
     uint64_t id;
@@ -31,8 +31,8 @@ typedef struct {
     double exploration; /* non-negative score penalty */
     double switch_margin; /* relative improvement in [0, 0.95] */
     uint32_t switch_confirm_samples; /* zero is normalized to one */
-    uint64_t switch_confirm_ms; /* monotonic milliseconds */
-    uint64_t switch_cooldown_ms; /* monotonic milliseconds */
+    uint64_t switch_confirm_ms; /* process-relative monotonic milliseconds */
+    uint64_t switch_cooldown_ms; /* process-relative monotonic milliseconds */
 } smart_engine_config;
 
 typedef struct {
@@ -72,6 +72,8 @@ typedef struct {
 typedef struct {
     double switch_margin;
     uint64_t switch_cooldown_ms;
+    uint32_t switch_confirm_samples;
+    uint64_t switch_confirm_ms;
     uint8_t mode;
     uint8_t manual_failure;
 } adaptive_engine_config;

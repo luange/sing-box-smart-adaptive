@@ -40,6 +40,10 @@ type AdaptivePoolPolicyOptions struct {
 	// 15%) before replacing a sticky healthy incumbent. Omit for default 0.15;
 	// set explicitly to 0 to disable margin while keeping cooldown.
 	SwitchMargin *float64 `json:"switch_margin,omitempty"`
+	// SwitchConfirm requires a challenger to remain better for both the sample
+	// count and time window before replacing a healthy incumbent.
+	SwitchConfirm        badoption.Duration `json:"switch_confirm,omitempty"`
+	SwitchConfirmSamples int                `json:"switch_confirm_samples,omitempty"`
 	// SwitchCooldown keeps the previous healthy egress preferred after a
 	// selection change.
 	//   omit / 0  => default 2m

@@ -56,7 +56,11 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         // A hard-open incumbent is unavailable (for example after the host's
         // passive throughput floor trips). Do not wait for performance
         // confirmation or cooldown: the next real connection must fail over.
-        if (current.state == 4) {
+        // An ineligible incumbent is equivalent to a hard-open one. This can
+        // happen during a provider refresh when the old endpoint disappears
+        // from the current catalog; retaining it would return a stale ID and
+        // force the host to fall back for the whole confirmation window.
+        if (current.state == 4 or current.eligible == 0) {
             state.selected_id = selected.id;
             state.cooldown_until = now_ms +| config.switch_cooldown_ms;
             state.challenge_id = 0;
@@ -74,6 +78,19 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             decision.reason = @intFromEnum(model.DecisionReason.retained);
             return decision;
         }
+    } else {
+        // The previous selection is no longer present in this catalog. There
+        // is no incumbent to protect, so adopt the best current candidate
+        // immediately instead of emitting a stale selected_id while waiting
+        // for confirmation samples that can never be observed.
+        state.selected_id = selected.id;
+        state.cooldown_until = now_ms +| config.switch_cooldown_ms;
+        state.challenge_id = 0;
+        state.challenge_count = 0;
+        state.challenge_since = 0;
+        decision.switched = 1;
+        decision.reason = @intFromEnum(model.DecisionReason.confirmed);
+        return decision;
     }
     if (state.challenge_id != selected.id or state.challenge_since == 0) {
         state.challenge_id = selected.id;

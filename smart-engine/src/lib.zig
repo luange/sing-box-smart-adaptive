@@ -89,7 +89,7 @@ const AdaptiveEngine = struct {
 };
 
 export fn adaptive_engine_abi_version() u32 {
-    return 2;
+    return 3;
 }
 
 export fn adaptive_engine_create(config: adaptive.Config) ?*AdaptiveEngine {
@@ -97,6 +97,7 @@ export fn adaptive_engine_create(config: adaptive.Config) ?*AdaptiveEngine {
     var normalized = config;
     if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
     if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
+    if (normalized.switch_confirm_samples == 0) normalized.switch_confirm_samples = 1;
     engine.* = .{ .config = normalized };
     return engine;
 }
@@ -106,6 +107,7 @@ export fn adaptive_engine_configure(engine: ?*AdaptiveEngine, config: adaptive.C
         var normalized = config;
         if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
         if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
+        if (normalized.switch_confirm_samples == 0) normalized.switch_confirm_samples = 1;
         value.config = normalized;
     }
 }
@@ -132,6 +134,9 @@ export fn adaptive_engine_remember(engine: ?*AdaptiveEngine, id: u64, now_ms: u6
         value.state.sticky_id = id;
         value.state.sticky_until = if (cooldown_ms > 0) now_ms +| cooldown_ms else 0;
         value.state.selected_id = id;
+        value.state.challenge_id = 0;
+        value.state.challenge_count = 0;
+        value.state.challenge_since = 0;
     }
 }
 
@@ -139,6 +144,10 @@ export fn adaptive_engine_forget(engine: ?*AdaptiveEngine) void {
     if (engine) |value| {
         value.state.sticky_id = 0;
         value.state.sticky_until = 0;
+        value.state.selected_id = 0;
+        value.state.challenge_id = 0;
+        value.state.challenge_count = 0;
+        value.state.challenge_since = 0;
     }
 }
 
@@ -167,6 +176,28 @@ test "hard-open incumbent fails over without confirmation" {
     const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, opened[0..], 1, .bulk);
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
+}
+
+test "stale incumbent is replaced immediately after catalog refresh" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0.15, .switch_confirm_samples = 3, .switch_confirm_ms = 60000, .switch_cooldown_ms = 120000 });
+    const old = [_]Candidate{.{ .id = 11, .reliability = 0.99, .connect_ms = 10, .first_byte_ms = 10, .jitter_ms = 1, .throughput_bps = 0, .samples = 4, .weight = 1, .state = 1, .eligible = 1 }};
+    _ = policy.chooseProfile(&engine.state, engine.config, &engine.observations, old[0..], 0, .interactive);
+    const refreshed = [_]Candidate{.{ .id = 22, .reliability = 0.80, .connect_ms = 100, .first_byte_ms = 100, .jitter_ms = 2, .throughput_bps = 0, .samples = 1, .weight = 1, .state = 1, .eligible = 1 }};
+    const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, refreshed[0..], 1, .interactive);
+    try std.testing.expectEqual(@as(u64, 22), decision.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), decision.switched);
+    try std.testing.expectEqual(@as(u64, 0), engine.state.challenge_id);
+}
+
+test "adaptive remember clears an in-flight challenge" {
+    var engine = AdaptiveEngine{ .config = .{ .switch_margin = 0, .switch_cooldown_ms = 0, .switch_confirm_samples = 3, .switch_confirm_ms = 60000, .mode = 1, .manual_failure = 0 } };
+    engine.state.challenge_id = 2;
+    engine.state.challenge_count = 2;
+    engine.state.challenge_since = 1;
+    adaptive_engine_remember(&engine, 1, 2, 0);
+    try std.testing.expectEqual(@as(u64, 0), engine.state.challenge_id);
+    try std.testing.expectEqual(@as(u32, 0), engine.state.challenge_count);
+    try std.testing.expectEqual(@as(u64, 0), engine.state.challenge_since);
 }
 
 test "bounded observations do not grow after reset" {

@@ -18,10 +18,12 @@ var (
 )
 
 const (
-	defaultSwitchMargin   = 0.15
-	defaultSwitchCooldown = 2 * time.Minute
-	earlySwitchWindow     = 20 * time.Second
-	maxStickyEntries      = 4096
+	defaultSwitchMargin         = 0.15
+	defaultSwitchCooldown       = 2 * time.Minute
+	defaultSwitchConfirm        = 2 * time.Minute
+	defaultSwitchConfirmSamples = 3
+	earlySwitchWindow           = 20 * time.Second
+	maxStickyEntries            = 4096
 )
 
 type DecisionReason string
@@ -37,6 +39,7 @@ const (
 	ReasonWarmingFallback DecisionReason = "warming_fallback"
 	ReasonStickyMargin    DecisionReason = "sticky_margin"
 	ReasonSwitchCooldown  DecisionReason = "switch_cooldown"
+	ReasonSwitchConfirmed DecisionReason = "switch_confirmed"
 )
 
 type DecisionPlan struct {
@@ -78,14 +81,20 @@ type stickyPreference struct {
 }
 
 type PolicyEngine struct {
-	health         *HealthStore
-	kernel         policyKernel
-	maxAttempts    int
-	manualFailure  string
-	bulkSequence   *atomic.Uint64
-	nodeWeights    *nodeweight.Matcher
-	switchMargin   float64
-	switchCooldown time.Duration
+	// lifecycleAccess protects the native kernel lifetime. Plans take a read
+	// lock, allowing concurrent decisions, while Clear/Close take the write
+	// lock so an epoch replacement cannot destroy a kernel during a plan.
+	lifecycleAccess      sync.RWMutex
+	health               *HealthStore
+	kernel               policyKernel
+	maxAttempts          int
+	manualFailure        string
+	bulkSequence         *atomic.Uint64
+	nodeWeights          *nodeweight.Matcher
+	switchMargin         float64
+	switchCooldown       time.Duration
+	switchConfirm        time.Duration
+	switchConfirmSamples int
 	// affinityMode: ""/"service" = per-product sticky; "disabled" = no sticky.
 	affinityMode string
 	stickyAccess sync.Mutex
@@ -100,14 +109,16 @@ func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string)
 		manualFailure = "fallback"
 	}
 	return &PolicyEngine{
-		health:         health,
-		kernel:         newAdaptivePolicyKernel(),
-		maxAttempts:    maxAttempts,
-		manualFailure:  manualFailure,
-		bulkSequence:   new(atomic.Uint64),
-		switchMargin:   defaultSwitchMargin,
-		switchCooldown: defaultSwitchCooldown,
-		sticky:         make(map[string]stickyPreference),
+		health:               health,
+		kernel:               newAdaptivePolicyKernel(),
+		maxAttempts:          maxAttempts,
+		manualFailure:        manualFailure,
+		switchConfirm:        defaultSwitchConfirm,
+		switchConfirmSamples: defaultSwitchConfirmSamples,
+		bulkSequence:         new(atomic.Uint64),
+		switchMargin:         defaultSwitchMargin,
+		switchCooldown:       defaultSwitchCooldown,
+		sticky:               make(map[string]stickyPreference),
 	}
 }
 
@@ -155,30 +166,36 @@ func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duratio
 	if cooldown < 0 {
 		cooldown = 0
 	}
+	e.lifecycleAccess.Lock()
 	e.switchMargin = margin
 	e.switchCooldown = cooldown
 	if e.kernel != nil {
-		e.kernel.Configure(margin, cooldown, e.manualFailure)
+		e.kernel.Configure(margin, cooldown, e.switchConfirm, e.switchConfirmSamples, e.manualFailure)
 	}
+	e.lifecycleAccess.Unlock()
 	return e
 }
 
-// importStickyFrom copies live sticky preferences into a status-time engine so
-// operator scores share the same cooldown/margin memory as dial Plan.
-func (e *PolicyEngine) importStickyFrom(src *PolicyEngine) {
-	if e == nil || src == nil {
-		return
+// BindSwitchConfirmation configures the sustained-evidence gate used by the
+// native kernel. A zero value restores the conservative defaults.
+func (e *PolicyEngine) BindSwitchConfirmation(window time.Duration, samples int) *PolicyEngine {
+	if e == nil {
+		return e
 	}
-	src.stickyAccess.Lock()
-	defer src.stickyAccess.Unlock()
-	e.stickyAccess.Lock()
-	defer e.stickyAccess.Unlock()
-	if e.sticky == nil {
-		e.sticky = make(map[string]stickyPreference, len(src.sticky))
+	if window <= 0 {
+		window = defaultSwitchConfirm
 	}
-	for key, pref := range src.sticky {
-		e.sticky[key] = pref
+	if samples <= 0 {
+		samples = defaultSwitchConfirmSamples
 	}
+	e.lifecycleAccess.Lock()
+	e.switchConfirm = window
+	e.switchConfirmSamples = samples
+	if e.kernel != nil {
+		e.kernel.Configure(e.switchMargin, e.switchCooldown, window, samples, e.manualFailure)
+	}
+	e.lifecycleAccess.Unlock()
+	return e
 }
 
 // Clear drops sticky selection state. Called on pool retire/reload so process
@@ -187,19 +204,26 @@ func (e *PolicyEngine) Clear() {
 	if e == nil {
 		return
 	}
+	e.lifecycleAccess.Lock()
 	e.stickyAccess.Lock()
 	e.sticky = make(map[string]stickyPreference)
 	e.stickyAccess.Unlock()
 	if e.kernel != nil {
 		e.kernel.Reset()
 	}
+	e.lifecycleAccess.Unlock()
 }
 
 // Close releases the portable kernel contexts when the pool is permanently
 // retired. Clear already drops them on an epoch retirement; this method makes
 // the final lifecycle boundary explicit for hosts that own PolicyEngine.
 func (e *PolicyEngine) Close() {
-	if e == nil || e.kernel == nil {
+	if e == nil {
+		return
+	}
+	e.lifecycleAccess.Lock()
+	defer e.lifecycleAccess.Unlock()
+	if e.kernel == nil {
 		return
 	}
 	e.kernel.Close()
@@ -215,6 +239,7 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 	if now.IsZero() {
 		now = time.Now()
 	}
+	e.lifecycleAccess.RLock()
 	e.stickyAccess.Lock()
 	if e.sticky == nil {
 		e.sticky = make(map[string]stickyPreference)
@@ -236,6 +261,7 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 	if e.kernel != nil {
 		e.kernel.Remember(key, handle.NodeID, now, e.switchCooldown)
 	}
+	e.lifecycleAccess.RUnlock()
 }
 
 // ForgetSelectionAfterEarlyFailure removes a newly selected incumbent when a
@@ -248,11 +274,13 @@ func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, 
 		now = time.Now()
 	}
 	key := e.stickyKey(service)
+	e.lifecycleAccess.RLock()
 	e.stickyAccess.Lock()
 	pref, loaded := e.sticky[key]
 	age := now.Sub(pref.updatedAt)
 	if !loaded || pref.handle != handle || age < 0 || age > earlySwitchWindow {
 		e.stickyAccess.Unlock()
+		e.lifecycleAccess.RUnlock()
 		return false
 	}
 	delete(e.sticky, key)
@@ -260,6 +288,7 @@ func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, 
 	if e.kernel != nil {
 		e.kernel.Forget(key)
 	}
+	e.lifecycleAccess.RUnlock()
 	return true
 }
 
@@ -323,6 +352,8 @@ func (e *PolicyEngine) pruneStickyLocked(now time.Time) {
 }
 
 func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext, lease *SessionLease, pinned *NodeID) (DecisionPlan, error) {
+	e.lifecycleAccess.RLock()
+	defer e.lifecycleAccess.RUnlock()
 	if snapshot == nil {
 		return DecisionPlan{}, ErrNoCandidates
 	}

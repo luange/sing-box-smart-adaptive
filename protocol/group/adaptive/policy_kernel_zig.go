@@ -14,31 +14,54 @@ import (
 	"time"
 )
 
-const adaptiveKernelMaxContexts = 128
+const (
+	adaptiveKernelShardCount       = 16
+	adaptiveKernelMaxContexts      = 128
+	adaptiveKernelContextsPerShard = adaptiveKernelMaxContexts / adaptiveKernelShardCount
+)
 
 type zigAdaptivePolicyKernel struct {
-	access         sync.Mutex
-	config         C.adaptive_engine_config
-	engines        map[string]*C.adaptive_engine
-	candidateCache []C.adaptive_candidate
+	configAccess sync.RWMutex
+	config       C.adaptive_engine_config
+	shards       [adaptiveKernelShardCount]adaptivePolicyShard
 }
+
+type adaptivePolicyShard struct {
+	access     sync.Mutex
+	engines    map[string]*adaptivePolicyEngine
+	candidates []C.adaptive_candidate
+}
+
+type adaptivePolicyEngine struct {
+	engine  *C.adaptive_engine
+	lastUse time.Time
+}
+
+// Native policy timestamps are process-relative rather than wall-clock
+// milliseconds. This keeps confirmation/cooldown behavior correct when NTP or
+// an operator changes the system clock while the process is running.
+var adaptiveKernelClockOrigin = time.Now()
 
 func newAdaptivePolicyKernel() policyKernel {
-	if C.adaptive_engine_abi_version() != 2 {
+	if C.adaptive_engine_abi_version() != 3 {
 		return nil
 	}
-	return &zigAdaptivePolicyKernel{
-		config:  C.adaptive_engine_config{switch_margin: C.double(0.15), switch_cooldown_ms: C.uint64_t(120000)},
-		engines: make(map[string]*C.adaptive_engine),
+	kernel := &zigAdaptivePolicyKernel{config: C.adaptive_engine_config{
+		switch_margin: C.double(defaultSwitchMargin), switch_cooldown_ms: C.uint64_t(defaultSwitchCooldown / time.Millisecond),
+		switch_confirm_samples: C.uint32_t(defaultSwitchConfirmSamples), switch_confirm_ms: C.uint64_t(defaultSwitchConfirm / time.Millisecond),
+	}}
+	for index := range kernel.shards {
+		kernel.shards[index].engines = make(map[string]*adaptivePolicyEngine)
 	}
+	return kernel
 }
 
-func (k *zigAdaptivePolicyKernel) Configure(margin float64, cooldown time.Duration, manualFailure string) {
+func (k *zigAdaptivePolicyKernel) Configure(margin float64, cooldown, confirm time.Duration, confirmSamples int, manualFailure string) {
 	if k == nil {
 		return
 	}
 	if margin < 0 {
-		margin = 0.15
+		margin = defaultSwitchMargin
 	}
 	if margin > 0.95 {
 		margin = 0.95
@@ -46,47 +69,69 @@ func (k *zigAdaptivePolicyKernel) Configure(margin float64, cooldown time.Durati
 	if cooldown < 0 {
 		cooldown = 0
 	}
-	k.access.Lock()
-	k.config.switch_margin = C.double(margin)
-	k.config.switch_cooldown_ms = C.uint64_t(cooldown / time.Millisecond)
+	if confirm <= 0 {
+		confirm = defaultSwitchConfirm
+	}
+	if confirmSamples <= 0 {
+		confirmSamples = defaultSwitchConfirmSamples
+	}
+	config := C.adaptive_engine_config{
+		switch_margin: C.double(margin), switch_cooldown_ms: C.uint64_t(cooldown / time.Millisecond),
+		switch_confirm_samples: C.uint32_t(confirmSamples), switch_confirm_ms: C.uint64_t(confirm / time.Millisecond),
+	}
 	if manualFailure == "fail_closed" {
-		k.config.manual_failure = 1
-	} else {
-		k.config.manual_failure = 0
+		config.manual_failure = 1
 	}
-	for _, engine := range k.engines {
-		C.adaptive_engine_configure(engine, k.config)
+	k.configAccess.Lock()
+	k.config = config
+	k.configAccess.Unlock()
+	for index := range k.shards {
+		shard := &k.shards[index]
+		shard.access.Lock()
+		for _, engine := range shard.engines {
+			C.adaptive_engine_configure(engine.engine, config)
+		}
+		shard.access.Unlock()
 	}
-	k.access.Unlock()
+}
+
+func (k *zigAdaptivePolicyKernel) configSnapshot() C.adaptive_engine_config {
+	k.configAccess.RLock()
+	config := k.config
+	k.configAccess.RUnlock()
+	return config
 }
 
 func (k *zigAdaptivePolicyKernel) Choose(key string, candidates []policyKernelCandidate, mode PolicyMode, now time.Time) policyKernelDecision {
 	if k == nil || key == "" || len(candidates) == 0 || len(candidates) > 8192 {
 		return policyKernelDecision{}
 	}
-	k.access.Lock()
-	defer k.access.Unlock()
-	engine := k.engineLocked(key)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	shard := k.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	engine := k.engineLocked(shard, key, now)
 	if engine == nil {
 		return policyKernelDecision{}
 	}
-	if cap(k.candidateCache) < len(candidates) {
-		k.candidateCache = make([]C.adaptive_candidate, len(candidates))
+	if cap(shard.candidates) < len(candidates) {
+		shard.candidates = make([]C.adaptive_candidate, len(candidates))
 	} else {
-		k.candidateCache = k.candidateCache[:len(candidates)]
+		shard.candidates = shard.candidates[:len(candidates)]
 	}
 	for index, candidate := range candidates {
-		k.candidateCache[index] = C.adaptive_candidate{
+		shard.candidates[index] = C.adaptive_candidate{
 			id: C.uint64_t(candidate.ID), sort_key_hi: C.uint64_t(candidate.SortKeyHi), sort_key_lo: C.uint64_t(candidate.SortKeyLo), health_priority: C.int32_t(candidate.HealthPriority),
-			weighted_delay_ms: C.double(candidate.WeightedDelayMS), throughput_bps: C.double(candidate.ThroughputBPS),
-			throughput_samples: C.double(candidate.ThroughputSamples), supported: C.uint8_t(boolByte(candidate.Supported)),
-			eligible: C.uint8_t(boolByte(candidate.Eligible)), pinned: C.uint8_t(boolByte(candidate.Pinned)),
-			leased: C.uint8_t(boolByte(candidate.Leased)),
+			weighted_delay_ms: C.double(candidate.WeightedDelayMS), throughput_bps: C.double(candidate.ThroughputBPS), throughput_samples: C.double(candidate.ThroughputSamples),
+			supported: C.uint8_t(boolByte(candidate.Supported)), eligible: C.uint8_t(boolByte(candidate.Eligible)), pinned: C.uint8_t(boolByte(candidate.Pinned)), leased: C.uint8_t(boolByte(candidate.Leased)),
 		}
 	}
-	k.config.mode = C.uint8_t(policyKernelMode(mode))
-	C.adaptive_engine_configure(engine, k.config)
-	decision := C.adaptive_engine_choose(engine, &k.candidateCache[0], C.uintptr_t(len(k.candidateCache)), C.uint64_t(kernelNowMS(now)))
+	config := k.configSnapshot()
+	config.mode = C.uint8_t(policyKernelMode(mode))
+	C.adaptive_engine_configure(engine.engine, config)
+	decision := C.adaptive_engine_choose(engine.engine, &shard.candidates[0], C.uintptr_t(len(shard.candidates)), C.uint64_t(kernelNowMS(now)))
 	return policyKernelDecision{SelectedID: uint64(decision.selected_id), Switched: decision.switched != 0, Reason: uint8(decision.reason)}
 }
 
@@ -94,10 +139,11 @@ func (k *zigAdaptivePolicyKernel) SetBulkSequence(key string, sequence uint64) {
 	if k == nil || key == "" {
 		return
 	}
-	k.access.Lock()
-	defer k.access.Unlock()
-	if engine := k.engineLocked(key); engine != nil {
-		C.adaptive_engine_set_bulk_sequence(engine, C.uint64_t(sequence))
+	shard := k.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	if engine := k.engineLocked(shard, key, time.Now()); engine != nil {
+		C.adaptive_engine_set_bulk_sequence(engine.engine, C.uint64_t(sequence))
 	}
 }
 
@@ -105,76 +151,100 @@ func (k *zigAdaptivePolicyKernel) Remember(key string, id NodeID, now time.Time,
 	if k == nil || key == "" || id == (NodeID{}) {
 		return
 	}
-	k.access.Lock()
-	defer k.access.Unlock()
-	engine := k.engineLocked(key)
-	if engine == nil {
-		return
+	if now.IsZero() {
+		now = time.Now()
 	}
-	C.adaptive_engine_remember(engine, C.uint64_t(kernelCandidateID(id)), C.uint64_t(kernelNowMS(now)), C.uint64_t(maxDurationMS(cooldown)))
+	shard := k.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	if engine := k.engineLocked(shard, key, now); engine != nil {
+		C.adaptive_engine_remember(engine.engine, C.uint64_t(kernelCandidateID(id)), C.uint64_t(kernelNowMS(now)), C.uint64_t(maxDurationMS(cooldown)))
+	}
 }
 
 func (k *zigAdaptivePolicyKernel) Forget(key string) {
 	if k == nil || key == "" {
 		return
 	}
-	k.access.Lock()
-	defer k.access.Unlock()
-	if engine := k.engines[key]; engine != nil {
-		C.adaptive_engine_forget(engine)
+	shard := k.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	if engine := shard.engines[key]; engine != nil {
+		C.adaptive_engine_forget(engine.engine)
 	}
 }
 
-func (k *zigAdaptivePolicyKernel) engineLocked(key string) *C.adaptive_engine {
-	if engine := k.engines[key]; engine != nil {
+func (k *zigAdaptivePolicyKernel) shardFor(key string) *adaptivePolicyShard {
+	return &k.shards[adaptivePolicyShardIndex(key)]
+}
+
+func adaptivePolicyShardIndex(key string) int {
+	return int(kernelHash(key) & (adaptiveKernelShardCount - 1))
+}
+
+func kernelHash(value string) uint64 {
+	var hash uint64 = 14695981039346656037
+	for index := 0; index < len(value); index++ {
+		hash ^= uint64(value[index])
+		hash *= 1099511628211
+	}
+	return hash
+}
+
+func (k *zigAdaptivePolicyKernel) engineLocked(shard *adaptivePolicyShard, key string, now time.Time) *adaptivePolicyEngine {
+	if engine := shard.engines[key]; engine != nil {
+		engine.lastUse = now
 		return engine
 	}
-	if len(k.engines) >= adaptiveKernelMaxContexts {
-		// The map is intentionally bounded. Context churn must not make the
-		// portable kernel a new source of process-lifetime memory growth.
-		for oldKey, oldEngine := range k.engines {
-			C.adaptive_engine_destroy(oldEngine)
-			delete(k.engines, oldKey)
-			break
+	if len(shard.engines) >= adaptiveKernelContextsPerShard {
+		var oldestKey string
+		var oldest time.Time
+		for candidateKey, candidate := range shard.engines {
+			if oldestKey == "" || candidate.lastUse.Before(oldest) {
+				oldestKey, oldest = candidateKey, candidate.lastUse
+			}
+		}
+		if evicted := shard.engines[oldestKey]; evicted != nil {
+			C.adaptive_engine_destroy(evicted.engine)
+			delete(shard.engines, oldestKey)
 		}
 	}
-	engine := C.adaptive_engine_create(k.config)
+	engine := C.adaptive_engine_create(k.configSnapshot())
 	if engine == nil {
 		return nil
 	}
-	k.engines[key] = engine
-	return engine
+	state := &adaptivePolicyEngine{engine: engine, lastUse: now}
+	shard.engines[key] = state
+	return state
 }
 
 func (k *zigAdaptivePolicyKernel) Reset() {
 	if k == nil {
 		return
 	}
-	k.access.Lock()
-	for key, engine := range k.engines {
-		C.adaptive_engine_destroy(engine)
-		delete(k.engines, key)
+	for index := range k.shards {
+		shard := &k.shards[index]
+		shard.access.Lock()
+		for key, engine := range shard.engines {
+			C.adaptive_engine_destroy(engine.engine)
+			delete(shard.engines, key)
+		}
+		shard.candidates = nil
+		shard.access.Unlock()
 	}
-	k.access.Unlock()
 }
 
-func (k *zigAdaptivePolicyKernel) Close() {
-	if k == nil {
-		return
-	}
-	k.access.Lock()
-	for key, engine := range k.engines {
-		C.adaptive_engine_destroy(engine)
-		delete(k.engines, key)
-	}
-	k.access.Unlock()
-}
+func (k *zigAdaptivePolicyKernel) Close() { k.Reset() }
 
 func kernelNowMS(now time.Time) int64 {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	return now.UnixMilli()
+	elapsed := now.Sub(adaptiveKernelClockOrigin)
+	if elapsed <= 0 {
+		return 0
+	}
+	return elapsed.Milliseconds()
 }
 
 func maxDurationMS(value time.Duration) int64 {

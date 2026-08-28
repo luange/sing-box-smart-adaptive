@@ -1495,7 +1495,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 
 	totalSamples := 0.0
 	policyCandidates := make([]smartPolicyCandidate, 0, len(ranking.candidates))
-	policyIDs := make(map[uint64]struct{}, len(ranking.candidates))
+	policyIndexes := make(map[uint64]int, len(ranking.candidates))
 	profile := smartProfileInteractive
 	if transport == N.NetworkUDP {
 		profile = smartProfileUDP
@@ -1546,15 +1546,20 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
-			if _, exists := policyIDs[policyID]; !exists {
-				policyIDs[policyID] = struct{}{}
-				policyCandidates = append(policyCandidates, smartPolicyCandidate{
-					ID: policyID, Reliability: estimate.Reliability, ConnectMS: estimate.ConnectMS,
-					FirstByteMS: estimate.FirstByteMS, JitterMS: estimate.JitterMS,
-					Throughput: estimate.ThroughputBPS, Samples: estimate.Samples,
-					Weight: s.nodeWeights.Explain(candidate.Tag()).Weight,
-					State:  smartPolicyState(estimate.State), Eligible: true,
-				})
+			merged := smartPolicyCandidate{
+				ID: policyID, Reliability: estimate.Reliability, ConnectMS: estimate.ConnectMS,
+				FirstByteMS: estimate.FirstByteMS, JitterMS: estimate.JitterMS,
+				Throughput: estimate.ThroughputBPS, Samples: estimate.Samples,
+				Weight: s.nodeWeights.Explain(candidate.Tag()).Weight,
+				State:  smartPolicyState(estimate.State), Eligible: true,
+			}
+			if policyIndex, exists := policyIndexes[policyID]; exists {
+				if betterSmartPolicyCandidate(merged, policyCandidates[policyIndex]) {
+					policyCandidates[policyIndex] = merged
+				}
+			} else {
+				policyIndexes[policyID] = len(policyCandidates)
+				policyCandidates = append(policyCandidates, merged)
 			}
 		}
 	}
@@ -1570,17 +1575,25 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			ranking.ranks[index].status.State = "open"
 			ranking.ranks[index].status.Reason = "passive throughput below floor"
 			ranking.ranks[index].passiveThroughputLow = true
-			identity := ""
-			s.access.RLock()
-			identity = s.candidateProbeKey[ranking.ranks[index].outbound.Tag()]
-			s.access.RUnlock()
-			policyID := smartPolicyID(identity)
-			for policyIndex := range policyCandidates {
-				if policyCandidates[policyIndex].ID == policyID {
-					policyCandidates[policyIndex].State = smartPolicyState("open")
-				}
-			}
 		}
+	}
+	// A shared endpoint remains usable when at least one duplicate provider line
+	// has healthy throughput. Only mark it open when every line is blocked by the
+	// passive gate or already circuit-open.
+	for policyID, policyIndex := range policyIndexes {
+		shared := policyCandidates[policyIndex]
+		shared.State = smartPolicyState("open")
+		for _, rank := range ranking.ranks {
+			s.access.RLock()
+			identity := s.candidateProbeKey[rank.outbound.Tag()]
+			s.access.RUnlock()
+			if smartPolicyID(identity) != policyID || rank.status.State == "open" || rank.passiveThroughputLow {
+				continue
+			}
+			shared.State = smartPolicyState(rank.status.State)
+			break
+		}
+		policyCandidates[policyIndex] = shared
 	}
 	for index := range ranking.ranks {
 		weightMatch := s.nodeWeights.Explain(ranking.ranks[index].outbound.Tag())
@@ -1653,6 +1666,9 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				identity = s.candidateProbeKey[ranks[index].outbound.Tag()]
 				s.access.RUnlock()
 				if smartPolicyID(identity) != decision.SelectedID {
+					continue
+				}
+				if ranks[index].status.State == "open" {
 					continue
 				}
 				reason := "zig policy retained candidate"

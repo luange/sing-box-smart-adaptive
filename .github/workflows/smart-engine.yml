@@ -51,8 +51,23 @@ jobs:
             smart_decision pending = smart_engine_choose(engine, candidates, 2, 1);
             smart_decision switched = smart_engine_choose(engine, candidates, 2, 2);
             smart_engine_destroy(engine);
-            return first.selected_id == 1 && pending.selected_id == 1 &&
-                   switched.selected_id == 2 && switched.switched == 1 ? 0 : 3;
+            if (!(first.selected_id == 1 && pending.selected_id == 1 &&
+                  switched.selected_id == 2 && switched.switched == 1)) return 3;
+
+            if (adaptive_engine_abi_version() != ADAPTIVE_ENGINE_ABI_VERSION) return 4;
+            adaptive_engine_config adaptive_cfg = {0, 0, 2, 0, 1, 0};
+            adaptive_engine *adaptive = adaptive_engine_create(adaptive_cfg);
+            if (!adaptive) return 5;
+            adaptive_candidate incumbent = {1, 0, 0, 0, 20, 0, 0, 1, 1, 0, 0};
+            adaptive_candidate challenger = {2, 0, 0, 0, 5, 0, 0, 1, 1, 0, 0};
+            adaptive_decision a_first = adaptive_engine_choose(adaptive, &incumbent, 1, 0);
+            adaptive_candidate pair[2] = {incumbent, challenger};
+            adaptive_decision a_pending = adaptive_engine_choose(adaptive, pair, 2, 1);
+            adaptive_engine_forget(adaptive);
+            adaptive_decision a_after_forget = adaptive_engine_choose(adaptive, &challenger, 1, 2);
+            adaptive_engine_destroy(adaptive);
+            return a_first.selected_id == 1 && a_pending.selected_id == 1 &&
+                   a_after_forget.selected_id == 2 ? 0 : 6;
           }
           EOF
           cc -std=c11 -Wall -Wextra -Werror -I include /tmp/smart_engine_abi.c zig-out/lib/libsmart_engine.a -lm -o /tmp/smart_engine_abi

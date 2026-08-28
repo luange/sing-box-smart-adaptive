@@ -380,7 +380,11 @@ func TestPolicySwitchMarginKeepsIncumbentOnSmallLatencyGain(t *testing.T) {
 	challenger := Candidate{ID: NodeID{72}, Handle: NodeHandle{NodeID: NodeID{72}, Slot: 2, Version: 1}, PrimaryTag: "challenger"}
 	health.Observe(Observation{NodeID: incumbent.ID, NodeSlot: 1, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 100 * time.Millisecond})
 	health.Observe(Observation{NodeID: challenger.ID, NodeSlot: 2, NodeVersion: 1, Scope: DomainEndpoint, Outcome: OutcomeSuccess, Delay: 90 * time.Millisecond})
-	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, 0)
+	// Keep this unit test focused on the margin. The native backend adds a
+	// separate confirmation sample, so account for that extra observation when
+	// the smart_zig build tag is enabled.
+	engine := NewPolicyEngine(health, 2, "fallback").BindSwitchStability(0.15, 0).BindSwitchConfirmation(time.Nanosecond, 1)
+	nativeConfirmation := engine.kernel != nil
 	service := ServiceContext{ID: "chatgpt_web", AffinityID: "browser-family", Mode: ModeAdaptive, Transport: N.NetworkTCP}
 	engine.RememberSelection(service.AffinityID, incumbent.Handle, time.Now())
 	plan, err := engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
@@ -396,6 +400,17 @@ func TestPolicySwitchMarginKeepsIncumbentOnSmallLatencyGain(t *testing.T) {
 	plan, err = engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if nativeConfirmation {
+		// The first materially-better observation starts confirmation; the next
+		// observation confirms it without allowing a single ranking sample to hop.
+		if plan.Candidates[0].ID != incumbent.ID {
+			t.Fatalf("first confirmation sample switched too early: %+v", plan)
+		}
+		plan, err = engine.Plan(testExecutionSnapshot(challenger, incumbent), service, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if plan.Candidates[0].ID != challenger.ID {
 		t.Fatalf("materially faster challenger was blocked: %+v", plan)

@@ -36,6 +36,30 @@ type smartPolicyDecision struct {
 	Reason     uint8
 }
 
+// betterSmartPolicyCandidate merges duplicate subscription lines that resolve
+// to one endpoint. Prefer a usable line over an open one, then retain the
+// strongest evidence so one stale provider copy cannot poison the shared
+// endpoint profile.
+func betterSmartPolicyCandidate(left, right smartPolicyCandidate) bool {
+	leftOpen, rightOpen := left.State == smartPolicyState("open"), right.State == smartPolicyState("open")
+	if leftOpen != rightOpen {
+		return !leftOpen
+	}
+	if left.Reliability != right.Reliability {
+		return left.Reliability > right.Reliability
+	}
+	if left.Samples != right.Samples {
+		return left.Samples > right.Samples
+	}
+	if left.ConnectMS != right.ConnectMS {
+		return left.ConnectMS > 0 && (right.ConnectMS <= 0 || left.ConnectMS < right.ConnectMS)
+	}
+	if left.FirstByteMS != right.FirstByteMS {
+		return left.FirstByteMS > 0 && (right.FirstByteMS <= 0 || left.FirstByteMS < right.FirstByteMS)
+	}
+	return left.Throughput > right.Throughput
+}
+
 // smartPolicyID is derived from the canonical Endpoint identity, not the
 // provider display tag.  Numeric suffixes added to duplicate subscription
 // lines therefore share one policy profile and cannot cause oscillation.
