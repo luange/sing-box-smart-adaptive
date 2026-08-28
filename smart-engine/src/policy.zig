@@ -53,6 +53,19 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         }
     }
     if (incumbent) |current| {
+        // A hard-open incumbent is unavailable (for example after the host's
+        // passive throughput floor trips). Do not wait for performance
+        // confirmation or cooldown: the next real connection must fail over.
+        if (current.state == 4) {
+            state.selected_id = selected.id;
+            state.cooldown_until = now_ms +| config.switch_cooldown_ms;
+            state.challenge_id = 0;
+            state.challenge_count = 0;
+            state.challenge_since = 0;
+            decision.switched = 1;
+            decision.reason = @intFromEnum(model.DecisionReason.confirmed);
+            return decision;
+        }
         const current_score = scoring.score(config, current, total_samples, profile);
         const improvement = if (current_score > 0) (current_score - best_score) / current_score else 0;
         if (improvement < config.switch_margin or now_ms < state.cooldown_until) {

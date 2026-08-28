@@ -33,6 +33,16 @@ release builds select the in-process Zig adapter with the `smart_zig` build
 tag after the same conformance gate; provider, routing, and API code are
 unchanged.
 
+## Passive bulk throughput gate
+
+Bulk candidates can be bypassed after the configured number of real-traffic
+throughput observations falls below `passive_throughput_floor_bps` (default
+512 KiB/s, two observations). This gate never fetches a probe resource and
+never interrupts an existing stream. It marks the candidate hard-open for the
+next new connection; the normal bounded candidate list then provides the
+failover opportunity. Service-local throughput takes precedence over global
+history, so a slow YouTube path cannot be hidden by unrelated traffic.
+
 ## Invariants and evolution
 
 Candidate IDs are stable endpoint identities, not provider display names.

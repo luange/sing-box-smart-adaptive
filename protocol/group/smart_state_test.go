@@ -435,6 +435,31 @@ func TestSmartDetectsBulkProfileOnlyAfterUsefulSamples(t *testing.T) {
 	}
 }
 
+func TestPassiveThroughputFloorUsesOnlyRealTrafficSamples(t *testing.T) {
+	base := smartEstimate{ThroughputBPS: 64 * 1024, ThroughputSamples: 3, HasThroughput: true}
+	if !passiveThroughputBelowFloor(base, 512*1024, 2) {
+		t.Fatal("sustained low real-traffic throughput should trip the passive floor")
+	}
+	if passiveThroughputBelowFloor(base, 512*1024, 4) {
+		t.Fatal("insufficient throughput samples should not trip the passive floor")
+	}
+	base.ThroughputBPS = 2 * 1024 * 1024
+	if passiveThroughputBelowFloor(base, 512*1024, 2) {
+		t.Fatal("throughput above the floor was incorrectly degraded")
+	}
+	base.ThroughputBPS = 2 * 1024 * 1024
+	base.LocalThroughputBPS = 64 * 1024
+	base.LocalThroughputSamples = 2
+	if !passiveThroughputBelowFloor(base, 512*1024, 2) {
+		t.Fatal("service-local low throughput must override a fast global history")
+	}
+	base.HasThroughput = false
+	base.ThroughputBPS = 1
+	if passiveThroughputBelowFloor(base, 512*1024, 2) {
+		t.Fatal("missing passive observations must not degrade a candidate")
+	}
+}
+
 func TestSmartHistorySnapshotRoundTrip(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(8000, 0)

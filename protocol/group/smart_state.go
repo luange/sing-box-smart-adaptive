@@ -59,6 +59,7 @@ type smartEstimate struct {
 	FirstByteMS            float64
 	ThroughputBPS          float64
 	ThroughputSamples      float64
+	LocalThroughputBPS     float64
 	LocalThroughputSamples float64
 	JitterMS               float64
 	Samples                float64
@@ -456,6 +457,7 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 		FirstByteMS:            blendOptional(globalEstimate.FirstByteMS, localEstimate.FirstByteMS, globalEstimate.HasFirstByte, localEstimate.HasFirstByte, localWeight),
 		ThroughputBPS:          blendOptional(globalEstimate.ThroughputBPS, localEstimate.ThroughputBPS, globalEstimate.HasThroughput, localEstimate.HasThroughput, localWeight),
 		ThroughputSamples:      math.Max(globalEstimate.ThroughputSamples, localEstimate.ThroughputSamples),
+		LocalThroughputBPS:     localEstimate.ThroughputBPS,
 		LocalThroughputSamples: localEstimate.ThroughputSamples,
 		JitterMS:               blendOptional(globalEstimate.JitterMS, localEstimate.JitterMS, globalEstimate.HasConnect, localEstimate.HasConnect, localWeight),
 		Samples:                math.Max(globalEstimate.Samples, localEstimate.Samples),
@@ -582,6 +584,25 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 		score -= exploration * math.Sqrt(math.Log(totalSamples+2)/(estimate.Samples+1))
 	}
 	return math.Max(0, score)
+}
+
+// passiveThroughputBelowFloor is intentionally separate from probing. It is
+// evaluated only from bytes observed on a real connection, so a candidate is
+// never penalized merely because no bulk traffic has used it yet.
+func passiveThroughputBelowFloor(estimate smartEstimate, floorBPS uint64, minSamples int) bool {
+	if floorBPS == 0 || !estimate.HasThroughput || estimate.ThroughputBPS <= 0 {
+		return false
+	}
+	if minSamples <= 0 {
+		minSamples = 2
+	}
+	throughput := estimate.ThroughputBPS
+	// Prefer the service-local EWMA whenever it has enough samples. A fast
+	// global history must not hide a slow YouTube (or other bulk) service path.
+	if estimate.LocalThroughputSamples >= float64(minSamples) && estimate.LocalThroughputBPS > 0 {
+		throughput = estimate.LocalThroughputBPS
+	}
+	return estimate.ThroughputSamples >= float64(minSamples) && throughput < float64(floorBPS)
 }
 
 func normalizedLogCost(value, ceiling float64) float64 {

@@ -50,28 +50,34 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL                  string                      `json:"url,omitempty"`
-	ProbeInterval        badoption.Duration          `json:"probe_interval,omitempty"`
-	ProbeCycleTimeout    badoption.Duration          `json:"probe_cycle_timeout,omitempty"`
-	ProbeTimeout         badoption.Duration          `json:"probe_timeout,omitempty"`
-	ProbeConcurrency     int                         `json:"probe_concurrency,omitempty"`
-	MaxAttempts          int                         `json:"max_attempts,omitempty"`
-	AttemptTimeout       badoption.Duration          `json:"attempt_timeout,omitempty"`
-	SiteStickiness       badoption.Duration          `json:"site_stickiness,omitempty"`
-	SwitchConfirm        badoption.Duration          `json:"switch_confirm,omitempty"`
-	SwitchConfirmSamples int                         `json:"switch_confirm_samples,omitempty"`
-	SwitchCooldown       badoption.Duration          `json:"switch_cooldown,omitempty"`
-	SwitchMargin         *float64                    `json:"switch_margin,omitempty"`
-	Exploration          *float64                    `json:"exploration,omitempty"`
-	MinSamples           int                         `json:"min_samples,omitempty"`
-	BreakerFailures      int                         `json:"breaker_failures,omitempty"`
-	BreakerCooldown      badoption.Duration          `json:"breaker_cooldown,omitempty"`
-	HalfLife             badoption.Duration          `json:"half_life,omitempty"`
-	HistoryPath          string                      `json:"history_path,omitempty"`
-	HistoryRetention     badoption.Duration          `json:"history_retention,omitempty"`
-	MaxHistoryEntries    int                         `json:"max_history_entries,omitempty"`
-	InterruptConnections bool                        `json:"interrupt_exist_connections,omitempty"`
-	InterruptPolicy      SmartInterruptPolicyOptions `json:"interrupt_policy,omitempty"`
+	URL                  string             `json:"url,omitempty"`
+	ProbeInterval        badoption.Duration `json:"probe_interval,omitempty"`
+	ProbeCycleTimeout    badoption.Duration `json:"probe_cycle_timeout,omitempty"`
+	ProbeTimeout         badoption.Duration `json:"probe_timeout,omitempty"`
+	ProbeConcurrency     int                `json:"probe_concurrency,omitempty"`
+	MaxAttempts          int                `json:"max_attempts,omitempty"`
+	AttemptTimeout       badoption.Duration `json:"attempt_timeout,omitempty"`
+	SiteStickiness       badoption.Duration `json:"site_stickiness,omitempty"`
+	SwitchConfirm        badoption.Duration `json:"switch_confirm,omitempty"`
+	SwitchConfirmSamples int                `json:"switch_confirm_samples,omitempty"`
+	SwitchCooldown       badoption.Duration `json:"switch_cooldown,omitempty"`
+	SwitchMargin         *float64           `json:"switch_margin,omitempty"`
+	Exploration          *float64           `json:"exploration,omitempty"`
+	MinSamples           int                `json:"min_samples,omitempty"`
+	// PassiveThroughputFloorBPS is a lower bound for real-traffic throughput
+	// observations in bulk profiles. It never performs a probe or fetches a
+	// resource; after PassiveThroughputSamples low observations the candidate
+	// is temporarily bypassed so the next real connection can try another line.
+	PassiveThroughputFloorBPS uint64                      `json:"passive_throughput_floor_bps,omitempty"`
+	PassiveThroughputSamples  int                         `json:"passive_throughput_samples,omitempty"`
+	BreakerFailures           int                         `json:"breaker_failures,omitempty"`
+	BreakerCooldown           badoption.Duration          `json:"breaker_cooldown,omitempty"`
+	HalfLife                  badoption.Duration          `json:"half_life,omitempty"`
+	HistoryPath               string                      `json:"history_path,omitempty"`
+	HistoryRetention          badoption.Duration          `json:"history_retention,omitempty"`
+	MaxHistoryEntries         int                         `json:"max_history_entries,omitempty"`
+	InterruptConnections      bool                        `json:"interrupt_exist_connections,omitempty"`
+	InterruptPolicy           SmartInterruptPolicyOptions `json:"interrupt_policy,omitempty"`
 }
 
 type SmartInterruptPolicyOptions struct {

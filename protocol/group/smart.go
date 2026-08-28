@@ -54,15 +54,20 @@ const (
 	// first byte before starting a competing dial.  This reduces Safari/Google
 	// asset bursts that otherwise create needless hedges; hard dial failures
 	// still advance immediately through the normal retry path.
-	maxSmartHedgeDelay          = 900 * time.Millisecond
-	defaultSmartSwitchMargin    = 0.15
-	smartSwitchAuditLimit       = 128
-	defaultSmartExploration     = 0.08
-	defaultSmartMinSamples      = 3
-	defaultSmartMaxAttempts     = 3
-	defaultSmartBreakerFailures = 3
-	defaultSmartBreakerCooldown = 2 * time.Minute
-	defaultSmartHalfLife        = 30 * time.Minute
+	maxSmartHedgeDelay       = 900 * time.Millisecond
+	defaultSmartSwitchMargin = 0.15
+	smartSwitchAuditLimit    = 128
+	defaultSmartExploration  = 0.08
+	defaultSmartMinSamples   = 3
+	// Passive bulk gating only consumes bytes observed on real connections.
+	// 512 KiB/s is deliberately conservative: it catches the measured
+	// YouTube/GCore stall without rejecting ordinary interactive traffic.
+	defaultSmartPassiveThroughputFloorBPS = 512 * 1024
+	defaultSmartPassiveThroughputSamples  = 2
+	defaultSmartMaxAttempts               = 3
+	defaultSmartBreakerFailures           = 3
+	defaultSmartBreakerCooldown           = 2 * time.Minute
+	defaultSmartHalfLife                  = 30 * time.Minute
 	// Homelab/router default: 48h + 4k is enough for site stickiness without
 	// multi-hundred-MB metric maps (5 groups × 50k was a common RSS blow-up).
 	defaultSmartHistoryRetention  = 48 * time.Hour
@@ -106,11 +111,12 @@ type smartAffinity struct {
 }
 
 type smartRank struct {
-	outbound adapter.Outbound
-	status   adapter.SmartCandidateStatus
-	profile  smartTrafficProfile
-	estimate smartEstimate
-	eligible bool
+	outbound             adapter.Outbound
+	status               adapter.SmartCandidateStatus
+	profile              smartTrafficProfile
+	estimate             smartEstimate
+	eligible             bool
+	passiveThroughputLow bool
 }
 
 type smartRanking struct {
@@ -236,59 +242,61 @@ type Smart struct {
 	statusAccess sync.RWMutex
 	status       adapter.SmartGroupStatus
 
-	store                  *smartStore
-	policyBackend          smartPolicyBackend
-	probeURL               string
-	probeInterval          time.Duration
-	probeCycleTimeout      time.Duration
-	probeTimeout           time.Duration
-	probeConcurrency       int
-	maxAttempts            int
-	attemptTimeout         time.Duration
-	siteStickiness         time.Duration
-	switchConfirm          time.Duration
-	switchConfirmSamples   int
-	switchCooldown         time.Duration
-	switchMargin           float64
-	exploration            float64
-	minSamples             int
-	halfLife               time.Duration
-	breakerFailures        int
-	breakerCooldown        time.Duration
-	historyRetention       time.Duration
-	maxHistoryEntries      int
-	interruptGroup         *interrupt.Group
-	interruptExternal      bool
-	interruptMode          string
-	interruptIdle          time.Duration
-	interruptLongAge       time.Duration
-	interruptGrace         time.Duration
-	switchesTotal          atomic.Uint64
-	performanceSwitches    atomic.Uint64
-	failureFailovers       atomic.Uint64
-	coldStarts             atomic.Uint64
-	switchAuditAccess      sync.Mutex
-	switchAudit            []adapter.SmartSwitchAudit
-	switchesForceAll       atomic.Uint64
-	switchesSelective      atomic.Uint64
-	connectionsInterrupted atomic.Uint64
-	connectionsKept        atomic.Uint64
-	streamFailureWakes     atomic.Uint64
-	probing                atomic.Bool
-	probeCursor            atomic.Uint64
-	lastActivityUnixNano   atomic.Int64
-	closing                atomic.Bool
-	cancel                 context.CancelFunc
-	worker                 sync.WaitGroup
-	lifecycleAccess        sync.Mutex
-	postStarted            bool
-	retired                bool
-	workerStarted          bool
-	probeRegistry          *smartProbeRegistry
-	releaseProbeRegistry   func()
-	probeStartupDelay      time.Duration
-	probeNow               chan struct{}
-	families               *trafficfamily.Resolver
+	store                     *smartStore
+	policyBackend             smartPolicyBackend
+	probeURL                  string
+	probeInterval             time.Duration
+	probeCycleTimeout         time.Duration
+	probeTimeout              time.Duration
+	probeConcurrency          int
+	maxAttempts               int
+	attemptTimeout            time.Duration
+	siteStickiness            time.Duration
+	switchConfirm             time.Duration
+	switchConfirmSamples      int
+	switchCooldown            time.Duration
+	switchMargin              float64
+	exploration               float64
+	minSamples                int
+	passiveThroughputFloorBPS uint64
+	passiveThroughputSamples  int
+	halfLife                  time.Duration
+	breakerFailures           int
+	breakerCooldown           time.Duration
+	historyRetention          time.Duration
+	maxHistoryEntries         int
+	interruptGroup            *interrupt.Group
+	interruptExternal         bool
+	interruptMode             string
+	interruptIdle             time.Duration
+	interruptLongAge          time.Duration
+	interruptGrace            time.Duration
+	switchesTotal             atomic.Uint64
+	performanceSwitches       atomic.Uint64
+	failureFailovers          atomic.Uint64
+	coldStarts                atomic.Uint64
+	switchAuditAccess         sync.Mutex
+	switchAudit               []adapter.SmartSwitchAudit
+	switchesForceAll          atomic.Uint64
+	switchesSelective         atomic.Uint64
+	connectionsInterrupted    atomic.Uint64
+	connectionsKept           atomic.Uint64
+	streamFailureWakes        atomic.Uint64
+	probing                   atomic.Bool
+	probeCursor               atomic.Uint64
+	lastActivityUnixNano      atomic.Int64
+	closing                   atomic.Bool
+	cancel                    context.CancelFunc
+	worker                    sync.WaitGroup
+	lifecycleAccess           sync.Mutex
+	postStarted               bool
+	retired                   bool
+	workerStarted             bool
+	probeRegistry             *smartProbeRegistry
+	releaseProbeRegistry      func()
+	probeStartupDelay         time.Duration
+	probeNow                  chan struct{}
+	families                  *trafficfamily.Resolver
 }
 
 type smartSwitchChallenge struct {
@@ -373,6 +381,17 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	minSamples := options.MinSamples
 	if minSamples <= 0 {
 		minSamples = defaultSmartMinSamples
+	}
+	passiveThroughputFloorBPS := options.PassiveThroughputFloorBPS
+	if passiveThroughputFloorBPS == 0 {
+		passiveThroughputFloorBPS = defaultSmartPassiveThroughputFloorBPS
+	}
+	passiveThroughputSamples := options.PassiveThroughputSamples
+	if passiveThroughputSamples <= 0 {
+		passiveThroughputSamples = defaultSmartPassiveThroughputSamples
+	}
+	if passiveThroughputSamples < 2 {
+		return nil, E.New("smart passive_throughput_samples must be at least 2")
 	}
 	breakerFailures := options.BreakerFailures
 	if breakerFailures <= 0 {
@@ -475,36 +494,38 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		store:               store,
 		policyBackend:       policyBackend,
 
-		probeURL:             options.URL,
-		probeInterval:        probeInterval,
-		probeCycleTimeout:    probeCycleTimeout,
-		probeTimeout:         probeTimeout,
-		probeConcurrency:     probeConcurrency,
-		maxAttempts:          maxAttempts,
-		attemptTimeout:       attemptTimeout,
-		siteStickiness:       siteStickiness,
-		switchConfirm:        switchConfirm,
-		switchConfirmSamples: switchConfirmSamples,
-		switchCooldown:       switchCooldown,
-		switchMargin:         switchMargin,
-		exploration:          exploration,
-		minSamples:           minSamples,
-		halfLife:             halfLife,
-		breakerFailures:      breakerFailures,
-		breakerCooldown:      breakerCooldown,
-		historyRetention:     historyRetention,
-		maxHistoryEntries:    maxHistoryEntries,
-		interruptGroup:       interrupt.NewGroup(),
-		interruptExternal:    options.InterruptConnections,
-		interruptMode:        interruptMode,
-		interruptIdle:        interruptIdle,
-		interruptLongAge:     interruptLongAge,
-		interruptGrace:       interruptGrace,
-		probeRegistry:        probeRegistry,
-		releaseProbeRegistry: releaseProbeRegistry,
-		probeStartupDelay:    probeRegistry.startupDelay(),
-		probeNow:             make(chan struct{}, 1),
-		families:             trafficfamily.NewResolver(),
+		probeURL:                  options.URL,
+		probeInterval:             probeInterval,
+		probeCycleTimeout:         probeCycleTimeout,
+		probeTimeout:              probeTimeout,
+		probeConcurrency:          probeConcurrency,
+		maxAttempts:               maxAttempts,
+		attemptTimeout:            attemptTimeout,
+		siteStickiness:            siteStickiness,
+		switchConfirm:             switchConfirm,
+		switchConfirmSamples:      switchConfirmSamples,
+		switchCooldown:            switchCooldown,
+		switchMargin:              switchMargin,
+		exploration:               exploration,
+		minSamples:                minSamples,
+		passiveThroughputFloorBPS: passiveThroughputFloorBPS,
+		passiveThroughputSamples:  passiveThroughputSamples,
+		halfLife:                  halfLife,
+		breakerFailures:           breakerFailures,
+		breakerCooldown:           breakerCooldown,
+		historyRetention:          historyRetention,
+		maxHistoryEntries:         maxHistoryEntries,
+		interruptGroup:            interrupt.NewGroup(),
+		interruptExternal:         options.InterruptConnections,
+		interruptMode:             interruptMode,
+		interruptIdle:             interruptIdle,
+		interruptLongAge:          interruptLongAge,
+		interruptGrace:            interruptGrace,
+		probeRegistry:             probeRegistry,
+		releaseProbeRegistry:      releaseProbeRegistry,
+		probeStartupDelay:         probeRegistry.startupDelay(),
+		probeNow:                  make(chan struct{}, 1),
+		families:                  trafficfamily.NewResolver(),
 	}
 	return smart, nil
 }
@@ -1537,6 +1558,30 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 		}
 	}
+	// Apply the passive bulk gate only after the traffic profile is known. This
+	// changes eligibility for future dials; it never interrupts an existing
+	// stream and never schedules an active resource probe.
+	if profile == smartProfileBulk {
+		for index := range ranking.ranks {
+			if !passiveThroughputBelowFloor(ranking.ranks[index].estimate, s.passiveThroughputFloorBPS, s.passiveThroughputSamples) {
+				continue
+			}
+			ranking.ranks[index].estimate.State = "open"
+			ranking.ranks[index].status.State = "open"
+			ranking.ranks[index].status.Reason = "passive throughput below floor"
+			ranking.ranks[index].passiveThroughputLow = true
+			identity := ""
+			s.access.RLock()
+			identity = s.candidateProbeKey[ranking.ranks[index].outbound.Tag()]
+			s.access.RUnlock()
+			policyID := smartPolicyID(identity)
+			for policyIndex := range policyCandidates {
+				if policyCandidates[policyIndex].ID == policyID {
+					policyCandidates[policyIndex].State = smartPolicyState("open")
+				}
+			}
+		}
+	}
 	for index := range ranking.ranks {
 		weightMatch := s.nodeWeights.Explain(ranking.ranks[index].outbound.Tag())
 		weight := weightMatch.Weight
@@ -1545,7 +1590,9 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		ranking.ranks[index].status.Weight = weight
 		ranking.ranks[index].status.WeightRule = weightMatch.Rule
 		ranking.ranks[index].status.WeightExact = weightMatch.Exact
-		ranking.ranks[index].status.Reason = smartEstimateReason(ranking.ranks[index].estimate)
+		if !ranking.ranks[index].passiveThroughputLow {
+			ranking.ranks[index].status.Reason = smartEstimateReason(ranking.ranks[index].estimate)
+		}
 		ranking.ranks[index].estimate = smartEstimate{}
 	}
 	sort.SliceStable(ranking.ranks, func(i, j int) bool {

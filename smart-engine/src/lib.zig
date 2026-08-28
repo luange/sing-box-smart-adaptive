@@ -93,6 +93,18 @@ test "retains incumbent until confirmation" {
     try std.testing.expectEqual(@as(u8, 1), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 2000).switched);
 }
 
+test "hard-open incumbent fails over without confirmation" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0.95, .switch_confirm_samples = 3, .switch_confirm_ms = 60000, .switch_cooldown_ms = 2000 });
+    const incumbent = Candidate{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 1, .eligible = 1 };
+    const fallback = Candidate{ .id = 2, .reliability = 0.30, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .throughput_bps = 0, .samples = 1, .weight = 1, .state = 1, .eligible = 1 };
+    const initial = [_]Candidate{incumbent};
+    _ = policy.chooseProfile(&engine.state, engine.config, &engine.observations, initial[0..], 0, .bulk);
+    const opened = [_]Candidate{.{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 4, .eligible = 1 }, fallback};
+    const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, opened[0..], 1, .bulk);
+    try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), decision.switched);
+}
+
 test "bounded observations do not grow after reset" {
     var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 });
     var id: u64 = 1;
