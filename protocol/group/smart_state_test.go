@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -359,7 +360,10 @@ func TestSmartControlStatePrunesExpiredSelectionMetadata(t *testing.T) {
 	smart := &Smart{
 		lastSelected:     map[string]string{"old": "node-a", "new": "node-b"},
 		selectionUpdated: map[string]time.Time{"old": time.Unix(0, 0), "new": time.Now()},
-		affinity:         make(map[string]smartAffinity),
+		affinity: map[string]smartAffinity{
+			"expired-affinity": {Candidate: "node-a", ExpiresAt: time.Unix(0, 0)},
+			"live-affinity":    {Candidate: "node-b", ExpiresAt: time.Now().Add(time.Hour)},
+		},
 		switchChallenges: map[string]smartSwitchChallenge{"old": {Since: time.Unix(0, 0)}},
 		performanceCooldown: map[string]time.Time{
 			"old": time.Unix(0, 0),
@@ -378,6 +382,68 @@ func TestSmartControlStatePrunesExpiredSelectionMetadata(t *testing.T) {
 	}
 	if _, ok := smart.performanceCooldown["old"]; ok {
 		t.Fatal("expired cooldown was retained")
+	}
+	if _, ok := smart.affinity["expired-affinity"]; ok {
+		t.Fatal("expired affinity was retained")
+	}
+	if _, ok := smart.affinity["live-affinity"]; !ok {
+		t.Fatal("live affinity was pruned")
+	}
+}
+
+func TestSmartControlStatePrunesOldestEntriesDeterministically(t *testing.T) {
+	now := time.Now()
+	smart := &Smart{
+		lastSelected:        make(map[string]string),
+		selectionUpdated:    make(map[string]time.Time),
+		affinity:            make(map[string]smartAffinity),
+		switchChallenges:    make(map[string]smartSwitchChallenge),
+		performanceCooldown: make(map[string]time.Time),
+		historyRetention:    24 * time.Hour,
+		maxHistoryEntries:   1024,
+	}
+	for i := 0; i < 1100; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		updated := now.Add(time.Duration(i) * time.Second)
+		smart.selectionUpdated[key] = updated
+		smart.lastSelected[key] = "node"
+		smart.affinity[key] = smartAffinity{Candidate: "node", ExpiresAt: updated.Add(time.Hour)}
+		smart.switchChallenges[key] = smartSwitchChallenge{Candidate: "node", Since: updated}
+	}
+	smart.access.Lock()
+	smart.pruneControlStateLocked(now)
+	smart.access.Unlock()
+
+	if len(smart.selectionUpdated) != 1024 {
+		t.Fatalf("selection state limit mismatch: %d", len(smart.selectionUpdated))
+	}
+	if len(smart.switchChallenges) != 1024 {
+		t.Fatalf("challenge state limit mismatch: %d", len(smart.switchChallenges))
+	}
+	if len(smart.affinity) != 1024 {
+		t.Fatalf("affinity state limit mismatch: %d", len(smart.affinity))
+	}
+	for _, key := range []string{"key-0000", "key-0075"} {
+		if _, ok := smart.selectionUpdated[key]; ok {
+			t.Fatalf("old selection entry %s was retained", key)
+		}
+		if _, ok := smart.switchChallenges[key]; ok {
+			t.Fatalf("old challenge entry %s was retained", key)
+		}
+		if _, ok := smart.affinity[key]; ok {
+			t.Fatalf("old affinity entry %s was retained", key)
+		}
+	}
+	for _, key := range []string{"key-0100", "key-1099"} {
+		if _, ok := smart.selectionUpdated[key]; !ok {
+			t.Fatalf("new selection entry %s was pruned", key)
+		}
+		if _, ok := smart.switchChallenges[key]; !ok {
+			t.Fatalf("new challenge entry %s was pruned", key)
+		}
+		if _, ok := smart.affinity[key]; !ok {
+			t.Fatalf("new affinity entry %s was pruned", key)
+		}
 	}
 }
 

@@ -2110,18 +2110,26 @@ func (s *Smart) releaseHalfOpen(candidate, networkKey, siteKey, transport string
 
 func (s *Smart) pruneAffinityLocked(now time.Time) {
 	limit := min(10000, max(1024, s.maxHistoryEntries/4))
-	if len(s.affinity) < limit {
-		return
-	}
 	for key, affinity := range s.affinity {
 		if !affinity.ExpiresAt.After(now) {
 			delete(s.affinity, key)
 		}
 	}
+	if len(s.affinity) <= limit {
+		return
+	}
+	keys := make([]string, 0, len(s.affinity))
 	for key := range s.affinity {
-		if len(s.affinity) < limit {
-			break
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := s.affinity[keys[i]], s.affinity[keys[j]]
+		if left.ExpiresAt.Equal(right.ExpiresAt) {
+			return keys[i] < keys[j]
 		}
+		return left.ExpiresAt.Before(right.ExpiresAt)
+	})
+	for _, key := range keys[:len(keys)-limit] {
 		delete(s.affinity, key)
 	}
 }
@@ -2139,10 +2147,18 @@ func (s *Smart) pruneControlStateLocked(now time.Time) {
 		}
 	}
 	if len(s.selectionUpdated) > limit {
+		keys := make([]string, 0, len(s.selectionUpdated))
 		for key := range s.selectionUpdated {
-			if len(s.selectionUpdated) <= limit {
-				break
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left, right := s.selectionUpdated[keys[i]], s.selectionUpdated[keys[j]]
+			if left.Equal(right) {
+				return keys[i] < keys[j]
 			}
+			return left.Before(right)
+		})
+		for _, key := range keys[:len(keys)-limit] {
 			delete(s.selectionUpdated, key)
 			delete(s.lastSelected, key)
 		}
@@ -2155,6 +2171,22 @@ func (s *Smart) pruneControlStateLocked(now time.Time) {
 	for key, until := range s.performanceCooldown {
 		if !until.After(now) {
 			delete(s.performanceCooldown, key)
+		}
+	}
+	if len(s.switchChallenges) > limit {
+		keys := make([]string, 0, len(s.switchChallenges))
+		for key := range s.switchChallenges {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left, right := s.switchChallenges[keys[i]], s.switchChallenges[keys[j]]
+			if left.Since.Equal(right.Since) {
+				return keys[i] < keys[j]
+			}
+			return left.Since.Before(right.Since)
+		})
+		for _, key := range keys[:len(keys)-limit] {
+			delete(s.switchChallenges, key)
 		}
 	}
 	// Affinity has its own expiry and size policy, but pruning it here avoids
