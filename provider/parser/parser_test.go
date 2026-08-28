@@ -12,40 +12,32 @@ import (
 func TestOverrideAnyTLSOptions(t *testing.T) {
 	testCases := []struct {
 		name                   string
-		clientMetadata         *string
-		disableReuse           bool
+		clientMetadata         string
 		override               *option.OverrideAnyTLSOptions
-		expectedClientMetadata *string
-		expectedDisableReuse   bool
+		expectedClientMetadata string
 	}{
 		{
 			name: "preserve unset",
 		},
 		{
 			name:                   "preserve value",
-			clientMetadata:         common.Ptr("original-client/1.0"),
-			disableReuse:           true,
-			expectedClientMetadata: common.Ptr("original-client/1.0"),
-			expectedDisableReuse:   true,
+			clientMetadata:         "original-client/1.0",
+			expectedClientMetadata: "original-client/1.0",
 		},
 		{
 			name:           "clear",
-			clientMetadata: common.Ptr("original-client/1.0"),
-			disableReuse:   true,
+			clientMetadata: "original-client/1.0",
 			override: &option.OverrideAnyTLSOptions{
 				ClientMetadata: common.Ptr(""),
-				DisableReuse:   common.Ptr(false),
 			},
-			expectedClientMetadata: common.Ptr(""),
+			expectedClientMetadata: "",
 		},
 		{
 			name: "replace",
 			override: &option.OverrideAnyTLSOptions{
 				ClientMetadata: common.Ptr("custom-client/1.0"),
-				DisableReuse:   common.Ptr(true),
 			},
-			expectedClientMetadata: common.Ptr("custom-client/1.0"),
-			expectedDisableReuse:   true,
+			expectedClientMetadata: "custom-client/1.0",
 		},
 	}
 	for _, testCase := range testCases {
@@ -54,12 +46,10 @@ func TestOverrideAnyTLSOptions(t *testing.T) {
 				Type: C.TypeAnyTLS,
 				Options: &option.AnyTLSOutboundOptions{
 					ClientMetadata: testCase.clientMetadata,
-					DisableReuse:   testCase.disableReuse,
 				},
 			}}, nil, nil, testCase.override, nil, "")
 			options := outbounds[0].Options.(*option.AnyTLSOutboundOptions)
 			require.Equal(t, testCase.expectedClientMetadata, options.ClientMetadata)
-			require.Equal(t, testCase.expectedDisableReuse, options.DisableReuse)
 		})
 	}
 }

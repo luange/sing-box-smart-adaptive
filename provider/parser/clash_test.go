@@ -34,7 +34,7 @@ proxies:
 	require.Equal(t, "example.com", snellOptions.ObfsOptions.ObfsHost)
 }
 
-func TestParseClashAnyTLSDisableReuse(t *testing.T) {
+func TestParseClashAnyTLSUnsupportedDisableReuse(t *testing.T) {
 	outbounds, endpoints, err := ParseClashSubscription(context.Background(), `
 proxies:
   - name: anytls-out
@@ -50,5 +50,8 @@ proxies:
 
 	anyTLSOptions, ok := outbounds[0].Options.(*option.AnyTLSOutboundOptions)
 	require.True(t, ok)
-	require.True(t, anyTLSOptions.DisableReuse)
+	// Pure SagerNet AnyTLS has no disable_reuse option. The parser must accept
+	// the provider field while explicitly ignoring it (and keep the outbound
+	// otherwise usable).
+	require.Equal(t, "", anyTLSOptions.ClientMetadata)
 }
