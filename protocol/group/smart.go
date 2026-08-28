@@ -244,8 +244,12 @@ type Smart struct {
 	statusAccess sync.RWMutex
 	status       adapter.SmartGroupStatus
 
-	store                     *smartStore
-	policyBackend             smartPolicyBackend
+	store         *smartStore
+	policyBackend smartPolicyBackend
+	// policyAccess keeps the backend alive while a request is using it. Close
+	// can run concurrently with late dials during HA shutdown; without this
+	// guard a late rank could call into an already-destroyed Zig engine.
+	policyAccess              sync.RWMutex
 	probeURL                  string
 	probeInterval             time.Duration
 	probeCycleTimeout         time.Duration
@@ -305,6 +309,55 @@ type smartSwitchChallenge struct {
 	Candidate string
 	Since     time.Time
 	Count     int
+}
+
+func (s *Smart) policyEnabled() bool {
+	s.policyAccess.RLock()
+	enabled := s.policyBackend != nil
+	s.policyAccess.RUnlock()
+	return enabled
+}
+
+func (s *Smart) policyReset() {
+	s.policyAccess.RLock()
+	if s.policyBackend != nil {
+		s.policyBackend.Reset()
+	}
+	s.policyAccess.RUnlock()
+}
+
+func (s *Smart) policyObserve(key string, id uint64, success bool, elapsed time.Duration, now time.Time) {
+	s.policyAccess.RLock()
+	if s.policyBackend != nil {
+		s.policyBackend.Observe(key, id, success, elapsed, now)
+	}
+	s.policyAccess.RUnlock()
+}
+
+func (s *Smart) policyStick(key string, id uint64, now, until time.Time) {
+	s.policyAccess.RLock()
+	if s.policyBackend != nil {
+		s.policyBackend.Stick(key, id, now, until)
+	}
+	s.policyAccess.RUnlock()
+}
+
+func (s *Smart) policySelected(key string) uint64 {
+	s.policyAccess.RLock()
+	defer s.policyAccess.RUnlock()
+	if s.policyBackend == nil {
+		return 0
+	}
+	return s.policyBackend.Selected(key)
+}
+
+func (s *Smart) policyChoose(key string, candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) smartPolicyDecision {
+	s.policyAccess.RLock()
+	defer s.policyAccess.RUnlock()
+	if s.policyBackend == nil {
+		return smartPolicyDecision{}
+	}
+	return s.policyBackend.Choose(key, candidates, profile, now)
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -640,10 +693,13 @@ func (s *Smart) Close() error {
 	s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
 	s.providerAccess.Unlock()
 	s.store.clear()
-	if s.policyBackend != nil {
-		s.policyBackend.Close()
-		s.policyBackend = nil
+	s.policyAccess.Lock()
+	policyBackend := s.policyBackend
+	s.policyBackend = nil
+	if policyBackend != nil {
+		policyBackend.Close()
 	}
+	s.policyAccess.Unlock()
 	if s.releaseProbeRegistry != nil {
 		s.releaseProbeRegistry()
 		s.releaseProbeRegistry = nil
@@ -893,9 +949,7 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	s.control.access.Lock()
 	s.control.pinned = tag
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.policyReset()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil {
 			s.logger.Error("store smart pin: ", err)
@@ -908,9 +962,7 @@ func (s *Smart) ClearSelection() {
 	s.control.access.Lock()
 	s.control.pinned = ""
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.policyReset()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil {
 			s.logger.Error("clear smart pin: ", err)
@@ -1481,14 +1533,14 @@ func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksa
 // enabled it receives the same event keyed by canonical endpoint identity.
 func (s *Smart) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
 	s.store.observeDial(now, network, site, candidate, transport, success, elapsed)
-	if s.policyBackend == nil {
+	if !s.policyEnabled() {
 		return
 	}
 	s.access.RLock()
 	identity := s.candidateProbeKey[candidate]
 	s.access.RUnlock()
 	if identity != "" {
-		s.policyBackend.Observe(smartSelectionKey(network, site, transport), smartPolicyID(identity), success, elapsed, now)
+		s.policyObserve(smartSelectionKey(network, site, transport), smartPolicyID(identity), success, elapsed, now)
 	}
 }
 
@@ -1564,7 +1616,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				Samples:       estimate.Samples,
 			},
 		})
-		if s.policyBackend != nil && identity != "" {
+		if s.policyEnabled() && identity != "" {
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
@@ -1682,7 +1734,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	if s.policyBackend != nil {
+	if s.policyEnabled() {
 		selectionKey := smartSelectionKey(networkKey, siteKey, transport)
 		// Keep the configured site-affinity lease effective when the Zig policy
 		// backend is active. Previously affinity was only consumed by the Go
@@ -1693,11 +1745,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			s.access.RUnlock()
 			if identity != "" {
 				if index := smartRankIndex(ranks, affinity.Candidate); index >= 0 && ranks[index].status.State != "open" {
-					s.policyBackend.Stick(selectionKey, smartPolicyID(identity), now, affinity.ExpiresAt)
+					s.policyStick(selectionKey, smartPolicyID(identity), now, affinity.ExpiresAt)
 				}
 			}
 		}
-		decision := s.policyBackend.Choose(selectionKey, policyCandidates, profile, now)
+		decision := s.policyChoose(selectionKey, policyCandidates, profile, now)
 		if decision.SelectedID != 0 {
 			for index := range ranks {
 				identity := ""
@@ -1775,8 +1827,9 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	key := smartSelectionKey(networkKey, siteKey, transport)
 	affinityKey := networkKey + "\x00" + siteKey + "\x00" + transport
 	policySelectedID := uint64(0)
-	if s.policyBackend != nil {
-		policySelectedID = s.policyBackend.Selected(key)
+	policyEnabled := s.policyEnabled()
+	if policyEnabled {
+		policySelectedID = s.policySelected(key)
 	}
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
@@ -1796,7 +1849,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
-	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !policyEnabled && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		coolingDown := s.performanceCooldown[key].After(now)
 		materiallyBetter := previousFound && currentFound && smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin)
 		if coolingDown || !materiallyBetter {
@@ -1811,7 +1864,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	s.selectionUpdated[key] = now
 	delete(s.switchChallenges, key)
-	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !policyEnabled && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		if s.performanceCooldown == nil {
 			s.performanceCooldown = make(map[string]time.Time)
 		}
@@ -2225,9 +2278,7 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 	}
 	s.control.pinned = ""
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.policyReset()
 	if s.logger != nil {
 		s.logger.Warn("smart manual pin released: ", reason, " tag=", candidate)
 	}
