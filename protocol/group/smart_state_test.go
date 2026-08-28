@@ -174,6 +174,34 @@ func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
 	}
 }
 
+func TestSmartProbeRegistryDefersWhenAllEntriesInflight(t *testing.T) {
+	called := 0
+	registry := &smartProbeRegistry{
+		ctx:     context.Background(),
+		cancel:  func() {},
+		entries: make(map[string]*smartProbeEntry, smartProbeRegistryLimit),
+		slots:   make(chan struct{}, 1),
+		probe: func(context.Context, string, adapter.Outbound) (uint16, error) {
+			called++
+			return 1, nil
+		},
+	}
+	for i := 0; i < smartProbeRegistryLimit; i++ {
+		registry.entries[fmt.Sprintf("inflight-%d", i)] = &smartProbeEntry{
+			inflight: true,
+			done:     make(chan struct{}),
+		}
+	}
+	leaf := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "new", []string{N.NetworkTCP}, nil)}
+	_, err := registry.run(context.Background(), "new-key", probe.GoogleConnectivityURL, time.Second, time.Minute, leaf)
+	if err != errSharedSmartProbeDeferred {
+		t.Fatalf("registry overflow error = %v, want deferred", err)
+	}
+	if called != 0 {
+		t.Fatalf("overflow bypassed shared probe gate: probe called %d times", called)
+	}
+}
+
 func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(1000, 0)

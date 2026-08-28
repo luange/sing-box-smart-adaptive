@@ -217,18 +217,12 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		r.pruneLocked(now)
 		if len(r.entries) >= smartProbeRegistryLimit {
 			r.access.Unlock()
-			// Overflow path must honor the caller's ctx so shutdown cancels promptly.
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
-			if probeCtx.Err() != nil {
-				cancel()
-				return 0, probeCtx.Err()
-			}
-			delay, err := r.probe(probeCtx, probeURL, candidate)
-			cancel()
-			if err != nil {
-				return 0, errSharedSmartProbeFailed
-			}
-			return delay, nil
+			// If every registry entry is still in flight, do not bypass the
+			// process-wide admission gate.  Doing so would defeat endpoint
+			// de-duplication exactly when the probe catalog is under pressure and
+			// could create an unbounded burst of duplicate probes.  The next
+			// scheduled cycle will retry after an in-flight entry completes.
+			return 0, errSharedSmartProbeDeferred
 		}
 	}
 	entry = &smartProbeEntry{inflight: true, done: make(chan struct{})}
