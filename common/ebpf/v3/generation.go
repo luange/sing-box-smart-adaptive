@@ -65,15 +65,36 @@ func (p *BankPublisher) Commit() (generation uint32, active uint32) {
 	if p == nil {
 		return 0, 0
 	}
-	newGen := p.generation.Load() + 1
-	if newGen == 0 {
-		newGen = 1
-	}
+	newGen := nextGeneration(p.generation.Load())
 	newActive := p.InactiveBank()
 	p.generation.Store(newGen)
 	p.active.Store(newActive)
 	p.compiling.Store(0)
 	return newGen, newActive
+}
+
+// AdvanceGeneration invalidates entries from the current generation without
+// changing the active policy bank. It is used by route/interface reloads that
+// must retire learned flows before the next static-policy commit.
+func (p *BankPublisher) AdvanceGeneration() uint32 {
+	if p == nil {
+		return 0
+	}
+	for {
+		current := p.generation.Load()
+		next := nextGeneration(current)
+		if p.generation.CompareAndSwap(current, next) {
+			return next
+		}
+	}
+}
+
+func nextGeneration(current uint32) uint32 {
+	next := current + 1
+	if next == 0 {
+		next = 1
+	}
+	return next
 }
 
 // Snapshot is a stable view for writing Control.
@@ -97,11 +118,19 @@ func (p *BankPublisher) SyncGeneration(generation uint32) {
 	}
 	for {
 		current := p.generation.Load()
-		if current >= generation {
+		if !generationNewer(generation, current) {
 			return
 		}
 		if p.generation.CompareAndSwap(current, generation) {
 			return
 		}
 	}
+}
+
+// generationNewer uses serial-number arithmetic so the uint32 generation can
+// wrap from max uint32 to 1 without treating the wrapped value as stale. A
+// difference of exactly 2^31 is undefined by design and is treated as not
+// newer; generations are expected to advance by a tiny fraction of that.
+func generationNewer(candidate, current uint32) bool {
+	return candidate != current && int32(candidate-current) > 0
 }

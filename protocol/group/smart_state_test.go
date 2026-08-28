@@ -202,6 +202,68 @@ func TestSmartProbeRegistryDefersWhenAllEntriesInflight(t *testing.T) {
 	}
 }
 
+func TestSmartProbeRegistryDeferralBacksOffAfterCancellation(t *testing.T) {
+	probeCalled := make(chan struct{}, 1)
+	registry := &smartProbeRegistry{
+		ctx:     context.Background(),
+		cancel:  func() {},
+		entries: make(map[string]*smartProbeEntry),
+		slots:   make(chan struct{}, 1),
+		probe: func(context.Context, string, adapter.Outbound) (uint16, error) {
+			probeCalled <- struct{}{}
+			return 0, nil
+		},
+	}
+	// Keep the only admission slot occupied so run must wait for it.
+	registry.slots <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		_, err := registry.run(ctx, "deferred-key", probe.GoogleConnectivityURL, time.Second, 2*time.Second, nil)
+		done <- outcome{err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		registry.access.Lock()
+		_, loaded := registry.entries["deferred-key"]
+		registry.access.Unlock()
+		if loaded || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case result := <-done:
+		if result.err != errSharedSmartProbeDeferred {
+			t.Fatalf("run error = %v, want deferred", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled probe waiter did not return")
+	}
+	registry.access.Lock()
+	entry := registry.entries["deferred-key"]
+	registry.access.Unlock()
+	if entry == nil || !entry.result.deferred {
+		t.Fatalf("deferred result missing: %+v", entry)
+	}
+	if !entry.result.nextProbeAt.After(entry.result.completedAt) {
+		t.Fatalf("deferred retry was immediate: completed=%v next=%v", entry.result.completedAt, entry.result.nextProbeAt)
+	}
+	if got := entry.result.nextProbeAt.Sub(entry.result.completedAt); got < 2*time.Second {
+		t.Fatalf("deferred retry interval = %v, want at least 2s", got)
+	}
+	select {
+	case <-probeCalled:
+		t.Fatal("canceled waiter started a probe")
+	default:
+	}
+}
+
 func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(1000, 0)

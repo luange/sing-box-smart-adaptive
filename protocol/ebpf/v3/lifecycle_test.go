@@ -96,8 +96,14 @@ type memSink struct {
 
 type rejectingStaticSink struct{ memSink }
 
+type rejectingInvalidateSink struct{ memSink }
+
 func (s *rejectingStaticSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
 	return errors.New("injected static publish failure")
+}
+
+func (s *rejectingInvalidateSink) InvalidateFlowDirect() error {
+	return errors.New("injected invalidate failure")
 }
 
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
@@ -196,6 +202,63 @@ func TestLifecycleStaticSinkFailureDoesNotAdvanceMirror(t *testing.T) {
 	after := lc.Backend().Control
 	if after != before {
 		t.Fatalf("mirror advanced after sink failure: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestLifecycleGenerationSyncAndInvalidationStayAligned(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	if _, _, err := lc.PublishStaticRules([]ebpfv3.CompileInput{{
+		Destination: netip.MustParsePrefix("1.1.1.1/32"),
+		Verdict:     ebpfv3.VerdictDirect,
+		Kind:        ebpfv3.RuleKindStatic,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	committed := lc.Backend().Control.PolicyGeneration
+	if committed != lc.Backend().Publisher.Generation() {
+		t.Fatalf("initial generations diverged: control=%d publisher=%d", committed, lc.Backend().Publisher.Generation())
+	}
+	// A late reload callback must not regress the accepted generation.
+	lc.SyncPolicyGeneration(committed - 1)
+	if got := lc.Backend().Control.PolicyGeneration; got != committed {
+		t.Fatalf("stale sync regressed control generation to %d", got)
+	}
+	if err := lc.InvalidateGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	invalidated := lc.Backend().Control.PolicyGeneration
+	if invalidated != committed+1 || invalidated != lc.Backend().Publisher.Generation() {
+		t.Fatalf("invalidation generations diverged: control=%d publisher=%d", invalidated, lc.Backend().Publisher.Generation())
+	}
+}
+
+func TestLifecycleInvalidationFailureDoesNotAdvanceMirror(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &rejectingInvalidateSink{memSink: memSink{gen: 1}}
+	lc.BindSink(sink)
+	before := lc.Backend().Control
+	if err := lc.InvalidateGeneration(); err == nil {
+		t.Fatal("expected invalidate failure")
+	}
+	after := lc.Backend().Control
+	if after != before || lc.Backend().Publisher.Generation() != before.PolicyGeneration {
+		t.Fatalf("mirror advanced after invalidate failure: before=%+v after=%+v publisher=%d", before, after, lc.Backend().Publisher.Generation())
 	}
 }
 

@@ -58,3 +58,20 @@ func TestBankPublisherSyncGenerationIsMonotonic(t *testing.T) {
 		t.Fatalf("commit after sync=%d, want 11", got)
 	}
 }
+
+func TestBankPublisherGenerationWrapUsesSerialOrdering(t *testing.T) {
+	p := NewBankPublisher()
+	p.generation.Store(1)
+	p.SyncGeneration(^uint32(0))
+	if got := p.Generation(); got != 1 {
+		t.Fatalf("stale pre-wrap sync changed generation to %d", got)
+	}
+	p.generation.Store(^uint32(0))
+	if got := p.AdvanceGeneration(); got != 1 {
+		t.Fatalf("advance did not wrap to 1: %d", got)
+	}
+	p.SyncGeneration(2)
+	if got := p.Generation(); got != 2 {
+		t.Fatalf("post-wrap sync=%d, want 2", got)
+	}
+}

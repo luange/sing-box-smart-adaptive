@@ -121,22 +121,6 @@ func smartProbeKey(identity, probeURL string, timeout time.Duration) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
-// failed reports a recent shared probe failure for a candidate. Probe
-// outcomes are process-wide, so every Smart group avoids the same failed node
-// until the shared TTL expires instead of rediscovering the failure itself.
-func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
-	if r == nil || key == "" {
-		return false
-	}
-	if ttl <= 0 {
-		ttl = time.Minute
-	}
-	r.access.Lock()
-	defer r.access.Unlock()
-	entry := r.entries[key]
-	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.nextProbeAt.IsZero() && time.Now().Before(entry.result.nextProbeAt)
-}
-
 func (r *smartProbeRegistry) dead(key string) bool {
 	if r == nil || key == "" {
 		return false
@@ -145,6 +129,20 @@ func (r *smartProbeRegistry) dead(key string) bool {
 	defer r.access.Unlock()
 	entry := r.entries[key]
 	return entry != nil && !entry.inflight && !entry.result.success && entry.result.failures >= 3
+}
+
+// deferredProbeTime prevents a canceled waiter from immediately re-entering
+// the admission queue on the next scheduler tick.  The caller supplies its
+// normal probe cycle as retryAfter; the one-second floor protects embedded
+// callers that use a sub-second cycle from a tight retry loop.
+func deferredProbeTime(now time.Time, retryAfter time.Duration) time.Time {
+	if retryAfter <= 0 {
+		retryAfter = time.Minute
+	}
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	return now.Add(retryAfter)
 }
 
 func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
@@ -177,6 +175,9 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	}
 	if ttl <= 0 {
 		ttl = time.Minute
+	}
+	if timeout <= 0 {
+		timeout = defaultSmartProbeTimeout
 	}
 	now := time.Now()
 	r.access.Lock()
@@ -232,16 +233,18 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	select {
 	case r.slots <- struct{}{}:
 	case <-ctx.Done():
+		completedAt := time.Now()
 		r.access.Lock()
-		entry.result = smartProbeResult{completedAt: time.Now(), nextProbeAt: time.Now(), deferred: true}
+		entry.result = smartProbeResult{completedAt: completedAt, nextProbeAt: deferredProbeTime(completedAt, ttl), deferred: true}
 		entry.inflight = false
 		close(entry.done)
 		entry.done = nil
 		r.access.Unlock()
 		return 0, errSharedSmartProbeDeferred
 	case <-r.ctx.Done():
+		completedAt := time.Now()
 		r.access.Lock()
-		entry.result = smartProbeResult{completedAt: time.Now(), nextProbeAt: time.Now(), deferred: true}
+		entry.result = smartProbeResult{completedAt: completedAt, nextProbeAt: deferredProbeTime(completedAt, ttl), deferred: true}
 		entry.inflight = false
 		close(entry.done)
 		entry.done = nil

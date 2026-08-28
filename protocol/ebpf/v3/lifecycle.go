@@ -72,7 +72,11 @@ func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	defer l.mu.Unlock()
 	if l.backend != nil {
 		l.backend.Publisher.SyncGeneration(generation)
-		l.backend.Control.PolicyGeneration = generation
+		// SyncGeneration intentionally ignores stale observations. Mirror the
+		// publisher's accepted value rather than writing the caller's value
+		// directly, otherwise a late reload callback can regress the control block
+		// while the bank publisher remains at the newer generation.
+		l.backend.Control.PolicyGeneration = l.backend.Publisher.Generation()
 	}
 }
 
@@ -269,14 +273,26 @@ func (l *Lifecycle) InvalidateGeneration() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.backend != nil {
-		l.backend.Control.PolicyGeneration++
-		if l.backend.Control.PolicyGeneration == 0 {
-			l.backend.Control.PolicyGeneration = 1
-		}
-	}
 	if l.sink != nil {
-		return l.sink.InvalidateFlowDirect()
+		// The live sink is authoritative for a kernel generation bump. Do not
+		// advance the in-process mirror until the sink confirms success; doing so
+		// on an error would make stale flow/DNS entries appear retired in tests and
+		// status while they remain active in the kernel.
+		if err := l.sink.InvalidateFlowDirect(); err != nil {
+			return err
+		}
+		if l.backend != nil {
+			l.backend.Publisher.SyncGeneration(l.sink.PolicyGeneration())
+			l.backend.Control.PolicyGeneration = l.backend.Publisher.Generation()
+		}
+		return nil
+	}
+	if l.backend != nil {
+		// Keep the publisher and control block in lockstep. Bumping only the
+		// control block used to let the next static commit reuse an older
+		// generation and resurrect learned entries in the mirror.
+		generation := l.backend.Publisher.AdvanceGeneration()
+		l.backend.Control.PolicyGeneration = generation
 	}
 	return nil
 }
