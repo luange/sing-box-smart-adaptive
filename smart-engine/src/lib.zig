@@ -3,6 +3,7 @@ const model = @import("model.zig");
 const metrics = @import("metrics.zig");
 const policy = @import("policy.zig");
 const scoring = @import("scoring.zig");
+const adaptive = @import("adaptive.zig");
 
 const max_candidates = 8192;
 
@@ -80,6 +81,69 @@ export fn smart_engine_choose_profile(engine: ?*Engine, candidates: ?[*]const Ca
 
 export fn smart_engine_reset(engine: ?*Engine) void {
     if (engine) |value| value.reset();
+}
+
+const AdaptiveEngine = struct {
+    config: adaptive.Config,
+    state: adaptive.State = .{},
+};
+
+export fn adaptive_engine_abi_version() u32 {
+    return 2;
+}
+
+export fn adaptive_engine_create(config: adaptive.Config) ?*AdaptiveEngine {
+    const engine = std.heap.page_allocator.create(AdaptiveEngine) catch return null;
+    var normalized = config;
+    if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
+    if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
+    engine.* = .{ .config = normalized };
+    return engine;
+}
+
+export fn adaptive_engine_configure(engine: ?*AdaptiveEngine, config: adaptive.Config) void {
+    if (engine) |value| {
+        var normalized = config;
+        if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
+        if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
+        value.config = normalized;
+    }
+}
+
+export fn adaptive_engine_destroy(engine: ?*AdaptiveEngine) void {
+    if (engine) |value| std.heap.page_allocator.destroy(value);
+}
+
+export fn adaptive_engine_choose(engine: ?*AdaptiveEngine, candidates: ?[*]const adaptive.Candidate, count: usize, now_ms: u64) adaptive.Decision {
+    if (engine) |value| {
+        if (candidates) |pointer| {
+            if (count <= adaptive.max_candidates) return adaptive.choose(&value.state, value.config, pointer[0..count], now_ms);
+        }
+    }
+    return .{ .selected_id = 0, .switched = 0, .reason = 5, .score = 0 };
+}
+
+export fn adaptive_engine_set_bulk_sequence(engine: ?*AdaptiveEngine, sequence: u64) void {
+    if (engine) |value| value.state.bulk_sequence = sequence;
+}
+
+export fn adaptive_engine_remember(engine: ?*AdaptiveEngine, id: u64, now_ms: u64, cooldown_ms: u64) void {
+    if (engine) |value| {
+        value.state.sticky_id = id;
+        value.state.sticky_until = if (cooldown_ms > 0) now_ms +| cooldown_ms else 0;
+        value.state.selected_id = id;
+    }
+}
+
+export fn adaptive_engine_forget(engine: ?*AdaptiveEngine) void {
+    if (engine) |value| {
+        value.state.sticky_id = 0;
+        value.state.sticky_until = 0;
+    }
+}
+
+export fn adaptive_engine_reset(engine: ?*AdaptiveEngine) void {
+    if (engine) |value| value.state.reset();
 }
 
 test "retains incumbent until confirmation" {

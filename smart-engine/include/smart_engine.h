@@ -12,6 +12,7 @@ typedef struct smart_engine smart_engine;
 /* Increment only when field order or enum semantics change. */
 #define SMART_ENGINE_ABI_VERSION 1u
 #define SMART_ENGINE_MAX_CANDIDATES 8192u
+#define ADAPTIVE_ENGINE_ABI_VERSION 2u
 
 typedef struct {
     uint64_t id;
@@ -49,6 +50,48 @@ smart_decision smart_engine_choose(smart_engine *engine, const smart_candidate *
 /* profile: 0 interactive, 1 bulk, 2 UDP; unknown values use interactive. */
 smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms, uint8_t profile);
 void smart_engine_reset(smart_engine *engine);
+
+/* Host-neutral AdaptivePool decision kernel.  The host still owns health
+ * evidence, Provider refresh, dialing, leases and persistence; this ABI owns
+ * candidate ordering and sticky/failover state only. */
+typedef struct adaptive_engine adaptive_engine;
+typedef struct {
+    uint64_t id;
+    uint64_t sort_key_hi;
+    uint64_t sort_key_lo;
+    int32_t health_priority;
+    double weighted_delay_ms;
+    double throughput_bps;
+    double throughput_samples;
+    uint8_t supported;
+    uint8_t eligible;
+    uint8_t pinned;
+    uint8_t leased;
+} adaptive_candidate;
+
+typedef struct {
+    double switch_margin;
+    uint64_t switch_cooldown_ms;
+    uint8_t mode;
+    uint8_t manual_failure;
+} adaptive_engine_config;
+
+typedef struct {
+    uint64_t selected_id;
+    uint8_t switched;
+    uint8_t reason;
+    double score;
+} adaptive_decision;
+
+uint32_t adaptive_engine_abi_version(void);
+adaptive_engine *adaptive_engine_create(adaptive_engine_config config);
+void adaptive_engine_configure(adaptive_engine *engine, adaptive_engine_config config);
+void adaptive_engine_destroy(adaptive_engine *engine);
+adaptive_decision adaptive_engine_choose(adaptive_engine *engine, const adaptive_candidate *candidates, uintptr_t count, uint64_t now_ms);
+void adaptive_engine_set_bulk_sequence(adaptive_engine *engine, uint64_t sequence);
+void adaptive_engine_remember(adaptive_engine *engine, uint64_t id, uint64_t now_ms, uint64_t cooldown_ms);
+void adaptive_engine_forget(adaptive_engine *engine);
+void adaptive_engine_reset(adaptive_engine *engine);
 
 #ifdef __cplusplus
 }

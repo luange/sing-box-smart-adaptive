@@ -582,6 +582,9 @@ func (p *AdaptivePool) Close() error {
 		return nil
 	}
 	p.OnRuntimeEpochRetire()
+	if p.policy != nil {
+		p.policy.Close()
+	}
 	if p.source != nil {
 		_ = p.source.Close()
 	}

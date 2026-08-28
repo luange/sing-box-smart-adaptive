@@ -79,6 +79,7 @@ type stickyPreference struct {
 
 type PolicyEngine struct {
 	health         *HealthStore
+	kernel         policyKernel
 	maxAttempts    int
 	manualFailure  string
 	bulkSequence   *atomic.Uint64
@@ -86,9 +87,9 @@ type PolicyEngine struct {
 	switchMargin   float64
 	switchCooldown time.Duration
 	// affinityMode: ""/"service" = per-product sticky; "disabled" = no sticky.
-	affinityMode   string
-	stickyAccess   sync.Mutex
-	sticky         map[string]stickyPreference
+	affinityMode string
+	stickyAccess sync.Mutex
+	sticky       map[string]stickyPreference
 }
 
 func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string) *PolicyEngine {
@@ -100,6 +101,7 @@ func NewPolicyEngine(health *HealthStore, maxAttempts int, manualFailure string)
 	}
 	return &PolicyEngine{
 		health:         health,
+		kernel:         newAdaptivePolicyKernel(),
 		maxAttempts:    maxAttempts,
 		manualFailure:  manualFailure,
 		bulkSequence:   new(atomic.Uint64),
@@ -155,6 +157,9 @@ func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duratio
 	}
 	e.switchMargin = margin
 	e.switchCooldown = cooldown
+	if e.kernel != nil {
+		e.kernel.Configure(margin, cooldown, e.manualFailure)
+	}
 	return e
 }
 
@@ -185,6 +190,20 @@ func (e *PolicyEngine) Clear() {
 	e.stickyAccess.Lock()
 	e.sticky = make(map[string]stickyPreference)
 	e.stickyAccess.Unlock()
+	if e.kernel != nil {
+		e.kernel.Reset()
+	}
+}
+
+// Close releases the portable kernel contexts when the pool is permanently
+// retired. Clear already drops them on an epoch retirement; this method makes
+// the final lifecycle boundary explicit for hosts that own PolicyEngine.
+func (e *PolicyEngine) Close() {
+	if e == nil || e.kernel == nil {
+		return
+	}
+	e.kernel.Close()
+	e.kernel = nil
 }
 
 // RememberSelection records the live egress for a service affinity so later
@@ -197,7 +216,6 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 		now = time.Now()
 	}
 	e.stickyAccess.Lock()
-	defer e.stickyAccess.Unlock()
 	if e.sticky == nil {
 		e.sticky = make(map[string]stickyPreference)
 	}
@@ -214,6 +232,10 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 	if len(e.sticky) > maxStickyEntries {
 		e.pruneStickyLocked(now)
 	}
+	e.stickyAccess.Unlock()
+	if e.kernel != nil {
+		e.kernel.Remember(key, handle.NodeID, now, e.switchCooldown)
+	}
 }
 
 // ForgetSelectionAfterEarlyFailure removes a newly selected incumbent when a
@@ -227,13 +249,17 @@ func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, 
 	}
 	key := e.stickyKey(service)
 	e.stickyAccess.Lock()
-	defer e.stickyAccess.Unlock()
 	pref, loaded := e.sticky[key]
 	age := now.Sub(pref.updatedAt)
 	if !loaded || pref.handle != handle || age < 0 || age > earlySwitchWindow {
+		e.stickyAccess.Unlock()
 		return false
 	}
 	delete(e.sticky, key)
+	e.stickyAccess.Unlock()
+	if e.kernel != nil {
+		e.kernel.Forget(key)
+	}
 	return true
 }
 
@@ -347,7 +373,52 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 			}
 		}
 	}
-	sort.SliceStable(eligible, func(i, j int) bool {
+	kernelUsed := false
+	kernelReason := ReasonRanked
+	bulkSequence := uint64(0)
+	if mode == ModeBulk {
+		bulkSequence = e.bulkSequence.Add(1)
+	}
+	if e.kernel != nil {
+		if mode == ModeBulk {
+			e.kernel.SetBulkSequence(e.stickyKey(service), bulkSequence)
+		}
+		kernelCandidates := make([]policyKernelCandidate, 0, len(eligible))
+		for _, candidate := range eligible {
+			score := e.candidateScore(candidate, service)
+			sortKeyHi, sortKeyLo := kernelCandidateSortKey(candidate.ID)
+			throughput := HealthStatus{}
+			if service.ID != "" {
+				throughput = e.health.StatusHandle(candidate.Handle, DomainService, "", service.ID)
+			}
+			kernelCandidates = append(kernelCandidates, policyKernelCandidate{
+				ID: kernelCandidateID(candidate.ID), SortKeyHi: sortKeyHi, SortKeyLo: sortKeyLo, HealthPriority: score.HealthPriority,
+				WeightedDelayMS: float64(score.WeightedDelay) / float64(time.Millisecond),
+				ThroughputBPS:   throughput.ThroughputBPS, ThroughputSamples: float64(throughput.ThroughputSamples),
+				Supported: true, Eligible: true,
+				Pinned: pinned != nil && candidate.ID == *pinned,
+				Leased: lease != nil && candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion,
+			})
+		}
+		decision := e.kernel.Choose(e.stickyKey(service), kernelCandidates, mode, time.Now())
+		if decision.SelectedID != 0 {
+			for index, candidate := range eligible {
+				if kernelCandidateID(candidate.ID) == decision.SelectedID {
+					moveCandidateFirst(eligible, index)
+					kernelUsed = true
+					kernelReason = kernelDecisionReason(decision.Reason)
+					break
+				}
+			}
+		}
+	}
+	sortStart := 0
+	if kernelUsed {
+		sortStart = 1
+	}
+	sort.SliceStable(eligible[sortStart:], func(i, j int) bool {
+		i += sortStart
+		j += sortStart
 		leftScore := e.candidateScore(eligible[i], service)
 		rightScore := e.candidateScore(eligible[j], service)
 		if leftScore.HealthPriority != rightScore.HealthPriority {
@@ -369,14 +440,14 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 		return bytes.Compare(eligible[i].ID[:], eligible[j].ID[:]) < 0
 	})
-	reason := ReasonRanked
+	reason := kernelReason
 	if pinned != nil {
 		reason = ReasonFallback
 	}
 	// Sticky margin/cooldown apply to adaptive browsing AND to strict identity
 	// replacement after a lease breaks. Without this, AI/account hosts (default
 	// strict-affinity) thrash egress on every recovery dial.
-	if mode == ModeAdaptive || mode == ModeStrictAffinity {
+	if !kernelUsed && (mode == ModeAdaptive || mode == ModeStrictAffinity) {
 		if stickyReason, ok := e.applyStickyStability(eligible, service, time.Now()); ok {
 			reason = stickyReason
 		}
@@ -400,7 +471,13 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		}
 		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeBulk:
-		sequence := e.bulkSequence.Add(1)
+		sequence := bulkSequence
+		if kernelUsed {
+			if kernelReason == ReasonBulkThroughput || kernelReason == ReasonBulkSpread {
+				return e.plan(snapshot, mode, kernelReason, service, limitCandidates(eligible, e.maxAttempts)), nil
+			}
+			return e.plan(snapshot, mode, ReasonBulkSpread, service, limitCandidates(eligible, e.maxAttempts)), nil
+		}
 		if hasTrustedBulkThroughput(e.health, eligible, service.ID) {
 			if sequence%5 != 0 {
 				return e.plan(snapshot, mode, ReasonBulkThroughput, service, limitCandidates(eligible, e.maxAttempts)), nil
@@ -408,7 +485,9 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 			eligible = rotateCandidates(eligible, int(sequence/5))
 			return e.plan(snapshot, mode, ReasonBulkSpread, service, limitCandidates(eligible, e.maxAttempts)), nil
 		}
-		eligible = rotateCandidates(eligible, int(sequence-1))
+		if !kernelUsed {
+			eligible = rotateCandidates(eligible, int(sequence-1))
+		}
 		return e.plan(snapshot, mode, ReasonBulkSpread, service, limitCandidates(eligible, e.maxAttempts)), nil
 	case ModeAdaptive:
 		return e.plan(snapshot, mode, reason, service, limitCandidates(eligible, e.maxAttempts)), nil
