@@ -1533,9 +1533,6 @@ func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksa
 // enabled it receives the same event keyed by canonical endpoint identity.
 func (s *Smart) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
 	s.store.observeDial(now, network, site, candidate, transport, success, elapsed)
-	if !s.policyEnabled() {
-		return
-	}
 	s.access.RLock()
 	identity := s.candidateProbeKey[candidate]
 	s.access.RUnlock()
@@ -1559,6 +1556,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	lastSelected := s.lastSelected[smartSelectionKey(networkKey, siteKey, transport)]
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
 	s.access.Unlock()
+	// Snapshot backend presence once per ranking pass. ABI calls below retain
+	// their lifecycle read lock, while large provider catalogs avoid a lock per
+	// candidate during candidate conversion.
+	policyEnabled := s.policyEnabled()
 
 	totalSamples := 0.0
 	policyCandidates := make([]smartPolicyCandidate, 0, len(ranking.candidates))
@@ -1616,7 +1617,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				Samples:       estimate.Samples,
 			},
 		})
-		if s.policyEnabled() && identity != "" {
+		if policyEnabled && identity != "" {
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
@@ -1734,7 +1735,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	if s.policyEnabled() {
+	if policyEnabled {
 		selectionKey := smartSelectionKey(networkKey, siteKey, transport)
 		// Keep the configured site-affinity lease effective when the Zig policy
 		// backend is active. Previously affinity was only consumed by the Go
