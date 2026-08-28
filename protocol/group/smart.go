@@ -865,6 +865,9 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	s.control.access.Lock()
 	s.control.pinned = tag
 	s.control.access.Unlock()
+	if s.policyBackend != nil {
+		s.policyBackend.Reset()
+	}
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil {
 			s.logger.Error("store smart pin: ", err)
@@ -877,6 +880,9 @@ func (s *Smart) ClearSelection() {
 	s.control.access.Lock()
 	s.control.pinned = ""
 	s.control.access.Unlock()
+	if s.policyBackend != nil {
+		s.policyBackend.Reset()
+	}
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil {
 			s.logger.Error("clear smart pin: ", err)
@@ -1450,7 +1456,7 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	identity := s.candidateProbeKey[candidate]
 	s.access.RUnlock()
 	if identity != "" {
-		s.policyBackend.Observe(smartPolicyID(identity), success, elapsed, now)
+		s.policyBackend.Observe(smartSelectionKey(network, site, transport), smartPolicyID(identity), success, elapsed, now)
 	}
 }
 
@@ -1592,7 +1598,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	if s.policyBackend != nil {
-		decision := s.policyBackend.Choose(policyCandidates, profile, now)
+		decision := s.policyBackend.Choose(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
 		if decision.SelectedID != 0 {
 			for index := range ranks {
 				identity := ""
@@ -2028,6 +2034,9 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 	}
 	s.control.pinned = ""
 	s.control.access.Unlock()
+	if s.policyBackend != nil {
+		s.policyBackend.Reset()
+	}
 	if s.logger != nil {
 		s.logger.Warn("smart manual pin released: ", reason, " tag=", candidate)
 	}

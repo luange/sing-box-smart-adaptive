@@ -10,8 +10,8 @@ import (
 // kernel.  A backend must own its selection state; the host must not run a
 // second confirmation/cooldown state machine for the same decision.
 type smartPolicyBackend interface {
-	Choose(candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) smartPolicyDecision
-	Observe(id uint64, success bool, elapsed time.Duration, now time.Time)
+	Choose(key string, candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) smartPolicyDecision
+	Observe(key string, id uint64, success bool, elapsed time.Duration, now time.Time)
 	Reset()
 	Close()
 }
