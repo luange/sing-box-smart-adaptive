@@ -384,7 +384,20 @@ func (s *smartStore) pruneLocked(now time.Time, retention time.Duration, maxEntr
 		ages = append(ages, metricAge{key: key, updatedAt: metric.LastUpdated})
 	}
 	sort.Slice(ages, func(i, j int) bool {
-		return ages[i].updatedAt.After(ages[j].updatedAt)
+		if !ages[i].updatedAt.Equal(ages[j].updatedAt) {
+			return ages[i].updatedAt.After(ages[j].updatedAt)
+		}
+		left, right := ages[i].key, ages[j].key
+		if left.Network != right.Network {
+			return left.Network < right.Network
+		}
+		if left.Site != right.Site {
+			return left.Site < right.Site
+		}
+		if left.Candidate != right.Candidate {
+			return left.Candidate < right.Candidate
+		}
+		return left.Transport < right.Transport
 	})
 	for _, entry := range ages[maxEntries:] {
 		delete(s.metrics, entry.key)

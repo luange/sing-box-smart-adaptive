@@ -295,7 +295,8 @@ func (r *smartProbeRegistry) pruneLocked(now time.Time) {
 			if entry.inflight {
 				continue
 			}
-			if oldestKey == "" || entry.result.completedAt.Before(oldest) {
+			if oldestKey == "" || entry.result.completedAt.Before(oldest) ||
+				(entry.result.completedAt.Equal(oldest) && key < oldestKey) {
 				oldestKey = key
 				oldest = entry.result.completedAt
 			}
