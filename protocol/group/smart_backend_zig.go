@@ -65,7 +65,9 @@ func (b *zigSmartPolicyBackend) Choose(key string, candidates []smartPolicyCandi
 	if b == nil || key == "" || len(candidates) == 0 || len(candidates) > 8192 {
 		return smartPolicyDecision{Score: 100, Reason: 3}
 	}
-	engine := b.engineFor(key, now)
+	b.access.Lock()
+	defer b.access.Unlock()
+	engine := b.engineForLocked(key, now)
 	if engine == nil {
 		return smartPolicyDecision{Score: 100, Reason: 3}
 	}
@@ -89,9 +91,7 @@ func (b *zigSmartPolicyBackend) Choose(key string, candidates []smartPolicyCandi
 	return smartPolicyDecision{SelectedID: uint64(decision.selected_id), Score: float64(decision.score), Switched: decision.switched != 0, Reason: uint8(decision.reason)}
 }
 
-func (b *zigSmartPolicyBackend) engineFor(key string, now time.Time) *C.smart_engine {
-	b.access.Lock()
-	defer b.access.Unlock()
+func (b *zigSmartPolicyBackend) engineForLocked(key string, now time.Time) *C.smart_engine {
 	if current := b.engines[key]; current != nil {
 		current.lastUse = now
 		return current.engine
@@ -132,7 +132,9 @@ func (b *zigSmartPolicyBackend) Observe(key string, id uint64, success bool, ela
 	if b == nil || key == "" || id == 0 {
 		return
 	}
-	engine := b.engineFor(key, now)
+	b.access.Lock()
+	defer b.access.Unlock()
+	engine := b.engineForLocked(key, now)
 	if engine == nil {
 		return
 	}
