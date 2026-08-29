@@ -3,6 +3,7 @@ package rule
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -38,6 +39,7 @@ type RemoteRuleSet struct {
 	outbound       adapter.OutboundManager
 	tag            string
 	url            string
+	urlHash        [32]byte
 	initialPath    string
 	options        option.RuleSet
 	updateInterval time.Duration
@@ -66,13 +68,15 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		initialPath = filemanager.BasePath(ctx, strings.ReplaceAll(options.RemoteOptions.InitialPath, C.RuleSetTagPlaceholder, tag))
 		initialPath, _ = filepath.Abs(initialPath)
 	}
+	url := strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag)
 	return &RemoteRuleSet{
 		ctx:            ctx,
 		cancel:         cancel,
 		outbound:       service.FromContext[adapter.OutboundManager](ctx),
 		logger:         logger,
 		tag:            tag,
-		url:            strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag),
+		url:            url,
+		urlHash:        sha256.Sum256([]byte(url)),
 		initialPath:    initialPath,
 		options:        options,
 		updateInterval: updateInterval,
@@ -98,9 +102,8 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	s.httpClient = &http.Client{Transport: transport}
 	if s.cacheFile != nil {
 		if savedSet := s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
-			err = s.loadBytes(savedSet.Content)
-			if err != nil {
-				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
 			} else {
 				err = s.loadBytes(savedSet.Content)
 				if err != nil {
@@ -254,6 +257,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
 			if savedRuleSet != nil {
 				savedRuleSet.LastUpdated = s.lastUpdated
+				savedRuleSet.URLHash = s.urlHash[:]
 				err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
 				if err != nil {
 					s.logger.Error("save rule-set updated time: ", err)
