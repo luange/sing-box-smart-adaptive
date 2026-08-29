@@ -1,9 +1,9 @@
-# sing-box v1.14.0-rc.2 性能与兼容性审查
+# sing-box v1.14.0-rc.4 性能与兼容性审查
 
 ## 范围
 
-审查基线为官方 `v1.14.0-rc.2`（`f5b8b7a57922084361907a13273f2c88f35ae7c7`）。
-自有分支通过合并提交 `a1123ecf` 接入 rc2，并保留 Smart、Zig policy、eBPF v3、
+审查基线为官方 `v1.14.0-rc.4`（`193aba27f722028bc7cdc4e2b096522e11b12964`）。
+自有分支在保留 Smart、Zig policy、eBPF v3、
 provider、connection-history、Clash/Zashboard API 和 PBR 适配层。没有把代理协议
 栈重复改写成第二套实现。
 
@@ -23,7 +23,7 @@ rc2 的 QUIC 拥塞控制、FakeIP UDP 回程映射、异步 DNS/本地缓存分
    查询会把堆和调度器放大。现在采用两个有界 worker slot，满载时丢弃 advisory
    hint（fail-open），关闭时等待已接纳任务完成，并记录
    `dns_prefill_queue_drops`。
-3. **发布漂移**：Linux 发布工作流已改为匹配 rc2 gateway 标签，避免 rc2 核心
+3. **发布漂移**：Linux 发布工作流已改为匹配 rc4 gateway 标签，避免 rc4 核心
    推送后不触发精简 eBPF 构建。
 
 ## 验证门
