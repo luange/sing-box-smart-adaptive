@@ -34,6 +34,7 @@ type CommandServer struct {
 	handler           CommandServerHandler
 	platformInterface PlatformInterface
 	platformWrapper   *platformInterfaceWrapper
+	powerManager      *powerreport.Manager
 	grpcServer        *grpc.Server
 	listener          net.Listener
 	endPauseTimer     *time.Timer
@@ -51,9 +52,12 @@ type CommandServerHandler interface {
 
 func NewCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
 	ctx := baseContext(platformInterface)
+	powerManager := powerreport.NewManager()
+	service.MustRegister[*powerreport.Manager](ctx, powerManager)
 	platformWrapper := &platformInterfaceWrapper{
-		iif:       platformInterface,
-		useProcFS: platformInterface.UseProcFS(),
+		iif:          platformInterface,
+		useProcFS:    platformInterface.UseProcFS(),
+		powerManager: powerManager,
 	}
 	service.MustRegister[adapter.PlatformInterface](ctx, platformWrapper)
 	server := &CommandServer{
@@ -61,6 +65,7 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
 		handler:           handler,
 		platformInterface: platformInterface,
 		platformWrapper:   platformWrapper,
+		powerManager:      powerManager,
 	}
 	server.StartedService = daemon.NewStartedService(daemon.ServiceOptions{
 		Context: ctx,
@@ -183,6 +188,7 @@ func (s *CommandServer) Close() {
 	}
 	common.Close(s.listener)
 	s.StartedService.Close()
+	s.powerManager.Close()
 }
 
 type OverrideOptions struct {
@@ -233,6 +239,10 @@ func (s *CommandServer) NeedFindProcess() bool {
 }
 
 func (s *CommandServer) Pause() {
+	recorder := s.powerManager.Recorder()
+	if recorder != nil {
+		recorder.RecordPlatformEvent("ne-sleep")
+	}
 	instance := s.StartedService.Instance()
 	if instance == nil || instance.PauseManager() == nil {
 		return
@@ -248,6 +258,10 @@ func (s *CommandServer) Pause() {
 }
 
 func (s *CommandServer) Wake() {
+	recorder := s.powerManager.Recorder()
+	if recorder != nil {
+		recorder.RecordPlatformEvent("ne-wake")
+	}
 	instance := s.StartedService.Instance()
 	if instance == nil || instance.PauseManager() == nil {
 		return

@@ -107,7 +107,7 @@ func (r *abstractDefaultRule) evaluateForMerge(metadata *adapter.InboundContext)
 }
 
 func (r *abstractDefaultRule) destinationIPCIDRMatchesSource(metadata *adapter.InboundContext) bool {
-	return !metadata.IgnoreDestinationIPCIDRMatch && metadata.IPCIDRMatchSource && len(r.destinationIPCIDRItems) > 0
+	return metadata.IPCIDRMatchSource && len(r.destinationIPCIDRItems) > 0
 }
 
 func (r *abstractDefaultRule) destinationIPCIDRMatchesDestination(metadata *adapter.InboundContext) bool {
@@ -254,6 +254,9 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 				break
 			}
 		}
+	}
+	if matched {
+		metadata.DeferredIPCIDRMatchGroups |= deferredGroups
 	}
 	if r.invert {
 		matched = !matched

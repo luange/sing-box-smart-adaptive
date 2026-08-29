@@ -6,16 +6,6 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
-type QuicheCongestionControl string
-
-const (
-	QuicheCongestionControlDefault QuicheCongestionControl = ""
-	QuicheCongestionControlBBR     QuicheCongestionControl = "TBBR"
-	QuicheCongestionControlBBRv2   QuicheCongestionControl = "B2ON"
-	QuicheCongestionControlCubic   QuicheCongestionControl = "QBIC"
-	QuicheCongestionControlReno    QuicheCongestionControl = "RENO"
-)
-
 type NaiveInboundOptions struct {
 	ListenOptions
 	Users                 []auth.User `json:"users,omitempty"`

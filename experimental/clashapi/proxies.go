@@ -316,6 +316,16 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 					Delay: delay,
 				})
 			}
+			for _, detour := range server.outbound.Outbounds() {
+				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
+				if !isURLTestGroup {
+					continue
+				}
+				if !groupContains(server.outbound, urlTestGroup, realTag, map[string]bool{detour.Tag(): true}) {
+					continue
+				}
+				urlTestGroup.PerformUpdateCheck()
+			}
 		}()
 
 		if ctx.Err() != nil {

@@ -102,8 +102,13 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 			if err != nil {
 				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
 			} else {
-				s.lastUpdated = savedSet.LastUpdated
-				s.lastEtag = savedSet.LastEtag
+				err = s.loadBytes(savedSet.Content)
+				if err != nil {
+					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+				} else {
+					s.lastUpdated = savedSet.LastUpdated
+					s.lastEtag = savedSet.LastEtag
+				}
 			}
 		}
 	}
@@ -279,6 +284,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 			LastUpdated: s.lastUpdated,
 			Content:     content,
 			LastEtag:    s.lastEtag,
+			URLHash:     s.urlHash[:],
 		})
 		if err != nil {
 			s.logger.Error("save rule-set cache: ", err)

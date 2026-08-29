@@ -39,6 +39,7 @@ type Router struct {
 	logger                logger.ContextLogger
 	transport             adapter.DNSTransportManager
 	outbound              adapter.OutboundManager
+	powerManager          *powerreport.Manager
 	client                adapter.DNSClient
 	rawRules              []option.DNSRule
 	rules                 []adapter.DNSRule

@@ -705,6 +705,194 @@ func stripDNSPadding(response *dns.Msg) {
 			return it.Option() != dns.EDNS0PADDING
 		})
 	}
+	if c.cache == nil {
+		return nil, 0, false
+	}
+	if c.disableExpire {
+		response, loaded := c.cache.Get(key)
+		if !loaded {
+			return nil, 0, false
+		}
+		return response.Copy(), 0, false
+	}
+	response, expireAt, loaded := c.cache.GetWithLifetimeNoExpire(key)
+	if !loaded {
+		return nil, 0, false
+	}
+	timeNow := time.Now()
+	if timeNow.After(expireAt) {
+		if c.optimisticTimeout > 0 && timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
+			response = response.Copy()
+			normalizeTTL(response, 1)
+			return response, 0, true
+		}
+		c.cache.Remove(key)
+		return nil, 0, false
+	}
+	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
+	response = response.Copy()
+	normalizeTTL(response, uint32(nowTTL))
+	return response, nowTTL, false
+}
+
+func (c *Client) loadPersistentResponse(key dnsCacheKey) (*dns.Msg, int, bool) {
+	rawMessage, expireAt, loaded := c.dnsCache.LoadDNSCache(key.persistentName(), key.Name, key.Qtype)
+	if !loaded {
+		return nil, 0, false
+	}
+	response := new(dns.Msg)
+	err := response.Unpack(rawMessage)
+	if err != nil {
+		return nil, 0, false
+	}
+	if c.disableExpire {
+		return response, 0, false
+	}
+	timeNow := time.Now()
+	if timeNow.After(expireAt) {
+		if c.optimisticTimeout > 0 && timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
+			normalizeTTL(response, 1)
+			return response, 0, true
+		}
+		return nil, 0, false
+	}
+	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
+	normalizeTTL(response, uint32(nowTTL))
+	return response, nowTTL, false
+}
+
+func applyResponseOptions(question dns.Question, response *dns.Msg, options adapter.DNSQueryOptions) uint32 {
+	if question.Qtype == dns.TypeHTTPS && (options.Strategy == C.DomainStrategyIPv4Only || options.Strategy == C.DomainStrategyIPv6Only) {
+		for _, rr := range response.Answer {
+			https, isHTTPS := rr.(*dns.HTTPS)
+			if !isHTTPS {
+				continue
+			}
+			content := https.SVCB
+			content.Value = common.Filter(content.Value, func(it dns.SVCBKeyValue) bool {
+				if options.Strategy == C.DomainStrategyIPv4Only {
+					return it.Key() != dns.SVCB_IPV6HINT
+				}
+				return it.Key() != dns.SVCB_IPV4HINT
+			})
+			https.SVCB = content
+		}
+	}
+	timeToLive := computeTimeToLive(response)
+	if options.RewriteTTL != nil {
+		timeToLive = *options.RewriteTTL
+	}
+	normalizeTTL(response, timeToLive)
+	return timeToLive
+}
+
+func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCacheKey, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) {
+	_, loaded := c.backgroundRefresh.LoadOrStore(key, struct{}{})
+	if loaded {
+		return
+	}
+	go func() {
+		defer c.backgroundRefresh.Delete(key)
+		ctx := adapter.ContextWithDNSTransportTag(c.ctx, transport.Tag())
+		response, err := c.exchangeToTransport(ctx, transport, message, options.Timeout)
+		if err != nil {
+			if c.logger != nil {
+				c.logger.DebugContext(ctx, "optimistic refresh failed for ", FqdnToDomain(key.Name), ": ", err)
+			}
+			return
+		}
+		if responseChecker != nil {
+			var rejected bool
+			if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+				rejected = true
+			} else {
+				rejected = !responseChecker(response)
+			}
+			if rejected {
+				if c.logger != nil {
+					c.logger.DebugContext(ctx, "optimistic refresh rejected for ", FqdnToDomain(key.Name))
+				}
+				if c.rdrc != nil {
+					c.rdrc.SaveRDRCAsync(transport.Tag(), key.Name, key.Qtype, c.logger)
+				}
+				return
+			}
+		} else if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+			return
+		}
+		storeKey, storable := c.finishCacheKey(transport, key)
+		if !storable {
+			return
+		}
+		timeToLive := applyResponseOptions(key.Question, response, options)
+		c.storeCache(storeKey, response, timeToLive)
+		logRefreshedResponse(c.logger, ctx, response, timeToLive)
+	}()
+}
+
+func (c *Client) prepareExchangeMessage(message *dns.Msg, options adapter.DNSQueryOptions) *dns.Msg {
+	if options.RemoveClientSubnet {
+		return removeClientSubnet(message)
+	}
+	clientSubnet := options.ClientSubnet
+	if !clientSubnet.IsValid() {
+		clientSubnet = c.clientSubnet
+	}
+	if clientSubnet.IsValid() {
+		message = SetClientSubnet(message, clientSubnet)
+	}
+	return message
+}
+
+func stripDNSPadding(response *dns.Msg) {
+	for _, record := range response.Extra {
+		opt, isOpt := record.(*dns.OPT)
+		if !isOpt {
+			continue
+		}
+		opt.Option = common.Filter(opt.Option, func(it dns.EDNS0) bool {
+			return it.Option() != dns.EDNS0PADDING
+		})
+	}
+}
+
+func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration) (*dns.Msg, error) {
+	if timeout == 0 {
+		timeout = c.timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	response, err := transport.Exchange(ctx, message)
+	if err == nil {
+		stripDNSPadding(response)
+		return response, nil
+	}
+	var rcodeError RcodeError
+	if errors.As(err, &rcodeError) {
+		return FixedResponseStatus(message, int(rcodeError)), nil
+	}
+	return nil, err
+}
+
+func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration, callback func(response *dns.Msg, err error)) {
+	if timeout == 0 {
+		timeout = c.timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	transport.ExchangeAsync(ctx, message, func(response *dns.Msg, err error) {
+		cancel()
+		if err == nil {
+			stripDNSPadding(response)
+			callback(response, nil)
+			return
+		}
+		var rcodeError RcodeError
+		if errors.As(err, &rcodeError) {
+			callback(FixedResponseStatus(message, int(rcodeError)), nil)
+			return
+		}
+		callback(nil, err)
+	})
 }
 
 func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration) (*dns.Msg, error) {

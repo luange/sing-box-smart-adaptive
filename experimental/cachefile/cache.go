@@ -55,7 +55,7 @@ type CacheFile struct {
 	rdrcTimeout        time.Duration
 	optimisticTimeout  time.Duration
 	DB                 *bbolt.DB
-	resetAccess        sync.Mutex
+	dbAccess           sync.RWMutex
 	saveMetadataAccess sync.Mutex
 	saveMetadata       *adapter.FakeIPMetadata
 	saveMetadataTimer  *time.Timer
@@ -182,11 +182,28 @@ func (c *CacheFile) start() error {
 	var db *bbolt.DB
 	for range 10 {
 		db, err = bbolt.Open(c.path, fileMode, &options)
+		if err != nil {
+			if errors.Is(err, bboltErrors.ErrTimeout) {
+				continue
+			}
+			if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
+				rmErr := filemanager.Remove(c.ctx, c.path)
+				if rmErr != nil {
+					return err
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		err = checkDatabase(db)
 		if err == nil {
 			break
 		}
-		if errors.Is(err, bboltErrors.ErrTimeout) {
-			continue
+		c.logger.Error("database corrupted: ", err, ": resetting")
+		db.Close()
+		rmErr := filemanager.Remove(c.ctx, c.path)
+		if rmErr != nil {
+			return err
 		}
 		if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
 			rmErr := filemanager.Remove(c.ctx, c.path)
@@ -232,40 +249,73 @@ func (c *CacheFile) start() error {
 }
 
 func (c *CacheFile) Close() error {
-	if c.DB == nil {
+	c.dbAccess.RLock()
+	db := c.DB
+	c.dbAccess.RUnlock()
+	if db == nil {
 		return nil
 	}
-	return c.DB.Close()
+	return db.Close()
+}
+
+func checkDatabase(db *bbolt.DB) error {
+	return db.View(func(tx *bbolt.Tx) error {
+		var checkErr error
+		for txErr := range tx.Check() {
+			if checkErr == nil {
+				checkErr = txErr
+			}
+		}
+		return checkErr
+	})
+}
+
+func (c *CacheFile) database() *bbolt.DB {
+	c.dbAccess.RLock()
+	defer c.dbAccess.RUnlock()
+	return c.DB
 }
 
 func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
 	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
 			err = E.New("database corrupted: ", r)
 		}
 	}()
-	return c.DB.View(fn)
+	return db.View(fn)
 }
 
 func (c *CacheFile) batch(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
 	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
 			err = E.New("database corrupted: ", r)
 		}
 	}()
-	return c.DB.Batch(fn)
+	err = db.Batch(fn)
+	var panicErr bbolt.PanickedError
+	if errors.As(err, &panicErr) {
+		c.resetDB(db, panicErr.Reason)
+		return E.New("database corrupted: ", panicErr.Reason)
+	}
+	return err
 }
 
 func (c *CacheFile) update(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
 	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
 			err = E.New("database corrupted: ", r)
 		}
 	}()
-	return c.DB.Update(fn)
+	return db.Update(fn)
 }
 
 func (c *CacheFile) resetDB() {
