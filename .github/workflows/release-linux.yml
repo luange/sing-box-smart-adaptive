@@ -105,7 +105,11 @@ jobs:
             ver="$(git describe --tags --always 2>/dev/null || echo dev)"
             ver="${ver#v}"
           fi
-          tags="$(tr -d '\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf,smart_zig"
+          # Gateway release profile: keep only protocols/features used by the
+          # adaptive PBR deployment. Do not inherit the upstream "others"
+          # bundle (OpenVPN, OCM/CCM, Cloudflared and USBIP add size without
+          # being part of this target).
+          tags="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,with_connection_history,with_tailscale,badlinkname,tfogo_checklinkname0,with_ebpf,smart_zig"
           ldflags="$(tr -d '\n' < release/LDFLAGS)"
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             target="x86_64-linux-musl"
