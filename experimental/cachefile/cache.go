@@ -318,10 +318,14 @@ func (c *CacheFile) update(fn func(tx *bbolt.Tx) error) (err error) {
 	return db.Update(fn)
 }
 
-func (c *CacheFile) resetDB() {
-	c.resetAccess.Lock()
-	defer c.resetAccess.Unlock()
-	c.DB.Close()
+func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
+	c.dbAccess.Lock()
+	defer c.dbAccess.Unlock()
+	if c.DB != failedDB {
+		return
+	}
+	c.logger.Error("database corrupted: ", reason, ": resetting")
+	failedDB.Close()
 	filemanager.Remove(c.ctx, c.path)
 	db, err := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
 	if err == nil {

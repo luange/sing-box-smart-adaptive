@@ -135,17 +135,17 @@ func (m *Manager) leave(tracker Tracker) {
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		m.closedConnections.PopFront()
 	}
-	m.closedConnections.PushBack(metadataCopy)
+	m.closedConnections.PushBack(*metadataCopy)
 	m.closedConnectionsAccess.Unlock()
 	m.historySinkAccess.RLock()
 	if m.historySink != nil {
-		m.historySink.ConnectionClosed(metadataCopy)
+		m.historySink.ConnectionClosed(*metadataCopy)
 	}
 	m.historySinkAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventClosed,
 		ID:       metadata.ID,
-		Metadata: &metadataCopy,
+		Metadata: metadataCopy,
 		ClosedAt: closedAt,
 	})
 }

@@ -271,7 +271,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		return nil, E.New("domain not resolved")
 	}
 	if d.networkStrategy == nil {
-		return d.trackConn(listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
+		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
@@ -342,7 +342,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if d.networkStrategy == nil {
-		return d.trackPacketConn(listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
+		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
 			if d.autoDetectBindFunc != nil {
 				listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
