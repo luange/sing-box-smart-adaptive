@@ -23,7 +23,7 @@ hosts; unknown profile values fall back to interactive scoring.
 - `metrics.zig`: fixed-capacity, allocation-free observation table. Entries are
   evicted by oldest update when the limit is reached; an open-addressing index
   makes normal lookup expected O(1), and reset releases no hidden map capacity.
-- `scoring.zig`: pure reliability/latency/jitter/weight scoring functions.
+- `scoring.zig`: pure reliability/tail-latency/jitter/weight scoring functions.
 - `policy.zig`: incumbent retention, margin, confirmation and cooldown state
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
 - `lib.zig`: thin lifecycle and C ABI facade.
@@ -52,9 +52,18 @@ history, so a slow YouTube path cannot be hidden by unrelated traffic.
 
 Candidate IDs are stable endpoint identities, not provider display names.
 Only eligible, non-open candidates can be selected. A current candidate is
-retained unless the relative improvement exceeds `switch_margin`, the new
+retained unless the relative improvement exceeds `switch_margin`, the p95
+latency improves by at least `switch_min_improvement` (default 100ms), the new
 candidate is observed for the configured confirmation count and time, and the
-cooldown has elapsed. Arithmetic is clamped and timestamp addition saturates.
+cooldown has elapsed. Hard-open candidates are removed before weights are
+applied, so a large manual weight cannot resurrect a failed endpoint.
+
+Interactive scoring uses 30% reliability, 25% p95 connect, 30% p95 first byte,
+10% jitter and 5% sample confidence. Bulk keeps 30% throughput weight, while
+UDP gives reliability and jitter priority. The host stores a bounded tail-EWMA
+instead of a per-node sample ring; old snapshots transparently fall back to
+their EWMA values. Provider display-name copies resolve to one endpoint
+portrait, while the dashboard still shows both the EWMA and p95 values.
 
 New evidence fields must be appended to the ABI or introduced with an ABI
 version; existing field order and enum values are never reused. Any host

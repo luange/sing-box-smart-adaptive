@@ -4,6 +4,21 @@
 
 ## Unreleased — Zig Smart production backend
 
+### Score evolution (v3.42)
+
+- Add bounded tail-EWMA latency portraits exposed as `connect_p95_ms` and
+  `first_byte_p95_ms`; a single slow sample remains visible without retaining
+  an unbounded per-node history.
+- Align Go and Zig scoring: interactive traffic now emphasizes reliability,
+  p95 first-byte and p95 connect latency, with a small confidence term; bulk
+  and UDP keep separate weights.
+- Apply hard-open eligibility before node weights, preventing a high weight
+  from resurrecting a failed endpoint.
+- Share Go-side dial, first-byte and throughput observations by canonical
+  Endpoint identity, so duplicate subscription lines use one portrait.
+- Add `switch_min_improvement` (default `100ms`) as an absolute p95 latency
+  floor in addition to the relative switch margin.
+
 - Connect the bounded Zig policy kernel to production `protocol/group/Smart`
   behind the `smart_zig` build tag; release Linux binaries now run Zig for
   scoring, confirmation, and cooldown instead of executing two state machines.

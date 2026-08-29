@@ -37,7 +37,9 @@ type smartMetric struct {
 	Successes           float64   `json:"successes"`
 	Failures            float64   `json:"failures"`
 	ConnectMS           float64   `json:"connect_ms,omitempty"`
+	ConnectP95MS        float64   `json:"connect_p95_ms,omitempty"`
 	FirstByteMS         float64   `json:"first_byte_ms,omitempty"`
+	FirstByteP95MS      float64   `json:"first_byte_p95_ms,omitempty"`
 	ThroughputLog       float64   `json:"throughput_log,omitempty"`
 	JitterMS            float64   `json:"jitter_ms,omitempty"`
 	ConnectSamples      float64   `json:"connect_samples,omitempty"`
@@ -56,7 +58,9 @@ type smartStoreSnapshot struct {
 type smartEstimate struct {
 	Reliability            float64
 	ConnectMS              float64
+	ConnectP95MS           float64
 	FirstByteMS            float64
+	FirstByteP95MS         float64
 	ThroughputBPS          float64
 	ThroughputSamples      float64
 	LocalThroughputBPS     float64
@@ -67,7 +71,9 @@ type smartEstimate struct {
 	CircuitUntil           time.Time
 	LastUpdated            time.Time
 	HasConnect             bool
+	HasConnectP95          bool
 	HasFirstByte           bool
+	HasFirstByteP95        bool
 	HasThroughput          bool
 }
 
@@ -413,10 +419,12 @@ func (m *smartMetric) decay(now time.Time, halfLife time.Duration) {
 func (m *smartMetric) updateConnect(value float64) {
 	if m.ConnectSamples == 0 {
 		m.ConnectMS = value
+		m.ConnectP95MS = value
 		m.JitterMS = 0
 	} else {
 		deviation := math.Abs(value - m.ConnectMS)
 		m.ConnectMS = updateEWMA(m.ConnectMS, value, m.ConnectSamples)
+		m.ConnectP95MS = updateTailEWMA(m.ConnectP95MS, value)
 		m.JitterMS = updateEWMA(m.JitterMS, deviation, m.ConnectSamples)
 	}
 	m.ConnectSamples++
@@ -424,7 +432,26 @@ func (m *smartMetric) updateConnect(value float64) {
 
 func (m *smartMetric) updateFirstByte(value float64) {
 	m.FirstByteMS = updateEWMA(m.FirstByteMS, value, m.FirstByteSamples)
+	m.FirstByteP95MS = updateTailEWMA(m.FirstByteP95MS, value)
 	m.FirstByteSamples++
+}
+
+// updateTailEWMA is a bounded, allocation-free approximation of a p95. High
+// observations move the estimate quickly while normal observations decay it
+// slowly. Unlike a retained sample ring, it keeps the Smart store bounded even
+// with thousands of provider lines and survives snapshot/restore unchanged.
+func updateTailEWMA(current, value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return current
+	}
+	if current <= 0 || math.IsNaN(current) || math.IsInf(current, 0) {
+		return value
+	}
+	alpha := 0.02
+	if value > current {
+		alpha = 0.20
+	}
+	return current + alpha*(value-current)
 }
 
 func updateEWMA(current, value, samples float64) float64 {
@@ -454,7 +481,9 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 	return smartEstimate{
 		Reliability:            blendValue(globalEstimate.Reliability, localEstimate.Reliability, localWeight),
 		ConnectMS:              blendOptional(globalEstimate.ConnectMS, localEstimate.ConnectMS, globalEstimate.HasConnect, localEstimate.HasConnect, localWeight),
+		ConnectP95MS:           blendOptional(globalEstimate.ConnectP95MS, localEstimate.ConnectP95MS, globalEstimate.HasConnectP95, localEstimate.HasConnectP95, localWeight),
 		FirstByteMS:            blendOptional(globalEstimate.FirstByteMS, localEstimate.FirstByteMS, globalEstimate.HasFirstByte, localEstimate.HasFirstByte, localWeight),
+		FirstByteP95MS:         blendOptional(globalEstimate.FirstByteP95MS, localEstimate.FirstByteP95MS, globalEstimate.HasFirstByteP95, localEstimate.HasFirstByteP95, localWeight),
 		ThroughputBPS:          blendOptional(globalEstimate.ThroughputBPS, localEstimate.ThroughputBPS, globalEstimate.HasThroughput, localEstimate.HasThroughput, localWeight),
 		ThroughputSamples:      math.Max(globalEstimate.ThroughputSamples, localEstimate.ThroughputSamples),
 		LocalThroughputBPS:     localEstimate.ThroughputBPS,
@@ -465,7 +494,9 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 		CircuitUntil:           laterTime(globalEstimate.CircuitUntil, localEstimate.CircuitUntil),
 		LastUpdated:            laterTime(globalEstimate.LastUpdated, localEstimate.LastUpdated),
 		HasConnect:             globalEstimate.HasConnect || localEstimate.HasConnect,
+		HasConnectP95:          globalEstimate.HasConnectP95 || localEstimate.HasConnectP95,
 		HasFirstByte:           globalEstimate.HasFirstByte || localEstimate.HasFirstByte,
+		HasFirstByteP95:        globalEstimate.HasFirstByteP95 || localEstimate.HasFirstByteP95,
 		HasThroughput:          globalEstimate.HasThroughput || localEstimate.HasThroughput,
 	}
 }
@@ -493,7 +524,9 @@ func estimateMetric(metric *smartMetric, now time.Time, minSamples int) smartEst
 	return smartEstimate{
 		Reliability:       reliability,
 		ConnectMS:         metric.ConnectMS,
+		ConnectP95MS:      firstNonZero(metric.ConnectP95MS, metric.ConnectMS),
 		FirstByteMS:       metric.FirstByteMS,
+		FirstByteP95MS:    firstNonZero(metric.FirstByteP95MS, metric.FirstByteMS),
 		ThroughputBPS:     math.Expm1(metric.ThroughputLog),
 		ThroughputSamples: metric.ThroughputSamples,
 		JitterMS:          metric.JitterMS,
@@ -502,9 +535,26 @@ func estimateMetric(metric *smartMetric, now time.Time, minSamples int) smartEst
 		CircuitUntil:      metric.CircuitUntil,
 		LastUpdated:       metric.LastUpdated,
 		HasConnect:        metric.ConnectSamples > 0,
+		HasConnectP95:     metric.ConnectSamples > 0,
 		HasFirstByte:      metric.FirstByteSamples > 0,
+		HasFirstByteP95:   metric.FirstByteSamples > 0,
 		HasThroughput:     metric.ThroughputSamples > 0,
 	}
+}
+
+func firstNonZero(primary, fallback float64) float64 {
+	if primary > 0 && !math.IsNaN(primary) && !math.IsInf(primary, 0) {
+		return primary
+	}
+	return fallback
+}
+
+func smartConnectScoreMS(estimate smartEstimate) float64 {
+	return firstNonZero(estimate.ConnectP95MS, estimate.ConnectMS)
+}
+
+func smartFirstByteScoreMS(estimate smartEstimate) float64 {
+	return firstNonZero(estimate.FirstByteP95MS, estimate.FirstByteMS)
 }
 
 type smartTrafficProfile uint8
@@ -546,22 +596,22 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 	if estimate.State == "open" {
 		return 100
 	}
-	var reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight float64
+	var reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight, confidenceWeight float64
 	switch profile {
 	case smartProfileBulk:
-		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = 0.35, 0.15, 0.10, 0.35, 0.05
+		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight, confidenceWeight = 0.30, 0.15, 0.20, 0.30, 0.00, 0.05
 	case smartProfileUDP:
-		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = 0.55, 0.20, 0, 0, 0.25
+		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight, confidenceWeight = 0.50, 0.25, 0, 0, 0.20, 0.05
 	default:
-		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = 0.45, 0.30, 0.15, 0, 0.10
+		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight, confidenceWeight = 0.30, 0.25, 0.30, 0, 0.10, 0.05
 	}
 	connectCost := 0.50
 	if estimate.HasConnect {
-		connectCost = normalizedLogCost(estimate.ConnectMS, 5000)
+		connectCost = normalizedLogCost(firstNonZero(estimate.ConnectP95MS, estimate.ConnectMS), 5000)
 	}
 	firstByteCost := 0.50
 	if estimate.HasFirstByte {
-		firstByteCost = normalizedLogCost(estimate.FirstByteMS, 10000)
+		firstByteCost = normalizedLogCost(firstNonZero(estimate.FirstByteP95MS, estimate.FirstByteMS), 10000)
 	}
 	throughputCost := 0.60
 	if estimate.HasThroughput {
@@ -572,11 +622,16 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 	if estimate.HasConnect {
 		jitterCost = math.Min(1, estimate.JitterMS/1000)
 	}
+	confidenceCost := 0.0
+	if estimate.Samples < 3 {
+		confidenceCost = math.Max(0, 1-estimate.Samples/3)
+	}
 	score := reliabilityWeight*(1-estimate.Reliability) +
 		connectWeight*connectCost +
 		firstByteWeight*firstByteCost +
 		throughputWeight*throughputCost +
-		jitterWeight*jitterCost
+		jitterWeight*jitterCost +
+		confidenceWeight*confidenceCost
 	if estimate.State == "half_open" {
 		score += 0.20
 	}

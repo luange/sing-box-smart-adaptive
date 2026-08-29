@@ -62,6 +62,10 @@ type SmartOutboundOptions struct {
 	SwitchConfirmSamples int                `json:"switch_confirm_samples,omitempty"`
 	SwitchCooldown       badoption.Duration `json:"switch_cooldown,omitempty"`
 	SwitchMargin         *float64           `json:"switch_margin,omitempty"`
+	// SwitchMinImprovement is the minimum absolute p95 latency gain required
+	// for a performance-driven switch. Omit/zero uses the 100ms default; hard
+	// failures still fail over immediately.
+	SwitchMinImprovement badoption.Duration `json:"switch_min_improvement,omitempty"`
 	Exploration          *float64           `json:"exploration,omitempty"`
 	MinSamples           int                `json:"min_samples,omitempty"`
 	// PassiveThroughputFloorBPS is a lower bound for real-traffic throughput

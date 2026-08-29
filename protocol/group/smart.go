@@ -48,6 +48,7 @@ const (
 	defaultSmartSwitchConfirm        = 2 * time.Minute
 	defaultSmartSwitchConfirmSamples = 3
 	defaultSmartSwitchCooldown       = 10 * time.Minute
+	defaultSmartMinSwitchImprovement = 100 * time.Millisecond
 	defaultSmartHedgeDelay           = 450 * time.Millisecond
 	minSmartHedgeDelay               = 250 * time.Millisecond
 	// Give a healthy, already-established path a little more time for its
@@ -57,8 +58,10 @@ const (
 	maxSmartHedgeDelay       = 900 * time.Millisecond
 	defaultSmartSwitchMargin = 0.15
 	smartSwitchAuditLimit    = 128
-	defaultSmartExploration  = 0.08
-	defaultSmartMinSamples   = 3
+	// Active probes already rotate through the catalog. Keep the score bonus
+	// small so exploration does not displace a proven path during real traffic.
+	defaultSmartExploration = 0.02
+	defaultSmartMinSamples  = 3
 	// Passive bulk gating only consumes bytes observed on real connections.
 	// 512 KiB/s is deliberately conservative: it catches the measured
 	// YouTube/GCore stall without rejecting ordinary interactive traffic.
@@ -256,6 +259,7 @@ type Smart struct {
 	switchConfirmSamples      int
 	switchCooldown            time.Duration
 	switchMargin              float64
+	switchMinImprovement      time.Duration
 	exploration               float64
 	minSamples                int
 	passiveThroughputFloorBPS uint64
@@ -373,6 +377,13 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	if switchMargin >= 1 {
 		return nil, E.New("smart switch_margin must be less than 1")
+	}
+	switchMinImprovement := time.Duration(options.SwitchMinImprovement)
+	if switchMinImprovement == 0 {
+		switchMinImprovement = defaultSmartMinSwitchImprovement
+	}
+	if switchMinImprovement < 0 {
+		return nil, E.New("smart switch_min_improvement must not be negative")
 	}
 	exploration := defaultSmartExploration
 	if options.Exploration != nil {
@@ -506,6 +517,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		switchConfirmSamples:      switchConfirmSamples,
 		switchCooldown:            switchCooldown,
 		switchMargin:              switchMargin,
+		switchMinImprovement:      switchMinImprovement,
 		exploration:               exploration,
 		minSamples:                minSamples,
 		passiveThroughputFloorBPS: passiveThroughputFloorBPS,
@@ -1000,9 +1012,9 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
-			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
+			s.store.observeFirstByte(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, firstByte)
 		}, func(bytes int64, duration time.Duration) {
-			s.store.observeThroughput(time.Now(), networkKey, siteKey, candidate.Tag(), transport, bytes, duration)
+			s.store.observeThroughput(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, bytes, duration)
 		}, func() {
 			// A stream can become unusable after DialContext succeeds (for
 			// example a stale multiplex session or a reset upstream socket).
@@ -1469,7 +1481,8 @@ func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksa
 // still the source of truth for API/status consumers; when the Zig backend is
 // enabled it receives the same event keyed by canonical endpoint identity.
 func (s *Smart) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
-	s.store.observeDial(now, network, site, candidate, transport, success, elapsed)
+	profileID := s.candidateProfileID(candidate)
+	s.store.observeDial(now, network, site, profileID, transport, success, elapsed)
 	if s.policyBackend == nil {
 		return
 	}
@@ -1479,6 +1492,24 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	if identity != "" {
 		s.policyBackend.Observe(smartSelectionKey(network, site, transport), smartPolicyID(identity), success, elapsed, now)
 	}
+}
+
+// candidateProfileID maps provider display tags to the canonical endpoint
+// identity. Subscription copies such as "JP 1" and "JP 2" therefore share
+// one health portrait in the Go store as well as in the Zig policy backend.
+// A tag is retained as the fallback for embedded/test candidates without a
+// probe identity.
+func (s *Smart) candidateProfileID(candidate string) string {
+	if s == nil || candidate == "" {
+		return candidate
+	}
+	s.access.RLock()
+	identity := s.candidateProbeKey[candidate]
+	s.access.RUnlock()
+	if identity == "" {
+		return candidate
+	}
+	return "endpoint:" + identity
 }
 
 func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.Socksaddr) (*smartRanking, string, string, string) {
@@ -1504,7 +1535,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if !common.Contains(candidate.Network(), transport) {
 			continue
 		}
-		estimate := s.store.estimate(now, networkKey, siteKey, candidate.Tag(), transport, s.minSamples)
+		estimate := s.store.estimate(now, networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, s.minSamples)
 		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
 			s.access.RLock()
@@ -1531,15 +1562,20 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		ranking.ranks = append(ranking.ranks, smartRank{
 			outbound: candidate,
 			estimate: estimate,
-			eligible: true,
+			// Hard health gates run before weights and soft score. A circuit-open
+			// endpoint must never become eligible merely because it has a large
+			// configured weight.
+			eligible: estimate.State != "open",
 			status: adapter.SmartCandidateStatus{
-				Tag:           candidate.Tag(),
-				State:         estimate.State,
-				Reliability:   estimate.Reliability,
-				ConnectMS:     estimate.ConnectMS,
-				FirstByteMS:   estimate.FirstByteMS,
-				ThroughputBPS: estimate.ThroughputBPS,
-				Samples:       estimate.Samples,
+				Tag:            candidate.Tag(),
+				State:          estimate.State,
+				Reliability:    estimate.Reliability,
+				ConnectMS:      estimate.ConnectMS,
+				ConnectP95MS:   estimate.ConnectP95MS,
+				FirstByteMS:    estimate.FirstByteMS,
+				FirstByteP95MS: estimate.FirstByteP95MS,
+				ThroughputBPS:  estimate.ThroughputBPS,
+				Samples:        estimate.Samples,
 			},
 		})
 		if s.policyBackend != nil && identity != "" {
@@ -1549,11 +1585,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			if _, exists := policyIDs[policyID]; !exists {
 				policyIDs[policyID] = struct{}{}
 				policyCandidates = append(policyCandidates, smartPolicyCandidate{
-					ID: policyID, Reliability: estimate.Reliability, ConnectMS: estimate.ConnectMS,
-					FirstByteMS: estimate.FirstByteMS, JitterMS: estimate.JitterMS,
+					ID: policyID, Reliability: estimate.Reliability, ConnectMS: smartConnectScoreMS(estimate),
+					FirstByteMS: smartFirstByteScoreMS(estimate), JitterMS: estimate.JitterMS,
 					Throughput: estimate.ThroughputBPS, Samples: estimate.Samples,
 					Weight: s.nodeWeights.Explain(candidate.Tag()).Weight,
-					State:  smartPolicyState(estimate.State), Eligible: true,
+					State:  smartPolicyState(estimate.State), Eligible: estimate.State != "open",
 				})
 			}
 		}
@@ -1568,6 +1604,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 			ranking.ranks[index].estimate.State = "open"
 			ranking.ranks[index].status.State = "open"
+			ranking.ranks[index].eligible = false
 			ranking.ranks[index].status.Reason = "passive throughput below floor"
 			ranking.ranks[index].passiveThroughputLow = true
 			identity := ""
@@ -1578,6 +1615,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			for policyIndex := range policyCandidates {
 				if policyCandidates[policyIndex].ID == policyID {
 					policyCandidates[policyIndex].State = smartPolicyState("open")
+					policyCandidates[policyIndex].Eligible = false
 				}
 			}
 		}
@@ -1647,6 +1685,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if s.policyBackend != nil {
 		decision := s.policyBackend.Choose(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
 		if decision.SelectedID != 0 {
+			selectedIndex := -1
 			for index := range ranks {
 				identity := ""
 				s.access.RLock()
@@ -1655,12 +1694,30 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				if smartPolicyID(identity) != decision.SelectedID {
 					continue
 				}
+				selectedIndex = index
+				break
+			}
+			if selectedIndex >= 0 {
+				currentIndex := smartRankIndex(ranks, lastSelected)
+				if currentIndex >= 0 && currentIndex != selectedIndex &&
+					!smartAbsoluteImprovement(ranks[selectedIndex], ranks[currentIndex], s.switchMinImprovement) {
+					// The Zig kernel already applies relative margin, confirmation,
+					// and cooldown. This additional absolute floor prevents a tiny
+					// score change from moving a healthy browser path when the p95
+					// latency gain is below the user-visible threshold.
+					ranks[currentIndex].status.Reason = "healthy current candidate retained below latency floor"
+					moveSmartRankFirst(ranks, currentIndex)
+					s.updateStatus(networkKey, siteDisplay, transport, ranks, "healthy current candidate retained below latency floor")
+					return ranking, networkKey, siteKey, siteDisplay
+				}
+			}
+			if selectedIndex >= 0 {
 				reason := "zig policy retained candidate"
 				if decision.Switched {
 					reason = "zig policy confirmed candidate"
 				}
-				ranks[index].status.Reason = reason
-				moveSmartRankFirst(ranks, index)
+				ranks[selectedIndex].status.Reason = reason
+				moveSmartRankFirst(ranks, selectedIndex)
 				s.updateStatus(networkKey, siteDisplay, transport, ranks, reason)
 				return ranking, networkKey, siteKey, siteDisplay
 			}
@@ -1690,7 +1747,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				s.clearSwitchChallenge(selectionKey)
 				switchReason = "equivalent subscription line retained"
 				switchStatusReason = "healthy equivalent line retained"
-			case !smartRelativeImprovement(bestScore, currentScore, s.switchMargin):
+			case !smartRelativeImprovement(bestScore, currentScore, s.switchMargin) ||
+				!smartAbsoluteImprovement(ranks[0], ranks[index], s.switchMinImprovement):
 				s.clearSwitchChallenge(selectionKey)
 			case s.performanceSwitchCoolingDown(selectionKey, now):
 				s.clearSwitchChallenge(selectionKey)
@@ -1729,7 +1787,9 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	// Do not let a late healthy completion undo a just-committed selection.
 	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		coolingDown := s.performanceCooldown[key].After(now)
-		materiallyBetter := previousFound && currentFound && smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin)
+		materiallyBetter := previousFound && currentFound &&
+			smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin) &&
+			smartAbsoluteImprovement(currentRank, previousRank, s.switchMinImprovement)
 		if coolingDown || !materiallyBetter {
 			s.access.Unlock()
 			s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "late healthy result retained current candidate")
@@ -1801,6 +1861,33 @@ func smartRelativeImprovement(bestScore, currentScore, margin float64) bool {
 		return true
 	}
 	return currentScore > bestScore/(1-margin)
+}
+
+func smartAbsoluteImprovement(best, current smartRank, minimum time.Duration) bool {
+	if minimum <= 0 {
+		return true
+	}
+	bestLatency := smartRankLatencyMS(best)
+	currentLatency := smartRankLatencyMS(current)
+	if bestLatency <= 0 || currentLatency <= 0 {
+		// Do not switch a healthy path on a score that has no comparable latency
+		// evidence. Hard failures are handled before this gate.
+		return false
+	}
+	return currentLatency-bestLatency >= float64(minimum)/float64(time.Millisecond)
+}
+
+func smartRankLatencyMS(rank smartRank) float64 {
+	if rank.status.FirstByteP95MS > 0 {
+		return rank.status.FirstByteP95MS
+	}
+	if rank.status.ConnectP95MS > 0 {
+		return rank.status.ConnectP95MS
+	}
+	if rank.status.FirstByteMS > 0 {
+		return rank.status.FirstByteMS
+	}
+	return rank.status.ConnectMS
 }
 
 // smartEquivalentLine recognizes only suffixes generated by the provider
@@ -1905,7 +1992,7 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 		forceAll = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 	}
 	if !forceAll {
-		forceAll = s.store.candidateDead(previous, time.Now())
+		forceAll = s.store.candidateDead(s.candidateProfileID(previous), time.Now())
 	}
 	// A performance-driven switch must be invisible to established flows. New
 	// connections use the better candidate while existing healthy connections
@@ -2061,7 +2148,7 @@ func (s *Smart) clearBrokenPin(candidate, networkKey, siteKey, transport string)
 	if temporaryCleared && s.logger != nil {
 		s.logger.Warn("smart temporary override cleared after connection failure: ", candidate)
 	}
-	estimate := s.store.estimate(time.Now(), networkKey, siteKey, candidate, transport, s.minSamples)
+	estimate := s.store.estimate(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate), transport, s.minSamples)
 	if estimate.State == "open" || estimate.State == "half_open" {
 		s.releaseConfirmedBrokenPin(candidate, "confirmed connection failure threshold reached")
 	}

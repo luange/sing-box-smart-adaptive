@@ -188,6 +188,50 @@ func TestSmartReliabilityUsesConfidence(t *testing.T) {
 	}
 }
 
+func TestSmartTailLatencyKeepsSingleSpikeVisible(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Unix(1500, 0)
+	for range 8 {
+		store.observeDial(now, "ethernet", "", "node-a", "tcp", true, 50*time.Millisecond)
+	}
+	store.observeFirstByte(now, "ethernet", "", "node-a", "tcp", 80*time.Millisecond)
+	store.observeFirstByte(now, "ethernet", "", "node-a", "tcp", 2*time.Second)
+	estimate := store.estimate(now, "ethernet", "", "node-a", "tcp", 3)
+	if estimate.FirstByteP95MS <= estimate.FirstByteMS {
+		t.Fatalf("tail estimate should retain a spike: p50=%f p95=%f", estimate.FirstByteMS, estimate.FirstByteP95MS)
+	}
+	if smartScoreForProfile(estimate, smartProfileInteractive, 0, estimate.Samples) <= 0 {
+		t.Fatal("tail-aware score must remain finite")
+	}
+}
+
+func TestSmartScoreUsesTailLatencyForInteractiveTraffic(t *testing.T) {
+	steady := smartEstimate{Reliability: .99, ConnectMS: 50, ConnectP95MS: 60, FirstByteMS: 100, FirstByteP95MS: 120, Samples: 12, State: "healthy", HasConnect: true, HasConnectP95: true, HasFirstByte: true, HasFirstByteP95: true}
+	spiky := steady
+	spiky.ConnectP95MS = 900
+	spiky.FirstByteP95MS = 3500
+	if smartScoreForProfile(spiky, smartProfileInteractive, 0, 24) <= smartScoreForProfile(steady, smartProfileInteractive, 0, 24) {
+		t.Fatal("interactive score should penalize a high p95 tail")
+	}
+}
+
+func TestSmartAbsoluteImprovementRequiresComparableLatency(t *testing.T) {
+	best := smartRank{status: adapter.SmartCandidateStatus{FirstByteP95MS: 700}}
+	current := smartRank{status: adapter.SmartCandidateStatus{FirstByteP95MS: 850}}
+	if !smartAbsoluteImprovement(best, current, 100*time.Millisecond) {
+		t.Fatal("expected a 150ms p95 improvement to pass the floor")
+	}
+	current.status.FirstByteP95MS = 760
+	if smartAbsoluteImprovement(best, current, 100*time.Millisecond) {
+		t.Fatal("sub-threshold improvement must retain the incumbent")
+	}
+	current.status.FirstByteP95MS = 0
+	current.status.ConnectP95MS = 0
+	if smartAbsoluteImprovement(best, current, 100*time.Millisecond) {
+		t.Fatal("missing comparable latency must not trigger a performance switch")
+	}
+}
+
 func TestSmartConnectivity204RTTFeedsEWMAAndJitter(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Now()

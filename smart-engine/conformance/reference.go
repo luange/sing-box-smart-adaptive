@@ -43,7 +43,11 @@ func score(c Config, candidate Candidate, total float64) float64 {
 	if candidate.Samples > 0 && total > 0 {
 		exploration *= math.Sqrt(math.Log(total+1) / candidate.Samples)
 	}
-	return math.Max(0, .45*(1-candidate.Reliability)+.30*connect+.15*first+.10*jitter-exploration) / math.Max(candidate.Weight, 1)
+	confidence := 0.0
+	if candidate.Samples < 3 {
+		confidence = math.Max(0, 1-candidate.Samples/3)
+	}
+	return math.Max(0, .30*(1-candidate.Reliability)+.25*connect+.30*first+.10*jitter+.05*confidence-exploration) / math.Max(candidate.Weight, 1)
 }
 
 func choose(s *state, c Config, candidates []Candidate, now uint64) Decision {
