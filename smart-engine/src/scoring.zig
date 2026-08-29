@@ -38,7 +38,7 @@ pub fn score(config: model.Config, candidate: model.Candidate, total_samples: f6
     var first_byte_weight: f64 = 0.30;
     var throughput_weight: f64 = 0;
     var jitter_weight: f64 = 0.10;
-    var confidence_weight: f64 = 0.05;
+    const confidence_weight: f64 = 0.05;
     switch (profile) {
         .bulk => {
             reliability_weight = 0.30;
