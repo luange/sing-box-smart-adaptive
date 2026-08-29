@@ -122,10 +122,15 @@ func (m *Manager) leave(tracker Tracker) {
 		return
 	}
 	// Rebuild leaf chain after dial so smart/selector/etc. real outbounds win.
-	metadata.FinalizeChain()
+	// Work on an immutable copy. Connections() may have handed the live
+	// metadata pointer to the Clash API or another subscriber; mutating Chain,
+	// Outbound, or OutboundType here races with JSON serialization and can tear
+	// a slice header. The copy keeps the finalized leaf for history without
+	// changing the object visible to active-connection readers.
+	metadataCopy := cloneTrackerMetadata(metadata)
+	metadataCopy.FinalizeChain()
 	closedAt := time.Now()
-	metadata.ClosedAt = closedAt
-	metadataCopy := *metadata
+	metadataCopy.ClosedAt = closedAt
 	m.closedConnectionsAccess.Lock()
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		m.closedConnections.PopFront()
@@ -156,7 +161,10 @@ func (m *Manager) ConnectionsLen() int {
 func (m *Manager) Connections() []*TrackerMetadata {
 	var connections []*TrackerMetadata
 	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
-		connections = append(connections, tracker.Metadata())
+		// Never expose the live tracker metadata. In particular, Chain and the
+		// route fields are immutable to readers even while a connection is
+		// being closed and its history entry is finalized.
+		connections = append(connections, cloneTrackerMetadata(tracker.Metadata()))
 		return true
 	})
 	return connections

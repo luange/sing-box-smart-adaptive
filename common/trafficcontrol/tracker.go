@@ -34,6 +34,19 @@ type Tracker interface {
 	Close() error
 }
 
+// cloneTrackerMetadata returns a reader-owned view of tracker metadata. The
+// byte counters intentionally keep their atomic pointers so dashboards can
+// observe live totals, while route identity slices are copied to prevent a
+// close/finalize operation from racing with JSON or protobuf encoding.
+func cloneTrackerMetadata(source *TrackerMetadata) *TrackerMetadata {
+	if source == nil {
+		return nil
+	}
+	copy := *source
+	copy.Chain = append([]string(nil), source.Chain...)
+	return &copy
+}
+
 // FinalizeChain rebuilds Chain/Outbound from the route root plus any real leaf
 // tags groups recorded during Dial (smart/selector/urltest/loadbalance/adaptive).
 // Call on close so history sees the leaf that actually carried traffic, not the
