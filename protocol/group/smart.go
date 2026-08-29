@@ -1306,6 +1306,17 @@ func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.probe(ctx)
 }
 
+// PerformUpdateCheck is the non-blocking hook used by the Clash API after a
+// manual delay test. Smart owns its probe worker, so the API must only wake a
+// bounded cycle instead of starting a second probe goroutine or mutating
+// selection state from the HTTP handler.
+func (s *Smart) PerformUpdateCheck() {
+	if s.closing.Load() {
+		return
+	}
+	s.requestProbe()
+}
+
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	return s.probeWithBudget(ctx, 0)
 }
