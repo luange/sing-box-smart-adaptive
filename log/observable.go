@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -84,7 +85,15 @@ func (f *defaultFactory) Start() error {
 	if f.needObservable {
 		f.observer = observable.NewObserver[Entry](f.subscriber, 64)
 	}
-	return nil
+	f.startAccess.Lock()
+	pendingEntries := f.pendingEntries
+	f.pendingEntries = nil
+	f.started.Store(true)
+	f.startAccess.Unlock()
+	for _, entry := range pendingEntries {
+		f.output(entry.ctx, entry.level, entry.tag, entry.message, entry.timestamp)
+	}
+	return err
 }
 
 func (f *defaultFactory) Close() error {
@@ -190,12 +199,7 @@ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 		}
 		l.startAccess.Unlock()
 	}
-	if len(platformWriters) > 0 {
-		message := l.platformFormatter.Format(ctx, level, l.tag, F.ToString(args...), nowTime)
-		for _, platformWriter := range platformWriters {
-			platformWriter.WriteMessage(level, message)
-		}
-	}
+	l.output(ctx, level, l.tag, message, nowTime)
 }
 
 func (l *observableLogger) Trace(args ...any) {
