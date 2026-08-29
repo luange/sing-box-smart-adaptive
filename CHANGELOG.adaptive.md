@@ -208,3 +208,9 @@ Design: `docs/ports/EBPF-DATAPLANE-V3-DESIGN.md`. QA: Codex outputs `EBPF-V3-117
 2. 生产建议：`log.level=info`（连接明细已在 Debug）  
 3. Smart：`probe_interval` 30m+、`dns_prefill.ttl` 10m、history retention 可 72h  
 4. 自检：`grep 'bypass miss sample' …`；`sh scripts/bypass-miss-sample.sh`  
+## v3.42-score portability fix
+
+- Pin Zig Smart release/test builds to the portable CPU baseline so binaries
+  built on feature-rich hosts do not execute unsupported AVX instructions on
+  older x86_64 virtual machines. Explicit `-Dcpu=native` remains available
+  for controlled deployments.

@@ -36,8 +36,11 @@ zero-dependency development.
 Build and test with Zig 0.14+:
 
 ```sh
-zig build test
-zig build -Doptimize=ReleaseFast
+zig build test -Dcpu=baseline
+zig build -Dcpu=baseline -Doptimize=ReleaseFast
+
+Release builds intentionally use the portable `baseline` CPU profile.  Use
+`-Dcpu=native` only for a deployment whose CPU feature set is controlled.
 ```
 
 Linux release builds select Zig with `smart_zig` and link the matching static

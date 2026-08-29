@@ -1,7 +1,16 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Keep release artifacts portable across older VM CPU models.  Zig's
+    // implicit target selection can otherwise inherit the build host's
+    // SIMD features (for example AVX), which makes the C ABI fail with
+    // SIGILL on a baseline x86_64 guest.  An explicit -Dcpu=native (or a
+    // named CPU) still opts into that optimization when it is intentional.
+    var target_query = b.standardTargetOptionsQueryOnly(.{});
+    if (target_query.cpu_model == .determined_by_cpu_arch) {
+        target_query.cpu_model = .baseline;
+    }
+    const target = b.resolveTargetQuery(target_query);
     const optimize = b.standardOptimizeOption(.{});
 
     const lib = b.addStaticLibrary(.{

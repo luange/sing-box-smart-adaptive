@@ -29,10 +29,10 @@ jobs:
           version: 0.14.1
       - name: Test
         working-directory: smart-engine
-        run: zig build test
+        run: zig build test -Dcpu=baseline
       - name: Build release library
         working-directory: smart-engine
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Exercise C ABI
         working-directory: smart-engine
         run: |
@@ -64,15 +64,15 @@ jobs:
         run: |
           set -euo pipefail
           cd smart-engine
-          zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
           test -s zig-out/lib/libsmart_engine.a
           cd ..
           CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
       - name: Cross-build Linux libraries
         working-directory: smart-engine
         run: |
-          zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
-          zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Check C ABI header
         working-directory: smart-engine
         run: |

@@ -87,7 +87,7 @@ jobs:
             zig_target="x86_64-linux-gnu"
             if [[ "${{ matrix.goarch }}" == "arm64" ]]; then zig_target="aarch64-linux-gnu"; fi
           fi
-          zig build -Dtarget="$zig_target" -Doptimize=ReleaseFast
+          zig build -Dtarget="$zig_target" -Dcpu=baseline -Doptimize=ReleaseFast
           test -s zig-out/lib/libsmart_engine.a
           file zig-out/lib/libsmart_engine.a
 
