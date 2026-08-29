@@ -1,13 +1,13 @@
 package adapter
 
 import (
-	"github.com/sagernet/sing-box/common/hash"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"time"
 
+	"github.com/sagernet/sing-box/common/hash"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
@@ -65,7 +65,11 @@ type SavedBinary struct {
 	Content     []byte
 	LastUpdated time.Time
 	LastEtag    string
-	Hash        hash.HashType
+	// URLHash belongs to the official rule-set cache format. Hash is kept
+	// separately for provider subscription identity and is serialized by the
+	// provider cache codec, not by MarshalBinary.
+	URLHash []byte
+	Hash    hash.HashType
 }
 
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {
