@@ -139,12 +139,13 @@ type AdaptivePool struct {
 	postStarted             bool
 	retired                 bool
 	scheduler               *ProbeScheduler
+	manualProbePending      atomic.Bool
 	schedulerOwner          *SchedulerCoordinator
 	schedulerGen            uint64
 	capabilityProvider      RefreshableProbeTargetProvider
 	capabilityServiceIDs    []string
-	capabilityRunner      *CapabilityProbeRunner
-	capabilityControllers map[string]*CapabilityProbeController
+	capabilityRunner        *CapabilityProbeRunner
+	capabilityControllers   map[string]*CapabilityProbeController
 	capabilityRefresh       time.Duration
 	capabilityTimeout       time.Duration
 	capabilityQuorum        int
@@ -400,19 +401,19 @@ func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag st
 			BindNodeWeights(nodeWeights).
 			BindSwitchStability(switchMargin, switchCooldown).
 			BindAffinityMode(affinityMode),
-		policyMaxAttempts: maxAttempts,
-		manualFailure:     manualFailure,
-		switchMargin:      switchMargin,
-		switchCooldown:    switchCooldown,
-		affinityMode:      affinityMode,
-		runner:                  NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
-		defaultMode:             defaultMode,
-		strictLeaseTTL:          strictLeaseTTL,
-		adaptiveLeaseTTL:        adaptiveLeaseTTL,
-		control:                 new(ControlState),
-		switchAudit:             NewSwitchAuditStore(),
-		selectionMemory:         make(map[selectionMemoryKey]selectionMemoryEntry),
-		observationIngestor:     NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
+		policyMaxAttempts:   maxAttempts,
+		manualFailure:       manualFailure,
+		switchMargin:        switchMargin,
+		switchCooldown:      switchCooldown,
+		affinityMode:        affinityMode,
+		runner:              NewAttemptRunner(attemptTimeout, hedgeDelay, catalog),
+		defaultMode:         defaultMode,
+		strictLeaseTTL:      strictLeaseTTL,
+		adaptiveLeaseTTL:    adaptiveLeaseTTL,
+		control:             new(ControlState),
+		switchAudit:         NewSwitchAuditStore(),
+		selectionMemory:     make(map[selectionMemoryKey]selectionMemoryEntry),
+		observationIngestor: NewObservationIngestor(nil, nil, 10*time.Minute, 16384),
 	}
 	pool.policy.BindBulkSequence(&pool.control.bulkSequence)
 	pool.loadPersistentState()
@@ -1162,6 +1163,40 @@ func (p *AdaptivePool) URLTest(ctx context.Context) (map[string]uint16, error) {
 		}
 	}
 	return result, nil
+}
+
+// PerformUpdateCheck is the non-blocking URLTestGroup hook used by the Clash
+// API after a manual delay test. The delay handler has already tested one
+// concrete outbound; adaptive only needs to wake a bounded, coalesced probe
+// batch so the shared profile can incorporate the fresh observation. Keeping
+// this path bounded avoids making an HTTP dashboard request enqueue one task
+// per provider node (and avoids creating an unbounded goroutine fan-out).
+func (p *AdaptivePool) PerformUpdateCheck() {
+	if p.closing.Load() || !p.manualProbePending.CompareAndSwap(false, true) {
+		return
+	}
+
+	p.lifecycleAccess.Lock()
+	scheduler := p.scheduler
+	p.lifecycleAccess.Unlock()
+	if scheduler == nil {
+		p.manualProbePending.Store(false)
+		return
+	}
+	snapshot := p.catalog.load()
+	if snapshot == nil || len(snapshot.Candidates) == 0 {
+		p.manualProbePending.Store(false)
+		return
+	}
+	limit := min(max(p.probeConcurrency, 1), len(snapshot.Candidates))
+	for _, candidate := range snapshot.Candidates[:limit] {
+		task := p.probeTask(snapshot, candidate, time.Now(), 0)
+		task.Priority = ProbePriorityOnDemand
+		if submission := scheduler.Submit(task); submission.Err != nil {
+			break
+		}
+	}
+	p.manualProbePending.Store(false)
 }
 
 func (p *AdaptivePool) TriggerAdaptiveProbe(ctx context.Context) error {

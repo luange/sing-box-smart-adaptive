@@ -58,21 +58,27 @@ func (r *abstractDefaultRule) Match(metadata *adapter.InboundContext) bool {
 	// Accumulate classes into a scratch copy so failed rules never pollute
 	// the caller's MatchInputs (even without ResetRuleCache).
 	before := metadata.MatchInputs
+	beforeDeferred := metadata.DeferredIPCIDRMatchGroups
 	metadata.MatchInputs = 0
+	metadata.DeferredIPCIDRMatchGroups = 0
 	matched := r.matchInner(metadata)
 	ruleInputs := metadata.MatchInputs
+	deferredGroups := metadata.DeferredIPCIDRMatchGroups
 	if r.invert {
-		if matched && metadata.IgnoreDestinationIPCIDRMatch && !metadata.DidMatch && len(r.destinationIPCIDRItems) > 0 {
+		if !matched {
+			deferredGroups = 0
 			matched = true
 		} else {
-			matched = !matched
+			matched = deferredGroups != 0
 		}
 	}
 	if matched {
 		// Commit only the winning rule's evaluated classes onto the prior base.
 		metadata.MatchInputs = before | ruleInputs
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred | deferredGroups
 	} else {
 		metadata.MatchInputs = before
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred
 	}
 	return matched
 }
@@ -80,24 +86,29 @@ func (r *abstractDefaultRule) Match(metadata *adapter.InboundContext) bool {
 func (r *abstractDefaultRule) matchInner(metadata *adapter.InboundContext) bool {
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
-		metadata.DidMatch = true
 		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return false
 		}
 	}
 	if r.ruleSetItem != nil {
-		metadata.DidMatch = true
 		metadata.MatchInputs |= itemMatchClass(r.ruleSetItem)
-		return r.ruleSetItem.matchWithOuterGroups(metadata, groups)
+		matched := r.ruleSetItem.matchWithOuterGroups(metadata, groups)
+		if matched {
+			metadata.DeferredIPCIDRMatchGroups &^= uint8(groups.satisfied)
+		}
+		return matched
 	}
-	return groups.done()
+	matched := groups.done()
+	if matched {
+		metadata.DeferredIPCIDRMatchGroups &^= uint8(groups.satisfied)
+	}
+	return matched
 }
 
 func (r *abstractDefaultRule) evaluateForMerge(metadata *adapter.InboundContext) (ruleGroupMatch, bool) {
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
-		metadata.DidMatch = true
 		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return ruleGroupMatch{}, false
@@ -117,7 +128,6 @@ func (r *abstractDefaultRule) destinationIPCIDRMatchesDestination(metadata *adap
 func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) ruleGroupMatch {
 	var groups ruleGroupMatch
 	if len(r.sourceAddressItems) > 0 {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.sourceAddressItems)
 		groups.required |= ruleMatchSourceAddress
 		if matchAnyItem(r.sourceAddressItems, metadata) {
@@ -125,7 +135,6 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		}
 	}
 	if r.destinationIPCIDRMatchesSource(metadata) {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchSourceAddress
 		if !groups.satisfied.has(ruleMatchSourceAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
@@ -133,7 +142,6 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		}
 	}
 	if len(r.sourcePortItems) > 0 {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.sourcePortItems)
 		groups.required |= ruleMatchSourcePort
 		if matchAnyItem(r.sourcePortItems, metadata) {
@@ -141,7 +149,6 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		}
 	}
 	if len(r.destinationAddressItems) > 0 {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.destinationAddressItems)
 		groups.required |= ruleMatchDestinationAddress
 		if matchAnyItem(r.destinationAddressItems, metadata) {
@@ -149,7 +156,6 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		}
 	}
 	if r.destinationIPCIDRMatchesDestination(metadata) {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchDestinationAddress
 		if !groups.satisfied.has(ruleMatchDestinationAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
@@ -157,12 +163,14 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		}
 	}
 	if len(r.destinationPortItems) > 0 {
-		metadata.DidMatch = true
 		accumulateItemClasses(metadata, r.destinationPortItems)
 		groups.required |= ruleMatchDestinationPort
 		if matchAnyItem(r.destinationPortItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationPort
 		}
+	}
+	if metadata.IgnoreDestinationIPCIDRMatch && !metadata.IPCIDRMatchSource && len(r.destinationIPCIDRItems) > 0 && len(r.destinationAddressItems) == 0 {
+		metadata.DeferredIPCIDRMatchGroups |= uint8(ruleMatchDestinationAddress)
 	}
 	return groups
 }
@@ -228,9 +236,13 @@ func (r *abstractLogicalRule) Close() error {
 }
 
 func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
-	var matched bool
-	var collected adapter.RouteMatchInputs
+	var (
+		matched        bool
+		collected      adapter.RouteMatchInputs
+		deferredGroups uint8
+	)
 	before := metadata.MatchInputs
+	beforeDeferred := metadata.DeferredIPCIDRMatchGroups
 	if r.mode == C.LogicalTypeAnd {
 		matched = true
 		for _, rule := range r.rules {
@@ -238,10 +250,12 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 			nestedMetadata.ResetRuleCache()
 			if !rule.Match(&nestedMetadata) {
 				matched = false
+				deferredGroups = 0
 				break
 			}
 			// AND: union classes from every satisfied sub-rule.
 			collected |= nestedMetadata.MatchInputs
+			deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
 		}
 	} else {
 		for _, rule := range r.rules {
@@ -249,9 +263,15 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 			nestedMetadata.ResetRuleCache()
 			if rule.Match(&nestedMetadata) {
 				matched = true
-				// OR: first satisfied sub-rule defines classes.
+				// OR: prefer the first fully-resolved match. If the match is
+				// deferred, retain its classes while allowing a later rule to
+				// resolve the same destination group.
 				collected = nestedMetadata.MatchInputs
-				break
+				if nestedMetadata.DeferredIPCIDRMatchGroups == 0 {
+					deferredGroups = 0
+					break
+				}
+				deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
 			}
 		}
 	}
@@ -259,12 +279,19 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 		metadata.DeferredIPCIDRMatchGroups |= deferredGroups
 	}
 	if r.invert {
-		matched = !matched
+		if !matched {
+			deferredGroups = 0
+			matched = true
+		} else {
+			matched = deferredGroups != 0
+		}
 	}
 	if matched {
 		metadata.MatchInputs = before | collected
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred | deferredGroups
 	} else {
 		metadata.MatchInputs = before
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred
 	}
 	return matched
 }

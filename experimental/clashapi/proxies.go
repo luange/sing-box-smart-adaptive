@@ -345,3 +345,30 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 }
+
+// groupContains follows nested outbound groups without recursing through the
+// same group twice. Manual delay tests use it to wake every affected URL-test
+// group while keeping the Clash API handler independent of group internals.
+func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapter.OutboundGroup, tag string, visited map[string]bool) bool {
+	for _, memberTag := range outboundGroup.All() {
+		if memberTag == tag {
+			return true
+		}
+		member, loaded := outboundManager.Outbound(memberTag)
+		if !loaded {
+			continue
+		}
+		if group.RealTag(member) == tag {
+			return true
+		}
+		memberGroup, isGroup := member.(adapter.OutboundGroup)
+		if !isGroup || visited[memberTag] {
+			continue
+		}
+		visited[memberTag] = true
+		if groupContains(outboundManager, memberGroup, tag, visited) {
+			return true
+		}
+	}
+	return false
+}
