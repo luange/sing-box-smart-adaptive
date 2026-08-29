@@ -25,6 +25,8 @@ type dnsPrefillOptions struct {
 	ttl     time.Duration
 }
 
+const dnsPrefillWorkerLimit = 2
+
 func dnsPrefillOptionsFrom(opts option.EBPFDNSPrefillOptions) dnsPrefillOptions {
 	ttl := time.Duration(opts.TTL)
 	if ttl <= 0 {
@@ -43,13 +45,25 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	if i == nil || len(addresses) == 0 {
 		return
 	}
-	if i.dnsPrefillClosed.Load() {
-		return
-	}
 	if fromFakeIP {
+		if i.dnsPrefillClosed.Load() {
+			return
+		}
 		i.onFakeIPAnswer(addresses)
 		return
 	}
+	// Admit before filtering or allocating. Answers are advisory hints, so a
+	// full worker budget is safely fail-open and cannot create one goroutine per
+	// DNS response during browser/messenger bursts.
+	if !i.acquireDNSPrefillSlot() {
+		return
+	}
+	release := true
+	defer func() {
+		if release {
+			i.releaseDNSPrefillWorker()
+		}
+	}()
 	v3DNS := i.v3DNSHintEnabled()
 	if !i.dnsPrefill.enabled && !v3DNS {
 		return
@@ -76,7 +90,43 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	if routeRouter == nil || outbounds == nil {
 		return
 	}
-	go i.dnsPrefillApply(tag, domain, addrs, ttl, routeRouter, outbounds)
+	release = false
+	go func() {
+		defer i.releaseDNSPrefillWorker()
+		i.dnsPrefillApply(tag, domain, addrs, ttl, routeRouter, outbounds)
+	}()
+}
+
+func (i *Inbound) acquireDNSPrefillSlot() bool {
+	i.dnsPrefillAccess.Lock()
+	defer i.dnsPrefillAccess.Unlock()
+	if i.dnsPrefillClosed.Load() {
+		return false
+	}
+	if i.dnsPrefillSlots == nil {
+		i.dnsPrefillSlots = make(chan struct{}, dnsPrefillWorkerLimit)
+	}
+	select {
+	case i.dnsPrefillSlots <- struct{}{}:
+		// Add while holding the admission lock. StopDNSPrefill takes the same
+		// lock before Wait, so it cannot observe a zero counter and return while
+		// this callback is about to start a worker.
+		i.dnsPrefillWorkers.Add(1)
+		return true
+	default:
+		i.dnsPrefillQueueDrops.Add(1)
+		return false
+	}
+}
+
+func (i *Inbound) releaseDNSPrefillWorker() {
+	i.dnsPrefillAccess.Lock()
+	slots := i.dnsPrefillSlots
+	i.dnsPrefillAccess.Unlock()
+	if slots != nil {
+		<-slots
+	}
+	i.dnsPrefillWorkers.Done()
 }
 
 func (i *Inbound) v3DNSHintEnabled() bool {
@@ -201,7 +251,12 @@ func (i *Inbound) wireDNSPrefill() {
 	}
 	i.dnsPrefillRouter = routeRouter
 	i.dnsPrefillOutbounds = outbounds
+	i.dnsPrefillAccess.Lock()
+	if i.dnsPrefillSlots == nil {
+		i.dnsPrefillSlots = make(chan struct{}, dnsPrefillWorkerLimit)
+	}
 	i.dnsPrefillClosed.Store(false)
+	i.dnsPrefillAccess.Unlock()
 	if hub := service.FromContext[*adapter.DNSAnswerObserverHub](i.ctx); hub != nil {
 		hub.Add(i)
 	} else {
@@ -221,10 +276,15 @@ func (i *Inbound) stopDNSPrefill() {
 	if i == nil {
 		return
 	}
+	i.dnsPrefillAccess.Lock()
 	i.dnsPrefillClosed.Store(true)
+	i.dnsPrefillAccess.Unlock()
 	if hub := service.FromContext[*adapter.DNSAnswerObserverHub](i.ctx); hub != nil {
 		hub.Remove(i)
 	}
+	// No new callbacks can enter after unregistering; wait for admitted work so
+	// a restart cannot retain route/outbound references from the old lifecycle.
+	i.dnsPrefillWorkers.Wait()
 }
 
 // filterPrefillAddresses drops invalid/private/dupes. Preserves first-seen order.

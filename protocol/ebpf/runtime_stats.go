@@ -270,6 +270,7 @@ func (i *Inbound) logVerdictRuntimeStatsValue(reason string, stats ECommon.Verdi
 	i.bypassRuleSetAccess.Unlock()
 	i.logger.Info("eBPF direct offload: route_promotes=", i.routeDirectPromotes.Load(),
 		" dns_prefill_promotes=", i.dnsPrefillPromotes.Load(),
+		" dns_prefill_queue_drops=", i.dnsPrefillQueueDrops.Load(),
 		" promoted_live=", promotedLive)
 	if i.bypassMiss != nil {
 		km, us, heal := i.bypassMiss.Snapshot()

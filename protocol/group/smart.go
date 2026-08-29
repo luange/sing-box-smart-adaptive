@@ -1522,6 +1522,18 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	ranking.candidates = append(ranking.candidates, s.candidates...)
 	lastSelected := s.lastSelected[smartSelectionKey(networkKey, siteKey, transport)]
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
+	// Keep one immutable identity snapshot for this ranking pass.  Provider
+	// refreshes may replace candidateProbeKey concurrently, but each candidate
+	// used to take up to three separate RLocks here (profile lookup, probe-dead
+	// lookup and policy selection).  A single bounded copy makes ranking scale
+	// with candidate count instead of lock round-trips while preserving the
+	// refresh boundary and the existing fallback-to-tag semantics.
+	candidateProbeKeys := make(map[string]string, len(ranking.candidates))
+	for _, candidate := range ranking.candidates {
+		if identity := s.candidateProbeKey[candidate.Tag()]; identity != "" {
+			candidateProbeKeys[candidate.Tag()] = identity
+		}
+	}
 	s.access.RUnlock()
 
 	totalSamples := 0.0
@@ -1535,21 +1547,19 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if !common.Contains(candidate.Network(), transport) {
 			continue
 		}
-		estimate := s.store.estimate(now, networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, s.minSamples)
+		identity := candidateProbeKeys[candidate.Tag()]
+		profileID := candidate.Tag()
+		if identity != "" && identity != profileID {
+			profileID = "endpoint:" + identity
+		}
+		estimate := s.store.estimate(now, networkKey, siteKey, profileID, transport, s.minSamples)
 		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
-			s.access.RLock()
-			identity := s.candidateProbeKey[candidate.Tag()]
-			s.access.RUnlock()
 			sharedProbeDead = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
 		}
 		if sharedProbeDead {
 			estimate.State = "open"
 		}
-		identity := ""
-		s.access.RLock()
-		identity = s.candidateProbeKey[candidate.Tag()]
-		s.access.RUnlock()
 		policyID := smartPolicyID(identity)
 		totalSamples += estimate.Samples
 		profileThroughputSamples := estimate.ThroughputSamples
@@ -1607,10 +1617,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			ranking.ranks[index].eligible = false
 			ranking.ranks[index].status.Reason = "passive throughput below floor"
 			ranking.ranks[index].passiveThroughputLow = true
-			identity := ""
-			s.access.RLock()
-			identity = s.candidateProbeKey[ranking.ranks[index].outbound.Tag()]
-			s.access.RUnlock()
+			identity := candidateProbeKeys[ranking.ranks[index].outbound.Tag()]
 			policyID := smartPolicyID(identity)
 			for policyIndex := range policyCandidates {
 				if policyCandidates[policyIndex].ID == policyID {
@@ -1687,10 +1694,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if decision.SelectedID != 0 {
 			selectedIndex := -1
 			for index := range ranks {
-				identity := ""
-				s.access.RLock()
-				identity = s.candidateProbeKey[ranks[index].outbound.Tag()]
-				s.access.RUnlock()
+				identity := candidateProbeKeys[ranks[index].outbound.Tag()]
 				if smartPolicyID(identity) != decision.SelectedID {
 					continue
 				}

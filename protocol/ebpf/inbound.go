@@ -102,6 +102,10 @@ type Inbound struct {
 	bypassMiss *bypassMissSampler
 	// dnsPrefillPromotes counts successful dns_prefill TC publishes.
 	dnsPrefillPromotes atomic.Uint64
+	// dnsPrefillQueueDrops counts advisory DNS hints dropped while the bounded
+	// async prefill workers are busy. Dropping a hint is fail-open; allowing an
+	// unbounded goroutine burst would make DNS traffic a heap amplifier.
+	dnsPrefillQueueDrops atomic.Uint64
 
 	// dns_kernel_direct: :53 server CIDR exceptions (empty when disabled).
 	dnsKernelDirectEnabled bool
@@ -112,6 +116,9 @@ type Inbound struct {
 	dnsPrefillRouter    adapter.Router
 	dnsPrefillOutbounds adapter.OutboundManager
 	dnsPrefillClosed    atomic.Bool // set on Close; async workers check
+	dnsPrefillAccess    sync.Mutex
+	dnsPrefillSlots     chan struct{}
+	dnsPrefillWorkers   sync.WaitGroup
 
 	// N8: throttle repeated "splice metrics unavailable" warns.
 	spliceStatsErrLogged bool
