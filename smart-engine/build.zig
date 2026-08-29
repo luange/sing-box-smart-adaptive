@@ -7,7 +7,12 @@ pub fn build(b: *std.Build) void {
     // SIGILL on a baseline x86_64 guest.  An explicit -Dcpu=native (or a
     // named CPU) still opts into that optimization when it is intentional.
     var target_query = b.standardTargetOptionsQueryOnly(.{});
-    if (target_query.cpu_model == .determined_by_cpu_arch) {
+    // Zig 0.13 calls this query state `determined_by_cpu_arch`; 0.14 calls
+    // it `determined_by_arch_os`. Compare the tag name so this build script
+    // remains usable with both toolchains used by our builders.
+    const cpu_is_implicit = std.mem.eql(u8, @tagName(target_query.cpu_model), "determined_by_cpu_arch") or
+        std.mem.eql(u8, @tagName(target_query.cpu_model), "determined_by_arch_os");
+    if (cpu_is_implicit) {
         target_query.cpu_model = .baseline;
     }
     const target = b.resolveTargetQuery(target_query);
