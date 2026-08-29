@@ -449,7 +449,10 @@ func updateTailEWMA(current, value float64) float64 {
 	}
 	alpha := 0.02
 	if value > current {
-		alpha = 0.20
+		// A tail sample is the signal we want to preserve. Move quickly on
+		// spikes so a single multi-second stall is visible to the selector;
+		// let ordinary samples decay slowly to avoid oscillation.
+		alpha = 0.80
 	}
 	return current + alpha*(value-current)
 }

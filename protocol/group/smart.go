@@ -1506,7 +1506,7 @@ func (s *Smart) candidateProfileID(candidate string) string {
 	s.access.RLock()
 	identity := s.candidateProbeKey[candidate]
 	s.access.RUnlock()
-	if identity == "" {
+	if identity == "" || identity == candidate {
 		return candidate
 	}
 	return "endpoint:" + identity
