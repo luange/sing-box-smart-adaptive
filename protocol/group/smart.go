@@ -39,18 +39,21 @@ import (
 )
 
 const (
-	defaultSmartProbeInterval        = 10 * time.Minute
-	defaultSmartProbeCycleTimeout    = 30 * time.Second
-	defaultSmartProbeTimeout         = 5 * time.Second
-	defaultSmartProbeConcurrency     = 2
-	defaultSmartAttemptTimeout       = 4 * time.Second
-	defaultSmartSiteStickiness       = 30 * time.Minute
-	defaultSmartSwitchConfirm        = 2 * time.Minute
-	defaultSmartSwitchConfirmSamples = 3
-	defaultSmartSwitchCooldown       = 10 * time.Minute
-	defaultSmartMinSwitchImprovement = 100 * time.Millisecond
-	defaultSmartHedgeDelay           = 450 * time.Millisecond
-	minSmartHedgeDelay               = 250 * time.Millisecond
+	defaultSmartProbeInterval           = 10 * time.Minute
+	defaultSmartProbeCycleTimeout       = 30 * time.Second
+	defaultSmartProbeTimeout            = 5 * time.Second
+	defaultSmartProbeConcurrency        = 2
+	defaultSmartAttemptTimeout          = 4 * time.Second
+	defaultSmartEstablishedStallTimeout = 10 * time.Second
+	minSmartEstablishedStallTimeout     = 5 * time.Second
+	maxSmartEstablishedStallTimeout     = 2 * time.Minute
+	defaultSmartSiteStickiness          = 30 * time.Minute
+	defaultSmartSwitchConfirm           = 2 * time.Minute
+	defaultSmartSwitchConfirmSamples    = 3
+	defaultSmartSwitchCooldown          = 10 * time.Minute
+	defaultSmartMinSwitchImprovement    = 100 * time.Millisecond
+	defaultSmartHedgeDelay              = 450 * time.Millisecond
+	minSmartHedgeDelay                  = 250 * time.Millisecond
 	// Give a healthy, already-established path a little more time for its
 	// first byte before starting a competing dial.  This reduces Safari/Google
 	// asset bursts that otherwise create needless hedges; hard dial failures
@@ -76,6 +79,7 @@ const (
 	defaultSmartHistoryRetention  = 48 * time.Hour
 	defaultSmartMaxHistoryEntries = 4096
 	smartStatusCandidateLimit     = 32
+	smartStatusContextLimit       = 32
 	smartNetworkFingerprintTTL    = 2 * time.Second
 	// Background profiling follows traffic demand. A cold/idle group only
 	// samples a small rotating subset; real traffic wakes a larger bounded
@@ -242,8 +246,10 @@ type Smart struct {
 	fingerprint         atomic.Pointer[smartFingerprintCache]
 	fingerprintLock     sync.Mutex
 
-	statusAccess sync.RWMutex
-	status       adapter.SmartGroupStatus
+	statusAccess       sync.RWMutex
+	status             adapter.SmartGroupStatus
+	statusContexts     map[string]adapter.SmartContextStatus
+	statusContextOrder []string
 
 	store                     *smartStore
 	policyBackend             smartPolicyBackend
@@ -254,6 +260,7 @@ type Smart struct {
 	probeConcurrency          int
 	maxAttempts               int
 	attemptTimeout            time.Duration
+	establishedStallTimeout   time.Duration
 	siteStickiness            time.Duration
 	switchConfirm             time.Duration
 	switchConfirmSamples      int
@@ -351,6 +358,13 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	attemptTimeout := time.Duration(options.AttemptTimeout)
 	if attemptTimeout <= 0 {
 		attemptTimeout = defaultSmartAttemptTimeout
+	}
+	establishedStallTimeout := time.Duration(options.EstablishedStallTimeout)
+	if establishedStallTimeout <= 0 {
+		establishedStallTimeout = defaultSmartEstablishedStallTimeout
+	}
+	if establishedStallTimeout < minSmartEstablishedStallTimeout || establishedStallTimeout > maxSmartEstablishedStallTimeout {
+		return nil, E.New("smart established_stall_timeout must be between 5s and 2m")
 	}
 	siteStickiness := time.Duration(options.SiteStickiness)
 	if siteStickiness <= 0 {
@@ -512,6 +526,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		probeConcurrency:          probeConcurrency,
 		maxAttempts:               maxAttempts,
 		attemptTimeout:            attemptTimeout,
+		establishedStallTimeout:   establishedStallTimeout,
 		siteStickiness:            siteStickiness,
 		switchConfirm:             switchConfirm,
 		switchConfirmSamples:      switchConfirmSamples,
@@ -871,10 +886,25 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.ConnectionsInterrupted = s.connectionsInterrupted.Load()
 	status.ConnectionsKept = s.connectionsKept.Load()
 	status.StreamFailureWakes = s.streamFailureWakes.Load()
+	if len(s.statusContexts) > 0 {
+		status.Contexts = make([]adapter.SmartContextStatus, 0, len(s.statusContexts))
+		for _, key := range s.statusContextOrder {
+			if contextStatus, loaded := s.statusContexts[key]; loaded {
+				status.Contexts = append(status.Contexts, cloneSmartContextStatus(contextStatus))
+			}
+		}
+	}
 	s.switchAuditAccess.Lock()
 	status.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), s.switchAudit...)
 	s.switchAuditAccess.Unlock()
 	return status
+}
+
+func cloneSmartContextStatus(source adapter.SmartContextStatus) adapter.SmartContextStatus {
+	result := source
+	result.StateCounts = cloneSmartStateCounts(source.StateCounts)
+	result.Candidates = append([]adapter.SmartCandidateStatus(nil), source.Candidates...)
+	return result
 }
 
 func cloneSmartStateCounts(source map[string]int) map[string]int {
@@ -1011,18 +1041,22 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
-		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
+		observedStartedAt := time.Now().Add(-result.elapsed)
+		return newSmartObservedConnWithStall(conn, observedStartedAt, func(firstByte time.Duration) {
 			s.store.observeFirstByte(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, firstByte)
 		}, func(bytes int64, duration time.Duration) {
 			s.store.observeThroughput(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, bytes, duration)
 		}, func() {
 			// A stream can become unusable after DialContext succeeds (for
-			// example a stale multiplex session or a reset upstream socket).
-			// Wake the control-plane probe, but do not directly penalize the
-			// candidate: the shared 204 probe remains the source of truth.
+			// example a stale multiplex session, a reset upstream socket, or
+			// a bounded first-response stall). Record the failure against this
+			// network/site/transport profile and wake the shared probe. The
+			// callback is coalesced once per connection by smartObservedConn.
 			s.streamFailureWakes.Add(1)
+			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, time.Since(observedStartedAt))
+			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
-		}), nil
+		}, s.establishedStallTimeout), nil
 	} else {
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
 		if len(attemptErrors) == 0 {
@@ -2096,6 +2130,31 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		StateCounts:               stateCounts,
 		Candidates:                statuses,
 	}
+	if s.statusContexts == nil {
+		s.statusContexts = make(map[string]adapter.SmartContextStatus)
+	}
+	contextKey := smartSelectionKey(networkKey, siteDisplay, transport)
+	if _, loaded := s.statusContexts[contextKey]; !loaded {
+		s.statusContextOrder = append(s.statusContextOrder, contextKey)
+		if len(s.statusContextOrder) > smartStatusContextLimit {
+			oldest := s.statusContextOrder[0]
+			s.statusContextOrder = s.statusContextOrder[1:]
+			delete(s.statusContexts, oldest)
+		}
+	}
+	s.statusContexts[contextKey] = adapter.SmartContextStatus{
+		Network:                   networkKey,
+		Site:                      siteDisplay,
+		Transport:                 transport,
+		Selected:                  selected,
+		Reason:                    transport + "/" + profile.String() + ": " + reason,
+		UpdatedAt:                 s.status.UpdatedAt,
+		CandidateCount:            len(ranks),
+		CandidateDetailsCount:     len(statuses),
+		CandidateDetailsTruncated: len(statuses) < len(ranks),
+		StateCounts:               cloneSmartStateCounts(stateCounts),
+		Candidates:                append([]adapter.SmartCandidateStatus(nil), statuses...),
+	}
 	s.statusAccess.Unlock()
 }
 
@@ -2107,6 +2166,8 @@ func (s *Smart) setWarmingStatus(reason string) {
 		StateCounts: map[string]int{},
 		Candidates:  []adapter.SmartCandidateStatus{},
 	}
+	clear(s.statusContexts)
+	s.statusContextOrder = nil
 	s.statusAccess.Unlock()
 }
 
@@ -2309,6 +2370,8 @@ func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {
 		StateCounts:               map[string]int{"warming": len(candidates)},
 		Candidates:                statuses,
 	}
+	clear(s.statusContexts)
+	s.statusContextOrder = nil
 	s.statusAccess.Unlock()
 }
 
@@ -2509,24 +2572,34 @@ func itoaSmall(value int) string {
 
 type smartObservedConn struct {
 	N.ExtendedConn
-	startedAt   time.Time
-	readBytes   atomic.Int64
-	writeBytes  atomic.Int64
-	firstRead   sync.Once
-	closeOnce   sync.Once
-	failureOnce sync.Once
-	onFirstByte func(time.Duration)
-	onClose     func(int64, time.Duration)
-	onFailure   func()
+	startedAt        time.Time
+	readBytes        atomic.Int64
+	writeBytes       atomic.Int64
+	firstRead        atomic.Bool
+	closeOnce        sync.Once
+	failureOnce      sync.Once
+	onFirstByte      func(time.Duration)
+	onClose          func(int64, time.Duration)
+	onFailure        func()
+	stallOnce        sync.Once
+	stallTimeout     time.Duration
+	stallTimerAccess sync.Mutex
+	stallTimer       *time.Timer
+	closed           atomic.Bool
 }
 
 func newSmartObservedConn(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onFailure func()) net.Conn {
+	return newSmartObservedConnWithStall(conn, startedAt, onFirstByte, onClose, onFailure, 0)
+}
+
+func newSmartObservedConnWithStall(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onFailure func(), stallTimeout time.Duration) net.Conn {
 	return &smartObservedConn{
 		ExtendedConn: bufio.NewExtendedConn(conn),
 		startedAt:    startedAt,
 		onFirstByte:  onFirstByte,
 		onClose:      onClose,
 		onFailure:    onFailure,
+		stallTimeout: stallTimeout,
 	}
 }
 
@@ -2565,6 +2638,8 @@ func (c *smartObservedConn) WriteBuffer(buffer *buf.Buffer) error {
 
 func (c *smartObservedConn) Close() error {
 	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.stopStallTimer()
 		if c.onClose != nil {
 			c.onClose(c.readBytes.Load()+c.writeBytes.Load(), time.Since(c.startedAt))
 		}
@@ -2589,23 +2664,57 @@ func (c *smartObservedConn) observeRead(n int64) {
 		return
 	}
 	c.readBytes.Add(n)
-	c.firstRead.Do(func() {
+	if c.firstRead.CompareAndSwap(false, true) {
+		c.stopStallTimer()
 		if c.onFirstByte != nil {
 			c.onFirstByte(time.Since(c.startedAt))
 		}
-	})
+	}
 }
 
 func (c *smartObservedConn) observeWrite(n int64) {
 	if n > 0 {
 		c.writeBytes.Add(n)
+		c.armStallTimer()
 	}
+}
+
+func (c *smartObservedConn) armStallTimer() {
+	if c.stallTimeout <= 0 || c.firstRead.Load() || c.closed.Load() {
+		return
+	}
+	c.stallTimerAccess.Lock()
+	if c.stallTimer == nil && !c.firstRead.Load() && !c.closed.Load() {
+		c.stallTimer = time.AfterFunc(c.stallTimeout, c.observeStall)
+	}
+	c.stallTimerAccess.Unlock()
+}
+
+func (c *smartObservedConn) stopStallTimer() {
+	c.stallTimerAccess.Lock()
+	if c.stallTimer != nil {
+		c.stallTimer.Stop()
+	}
+	c.stallTimerAccess.Unlock()
+}
+
+func (c *smartObservedConn) observeStall() {
+	if c.closed.Load() || c.firstRead.Load() || c.writeBytes.Load() == 0 {
+		return
+	}
+	c.stallOnce.Do(func() {
+		c.notifyFailure()
+	})
 }
 
 func (c *smartObservedConn) observeFailure(err error) {
 	if !isSmartStreamFailure(err) {
 		return
 	}
+	c.notifyFailure()
+}
+
+func (c *smartObservedConn) notifyFailure() {
 	c.failureOnce.Do(func() {
 		if c.onFailure != nil {
 			c.onFailure()

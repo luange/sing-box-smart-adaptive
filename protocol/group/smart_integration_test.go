@@ -1059,6 +1059,70 @@ func TestSmartObservedConnWakesOnceOnEstablishedTimeout(t *testing.T) {
 	}
 }
 
+func TestSmartObservedConnWakesOnFirstResponseStall(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithStall(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	}, 20*time.Millisecond)
+	go func() {
+		buffer := make([]byte, 1)
+		_, _ = peer.Read(buffer)
+	}()
+	if _, err := observed.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if failures.Load() != 1 {
+		t.Fatalf("expected one first-response stall wake, got %d", failures.Load())
+	}
+	if err := observed.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSmartObservedConnCancelsStallAfterFirstByte(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithStall(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	}, 30*time.Millisecond)
+	go func() {
+		buffer := make([]byte, 7)
+		_, _ = peer.Read(buffer)
+		_, _ = peer.Write([]byte("reply"))
+	}()
+	if _, err := observed.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 5)
+	if _, err := observed.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if failures.Load() != 0 {
+		t.Fatalf("first byte should cancel stall wake, got %d", failures.Load())
+	}
+	_ = observed.Close()
+}
+
+func TestSmartStatusTracksIndependentContexts(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	smart := newTestSmart(first)
+	ranks := []smartRank{{outbound: first, status: adapter.SmartCandidateStatus{Tag: "first", State: "healthy"}, profile: smartProfileInteractive}}
+	smart.updateStatusSelected("network", "site-a", N.NetworkTCP, ranks, "first", "tcp ok")
+	smart.updateStatusSelected("network", "site-b", N.NetworkUDP, ranks, "first", "udp ok")
+	status := smart.SmartStatus()
+	if len(status.Contexts) != 2 {
+		t.Fatalf("expected two independent contexts, got %d", len(status.Contexts))
+	}
+	if status.Contexts[0].Transport != N.NetworkTCP || status.Contexts[1].Transport != N.NetworkUDP {
+		t.Fatalf("unexpected context transports: %#v", status.Contexts)
+	}
+}
+
 func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
 	local, peer := net.Pipe()
 	var failures atomic.Int32

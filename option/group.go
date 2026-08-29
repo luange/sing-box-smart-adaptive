@@ -50,18 +50,21 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL                  string             `json:"url,omitempty"`
-	ProbeInterval        badoption.Duration `json:"probe_interval,omitempty"`
-	ProbeCycleTimeout    badoption.Duration `json:"probe_cycle_timeout,omitempty"`
-	ProbeTimeout         badoption.Duration `json:"probe_timeout,omitempty"`
-	ProbeConcurrency     int                `json:"probe_concurrency,omitempty"`
-	MaxAttempts          int                `json:"max_attempts,omitempty"`
-	AttemptTimeout       badoption.Duration `json:"attempt_timeout,omitempty"`
-	SiteStickiness       badoption.Duration `json:"site_stickiness,omitempty"`
-	SwitchConfirm        badoption.Duration `json:"switch_confirm,omitempty"`
-	SwitchConfirmSamples int                `json:"switch_confirm_samples,omitempty"`
-	SwitchCooldown       badoption.Duration `json:"switch_cooldown,omitempty"`
-	SwitchMargin         *float64           `json:"switch_margin,omitempty"`
+	URL               string             `json:"url,omitempty"`
+	ProbeInterval     badoption.Duration `json:"probe_interval,omitempty"`
+	ProbeCycleTimeout badoption.Duration `json:"probe_cycle_timeout,omitempty"`
+	ProbeTimeout      badoption.Duration `json:"probe_timeout,omitempty"`
+	ProbeConcurrency  int                `json:"probe_concurrency,omitempty"`
+	MaxAttempts       int                `json:"max_attempts,omitempty"`
+	AttemptTimeout    badoption.Duration `json:"attempt_timeout,omitempty"`
+	// EstablishedStallTimeout bounds passive first-response observation after
+	// a successful dial and first write. Smart does not generate traffic.
+	EstablishedStallTimeout badoption.Duration `json:"established_stall_timeout,omitempty"`
+	SiteStickiness          badoption.Duration `json:"site_stickiness,omitempty"`
+	SwitchConfirm           badoption.Duration `json:"switch_confirm,omitempty"`
+	SwitchConfirmSamples    int                `json:"switch_confirm_samples,omitempty"`
+	SwitchCooldown          badoption.Duration `json:"switch_cooldown,omitempty"`
+	SwitchMargin            *float64           `json:"switch_margin,omitempty"`
 	// SwitchMinImprovement is the minimum absolute p95 latency gain required
 	// for a performance-driven switch. Omit/zero uses the 100ms default; hard
 	// failures still fail over immediately.

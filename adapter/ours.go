@@ -60,6 +60,23 @@ type SmartCandidateStatus struct {
 	Reason         string  `json:"reason,omitempty"`
 }
 
+// SmartContextStatus is a bounded snapshot for one network/site/transport
+// selection context. It prevents an unrelated TCP or UDP context from hiding
+// the evidence used for the current decision in dashboards.
+type SmartContextStatus struct {
+	Network                   string                 `json:"network,omitempty"`
+	Site                      string                 `json:"site,omitempty"`
+	Transport                 string                 `json:"transport,omitempty"`
+	Selected                  string                 `json:"selected,omitempty"`
+	Reason                    string                 `json:"reason,omitempty"`
+	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
+	CandidateCount            int                    `json:"candidate_count"`
+	CandidateDetailsCount     int                    `json:"candidate_details_count"`
+	CandidateDetailsTruncated bool                   `json:"candidate_details_truncated"`
+	StateCounts               map[string]int         `json:"state_counts"`
+	Candidates                []SmartCandidateStatus `json:"candidates"`
+}
+
 // SmartGroupStatus is exported for clash/API status surfaces.
 type SmartGroupStatus struct {
 	Selected                  string                 `json:"selected,omitempty"`
@@ -87,6 +104,7 @@ type SmartGroupStatus struct {
 	ConnectionsKept           uint64                 `json:"connections_kept,omitempty"`
 	StreamFailureWakes        uint64                 `json:"stream_failure_wakes,omitempty"`
 	Candidates                []SmartCandidateStatus `json:"candidates"`
+	Contexts                  []SmartContextStatus   `json:"contexts,omitempty"`
 }
 
 type SmartSwitchAudit struct {
