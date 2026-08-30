@@ -72,8 +72,22 @@ pub const Queue = struct {
     /// backpressure: return the frame to the kernel instead of dropping it
     /// or growing an unbounded userspace queue.
     pub fn forward(self: *Queue, peer: *Queue) bool {
-        if (!self.rx.release(1)) return false;
-        if (peer.tx.reserve(1) == null) {
+        // Reserve the destination before consuming the source.  If the peer
+        // is full, the caller still owns the RX descriptor and can return it
+        // to the kernel/TC path.  The old order consumed RX first and lost a
+        // frame whenever the peer TX ring was saturated.
+        if (self.rx.pending() == 0 or peer.tx.free() == 0) {
+            self.fail_open += 1;
+            return false;
+        }
+        _ = peer.tx.reserve(1) orelse {
+            self.fail_open += 1;
+            return false;
+        };
+        if (!self.rx.release(1)) {
+            // The model is host-serialized, so this is defensive.  Roll back
+            // the reservation if a future caller violates that contract.
+            _ = peer.tx.release(1);
             self.fail_open += 1;
             return false;
         }
@@ -131,8 +145,17 @@ test "full peer queue fails open without frame growth" {
     _ = peer.tx.reserve(64);
     try std.testing.expect(!source.forward(&peer));
     try std.testing.expectEqual(@as(u64, 1), source.fail_open);
-    try std.testing.expectEqual(@as(u32, 0), source.rx.pending());
+    try std.testing.expectEqual(@as(u32, 1), source.rx.pending());
     try std.testing.expectEqual(@as(u32, 64), peer.tx.pending());
+}
+
+test "forward consumes RX only after reserving peer TX" {
+    var source = Queue.init(64);
+    var peer = Queue.init(64);
+    _ = source.rx.reserve(1);
+    try std.testing.expect(source.forward(&peer));
+    try std.testing.expectEqual(@as(u32, 0), source.rx.pending());
+    try std.testing.expectEqual(@as(u32, 1), peer.tx.pending());
 }
 
 test "tx completion recycles bounded ownership" {
