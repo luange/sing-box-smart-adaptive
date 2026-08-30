@@ -5,7 +5,9 @@
 - `xdp-engine/src/linux_adapter.zig` implements bounded Linux AF_XDP
   UMEM, one XSK per selected queue, RX/TX/fill/completion rings, poll,
   completion recycling, borrowed frame access, and explicit copy/zero-copy
-  bind modes.
+  bind modes. The fill/completion rings are created once per shared UMEM (not
+  once per queue), and a bounded frame ownership table prevents duplicate
+  recycle/TX descriptors when a frame moves between queues.
 - `xdp-engine/src/controller.zig` enforces the hand-off order: probe → verified
   program attach → every queue bound → XSKMAP publication → control enable.
 - `common/ebpf/native/xdp_runtime.c` rejects control enable until all selected

@@ -15,6 +15,13 @@ operations. `controller.zig` is the host-neutral ordering gate shared by a
 sing-box or mihomo integration. Proxy traffic is never mapped to
 `XDP_REDIRECT`.
 
+The adapter uses one shared UMEM fill/completion ring for all queues and
+separate RX/TX rings per XSK. Frame addresses are therefore not queue-owned:
+the bounded ownership table (`in_kernel` → `rx_owned` → `tx_owned`) is the
+source of truth and every recycle returns to the shared fill ring. This avoids
+duplicate descriptors and the cross-queue frame rejection that can otherwise
+starve a multi-queue XSK setup.
+
 The adapter does not attach or enable the XDP policy by itself. A host must
 first verify the program/mode, open and bind every queue, publish every XSK
 FD to the XSKMAP, and only then enable the separate XDP control record. Any

@@ -22,6 +22,8 @@ struct sb_xdp_adapter_config {
 };
 
 struct sb_xdp_frame {
+	/* Queue that delivered the descriptor; shared-UMEM frames are not
+	 * partition-owned and may be transmitted on another queue. */
 	uint32_t queue;
 	uint64_t address;
 	uint32_t length;

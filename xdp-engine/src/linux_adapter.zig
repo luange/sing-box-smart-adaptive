@@ -54,6 +54,8 @@ const map_private: CInt = 2;
 const map_anonymous: CInt = 0x20;
 const poll_in: i16 = 0x001;
 const poll_err: i16 = 0x008;
+const poll_hup: i16 = 0x010;
+const poll_nval: i16 = 0x020;
 const msg_dontwait: CInt = 0x40;
 
 const max_usize = std.math.maxInt(usize);
@@ -117,6 +119,8 @@ pub const Config = extern struct {
 };
 
 pub const CFrame = extern struct {
+    /// Queue that delivered the descriptor (not a UMEM partition owner).
+    /// Shared-UMEM frames may be received by any bound queue.
     queue: u32,
     address: u64,
     length: u32,
@@ -150,6 +154,12 @@ const AdapterError = error{
     FillRingFull,
     TxRingFull,
     InvalidFrame,
+};
+
+const FrameState = enum(u8) {
+    in_kernel = 0,
+    rx_owned = 1,
+    tx_owned = 2,
 };
 
 const RingView = struct {
@@ -241,6 +251,7 @@ pub const Adapter = struct {
     queues: [model.max_queues]Queue = undefined,
     queue_count: u32 = 0,
     offsets: MmapOffsets = undefined,
+    frame_states: ?[]FrameState = null,
     ready: bool = false,
     stats: Stats = .{},
 
@@ -259,6 +270,8 @@ pub const Adapter = struct {
         try self.normalize(input);
         errdefer self.close();
         try self.allocateUmem();
+        self.frame_states = allocator.alloc(FrameState, self.frame_count) catch return error.SystemCallFailed;
+        @memset(self.frame_states.?, .in_kernel);
         try self.openQueues();
         return self;
     }
@@ -333,16 +346,27 @@ pub const Adapter = struct {
                 if (setsockopt(fd, sol_xdp, xdp_umem_reg, @ptrCast(&registration), @intCast(@sizeOf(UmemReg))) != 0) return error.SystemCallFailed;
                 self.offsets = try getOffsets(fd);
             }
-            try setOptionU32(fd, xdp_umem_fill_ring, self.ring_size);
-            try setOptionU32(fd, xdp_umem_completion_ring, self.ring_size);
+            // Fill/completion rings belong to the UMEM, not to each XSK.
+            // With XDP_SHARED_UMEM only the first socket creates/maps them;
+            // subsequent sockets get their own RX/TX rings and alias the
+            // first socket's UMEM rings below.
+            if (queue_index == 0) {
+                try setOptionU32(fd, xdp_umem_fill_ring, self.ring_size);
+                try setOptionU32(fd, xdp_umem_completion_ring, self.ring_size);
+            }
             try setOptionU32(fd, xdp_rx_ring, self.ring_size);
             try setOptionU32(fd, xdp_tx_ring, self.ring_size);
 
             const queue = &self.queues[queue_index];
             queue.rx = try RingView.map(fd, self.offsets.rx, xdp_pgoff_rx_ring, self.ring_size, @sizeOf(XdpDesc));
             queue.tx = try RingView.map(fd, self.offsets.tx, xdp_pgoff_tx_ring, self.ring_size, @sizeOf(XdpDesc));
-            queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.ring_size, @sizeOf(u64));
-            queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.ring_size, @sizeOf(u64));
+            if (queue_index == 0) {
+                queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.ring_size, @sizeOf(u64));
+                queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.ring_size, @sizeOf(u64));
+            } else {
+                queue.fill = self.queues[0].fill;
+                queue.completion = self.queues[0].completion;
+            }
 
             var address = SockAddrXdp{
                 .family = af_xdp,
@@ -355,22 +379,28 @@ pub const Adapter = struct {
             if (bind(fd, @ptrCast(&address), @intCast(@sizeOf(SockAddrXdp))) != 0) return error.BindFailed;
             queue.frame_base = queue_index * self.frames_per_queue;
             queue.frame_limit = queue.frame_base + self.frames_per_queue;
-            try self.prefill(queue);
             queue.bound = true;
         }
+        // There is one shared fill ring.  Prefill it once, round-robin across
+        // queue partitions, and never attempt to push queue_count * ring_size
+        // descriptors into a ring whose capacity is only ring_size.
+        try self.prefillAll();
         self.ready = true;
     }
 
-    fn prefill(self: *Adapter, queue: *Queue) AdapterError!void {
-        const count = @min(queue.frame_limit - queue.frame_base, queue.fill.entries);
-        if (queue.fill.free() < count) return error.FillRingFull;
-        const producer = @atomicLoad(u32, queue.fill.producer.?, .monotonic);
+    fn prefillAll(self: *Adapter) AdapterError!void {
+        const fill = &self.queues[0].fill;
+        const count = @min(self.frame_count, fill.entries);
+        if (fill.free() < count) return error.FillRingFull;
+        const producer = @atomicLoad(u32, fill.producer.?, .monotonic);
         var index: u32 = 0;
         while (index < count) : (index += 1) {
-            const frame = queue.frame_base + index;
-            queue.fill.address(producer + index).* = @as(u64, @intCast(frame)) * @as(u64, @intCast(self.frame_size));
+            const queue_index = index % self.queue_count;
+            const frame = self.queues[queue_index].frame_base + (index / self.queue_count);
+            if (frame >= self.queues[queue_index].frame_limit) break;
+            fill.address(producer + index).* = @as(u64, @intCast(frame)) * @as(u64, @intCast(self.frame_size));
         }
-        @atomicStore(u32, queue.fill.producer.?, producer + count, .release);
+        @atomicStore(u32, fill.producer.?, producer + index, .release);
     }
 
     pub fn deinit(self: *Adapter) void {
@@ -381,6 +411,8 @@ pub const Adapter = struct {
         self.ready = false;
         var index: u32 = 0;
         while (index < self.queue_count) : (index += 1) self.queues[index].release();
+        if (self.frame_states) |states| self.allocator.free(states);
+        self.frame_states = null;
         if (self.umem) |memory| _ = munmap(memory.ptr, memory.len);
         self.umem = null;
         self.queue_count = 0;
@@ -397,11 +429,14 @@ pub const Adapter = struct {
 
     pub fn frameBytes(self: *Adapter, frame: CFrame) ?[]u8 {
         const memory = self.umem orelse return null;
+        const states = self.frame_states orelse return null;
         if (frame.queue >= self.queue_count or frame.options != 0) return null;
         const frame_size = @as(u64, @intCast(self.frame_size));
         if (frame.address % frame_size != 0) return null;
-        const owner = frame.address / frame_size / @as(u64, @intCast(self.frames_per_queue));
-        if (owner != frame.queue or frame.length > self.frame_size) return null;
+        const frame_index = frame.address / frame_size;
+        if (frame_index >= self.frame_count) return null;
+        if (frame.length > self.frame_size) return null;
+        if (states[@intCast(frame_index)] != .rx_owned and states[@intCast(frame_index)] != .tx_owned) return null;
         if (frame.address >= @as(u64, @intCast(memory.len))) return null;
         const end = std.math.add(usize, @intCast(frame.address), @as(usize, @intCast(frame.length))) catch return null;
         if (end > memory.len) return null;
@@ -421,7 +456,8 @@ pub const Adapter = struct {
         var ready_mask: u64 = 0;
         index = 0;
         while (index < self.queue_count) : (index += 1) {
-            if ((fds[index].revents & (poll_in | poll_err)) != 0) ready_mask |= @as(u64, 1) << @intCast(index);
+            if ((fds[index].revents & (poll_in | poll_err | poll_hup | poll_nval)) != 0)
+                ready_mask |= @as(u64, 1) << @intCast(index);
         }
         return ready_mask;
     }
@@ -434,48 +470,71 @@ pub const Adapter = struct {
         if (consumer == producer) return null;
         const descriptor = queue.rx.descriptor(consumer).*;
         @atomicStore(u32, queue.rx.consumer.?, consumer + 1, .release);
+        const frame_index = self.frameIndex(descriptor.address) orelse {
+            self.stats.invalid_descriptor += 1;
+            return null;
+        };
+        if (self.frame_states.?[frame_index] != .in_kernel) {
+            self.stats.invalid_descriptor += 1;
+            return null;
+        }
+        self.frame_states.?[frame_index] = .rx_owned;
         const end = std.math.add(u64, descriptor.address, @as(u64, @intCast(descriptor.length))) catch {
             self.stats.invalid_descriptor += 1;
+            self.recycleAddress(descriptor.address, .rx_owned) catch {};
             return null;
         };
         if (end > @as(u64, @intCast(self.umem.?.len)) or descriptor.length > self.frame_size or descriptor.options != 0 or descriptor.address % @as(u64, @intCast(self.frame_size)) != 0) {
             self.stats.invalid_descriptor += 1;
-            if (descriptor.address % @as(u64, @intCast(self.frame_size)) == 0) {
-                self.recycleAddress(queue_index, descriptor.address) catch {};
-            }
+            self.recycleAddress(descriptor.address, .rx_owned) catch {};
             return null;
         }
         self.stats.rx += 1;
         return .{ .queue = queue_index, .address = descriptor.address, .length = descriptor.length, .options = descriptor.options };
     }
 
-    fn recycleAddress(self: *Adapter, queue_index: u32, address: u64) AdapterError!void {
-        const memory = self.umem orelse return error.InvalidFrame;
+    fn frameIndex(self: *const Adapter, address: u64) ?u32 {
         const frame_size = @as(u64, @intCast(self.frame_size));
-        if (queue_index >= self.queue_count or address % frame_size != 0) return error.InvalidFrame;
+        if (frame_size == 0 or address % frame_size != 0) return null;
+        const frame_index = address / frame_size;
+        if (frame_index >= self.frame_count) return null;
+        return @intCast(frame_index);
+    }
+
+    fn recycleAddress(self: *Adapter, address: u64, expected: FrameState) AdapterError!void {
+        const memory = self.umem orelse return error.InvalidFrame;
+        const states = self.frame_states orelse return error.InvalidFrame;
+        const frame_index = self.frameIndex(address) orelse return error.InvalidFrame;
+        const frame_size = @as(u64, @intCast(self.frame_size));
         const end = std.math.add(u64, address, frame_size) catch return error.InvalidFrame;
         if (end > @as(u64, @intCast(memory.len))) return error.InvalidFrame;
-        const frame_index = address / frame_size;
-        const owner = frame_index / @as(u64, @intCast(self.frames_per_queue));
-        if (owner != queue_index) return error.InvalidFrame;
-        const queue = &self.queues[queue_index];
-        if (queue.fill.free() == 0) {
+        if (states[frame_index] != expected) return error.InvalidFrame;
+        // A shared UMEM has one fill ring.  A frame received on queue N may
+        // originate from any partition, so queue ownership is not encoded in
+        // the address and all recycling goes through queue 0's UMEM ring.
+        const fill = &self.queues[0].fill;
+        if (fill.free() == 0) {
             self.stats.fill_starved += 1;
             return error.FillRingFull;
         }
-        const producer = @atomicLoad(u32, queue.fill.producer.?, .monotonic);
-        queue.fill.address(producer).* = address;
-        @atomicStore(u32, queue.fill.producer.?, producer + 1, .release);
+        const producer = @atomicLoad(u32, fill.producer.?, .monotonic);
+        fill.address(producer).* = address;
+        @atomicStore(u32, fill.producer.?, producer + 1, .release);
+        states[frame_index] = .in_kernel;
         self.stats.recycled += 1;
     }
 
     pub fn recycle(self: *Adapter, frame: CFrame) AdapterError!void {
         if (frame.queue >= self.queue_count) return error.InvalidFrame;
-        try self.recycleAddress(frame.queue, frame.address);
+        try self.recycleAddress(frame.address, .rx_owned);
     }
 
     pub fn transmit(self: *Adapter, frame: CFrame, queue_index: u32) AdapterError!void {
-        if (!self.ready or queue_index >= self.queue_count or frame.address % @as(u64, @intCast(self.frame_size)) != 0 or self.frameBytes(frame) == null) return error.InvalidFrame;
+        if (!self.ready or queue_index >= self.queue_count) return error.InvalidFrame;
+        const frame_index = self.frameIndex(frame.address) orelse return error.InvalidFrame;
+        const states = self.frame_states orelse return error.InvalidFrame;
+        if (states[frame_index] != .rx_owned) return error.InvalidFrame;
+        if (self.frameBytes(frame) == null) return error.InvalidFrame;
         const queue = &self.queues[queue_index];
         const producer = @atomicLoad(u32, queue.tx.producer.?, .monotonic);
         const consumer = @atomicLoad(u32, queue.tx.consumer.?, .acquire);
@@ -486,6 +545,7 @@ pub const Adapter = struct {
         const descriptor = queue.tx.descriptor(producer);
         descriptor.* = .{ .address = frame.address, .length = frame.length, .options = frame.options };
         @atomicStore(u32, queue.tx.producer.?, producer + 1, .release);
+        states[frame_index] = .tx_owned;
         self.stats.tx += 1;
         const flags = @atomicLoad(u32, queue.tx.flags.?, .acquire);
         if ((flags & 1) != 0) _ = send(queue.fd, null, 0, msg_dontwait);
@@ -500,9 +560,12 @@ pub const Adapter = struct {
         const max_count = @min(limit, producer -% consumer);
         while (drained < max_count) : (drained += 1) {
             const address = queue.completion.address(consumer).*;
-            const owner64 = address / @as(u64, @intCast(self.frame_size)) / @as(u64, @intCast(self.frames_per_queue));
-            const owner = if (owner64 < self.queue_count) @as(u32, @intCast(owner64)) else queue_index;
-            self.recycleAddress(owner, address) catch {
+            const frame_index = self.frameIndex(address) orelse {
+                self.stats.invalid_descriptor += 1;
+                self.stats.fill_starved += 1;
+                break;
+            };
+            self.recycleAddress(address, .tx_owned) catch {
                 self.stats.invalid_descriptor += 1;
                 self.stats.fill_starved += 1;
                 break;

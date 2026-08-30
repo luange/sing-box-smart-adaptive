@@ -65,11 +65,20 @@ pub const umem_frame_count_min: u32 = 512;
 pub const umem_frame_count_max: u32 = 16384;
 pub const max_queues: u32 = 64;
 
+fn floorPowerOfTwo(value: u32) u32 {
+    var power: u32 = 1;
+    while ((power << 1) <= value) : (power <<= 1) {}
+    return power;
+}
+
 pub fn clampUmem(frame_size: u32, frame_count: u32) struct { size: u32, count: u32 } {
     var size = frame_size;
     var count = frame_count;
     if (size < umem_frame_size_min) size = umem_frame_size_min;
     if (size > umem_frame_size_max) size = umem_frame_size_max;
+    // The kernel requires UMEM chunk_size to be a power of two.  Round down
+    // instead of silently asking the bind path to accept an invalid chunk.
+    size = floorPowerOfTwo(size);
     if (count < umem_frame_count_min) count = umem_frame_count_min;
     if (count > umem_frame_count_max) count = umem_frame_count_max;
     return .{ .size = size, .count = count };
@@ -88,4 +97,9 @@ test "umem bounds do not grow with node count" {
     const clamped = clampUmem(2048, huge_nodes);
     try std.testing.expectEqual(umem_frame_count_max, clamped.count);
     try std.testing.expectEqual(umem_frame_size, clampUmem(2048, 4096).size);
+}
+
+test "umem chunk size is a kernel-valid power of two" {
+    try std.testing.expectEqual(@as(u32, 2048), clampUmem(3072, 512).size);
+    try std.testing.expectEqual(@as(u32, 4096), clampUmem(4095, 512).size);
 }
