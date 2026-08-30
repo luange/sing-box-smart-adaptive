@@ -587,7 +587,7 @@ pub const Adapter = struct {
         const fill = &self.queues[0].fill;
         if ((@atomicLoad(u32, fill.flags.?, .acquire) & xdp_need_wakeup) == 0) return;
         var fd = PollFd{ .fd = self.queues[0].fd, .events = poll_in, .revents = 0 };
-        _ = poll(&fd, 1, 0);
+        _ = poll(@ptrCast(&fd), 1, 0);
     }
 
     pub fn recycle(self: *Adapter, frame: CFrame) AdapterError!void {
