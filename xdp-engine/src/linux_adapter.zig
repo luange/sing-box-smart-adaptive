@@ -560,11 +560,11 @@ pub const Adapter = struct {
         const max_count = @min(limit, producer -% consumer);
         while (drained < max_count) : (drained += 1) {
             const address = queue.completion.address(consumer).*;
-            const frame_index = self.frameIndex(address) orelse {
+            if (self.frameIndex(address) == null) {
                 self.stats.invalid_descriptor += 1;
                 self.stats.fill_starved += 1;
                 break;
-            };
+            }
             self.recycleAddress(address, .tx_owned) catch {
                 self.stats.invalid_descriptor += 1;
                 self.stats.fill_starved += 1;
