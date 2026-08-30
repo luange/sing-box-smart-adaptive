@@ -61,7 +61,7 @@ jobs:
         working-directory: common/ebpf
         run: |
           set -euo pipefail
-          llvm-objdump -t v3/kern/xdp.bpf.o | grep -E 'sb_v3_xdp_ingress|v3_xsk_map|v3_xdp_control'
+          readelf -s v3/kern/xdp.bpf.o | grep -E 'sb_v3_xdp_ingress|v3_xsk_map|v3_xdp_control'
           ! grep -nE 'bpf_sk_assign|skb->mark|BPF_FUNC_sk_assign' v3/kern/xdp.bpf.c
       - name: Publish Linux XDP object for lab validation
         uses: actions/upload-artifact@v4
