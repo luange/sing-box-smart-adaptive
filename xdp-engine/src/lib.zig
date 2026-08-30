@@ -5,6 +5,7 @@ const model = @import("model.zig");
 const classify = @import("classify.zig");
 const probe = @import("probe.zig");
 const lifecycle = @import("lifecycle.zig");
+const controller = @import("controller.zig");
 pub const afxdp = @import("afxdp.zig");
 pub const host = if (@import("builtin").os.tag == .linux)
     @import("linux_adapter.zig")
@@ -20,6 +21,7 @@ pub const XdpMode = probe.Mode;
 pub const XdpModeCapabilities = probe.ModeCapabilities;
 pub const selectXdpMode = probe.selectMode;
 pub const Session = lifecycle.Session;
+pub const XdpController = controller.Controller;
 
 pub fn version() u32 {
     return abi_version;
@@ -30,6 +32,7 @@ comptime {
     _ = classify;
     _ = probe;
     _ = lifecycle;
+    _ = controller;
     _ = afxdp;
     _ = host;
 }

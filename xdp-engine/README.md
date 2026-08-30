@@ -11,7 +11,9 @@ This directory classifies packets, evaluates NIC capability samples, selects
 hardware/native/generic XDP mode only after a real program probe, and tracks
 attach/fallback state. `afxdp.zig` owns bounded ring arithmetic;
 `linux_adapter.zig` owns Linux AF_XDP socket/UMEM/ring/poll/ownership
-operations. Proxy traffic is never mapped to `XDP_REDIRECT`.
+operations. `controller.zig` is the host-neutral ordering gate shared by a
+sing-box or mihomo integration. Proxy traffic is never mapped to
+`XDP_REDIRECT`.
 
 The adapter does not attach or enable the XDP policy by itself. A host must
 first verify the program/mode, open and bind every queue, publish every XSK
