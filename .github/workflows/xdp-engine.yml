@@ -59,12 +59,12 @@ jobs:
         run: zig build test -Dcpu=baseline
       - name: Build release library
         working-directory: xdp-engine
-        run: zig build -Dcpu=baseline -Doptimize=ReleaseFast
+        run: zig build -p zig-out-native -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Cross-build Linux libraries
         working-directory: xdp-engine
         run: |
-          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
-          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -p zig-out-x86_64-linux-gnu -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -p zig-out-aarch64-linux-gnu -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Check exported host-adapter ABI
         run: |
           cat > /tmp/xdp-abi-smoke.c <<'EOF'
@@ -79,6 +79,16 @@ jobs:
           EOF
           cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
             -I xdp-engine/include /tmp/xdp-abi-smoke.c
+      - name: Publish Linux host-adapter libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-xdp-engine-linux-libs
+          path: |
+            xdp-engine/zig-out-x86_64-linux-gnu/lib/libxdp_engine.a
+            xdp-engine/zig-out-aarch64-linux-gnu/lib/libxdp_engine.a
+            xdp-engine/zig-out-x86_64-linux-gnu/include/xdp_engine.h
+            xdp-engine/zig-out-aarch64-linux-gnu/include/xdp_engine.h
+          if-no-files-found: error
 
   bpf:
     name: Linux XDP object and verifier surface

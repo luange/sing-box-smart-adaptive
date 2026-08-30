@@ -225,6 +225,13 @@ XSK FDs and enable the control record only after the adapter reports ready.
 CI builds and inspects the object; a privileged multi-queue lab is required
 before enabling the forwarding adapter.
 
+The required hand-off is now explicit: `probe_bind` → mode-specific program
+probe/attach → open/bind all queues → publish each XSKMAP entry → enable the
+separate control record. A missing step leaves XDP disabled and TC active. The
+Go control plane is not linked to this library yet; this is deliberate until a
+Linux lab demonstrates bidirectional DIRECT forwarding and link-change
+rollback with real traffic.
+
 ## 10. Hard prohibitions
 
 1. Do not `bpf_sk_assign` from XDP.

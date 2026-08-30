@@ -36,6 +36,35 @@ uncertain traffic stay in the kernel/TC path.
 The host must serialize `Session` methods. The core holds no locks and no
 global mutable session.
 
+## Host integration order
+
+The exported ABI is intentionally usable by either sing-box or mihomo without
+sharing their control plane:
+
+```c
+/* mode 0 is zero-copy; mode 1 is an explicit copy-mode opt-in */
+struct sb_xdp_adapter_config cfg = {
+    .ifindex = ifindex, .queue_count = rx_queues,
+    .ring_size = 2048, .frame_size = 2048, .frame_count = 4096,
+    .mode = 0,
+};
+if (sb_xdp_adapter_probe_bind(&cfg) == 1 &&
+    sb_ebpf_xdp_probe_mode(&runtime, ifindex, SB_EBPF_XDP_MODE_NATIVE) == 0) {
+    struct sb_xdp_adapter *a = sb_xdp_adapter_open(&cfg);
+    for (uint32_t q = 0; q < rx_queues; q++)
+        sb_ebpf_xdp_set_xsk(&runtime, q, sb_xdp_adapter_queue_fd(a, q));
+    /* Fails with EAGAIN until every queue has an XSKMAP entry. */
+    sb_ebpf_xdp_set_control(&runtime, true, generation, bank,
+                            rx_queues, 2048, false, now_ns);
+}
+```
+
+The packet loop must call `sb_xdp_adapter_poll`, classify only DIRECT frames,
+queue them to a TX ring, and recycle every frame on TX completion or any
+backpressure error. On link/queue/MTU change it disables the control record,
+detaches XDP, clears the XSKMAP, and returns to TC before re-probing. No
+failure in this sequence is allowed to stop the inbound or remove TC.
+
 ## Build (Linux CI / PVE only)
 
 Do not compile on macOS. Do not deploy to hosts 107 or 115.

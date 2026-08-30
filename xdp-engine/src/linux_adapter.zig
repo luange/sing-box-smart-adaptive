@@ -397,6 +397,11 @@ pub const Adapter = struct {
 
     pub fn frameBytes(self: *Adapter, frame: CFrame) ?[]u8 {
         const memory = self.umem orelse return null;
+        if (frame.queue >= self.queue_count or frame.options != 0) return null;
+        const frame_size = @as(u64, @intCast(self.frame_size));
+        if (frame.address % frame_size != 0) return null;
+        const owner = frame.address / frame_size / @as(u64, @intCast(self.frames_per_queue));
+        if (owner != frame.queue or frame.length > self.frame_size) return null;
         if (frame.address >= @as(u64, @intCast(memory.len))) return null;
         const end = std.math.add(usize, @intCast(frame.address), @as(usize, @intCast(frame.length))) catch return null;
         if (end > memory.len) return null;
@@ -433,7 +438,7 @@ pub const Adapter = struct {
             self.stats.invalid_descriptor += 1;
             return null;
         };
-        if (end > @as(u64, @intCast(self.umem.?.len)) or descriptor.address % @as(u64, @intCast(self.frame_size)) != 0) {
+        if (end > @as(u64, @intCast(self.umem.?.len)) or descriptor.length > self.frame_size or descriptor.options != 0 or descriptor.address % @as(u64, @intCast(self.frame_size)) != 0) {
             self.stats.invalid_descriptor += 1;
             if (descriptor.address % @as(u64, @intCast(self.frame_size)) == 0) {
                 self.recycleAddress(queue_index, descriptor.address) catch {};
@@ -567,6 +572,13 @@ pub export fn sb_xdp_adapter_rx(adapter: ?*Adapter, queue: u32, frame: ?*CFrame)
     return 0;
 }
 
+pub export fn sb_xdp_adapter_frame_data(adapter: ?*Adapter, frame: ?*const CFrame, length: ?*u32) callconv(.c) ?*u8 {
+    if (adapter == null or frame == null or length == null) return null;
+    const bytes = adapter.?.frameBytes(frame.?.*) orelse return null;
+    length.?.* = @intCast(bytes.len);
+    return bytes.ptr;
+}
+
 pub export fn sb_xdp_adapter_recycle(adapter: ?*Adapter, frame: ?*const CFrame) callconv(.c) CInt {
     if (adapter == null or frame == null) return -1;
     adapter.?.recycle(frame.?.*) catch return -1;
@@ -615,6 +627,12 @@ test "adapter config clamps memory and partitions frames" {
     try std.testing.expectEqual(@as(u32, 256), adapter.frames_per_queue);
     try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
     try std.testing.expectEqual(@as(u32, 1024), adapter.ring_size);
+}
+
+test "C ABI records stay fixed width" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Config));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(CFrame));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(Stats));
 }
 
 test "zero copy refuses a single queue" {

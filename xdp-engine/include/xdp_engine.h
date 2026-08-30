@@ -54,6 +54,10 @@ int sb_xdp_adapter_poll(struct sb_xdp_adapter *adapter, int timeout_ms,
 /* Returns 1 for a frame, 0 for no frame, and -1 for invalid input. */
 int sb_xdp_adapter_rx(struct sb_xdp_adapter *adapter, uint32_t queue,
 	struct sb_xdp_frame *frame);
+/* Returns a borrowed pointer valid until the frame is recycled or queued for
+ * TX. Multi-buffer descriptors are rejected and return NULL. */
+uint8_t *sb_xdp_adapter_frame_data(struct sb_xdp_adapter *adapter,
+	const struct sb_xdp_frame *frame, uint32_t *length);
 int sb_xdp_adapter_recycle(struct sb_xdp_adapter *adapter,
 	const struct sb_xdp_frame *frame);
 int sb_xdp_adapter_tx(struct sb_xdp_adapter *adapter,
