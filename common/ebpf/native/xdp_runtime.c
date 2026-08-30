@@ -55,6 +55,16 @@
 #ifndef IFLA_XDP_FLAGS
 #define IFLA_XDP_FLAGS 3
 #endif
+#ifndef IFLA_XDP_ATTACHED
+#define IFLA_XDP_ATTACHED 2
+#endif
+#ifndef XDP_ATTACHED_NONE
+#define XDP_ATTACHED_NONE 0
+#define XDP_ATTACHED_DRV 1
+#define XDP_ATTACHED_SKB 2
+#define XDP_ATTACHED_HW 3
+#define XDP_ATTACHED_MULTI 4
+#endif
 #ifndef NLA_F_NESTED
 #define NLA_F_NESTED (1U << 15)
 #endif
@@ -66,6 +76,18 @@
 #endif
 #ifndef NLA_HDRLEN
 #define NLA_HDRLEN ((int)NLA_ALIGN(sizeof(struct nlattr)))
+#endif
+#ifndef NLA_DATA
+#define NLA_DATA(attribute) ((void *)((uint8_t *)(attribute) + NLA_HDRLEN))
+#endif
+#ifndef NLA_OK
+#define NLA_OK(attribute, remaining) ((remaining) >= (int)sizeof(struct nlattr) && \
+	(attribute)->nla_len >= sizeof(struct nlattr) && \
+	(attribute)->nla_len <= (remaining))
+#endif
+#ifndef NLA_NEXT
+#define NLA_NEXT(attribute, remaining) ((remaining) -= NLA_ALIGN((attribute)->nla_len), \
+	(struct nlattr *)((uint8_t *)(attribute) + NLA_ALIGN((attribute)->nla_len)))
 #endif
 
 #ifndef __NR_bpf
@@ -201,6 +223,106 @@ static int xdp_set_link_fd(uint32_t ifindex, int program_fd, uint32_t mode_flags
 	return result < 0 ? -1 : 0;
 }
 
+/* Return the kernel's actual XDP attach mode for an interface.  A successful
+ * attach API call is not enough: a dispatcher or a driver may have selected a
+ * different mode than requested.  The caller treats NONE and MULTI as an
+ * admission failure so the AF_XDP path never runs on an unverified hook. */
+static int xdp_get_attached_mode(uint32_t ifindex) {
+	struct {
+		struct nlmsghdr header;
+		struct ifinfomsg interface;
+	} request;
+	memset(&request, 0, sizeof(request));
+	request.header.nlmsg_len = NLMSG_LENGTH(sizeof(request.interface));
+	request.header.nlmsg_type = RTM_GETLINK;
+	request.header.nlmsg_flags = NLM_F_REQUEST;
+	request.header.nlmsg_seq = 2U;
+	request.interface.ifi_family = AF_UNSPEC;
+	request.interface.ifi_index = (int)ifindex;
+	int netlink = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (netlink < 0)
+		return -1;
+	struct sockaddr_nl address = {.nl_family = AF_NETLINK};
+	struct iovec vector = {.iov_base = &request, .iov_len = request.header.nlmsg_len};
+	struct msghdr message = {.msg_name = &address, .msg_namelen = sizeof(address),
+		.msg_iov = &vector, .msg_iovlen = 1};
+	int result = (int)sendmsg(netlink, &message, 0);
+	if (result < 0) {
+		int saved_errno = errno;
+		(void)close(netlink);
+		errno = saved_errno;
+		return -1;
+	}
+	uint8_t response[8192];
+	for (;;) {
+		struct iovec receive_vector = {.iov_base = response, .iov_len = sizeof(response)};
+		struct msghdr receive_message = {.msg_name = &address, .msg_namelen = sizeof(address),
+			.msg_iov = &receive_vector, .msg_iovlen = 1};
+		result = (int)recvmsg(netlink, &receive_message, 0);
+		if (result < 0) {
+			int saved_errno = errno;
+			(void)close(netlink);
+			errno = saved_errno;
+			return -1;
+		}
+		for (struct nlmsghdr *header = (struct nlmsghdr *)response;
+		     NLMSG_OK(header, (unsigned int)result);
+		     header = NLMSG_NEXT(header, result)) {
+			if (header->nlmsg_type == NLMSG_DONE) {
+				(void)close(netlink);
+				return XDP_ATTACHED_NONE;
+			}
+			if (header->nlmsg_type == NLMSG_ERROR) {
+				if (header->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+					(void)close(netlink);
+					errno = EBADMSG;
+					return -1;
+				}
+				struct nlmsgerr *error = (struct nlmsgerr *)NLMSG_DATA(header);
+				if (error->error != 0) {
+					(void)close(netlink);
+					errno = -error->error;
+					return -1;
+				}
+				continue;
+			}
+			if (header->nlmsg_type != RTM_NEWLINK || header->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
+				continue;
+			int remaining = (int)header->nlmsg_len - NLMSG_LENGTH(sizeof(struct ifinfomsg));
+			struct nlattr *attribute = (struct nlattr *)((uint8_t *)NLMSG_DATA(header) + NLMSG_ALIGN(sizeof(struct ifinfomsg)));
+			while (NLA_OK(attribute, remaining)) {
+				if ((attribute->nla_type & NLA_F_NESTED) == NLA_F_NESTED &&
+				    (attribute->nla_type & ~NLA_F_NESTED) == IFLA_XDP) {
+					int nested_remaining = (int)attribute->nla_len - NLA_HDRLEN;
+					struct nlattr *nested = (struct nlattr *)NLA_DATA(attribute);
+					while (NLA_OK(nested, nested_remaining)) {
+						if ((nested->nla_type & ~NLA_F_NESTED) == IFLA_XDP_ATTACHED &&
+						    nested->nla_len >= NLA_HDRLEN + (int)sizeof(uint8_t)) {
+							int mode = *(uint8_t *)NLA_DATA(nested);
+							(void)close(netlink);
+							return mode;
+						}
+						nested = NLA_NEXT(nested, nested_remaining);
+					}
+				}
+				attribute = NLA_NEXT(attribute, remaining);
+			}
+			(void)close(netlink);
+			return XDP_ATTACHED_NONE;
+		}
+	}
+}
+
+static int xdp_expected_attached_mode(uint32_t mode) {
+	if (mode == SB_EBPF_XDP_MODE_SKB)
+		return XDP_ATTACHED_SKB;
+	if (mode == SB_EBPF_XDP_MODE_NATIVE)
+		return XDP_ATTACHED_DRV;
+	if (mode == SB_EBPF_XDP_MODE_OFFLOAD)
+		return XDP_ATTACHED_HW;
+	return XDP_ATTACHED_NONE;
+}
+
 int sb_ebpf_xdp_prepare(
 	const uint8_t *object,
 	size_t object_size,
@@ -302,6 +424,13 @@ int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifinde
 	runtime->link_fd = link;
 	runtime->ifindex = ifindex;
 	runtime->mode = mode;
+	int attached_mode = xdp_get_attached_mode(ifindex);
+	if (attached_mode < 0 || attached_mode != xdp_expected_attached_mode(mode)) {
+		int saved_errno = attached_mode < 0 ? errno : EPROTONOSUPPORT;
+		(void)sb_ebpf_xdp_detach(runtime);
+		errno = saved_errno;
+		return -1;
+	}
 	return 0;
 }
 
