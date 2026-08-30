@@ -126,19 +126,22 @@ func TestRuntimePublishCommitHandsProbeOwnershipToNewEpoch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("new epoch scheduler did not take ownership")
 	}
+	secondSnapshot := second.catalog.load()
 	deadline := time.Now().Add(time.Second)
+	var status HealthStatus
 	for {
-		_, _, completed := second.scheduler.Stats()
-		if completed > 0 {
+		status = second.health.EndpointHandle(secondSnapshot.Candidates[0].Handle)
+		// Scheduler completion is published before Observe runs. Wait for the
+		// health reducer's settled evidence instead of racing that handoff.
+		if status.NonBreakerSuccesses > 0 || status.NonBreakerFailures > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("new epoch probe did not complete")
+			t.Fatalf("new epoch probe did not publish evidence: %+v", status)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	secondSnapshot := second.catalog.load()
-	if status := second.health.EndpointHandle(secondSnapshot.Candidates[0].Handle); status.NonBreakerSuccesses != 1 || status.NonBreakerFailures != 0 {
+	if status.NonBreakerSuccesses != 1 || status.NonBreakerFailures != 0 {
 		t.Fatalf("revoked old epoch wrote probe evidence: %+v", status)
 	}
 	// Capture scheduler stats before retire/trigger so coalesce does not flake the
