@@ -577,7 +577,7 @@ test "adapter config clamps memory and partitions frames" {
         .queue_count = 0,
     };
     for (&adapter.queues) |*queue| queue.* = .{};
-    try adapter.normalize(.{ .ifindex = 2, .queue_count = 2, .ring_size = 0, .frame_size = 1025, .frame_count = 513, .mode = 1 });
+    try adapter.normalize(.{ .ifindex = 2, .queue_count = 2, .ring_size = 1025, .frame_size = 1025, .frame_count = 513, .mode = 1 });
     try std.testing.expectEqual(@as(u32, model.umem_frame_size_min), adapter.frame_size);
     try std.testing.expectEqual(@as(u32, 256), adapter.frames_per_queue);
     try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
