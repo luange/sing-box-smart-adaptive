@@ -473,7 +473,7 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 	var resultAccess sync.Mutex
 	for _, detour := range g.outbounds {
 		tag := detour.Tag()
-		realTag := RealTag(detour)
+		realTag := RealTag(g.outbound, detour)
 		if checked[realTag] {
 			continue
 		}
@@ -519,7 +519,7 @@ func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matc
 }
 
 func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
-	if history := g.history.LoadURLTestHistory(RealTag(proxy)); history != nil {
+	if history := g.history.LoadURLTestHistory(RealTag(g.outbound, proxy)); history != nil {
 		return true
 	}
 	return false

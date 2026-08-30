@@ -287,30 +287,6 @@ func useTemporarySmartOverride(request UpdateProxyRequest) bool {
 	return request.Temporary != nil && *request.Temporary && !request.Persistent
 }
 
-func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapter.OutboundGroup, tag string, visited map[string]bool) bool {
-	for _, memberTag := range outboundGroup.All() {
-		if memberTag == tag {
-			return true
-		}
-		member, loaded := outboundManager.Outbound(memberTag)
-		if !loaded {
-			continue
-		}
-		if group.RealTag(outboundManager, member) == tag {
-			return true
-		}
-		memberGroup, isGroup := member.(adapter.OutboundGroup)
-		if !isGroup || visited[memberTag] {
-			continue
-		}
-		visited[memberTag] = true
-		if groupContains(outboundManager, memberGroup, tag, visited) {
-			return true
-		}
-	}
-	return false
-}
-
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -382,7 +358,7 @@ func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapte
 		if !loaded {
 			continue
 		}
-		if group.RealTag(member) == tag {
+		if group.RealTag(outboundManager, member) == tag {
 			return true
 		}
 		memberGroup, isGroup := member.(adapter.OutboundGroup)
