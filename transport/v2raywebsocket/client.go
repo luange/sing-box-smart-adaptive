@@ -81,7 +81,15 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if c.maxEarlyData > 0 {
 		return &EarlyWebsocketConn{Client: c, rawConn: conn, create: make(chan struct{})}, nil
 	}
-	return c.upgrade(conn, &c.requestURL, c.headers)
+	// Do not return a typed-nil *WebsocketConn through the net.Conn
+	// interface when the upgrade fails. Callers commonly close the partially
+	// created connection on error; returning a typed nil there turns cleanup
+	// into a panic instead of a normal dial failure.
+	websocketConn, err := c.upgrade(conn, &c.requestURL, c.headers)
+	if err != nil {
+		return nil, err
+	}
+	return websocketConn, nil
 }
 
 func (c *Client) upgrade(conn net.Conn, requestURL *url.URL, headers http.Header) (*WebsocketConn, error) {
@@ -92,12 +100,15 @@ func (c *Client) upgrade(conn net.Conn, requestURL *url.URL, headers http.Header
 		deadlineConn = conn
 	}
 	deadlineConn.SetDeadline(time.Now().Add(C.TCPTimeout))
+	// Each dial can run concurrently during provider health checks. Never
+	// mutate the Client-owned header map while extracting the protocol header.
+	requestHeaders := headers.Clone()
 	var protocols []string
-	if protocolHeader := headers.Get("Sec-WebSocket-Protocol"); protocolHeader != "" {
+	if protocolHeader := requestHeaders.Get("Sec-WebSocket-Protocol"); protocolHeader != "" {
 		protocols = []string{protocolHeader}
-		headers.Del("Sec-WebSocket-Protocol")
+		requestHeaders.Del("Sec-WebSocket-Protocol")
 	}
-	reader, _, err := ws.Dialer{Header: ws.HandshakeHeaderHTTP(headers), Protocols: protocols}.Upgrade(deadlineConn, requestURL)
+	reader, _, err := ws.Dialer{Header: ws.HandshakeHeaderHTTP(requestHeaders), Protocols: protocols}.Upgrade(deadlineConn, requestURL)
 	deadlineConn.SetDeadline(time.Time{})
 	if err != nil {
 		conn.Close()

@@ -48,6 +48,21 @@ next new connection; the normal bounded candidate list then provides the
 failover opportunity. Service-local throughput takes precedence over global
 history, so a slow YouTube path cannot be hidden by unrelated traffic.
 
+## Established stream stall observation
+
+After a successful dial, Smart arms one runtime timer only when the caller
+actually writes. If no response byte arrives before
+`established_stall_timeout` (default 10s, bounded to 5s–2m), the connection
+contributes one failure observation and wakes the shared probe registry. The
+timer is cancelled on the first byte or close, so idle WebSockets and normal
+long-lived streams are not penalized. This is passive and does not generate
+traffic; the existing per-connection failure-once gate also coalesces a later
+socket error.
+
+The Clash status extension exposes a bounded `contexts` array (at most 32)
+with independent network/site/transport snapshots. Legacy top-level fields
+remain the most recently updated context for older dashboards.
+
 ## Invariants and evolution
 
 Candidate IDs are stable endpoint identities, not provider display names.
