@@ -6,6 +6,8 @@
 // has been bound and userspace owns the RX/TX rings.  Any failure leaves TC
 // as the live path.
 
+#define _GNU_SOURCE
+
 #include "singbox_ebpf.h"
 
 #include "../v3/kern/abi.h"

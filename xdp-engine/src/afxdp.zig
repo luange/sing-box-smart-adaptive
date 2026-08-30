@@ -16,7 +16,7 @@ pub fn clampRingSize(value: u32) u32 {
     if (value > max_ring_size) return max_ring_size;
     // AF_XDP ring sizes must be powers of two. Round down so a bad config
     // never allocates more frames than the configured memory budget.
-    var n = value;
+    const n = value;
     var power: u32 = 1;
     while ((power << 1) <= n) : (power <<= 1) {}
     return power;
@@ -64,6 +64,10 @@ pub const Queue = struct {
     completed: Ring,
     fail_open: u64 = 0,
 
+    pub fn init(ring_size: u32) Queue {
+        return .{ .rx = Ring.init(ring_size), .tx = Ring.init(ring_size), .completed = Ring.init(ring_size) };
+    }
+
     /// Move one RX frame into a peer TX ring. A full peer ring is normal
     /// backpressure: return the frame to the kernel instead of dropping it
     /// or growing an unbounded userspace queue.
@@ -96,7 +100,7 @@ pub const Fabric = struct {
 
     pub fn init(queue_count: u32, ring_size: u32) Fabric {
         var fabric = Fabric{ .queues = undefined, .queue_count = @min(queue_count, max_queues) };
-        for (&fabric.queues) |*queue| queue.* = Queue.init(ring_size);
+        for (&fabric.queues) |*item| item.* = Queue.init(ring_size);
         return fabric;
     }
 
