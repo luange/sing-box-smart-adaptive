@@ -1067,7 +1067,10 @@ func TestSmartObservedConnWakesOnFirstResponseStall(t *testing.T) {
 		failures.Add(1)
 	}, 20*time.Millisecond)
 	go func() {
-		buffer := make([]byte, 1)
+		// net.Pipe.Write blocks until the complete payload is consumed. Read the
+		// full request here so the test exercises the stall timer instead of
+		// deadlocking in the transport write.
+		buffer := make([]byte, len("request"))
 		_, _ = peer.Read(buffer)
 	}()
 	if _, err := observed.Write([]byte("request")); err != nil {
