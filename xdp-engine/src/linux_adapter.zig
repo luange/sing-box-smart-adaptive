@@ -16,29 +16,29 @@ comptime {
     if (builtin.os.tag != .linux) @compileError("linux_adapter.zig is Linux-only");
 }
 
-const c_int = i32;
-const c_uint = u32;
+const CInt = i32;
+const CUint = u32;
 
-extern fn socket(domain: c_int, socket_type: c_int, protocol: c_int) callconv(.c) c_int;
-extern fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const anyopaque, value_len: c_uint) callconv(.c) c_int;
-extern fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *anyopaque, value_len: *c_uint) callconv(.c) c_int;
-extern fn bind(fd: c_int, address: *const anyopaque, address_len: c_uint) callconv(.c) c_int;
-extern fn close(fd: c_int) callconv(.c) c_int;
-extern fn mmap(address: ?*anyopaque, length: usize, protection: c_int, flags: c_int, fd: c_int, offset: i64) callconv(.c) ?*anyopaque;
-extern fn munmap(address: *anyopaque, length: usize) callconv(.c) c_int;
-extern fn poll(fds: [*]PollFd, count: usize, timeout_ms: c_int) callconv(.c) c_int;
-extern fn send(fd: c_int, buffer: ?*const anyopaque, length: usize, flags: c_int) callconv(.c) isize;
+extern fn socket(domain: CInt, socket_type: CInt, protocol: CInt) callconv(.c) CInt;
+extern fn setsockopt(fd: CInt, level: CInt, name: CInt, value: *const anyopaque, value_len: CUint) callconv(.c) CInt;
+extern fn getsockopt(fd: CInt, level: CInt, name: CInt, value: *anyopaque, value_len: *CUint) callconv(.c) CInt;
+extern fn bind(fd: CInt, address: *const anyopaque, address_len: CUint) callconv(.c) CInt;
+extern fn close(fd: CInt) callconv(.c) CInt;
+extern fn mmap(address: ?*anyopaque, length: usize, protection: CInt, flags: CInt, fd: CInt, offset: i64) callconv(.c) ?*anyopaque;
+extern fn munmap(address: *anyopaque, length: usize) callconv(.c) CInt;
+extern fn poll(fds: [*]PollFd, count: usize, timeout_ms: CInt) callconv(.c) CInt;
+extern fn send(fd: CInt, buffer: ?*const anyopaque, length: usize, flags: CInt) callconv(.c) isize;
 
-const af_xdp: c_int = 44;
-const sock_raw: c_int = 3;
-const sock_cloexec: c_int = 0x80000;
-const sol_xdp: c_int = 283;
-const xdp_umem_reg: c_int = 4;
-const xdp_umem_fill_ring: c_int = 5;
-const xdp_umem_completion_ring: c_int = 6;
-const xdp_rx_ring: c_int = 7;
-const xdp_tx_ring: c_int = 8;
-const xdp_mmap_offsets: c_int = 1;
+const af_xdp: CInt = 44;
+const sock_raw: CInt = 3;
+const sock_cloexec: CInt = 0x80000;
+const sol_xdp: CInt = 283;
+const xdp_umem_reg: CInt = 4;
+const xdp_umem_fill_ring: CInt = 5;
+const xdp_umem_completion_ring: CInt = 6;
+const xdp_rx_ring: CInt = 7;
+const xdp_tx_ring: CInt = 8;
+const xdp_mmap_offsets: CInt = 1;
 const xdp_shared_umem: u16 = 1 << 0;
 const xdp_copy: u16 = 1 << 1;
 const xdp_zerocopy: u16 = 1 << 2;
@@ -47,14 +47,14 @@ const xdp_pgoff_rx_ring: i64 = 0;
 const xdp_pgoff_tx_ring: i64 = 0x80000000;
 const xdp_umem_pgoff_fill_ring: i64 = 0x100000000;
 const xdp_umem_pgoff_completion_ring: i64 = 0x180000000;
-const prot_read: c_int = 1;
-const prot_write: c_int = 2;
-const map_shared: c_int = 1;
-const map_private: c_int = 2;
-const map_anonymous: c_int = 0x20;
+const prot_read: CInt = 1;
+const prot_write: CInt = 2;
+const map_shared: CInt = 1;
+const map_private: CInt = 2;
+const map_anonymous: CInt = 0x20;
 const poll_in: i16 = 0x001;
 const poll_err: i16 = 0x008;
-const msg_dontwait: c_int = 0x40;
+const msg_dontwait: CInt = 0x40;
 
 const max_usize = std.math.maxInt(usize);
 
@@ -96,7 +96,7 @@ const XdpDesc = extern struct {
 };
 
 const PollFd = extern struct {
-    fd: c_int,
+    fd: CInt,
     events: i16,
     revents: i16,
 };
@@ -155,7 +155,7 @@ const RingView = struct {
     entries: u32 = 0,
     stride: u32 = 0,
 
-    fn map(fd: c_int, offset: RingOffset, mmap_offset: i64, entries: u32, stride: u32) AdapterError!RingView {
+    fn map(fd: CInt, offset: RingOffset, mmap_offset: i64, entries: u32, stride: u32) AdapterError!RingView {
         if (entries == 0 or stride == 0) return error.InvalidConfig;
         const desc_bytes = @as(u64, @intCast(entries)) * @as(u64, @intCast(stride));
         const length_u64 = offset.desc + desc_bytes;
@@ -204,7 +204,7 @@ const RingView = struct {
 };
 
 const Queue = struct {
-    fd: c_int = -1,
+    fd: CInt = -1,
     rx: RingView = .{},
     tx: RingView = .{},
     fill: RingView = .{},
@@ -285,15 +285,15 @@ pub const Adapter = struct {
         self.config.ring_size = self.ring_size;
     }
 
-    fn setOptionU32(fd: c_int, option: c_int, value: u32) AdapterError!void {
+    fn setOptionU32(fd: CInt, option: CInt, value: u32) AdapterError!void {
         if (setsockopt(fd, sol_xdp, option, @ptrCast(&value), @intCast(@sizeOf(u32))) != 0) return error.SystemCallFailed;
     }
 
-    fn getOffsets(fd: c_int) AdapterError!MmapOffsets {
+    fn getOffsets(fd: CInt) AdapterError!MmapOffsets {
         var offsets: MmapOffsets = undefined;
-        var length: c_uint = @sizeOf(MmapOffsets);
+        var length: CUint = @sizeOf(MmapOffsets);
         if (getsockopt(fd, sol_xdp, xdp_mmap_offsets, @ptrCast(&offsets), &length) != 0) return error.SystemCallFailed;
-        if (length < @as(c_uint, @intCast(@sizeOf(MmapOffsets)))) return error.SystemCallFailed;
+        if (length < @as(CUint, @intCast(@sizeOf(MmapOffsets)))) return error.SystemCallFailed;
         return offsets;
     }
 
@@ -307,7 +307,7 @@ pub const Adapter = struct {
     }
 
     fn openQueues(self: *Adapter) AdapterError!void {
-        var first_fd: c_int = -1;
+        var first_fd: CInt = -1;
         var queue_index: u32 = 0;
         while (queue_index < self.queue_count) : (queue_index += 1) {
             const fd = socket(af_xdp, sock_raw | sock_cloexec, 0);
@@ -380,7 +380,7 @@ pub const Adapter = struct {
         self.queue_count = 0;
     }
 
-    pub fn queueFd(self: *const Adapter, queue: u32) c_int {
+    pub fn queueFd(self: *const Adapter, queue: u32) CInt {
         if (queue >= self.queue_count) return -1;
         return self.queues[queue].fd;
     }
@@ -392,13 +392,13 @@ pub const Adapter = struct {
     pub fn frameBytes(self: *Adapter, frame: CFrame) ?[]u8 {
         const memory = self.umem orelse return null;
         if (frame.address >= @as(u64, @intCast(memory.len))) return null;
-        const end = std.math.add(usize, @intCast(frame.address), frame.length) catch return null;
+        const end = std.math.add(usize, @intCast(frame.address), @as(usize, @intCast(frame.length))) catch return null;
         if (end > memory.len) return null;
         const base = @intFromPtr(memory.ptr) + @as(usize, @intCast(frame.address));
         return @as([*]u8, @ptrFromInt(base))[0..@as(usize, @intCast(frame.length))];
     }
 
-    pub fn pollQueues(self: *Adapter, timeout_ms: c_int) AdapterError!u64 {
+    pub fn pollQueues(self: *Adapter, timeout_ms: CInt) AdapterError!u64 {
         if (!self.ready) return error.InvalidConfig;
         var fds: [model.max_queues]PollFd = undefined;
         var index: u32 = 0;
@@ -423,7 +423,7 @@ pub const Adapter = struct {
         if (consumer == producer) return null;
         const descriptor = queue.rx.descriptor(consumer).*;
         @atomicStore(u32, queue.rx.consumer.?, consumer + 1, .release);
-        const end = std.math.add(u64, descriptor.address, @as(u64, descriptor.length)) catch {
+        const end = std.math.add(u64, descriptor.address, @as(u64, @intCast(descriptor.length))) catch {
             self.stats.invalid_descriptor += 1;
             return null;
         };
@@ -511,7 +511,7 @@ pub export fn sb_xdp_adapter_open(config: ?*const Config) callconv(.c) ?*Adapter
     return adapter;
 }
 
-pub export fn sb_xdp_adapter_queue_fd(adapter: ?*Adapter, queue: u32) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_queue_fd(adapter: ?*Adapter, queue: u32) callconv(.c) CInt {
     return if (adapter) |value| value.queueFd(queue) else -1;
 }
 
@@ -519,7 +519,7 @@ pub export fn sb_xdp_adapter_ready(adapter: ?*const Adapter) callconv(.c) bool {
     return if (adapter) |value| value.isReady() else false;
 }
 
-pub export fn sb_xdp_adapter_poll(adapter: ?*Adapter, timeout_ms: c_int, ready_mask: ?*u64) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_poll(adapter: ?*Adapter, timeout_ms: CInt, ready_mask: ?*u64) callconv(.c) CInt {
     if (adapter == null or ready_mask == null) return -1;
     ready_mask.?.* = adapter.?.pollQueues(timeout_ms) catch |err| {
         _ = err;
@@ -528,7 +528,7 @@ pub export fn sb_xdp_adapter_poll(adapter: ?*Adapter, timeout_ms: c_int, ready_m
     return 0;
 }
 
-pub export fn sb_xdp_adapter_rx(adapter: ?*Adapter, queue: u32, frame: ?*CFrame) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_rx(adapter: ?*Adapter, queue: u32, frame: ?*CFrame) callconv(.c) CInt {
     if (adapter == null or frame == null) return -1;
     if (adapter.?.receive(queue)) |value| {
         frame.?.* = value;
@@ -537,24 +537,24 @@ pub export fn sb_xdp_adapter_rx(adapter: ?*Adapter, queue: u32, frame: ?*CFrame)
     return 0;
 }
 
-pub export fn sb_xdp_adapter_recycle(adapter: ?*Adapter, frame: ?*const CFrame) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_recycle(adapter: ?*Adapter, frame: ?*const CFrame) callconv(.c) CInt {
     if (adapter == null or frame == null) return -1;
     adapter.?.recycle(frame.?.*) catch return -1;
     return 0;
 }
 
-pub export fn sb_xdp_adapter_tx(adapter: ?*Adapter, frame: ?*const CFrame, queue: u32) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_tx(adapter: ?*Adapter, frame: ?*const CFrame, queue: u32) callconv(.c) CInt {
     if (adapter == null or frame == null) return -1;
     adapter.?.transmit(frame.?.*, queue) catch return -1;
     return 0;
 }
 
-pub export fn sb_xdp_adapter_drain_completions(adapter: ?*Adapter, queue: u32, limit: u32) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_drain_completions(adapter: ?*Adapter, queue: u32, limit: u32) callconv(.c) CInt {
     if (adapter == null) return -1;
     return @intCast(adapter.?.drainCompletions(queue, limit) catch return -1);
 }
 
-pub export fn sb_xdp_adapter_stats(adapter: ?*const Adapter, stats: ?*Stats) callconv(.c) c_int {
+pub export fn sb_xdp_adapter_stats(adapter: ?*const Adapter, stats: ?*Stats) callconv(.c) CInt {
     if (adapter == null or stats == null) return -1;
     stats.?.* = adapter.?.getStats();
     return 0;
