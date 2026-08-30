@@ -29,6 +29,11 @@ jobs:
         working-directory: common/ebpf
         run: |
           set -euo pipefail
+          # Check the object that a plain `go build`/`go install` would embed
+          # before generation can replace it.  This is the actual stale-object
+          # gate; running it after `make generate` only proves compiler
+          # determinism and would miss a committed artifact drift.
+          make check-v2-source
           make generate
           make check-v2-source
           test -s native/shared_network_v2.bpf.o
