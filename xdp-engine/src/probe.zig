@@ -109,27 +109,26 @@ fn fallback(reason: FallbackReason, multibuffer: bool) Result {
 pub fn evaluate(sample: Sample) Result {
     const multibuffer = sample.features_present and (sample.features & feat_rx_sg) != 0;
 
-    if (sample.rx_queues < 2) {
-        return fallback(.single_queue, multibuffer);
-    }
-
     if (sample.features_present) {
         if (sample.features & feat_redirect == 0) {
             return fallback(.missing_redirect, multibuffer);
         }
-        if (sample.features & feat_xsk_zerocopy == 0) {
+        // XSK_ZEROCOPY is only an admission requirement for the zero-copy
+        // bind. Generic/SKB copy mode must remain usable on drivers that
+        // expose redirect but not zero-copy support.
+        if (sample.bind == .zerocopy_ok and sample.features & feat_xsk_zerocopy == 0) {
             return fallback(.missing_zerocopy, multibuffer);
         }
     }
 
     return switch (sample.bind) {
-        .zerocopy_ok => .{
+        .zerocopy_ok => if (sample.rx_queues >= 2) .{
             .outcome = .attach_zerocopy,
             .reason = if (sample.features_present) .none else .features_absent_skip,
             .need_multibuffer_pass = multibuffer,
             .fatal = false,
-        },
-        .copy_ok => if (sample.allow_copy_mode) .{
+        } else fallback(.single_queue, multibuffer),
+        .copy_ok => if (sample.rx_queues == 0) fallback(.single_queue, multibuffer) else if (sample.allow_copy_mode) .{
             .outcome = .attach_copy,
             .reason = .none,
             .need_multibuffer_pass = multibuffer,
@@ -178,6 +177,17 @@ test "copy bind with allow_copy_mode attaches copy" {
     const r = evaluate(.{ .features = capable, .rx_queues = 4, .bind = .copy_ok, .allow_copy_mode = true });
     try std.testing.expectEqual(Outcome.attach_copy, r.outcome);
     try std.testing.expect(!r.fatal);
+}
+
+test "copy mode does not require zero-copy capability or two queues" {
+    const r = evaluate(.{
+        .features = feat_basic | feat_redirect,
+        .rx_queues = 1,
+        .bind = .copy_ok,
+        .allow_copy_mode = true,
+    });
+    try std.testing.expectEqual(Outcome.attach_copy, r.outcome);
+    try std.testing.expectEqual(FallbackReason.none, r.reason);
 }
 
 test "rx_sg records multibuffer pass" {

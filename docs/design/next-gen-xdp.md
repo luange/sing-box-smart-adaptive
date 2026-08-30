@@ -271,8 +271,8 @@ change.
 | ID | Requirement | Evidence |
 |----|-------------|----------|
 | P-1 | Missing `REDIRECT` bit → fallback TC, not attach. | `probe.zig` |
-| P-2 | Missing `XSK_ZEROCOPY` → fallback TC. | `probe.zig` |
-| P-3 | RX queues < 2 → fallback TC. | `probe.zig` |
+| P-2 | Missing `XSK_ZEROCOPY` → reject only the zero-copy bind; an explicitly allowed generic/SKB copy bind may still attach. | `probe.zig` |
+| P-3 | RX queues < 2 → reject zero-copy; generic/SKB copy mode requires at least one queue and may proceed when explicitly allowed. | `probe.zig` |
 | P-4 | ZC and copy bind both fail → fallback TC. | `probe.zig` |
 | P-5 | Copy bind only → fallback TC unless `allow_copy_mode`. | `probe.zig` |
 | P-6 | `RX_SG` set → `need_multibuffer_pass`, still may attach for non-SG later; skeleton records the flag. | `probe.zig` |
