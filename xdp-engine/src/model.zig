@@ -101,5 +101,6 @@ test "umem bounds do not grow with node count" {
 
 test "umem chunk size is a kernel-valid power of two" {
     try std.testing.expectEqual(@as(u32, 2048), clampUmem(3072, 512).size);
-    try std.testing.expectEqual(@as(u32, 4096), clampUmem(4095, 512).size);
+    try std.testing.expectEqual(@as(u32, 2048), clampUmem(4095, 512).size);
+    try std.testing.expectEqual(@as(u32, 4096), clampUmem(4096, 512).size);
 }
