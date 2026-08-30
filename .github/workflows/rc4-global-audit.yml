@@ -26,11 +26,13 @@ jobs:
         with:
           go-version: 1.26.7
       - name: Focused tests
-        run: go test ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+        run: |
+          make -C common/ebpf generate
+          CGO_ENABLED=1 go test -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
       - name: Race tests for stateful paths
-        run: go test -race ./protocol/group/... ./protocol/ebpf/...
+        run: CGO_ENABLED=1 go test -race -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
       - name: Static checks
-        run: go vet ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+        run: CGO_ENABLED=1 go vet -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
 
   smart-zig:
     name: Smart Zig conformance
@@ -48,4 +50,3 @@ jobs:
           zig build test -Dcpu=baseline
           zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
           zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
-
