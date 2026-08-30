@@ -14,6 +14,7 @@ on:
       - "docs/audits/xdp-originality.md"
       - "docs/audits/xdp-host-adapter-20260830.md"
       - ".github/workflows/xdp-engine.yml"
+      - ".github/workflows/rc4-global-audit.yml"
   pull_request:
     paths:
       - "xdp-engine/**"
@@ -27,6 +28,7 @@ on:
       - "docs/audits/xdp-originality.md"
       - "docs/audits/xdp-host-adapter-20260830.md"
       - ".github/workflows/xdp-engine.yml"
+      - ".github/workflows/rc4-global-audit.yml"
   workflow_dispatch:
 
 permissions:

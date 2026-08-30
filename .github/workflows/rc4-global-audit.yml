@@ -1,0 +1,51 @@
+name: RC4 global audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "protocol/group/**"
+      - "protocol/ebpf/**"
+      - "common/ebpf/**"
+      - "smart-engine/**"
+      - "xdp-engine/**"
+      - ".github/workflows/rc4-global-audit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  go-regression:
+    name: Smart and eBPF regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Focused tests
+        run: go test ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+      - name: Race tests for stateful paths
+        run: go test -race ./protocol/group/... ./protocol/ebpf/...
+      - name: Static checks
+        run: go vet ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+
+  smart-zig:
+    name: Smart Zig conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Smart engine tests and Linux libraries
+        working-directory: smart-engine
+        run: |
+          zig build test -Dcpu=baseline
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+
