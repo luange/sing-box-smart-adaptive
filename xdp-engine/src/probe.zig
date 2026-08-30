@@ -80,6 +80,7 @@ pub const FallbackReason = enum(u8) {
     bind_failed = 4,
     copy_disallowed = 5,
     features_absent_skip = 6,
+    multibuffer_unsupported = 7,
 };
 
 pub const Sample = struct {
@@ -110,6 +111,11 @@ pub fn evaluate(sample: Sample) Result {
     const multibuffer = sample.features_present and (sample.features & feat_rx_sg) != 0;
 
     if (sample.features_present) {
+        // The current parser and Zig adapter consume one descriptor per
+        // packet. RX scatter-gather requires a bounded multi-segment parser;
+        // until that exists, keep the whole interface on TC rather than
+        // redirecting only the first segment into UMEM.
+        if (multibuffer) return fallback(.multibuffer_unsupported, true);
         if (sample.features & feat_redirect == 0) {
             return fallback(.missing_redirect, multibuffer);
         }
@@ -190,13 +196,14 @@ test "copy mode does not require zero-copy capability or two queues" {
     try std.testing.expectEqual(FallbackReason.none, r.reason);
 }
 
-test "rx_sg records multibuffer pass" {
+test "rx_sg stays on TC until multi-buffer parsing exists" {
     const r = evaluate(.{
         .features = capable | feat_rx_sg,
         .rx_queues = 4,
         .bind = .zerocopy_ok,
     });
-    try std.testing.expectEqual(Outcome.attach_zerocopy, r.outcome);
+    try std.testing.expectEqual(Outcome.fallback_tc, r.outcome);
+    try std.testing.expectEqual(FallbackReason.multibuffer_unsupported, r.reason);
     try std.testing.expect(r.need_multibuffer_pass);
 }
 

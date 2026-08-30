@@ -171,6 +171,11 @@ int sb_v3_xdp_ingress(struct xdp_md *ctx) {
 	    !control->enabled || xdp->policy_generation != control->policy_generation ||
 	    xdp->active_bank != control->active_bank)
 		return XDP_PASS;
+	/* The one-descriptor parser is intentionally conservative.  A host that
+	 * advertises scatter-gather support must not accidentally redirect a
+	 * multi-buffer frame until the bounded segment walker is implemented. */
+	if ((xdp->flags & SB_XDP_CTRL_ALLOW_MULTIBUFFER) != 0)
+		return XDP_PASS;
 
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;

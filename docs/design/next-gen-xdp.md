@@ -130,14 +130,14 @@ Four tiers. Kind/driver names appear only in diagnostic logs.
 
 | Tier | Input | Fail action |
 |------|-------|-------------|
-| 0 | `netdev` generic-netlink `NETDEV_A_DEV_XDP_FEATURES` | missing `REDIRECT` or `XSK_ZEROCOPY` → fallback TC. Absent family/attribute (old kernel) → skip to Tier 1. `RX_SG` set → multi-buffer `XDP_PASS` until parser supports it. |
+| 0 | `netdev` generic-netlink `NETDEV_A_DEV_XDP_FEATURES` | missing `REDIRECT` or `XSK_ZEROCOPY` → fallback TC. Absent family/attribute (old kernel) → skip to Tier 1. `RX_SG` set → fallback TC until the bounded segment parser exists. |
 | 1 | `bind(XDP_ZEROCOPY)` then optional `XDP_COPY` | both fail → fallback TC. Copy-only succeeds → fallback TC unless `allow_copy_mode`. |
 | 2 | RX queue count | `< 2` → fallback TC. |
 | 3 | `RTM_NEWLINK` | queue/MTU/driver reset → detach + re-probe. |
 
 Admission for native zero-copy attach: `REDIRECT | XSK_ZEROCOPY`, queues ≥ 2,
-ZC bind OK. Generic/SKB admission is a separate copy-mode probe and requires
-`allow_copy_mode`. Hardware/offload admission requires the same object to pass
+ZC bind OK, and no RX scatter-gather. Generic/SKB admission is a separate
+copy-mode probe and requires `allow_copy_mode`. Hardware/offload admission requires the same object to pass
 the NIC's offload verifier; feature bits alone never enable it. No hardcoded
 macvlan/veth blacklist: those devices already report 0 bits or fail `bind()`.
 
@@ -286,7 +286,7 @@ change.
 | P-3 | RX queues < 2 → reject zero-copy; generic/SKB copy mode requires at least one queue and may proceed when explicitly allowed. | `probe.zig` |
 | P-4 | ZC and copy bind both fail → fallback TC. | `probe.zig` |
 | P-5 | Copy bind only → fallback TC unless `allow_copy_mode`. | `probe.zig` |
-| P-6 | `RX_SG` set → `need_multibuffer_pass`, still may attach for non-SG later; skeleton records the flag. | `probe.zig` |
+| P-6 | `RX_SG` set → fallback TC; the current one-descriptor parser never redirects a scatter-gather frame. | `probe.zig` + XDP control guard |
 | P-7 | Absent feature bitmap skips Tier 0 and uses bind + queues. | `probe.zig` |
 | P-8 | No probe result is “fatal/exit”. | `ProbeResult.fatal == false` always |
 | P-9 | Kind/driver strings are not consulted. | no such fields on `ProbeSample` |

@@ -504,6 +504,13 @@ int sb_ebpf_xdp_set_control(
 			errno = EAGAIN;
 			return -1;
 		}
+		if (allow_multibuffer) {
+			/* The current parser/adapter consumes one descriptor per frame.
+			 * Never let a caller opt into RX scatter-gather until a bounded
+			 * multi-segment implementation exists. */
+			errno = ENOTSUP;
+			return -1;
+		}
 	}
 	uint32_t zero = 0U;
 	struct sb_xdp_control control = {};
