@@ -192,6 +192,7 @@ Suggested bounds (skeleton constants, overridable later):
     "data_plane": "socket_assign",
     "xdp": {
       "enabled": false,
+      "mode": "auto",
       "allow_copy_mode": false
     }
   }
@@ -200,7 +201,10 @@ Suggested bounds (skeleton constants, overridable later):
 
 Default `xdp.enabled` is false. `data_plane` stays `socket_assign`. A later
 `data_plane: "afxdp"` may enable the DIRECT accelerator **in addition to** TC
-proxy, never instead of it.
+proxy, never instead of it. `mode: "auto"` probes hardware offload first,
+then native/driver, then generic/SKB; each candidate must pass the real
+verifier/attach and AF_XDP bind probe. Explicit `skb`, `native`, or `offload`
+fails open to TC instead of selecting a different mode.
 
 ## 9. Phasing
 

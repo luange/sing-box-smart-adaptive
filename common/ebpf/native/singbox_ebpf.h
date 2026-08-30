@@ -251,6 +251,10 @@ int sb_ebpf_xdp_prepare(
 	struct sb_ebpf_xdp_runtime *runtime);
 int sb_ebpf_xdp_attach(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex);
 int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode);
+/* Probe the real verifier/attach path and immediately detach.  This never
+ * enables the data plane and returns failure for an occupied or unsupported
+ * mode so the caller can keep TC active. */
+int sb_ebpf_xdp_probe_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode);
 int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime);
 int sb_ebpf_xdp_set_control(
 	struct sb_ebpf_xdp_runtime *runtime,

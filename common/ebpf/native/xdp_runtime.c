@@ -305,6 +305,23 @@ int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifinde
 	return 0;
 }
 
+int sb_ebpf_xdp_probe_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode) {
+	if (runtime == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (sb_ebpf_xdp_attach_mode(runtime, ifindex, mode) != 0)
+		return -1;
+	int attach_errno = 0;
+	if (sb_ebpf_xdp_detach(runtime) != 0)
+		attach_errno = errno;
+	if (attach_errno != 0) {
+		errno = attach_errno;
+		return -1;
+	}
+	return 0;
+}
+
 int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime) {
 	if (runtime == NULL)
 		return 0;
