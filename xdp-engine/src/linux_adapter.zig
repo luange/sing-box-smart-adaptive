@@ -133,6 +133,12 @@ pub const Stats = extern struct {
     invalid_descriptor: u64 = 0,
 };
 
+pub const BindResult = enum(u32) {
+    failed = 0,
+    zero_copy_ok = 1,
+    copy_ok = 2,
+};
+
 const AdapterError = error{
     InvalidConfig,
     UnsupportedPlatform,
@@ -439,7 +445,14 @@ pub const Adapter = struct {
     }
 
     fn recycleAddress(self: *Adapter, queue_index: u32, address: u64) AdapterError!void {
-        if (queue_index >= self.queue_count or address % @as(u64, @intCast(self.frame_size)) != 0) return error.InvalidFrame;
+        const memory = self.umem orelse return error.InvalidFrame;
+        const frame_size = @as(u64, @intCast(self.frame_size));
+        if (queue_index >= self.queue_count or address % frame_size != 0) return error.InvalidFrame;
+        const end = std.math.add(u64, address, frame_size) catch return error.InvalidFrame;
+        if (end > @as(u64, @intCast(memory.len))) return error.InvalidFrame;
+        const frame_index = address / frame_size;
+        const owner = frame_index / @as(u64, @intCast(self.frames_per_queue));
+        if (owner != queue_index) return error.InvalidFrame;
         const queue = &self.queues[queue_index];
         if (queue.fill.free() == 0) {
             self.stats.fill_starved += 1;
@@ -482,13 +495,18 @@ pub const Adapter = struct {
         const max_count = @min(limit, producer -% consumer);
         while (drained < max_count) : (drained += 1) {
             const address = queue.completion.address(consumer).*;
-            @atomicStore(u32, queue.completion.consumer.?, consumer + 1, .release);
-            consumer += 1;
-            const owner = @as(u32, @intCast(address / @as(u64, @intCast(self.frame_size)) / @as(u64, @intCast(self.frames_per_queue))));
-            self.recycleAddress(if (owner < self.queue_count) owner else queue_index, address) catch {
+            const owner64 = address / @as(u64, @intCast(self.frame_size)) / @as(u64, @intCast(self.frames_per_queue));
+            const owner = if (owner64 < self.queue_count) @as(u32, @intCast(owner64)) else queue_index;
+            self.recycleAddress(owner, address) catch {
+                self.stats.invalid_descriptor += 1;
                 self.stats.fill_starved += 1;
                 break;
             };
+            // Do not release the completion entry until its frame is safely
+            // back in a fill ring.  This makes fill-ring backpressure a
+            // retryable condition instead of silently losing a UMEM frame.
+            @atomicStore(u32, queue.completion.consumer.?, consumer + 1, .release);
+            consumer += 1;
             self.stats.completed += 1;
         }
         return drained;
@@ -500,6 +518,16 @@ pub const Adapter = struct {
 
 };
 
+/// Probe the real XSK socket/bind path without attaching an XDP program.  The
+/// adapter is opened and closed inside this call, so no socket or UMEM is
+/// retained.  The caller still has to run the mode-specific BPF verifier/
+/// attach probe before publishing the XDP control record.
+pub fn probeBind(allocator: std.mem.Allocator, config: Config) BindResult {
+    var adapter = Adapter.init(allocator, config) catch return .failed;
+    adapter.close();
+    return if (config.mode == @intFromEnum(BindMode.zero_copy)) .zero_copy_ok else .copy_ok;
+}
+
 pub export fn sb_xdp_adapter_open(config: ?*const Config) callconv(.c) ?*Adapter {
     if (config == null) return null;
     const allocator = std.heap.c_allocator;
@@ -509,6 +537,11 @@ pub export fn sb_xdp_adapter_open(config: ?*const Config) callconv(.c) ?*Adapter
         return null;
     };
     return adapter;
+}
+
+pub export fn sb_xdp_adapter_probe_bind(config: ?*const Config) callconv(.c) BindResult {
+    if (config == null) return .failed;
+    return probeBind(std.heap.c_allocator, config.?.*);
 }
 
 pub export fn sb_xdp_adapter_queue_fd(adapter: ?*Adapter, queue: u32) callconv(.c) CInt {

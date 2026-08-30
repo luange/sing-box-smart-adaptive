@@ -40,6 +40,10 @@ struct sb_xdp_adapter_stats {
 
 struct sb_xdp_adapter;
 
+/* Returns 1 for a real zero-copy bind, 2 for an explicitly requested copy
+ * bind, and 0 when the interface/queue cannot create the requested XSK. */
+uint32_t sb_xdp_adapter_probe_bind(
+	const struct sb_xdp_adapter_config *config);
 struct sb_xdp_adapter *sb_xdp_adapter_open(
 	const struct sb_xdp_adapter_config *config);
 int sb_xdp_adapter_queue_fd(const struct sb_xdp_adapter *adapter,

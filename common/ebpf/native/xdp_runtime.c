@@ -140,6 +140,14 @@ static int xdp_map_delete(int map_fd, const void *key) {
 	return (int)xdp_bpf_sys(BPF_MAP_DELETE_ELEM, &attr);
 }
 
+static void xdp_clear_all_xsk(struct sb_ebpf_xdp_runtime *runtime) {
+	if (runtime == NULL || runtime->xsk_map_fd < 0)
+		return;
+	for (uint32_t queue = 0; queue < runtime->queue_count; queue++)
+		(void)xdp_map_delete(runtime->xsk_map_fd, &queue);
+	runtime->xsk_bound_mask = 0U;
+}
+
 static int xdp_link_create(uint32_t ifindex, int program_fd) {
 	union bpf_attr attr;
 	memset(&attr, 0, sizeof(attr));
@@ -462,6 +470,9 @@ int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime) {
 	}
 	runtime->ifindex = 0U;
 	runtime->mode = 0U;
+	/* A link change or failed probe must not leave queue FDs armed for a
+	 * later attach.  The next attach has to republish every queue explicitly. */
+	xdp_clear_all_xsk(runtime);
 	/* A detached program must never leave redirect enabled. */
 	(void)sb_ebpf_xdp_set_control(runtime, false, 0U, 0U, 0U, 0U, false, 0U);
 	return result;
@@ -479,6 +490,20 @@ int sb_ebpf_xdp_set_control(
 	if (runtime == NULL || runtime->control_map_fd < 0 || queue_count > runtime->queue_count) {
 		errno = EINVAL;
 		return -1;
+	}
+	if (enabled) {
+		if (queue_count == 0U) {
+			errno = EINVAL;
+			return -1;
+		}
+		uint64_t required = queue_count == 64U ? UINT64_MAX : ((UINT64_C(1) << queue_count) - 1U);
+		if ((runtime->xsk_bound_mask & required) != required) {
+			/* Keep the XDP control map disabled until every selected queue has
+			 * an XSKMAP entry.  This is a retryable readiness failure, not a
+			 * process-fatal dataplane error. */
+			errno = EAGAIN;
+			return -1;
+		}
 	}
 	uint32_t zero = 0U;
 	struct sb_xdp_control control = {};
@@ -499,7 +524,10 @@ int sb_ebpf_xdp_set_xsk(struct sb_ebpf_xdp_runtime *runtime, uint32_t queue, int
 		errno = EINVAL;
 		return -1;
 	}
-	return xdp_map_update(runtime->xsk_map_fd, &queue, &xsk_fd);
+	int result = xdp_map_update(runtime->xsk_map_fd, &queue, &xsk_fd);
+	if (result == 0)
+		runtime->xsk_bound_mask |= UINT64_C(1) << queue;
+	return result;
 }
 
 int sb_ebpf_xdp_clear_xsk(struct sb_ebpf_xdp_runtime *runtime, uint32_t queue) {
@@ -507,7 +535,10 @@ int sb_ebpf_xdp_clear_xsk(struct sb_ebpf_xdp_runtime *runtime, uint32_t queue) {
 		errno = EINVAL;
 		return -1;
 	}
-	return xdp_map_delete(runtime->xsk_map_fd, &queue);
+	int result = xdp_map_delete(runtime->xsk_map_fd, &queue);
+	if (result == 0 || errno == ENOENT)
+		runtime->xsk_bound_mask &= ~(UINT64_C(1) << queue);
+	return result;
 }
 
 int sb_ebpf_xdp_close(struct sb_ebpf_xdp_runtime *runtime) {
@@ -523,5 +554,6 @@ int sb_ebpf_xdp_close(struct sb_ebpf_xdp_runtime *runtime) {
 	if (xdp_close_fd(&runtime->control_map_fd) != 0 && result == 0)
 		result = -1;
 	runtime->queue_count = 0U;
+	runtime->xsk_bound_mask = 0U;
 	return result;
 }

@@ -235,6 +235,7 @@ struct sb_ebpf_xdp_runtime {
 	uint32_t ifindex;
 	uint32_t queue_count;
 	uint32_t mode;
+	uint64_t xsk_bound_mask;
 };
 
 enum sb_ebpf_xdp_mode {
