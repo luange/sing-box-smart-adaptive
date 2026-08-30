@@ -68,6 +68,10 @@ jobs:
           test -s zig-out/lib/libsmart_engine.a
           cd ..
           CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
+      - name: Run Smart and transport regression tests
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group ./transport/v2raywebsocket
       - name: Cross-build Linux libraries
         working-directory: smart-engine
         run: |
