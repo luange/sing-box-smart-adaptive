@@ -65,6 +65,20 @@ jobs:
         run: |
           zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
           zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Check exported host-adapter ABI
+        run: |
+          cat > /tmp/xdp-abi-smoke.c <<'EOF'
+          #include "xdp_engine.h"
+          int main(void) {
+            struct sb_xdp_adapter_config c = {0};
+            struct sb_xdp_frame f = {0};
+            struct sb_xdp_adapter_stats s = {0};
+            (void)c; (void)f; (void)s;
+            return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+            -I xdp-engine/include /tmp/xdp-abi-smoke.c
 
   bpf:
     name: Linux XDP object and verifier surface

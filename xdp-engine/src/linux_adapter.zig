@@ -1,0 +1,620 @@
+//! Linux AF_XDP host adapter.
+//!
+//! This is deliberately a small, ownership-focused adapter rather than a
+//! packet stack.  It creates bounded shared UMEM, configures one XSK per RX
+//! queue, exposes the four kernel rings, and returns frames to the kernel on
+//! every failure path.  Policy and XDP attach are owned by the caller
+//! (`common/ebpf/native/xdp_runtime.c`); this module never enables the XDP
+//! control map by itself.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const model = @import("model.zig");
+const afxdp = @import("afxdp.zig");
+
+comptime {
+    if (builtin.os.tag != .linux) @compileError("linux_adapter.zig is Linux-only");
+}
+
+const c_int = i32;
+const c_uint = u32;
+
+extern fn socket(domain: c_int, socket_type: c_int, protocol: c_int) callconv(.c) c_int;
+extern fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const anyopaque, value_len: c_uint) callconv(.c) c_int;
+extern fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *anyopaque, value_len: *c_uint) callconv(.c) c_int;
+extern fn bind(fd: c_int, address: *const anyopaque, address_len: c_uint) callconv(.c) c_int;
+extern fn close(fd: c_int) callconv(.c) c_int;
+extern fn mmap(address: ?*anyopaque, length: usize, protection: c_int, flags: c_int, fd: c_int, offset: i64) callconv(.c) ?*anyopaque;
+extern fn munmap(address: *anyopaque, length: usize) callconv(.c) c_int;
+extern fn poll(fds: [*]PollFd, count: usize, timeout_ms: c_int) callconv(.c) c_int;
+extern fn send(fd: c_int, buffer: ?*const anyopaque, length: usize, flags: c_int) callconv(.c) isize;
+
+const af_xdp: c_int = 44;
+const sock_raw: c_int = 3;
+const sock_cloexec: c_int = 0x80000;
+const sol_xdp: c_int = 283;
+const xdp_umem_reg: c_int = 4;
+const xdp_umem_fill_ring: c_int = 5;
+const xdp_umem_completion_ring: c_int = 6;
+const xdp_rx_ring: c_int = 7;
+const xdp_tx_ring: c_int = 8;
+const xdp_mmap_offsets: c_int = 1;
+const xdp_shared_umem: u16 = 1 << 0;
+const xdp_copy: u16 = 1 << 1;
+const xdp_zerocopy: u16 = 1 << 2;
+const xdp_use_need_wakeup: u16 = 1 << 3;
+const xdp_pgoff_rx_ring: i64 = 0;
+const xdp_pgoff_tx_ring: i64 = 0x80000000;
+const xdp_umem_pgoff_fill_ring: i64 = 0x100000000;
+const xdp_umem_pgoff_completion_ring: i64 = 0x180000000;
+const prot_read: c_int = 1;
+const prot_write: c_int = 2;
+const map_shared: c_int = 1;
+const map_private: c_int = 2;
+const map_anonymous: c_int = 0x20;
+const poll_in: i16 = 0x001;
+const poll_err: i16 = 0x008;
+const msg_dontwait: c_int = 0x40;
+
+const max_usize = std.math.maxInt(usize);
+
+const SockAddrXdp = extern struct {
+    family: u16,
+    flags: u16,
+    ifindex: u32,
+    queue: u32,
+    shared_umem_fd: u32,
+};
+
+const UmemReg = extern struct {
+    address: u64,
+    length: u64,
+    chunk_size: u32,
+    headroom: u32,
+    flags: u32,
+    tx_metadata_len: u32,
+};
+
+const RingOffset = extern struct {
+    producer: u64,
+    consumer: u64,
+    desc: u64,
+    flags: u64,
+};
+
+const MmapOffsets = extern struct {
+    rx: RingOffset,
+    tx: RingOffset,
+    fill: RingOffset,
+    completion: RingOffset,
+};
+
+const XdpDesc = extern struct {
+    address: u64,
+    length: u32,
+    options: u32,
+};
+
+const PollFd = extern struct {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+};
+
+pub const BindMode = enum(u32) {
+    zero_copy = 0,
+    copy = 1,
+};
+
+/// C-compatible configuration. Zero values select bounded defaults.
+pub const Config = extern struct {
+    ifindex: u32,
+    queue_count: u32,
+    ring_size: u32,
+    frame_size: u32,
+    frame_count: u32,
+    mode: u32,
+};
+
+pub const CFrame = extern struct {
+    queue: u32,
+    address: u64,
+    length: u32,
+    options: u32,
+};
+
+pub const Stats = extern struct {
+    rx: u64 = 0,
+    tx: u64 = 0,
+    recycled: u64 = 0,
+    completed: u64 = 0,
+    fill_starved: u64 = 0,
+    tx_full: u64 = 0,
+    invalid_descriptor: u64 = 0,
+};
+
+const AdapterError = error{
+    InvalidConfig,
+    UnsupportedPlatform,
+    SingleQueue,
+    FrameBudget,
+    SystemCallFailed,
+    RingMapFailed,
+    BindFailed,
+    FillRingFull,
+    TxRingFull,
+    InvalidFrame,
+};
+
+const RingView = struct {
+    mapping: ?[]u8 = null,
+    producer: ?*u32 = null,
+    consumer: ?*u32 = null,
+    flags: ?*u32 = null,
+    descriptors: ?*u8 = null,
+    entries: u32 = 0,
+    stride: u32 = 0,
+
+    fn map(fd: c_int, offset: RingOffset, mmap_offset: i64, entries: u32, stride: u32) AdapterError!RingView {
+        if (entries == 0 or stride == 0) return error.InvalidConfig;
+        const desc_bytes = @as(u64, @intCast(entries)) * @as(u64, @intCast(stride));
+        const length_u64 = offset.desc + desc_bytes;
+        if (length_u64 > @as(u64, @intCast(max_usize))) return error.RingMapFailed;
+        const length: usize = @intCast(length_u64);
+        const pointer = mmap(null, length, prot_read | prot_write, map_shared, fd, mmap_offset);
+        if (pointer == null or @intFromPtr(pointer.?) == max_usize) return error.RingMapFailed;
+        const bytes = @as([*]u8, @ptrCast(pointer.?))[0..length];
+        const base = @intFromPtr(bytes.ptr);
+        return .{
+            .mapping = bytes,
+            .producer = @ptrFromInt(base + @as(usize, @intCast(offset.producer))),
+            .consumer = @ptrFromInt(base + @as(usize, @intCast(offset.consumer))),
+            .flags = @ptrFromInt(base + @as(usize, @intCast(offset.flags))),
+            .descriptors = @ptrFromInt(base + @as(usize, @intCast(offset.desc))),
+            .entries = entries,
+            .stride = stride,
+        };
+    }
+
+    fn unmap(self: *RingView) void {
+        if (self.mapping) |mapping| {
+            _ = munmap(mapping.ptr, mapping.len);
+        }
+        self.* = .{};
+    }
+
+    fn pending(self: *const RingView) u32 {
+        return @atomicLoad(u32, self.producer.?, .acquire) -% @atomicLoad(u32, self.consumer.?, .relaxed);
+    }
+
+    fn free(self: *const RingView) u32 {
+        const used = self.pending();
+        return if (used >= self.entries) 0 else self.entries - used;
+    }
+
+    fn descriptor(self: *const RingView, index: u32) *XdpDesc {
+        const address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
+        return @ptrFromInt(address);
+    }
+
+    fn address(self: *const RingView, index: u32) *u64 {
+        const address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
+        return @ptrFromInt(address);
+    }
+};
+
+const Queue = struct {
+    fd: c_int = -1,
+    rx: RingView = .{},
+    tx: RingView = .{},
+    fill: RingView = .{},
+    completion: RingView = .{},
+    frame_base: u32 = 0,
+    frame_limit: u32 = 0,
+    bound: bool = false,
+
+    fn close(self: *Queue) void {
+        self.rx.unmap();
+        self.tx.unmap();
+        self.fill.unmap();
+        self.completion.unmap();
+        if (self.fd >= 0) _ = close(self.fd);
+        self.* = .{};
+    }
+};
+
+pub const Adapter = struct {
+    allocator: std.mem.Allocator,
+    config: Config,
+    bind_mode: BindMode,
+    frame_size: u32,
+    frame_count: u32,
+    ring_size: u32,
+    frames_per_queue: u32,
+    umem: ?[]u8 = null,
+    queues: [model.max_queues]Queue = undefined,
+    queue_count: u32 = 0,
+    offsets: MmapOffsets = undefined,
+    ready: bool = false,
+    stats: Stats = .{},
+
+    pub fn init(allocator: std.mem.Allocator, input: Config) AdapterError!Adapter {
+        var self = Adapter{
+            .allocator = allocator,
+            .config = input,
+            .bind_mode = undefined,
+            .frame_size = 0,
+            .frame_count = 0,
+            .ring_size = 0,
+            .frames_per_queue = 0,
+            .queue_count = 0,
+        };
+        for (&self.queues) |*queue| queue.* = .{};
+        try self.normalize(input);
+        errdefer self.close();
+        try self.allocateUmem();
+        try self.openQueues();
+        return self;
+    }
+
+    fn normalize(self: *Adapter, input: Config) AdapterError!void {
+        if (input.ifindex == 0) return error.InvalidConfig;
+        const queues = if (input.queue_count == 0) @as(u32, 1) else input.queue_count;
+        if (queues > model.max_queues) return error.InvalidConfig;
+        self.queue_count = queues;
+        self.bind_mode = switch (input.mode) {
+            0 => .zero_copy,
+            1 => .copy,
+            else => return error.InvalidConfig,
+        };
+        if (self.bind_mode == .zero_copy and queues < 2) return error.SingleQueue;
+        const mem = model.clampUmem(
+            if (input.frame_size == 0) model.umem_frame_size else input.frame_size,
+            if (input.frame_count == 0) model.umem_frame_count else input.frame_count,
+        );
+        self.frame_size = mem.size;
+        self.frame_count = mem.count;
+        self.frames_per_queue = self.frame_count / queues;
+        if (self.frames_per_queue < afxdp.min_ring_size) return error.FrameBudget;
+        self.frame_count = self.frames_per_queue * queues;
+        self.ring_size = afxdp.clampRingSize(if (input.ring_size == 0) 2048 else input.ring_size);
+        self.config = input;
+        self.config.queue_count = queues;
+        self.config.frame_size = self.frame_size;
+        self.config.frame_count = self.frame_count;
+        self.config.ring_size = self.ring_size;
+    }
+
+    fn setOptionU32(fd: c_int, option: c_int, value: u32) AdapterError!void {
+        if (setsockopt(fd, sol_xdp, option, @ptrCast(&value), @intCast(@sizeOf(u32))) != 0) return error.SystemCallFailed;
+    }
+
+    fn getOffsets(fd: c_int) AdapterError!MmapOffsets {
+        var offsets: MmapOffsets = undefined;
+        var length: c_uint = @sizeOf(MmapOffsets);
+        if (getsockopt(fd, sol_xdp, xdp_mmap_offsets, @ptrCast(&offsets), &length) != 0) return error.SystemCallFailed;
+        if (length < @as(c_uint, @intCast(@sizeOf(MmapOffsets)))) return error.SystemCallFailed;
+        return offsets;
+    }
+
+    fn allocateUmem(self: *Adapter) AdapterError!void {
+        const length_u64 = @as(u64, @intCast(self.frame_size)) * @as(u64, @intCast(self.frame_count));
+        if (length_u64 == 0 or length_u64 > @as(u64, @intCast(max_usize))) return error.InvalidConfig;
+        const length: usize = @intCast(length_u64);
+        const pointer = mmap(null, length, prot_read | prot_write, map_private | map_anonymous, -1, 0);
+        if (pointer == null or @intFromPtr(pointer.?) == max_usize) return error.SystemCallFailed;
+        self.umem = @as([*]u8, @ptrCast(pointer.?))[0..length];
+    }
+
+    fn openQueues(self: *Adapter) AdapterError!void {
+        var first_fd: c_int = -1;
+        var queue_index: u32 = 0;
+        while (queue_index < self.queue_count) : (queue_index += 1) {
+            const fd = socket(af_xdp, sock_raw | sock_cloexec, 0);
+            if (fd < 0) return error.SystemCallFailed;
+            self.queues[queue_index].fd = fd;
+            if (queue_index == 0) {
+                first_fd = fd;
+                const memory = self.umem.?;
+                const registration = UmemReg{
+                    .address = @intFromPtr(memory.ptr),
+                    .length = memory.len,
+                    .chunk_size = self.frame_size,
+                    .headroom = 0,
+                    .flags = 0,
+                    .tx_metadata_len = 0,
+                };
+                if (setsockopt(fd, sol_xdp, xdp_umem_reg, @ptrCast(&registration), @intCast(@sizeOf(UmemReg))) != 0) return error.SystemCallFailed;
+                self.offsets = try getOffsets(fd);
+            }
+            try setOptionU32(fd, xdp_umem_fill_ring, self.ring_size);
+            try setOptionU32(fd, xdp_umem_completion_ring, self.ring_size);
+            try setOptionU32(fd, xdp_rx_ring, self.ring_size);
+            try setOptionU32(fd, xdp_tx_ring, self.ring_size);
+
+            const queue = &self.queues[queue_index];
+            queue.rx = try RingView.map(fd, self.offsets.rx, xdp_pgoff_rx_ring, self.ring_size, @sizeOf(XdpDesc));
+            queue.tx = try RingView.map(fd, self.offsets.tx, xdp_pgoff_tx_ring, self.ring_size, @sizeOf(XdpDesc));
+            queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.ring_size, @sizeOf(u64));
+            queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.ring_size, @sizeOf(u64));
+
+            var address = SockAddrXdp{
+                .family = af_xdp,
+                .flags = xdp_use_need_wakeup | if (self.bind_mode == .zero_copy) xdp_zerocopy else xdp_copy,
+                .ifindex = self.config.ifindex,
+                .queue = queue_index,
+                .shared_umem_fd = if (queue_index == 0) 0 else @intCast(first_fd),
+            };
+            if (queue_index != 0) address.flags |= xdp_shared_umem;
+            if (bind(fd, @ptrCast(&address), @intCast(@sizeOf(SockAddrXdp))) != 0) return error.BindFailed;
+            queue.frame_base = queue_index * self.frames_per_queue;
+            queue.frame_limit = queue.frame_base + self.frames_per_queue;
+            try self.prefill(queue);
+            queue.bound = true;
+        }
+        self.ready = true;
+    }
+
+    fn prefill(self: *Adapter, queue: *Queue) AdapterError!void {
+        const count = @min(queue.frame_limit - queue.frame_base, queue.fill.entries);
+        if (queue.fill.free() < count) return error.FillRingFull;
+        const producer = @atomicLoad(u32, queue.fill.producer.?, .relaxed);
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const frame = queue.frame_base + index;
+            queue.fill.address(producer + index).* = @as(u64, @intCast(frame)) * @as(u64, @intCast(self.frame_size));
+        }
+        @atomicStore(u32, queue.fill.producer.?, producer + count, .release);
+    }
+
+    pub fn deinit(self: *Adapter) void {
+        self.close();
+    }
+
+    pub fn close(self: *Adapter) void {
+        self.ready = false;
+        var index: u32 = 0;
+        while (index < self.queue_count) : (index += 1) self.queues[index].close();
+        if (self.umem) |memory| _ = munmap(memory.ptr, memory.len);
+        self.umem = null;
+        self.queue_count = 0;
+    }
+
+    pub fn queueFd(self: *const Adapter, queue: u32) c_int {
+        if (queue >= self.queue_count) return -1;
+        return self.queues[queue].fd;
+    }
+
+    pub fn isReady(self: *const Adapter) bool {
+        return self.ready;
+    }
+
+    pub fn frameBytes(self: *Adapter, frame: CFrame) ?[]u8 {
+        const memory = self.umem orelse return null;
+        if (frame.address >= @as(u64, @intCast(memory.len))) return null;
+        const end = std.math.add(usize, @intCast(frame.address), frame.length) catch return null;
+        if (end > memory.len) return null;
+        const base = @intFromPtr(memory.ptr) + @as(usize, @intCast(frame.address));
+        return @as([*]u8, @ptrFromInt(base))[0..@as(usize, @intCast(frame.length))];
+    }
+
+    pub fn pollQueues(self: *Adapter, timeout_ms: c_int) AdapterError!u64 {
+        if (!self.ready) return error.InvalidConfig;
+        var fds: [model.max_queues]PollFd = undefined;
+        var index: u32 = 0;
+        while (index < self.queue_count) : (index += 1) {
+            fds[index] = .{ .fd = self.queues[index].fd, .events = poll_in, .revents = 0 };
+        }
+        const result = poll(&fds, @intCast(self.queue_count), timeout_ms);
+        if (result < 0) return error.SystemCallFailed;
+        var ready_mask: u64 = 0;
+        index = 0;
+        while (index < self.queue_count) : (index += 1) {
+            if ((fds[index].revents & (poll_in | poll_err)) != 0) ready_mask |= @as(u64, 1) << @intCast(index);
+        }
+        return ready_mask;
+    }
+
+    pub fn receive(self: *Adapter, queue_index: u32) ?CFrame {
+        if (!self.ready or queue_index >= self.queue_count) return null;
+        const queue = &self.queues[queue_index];
+        const producer = @atomicLoad(u32, queue.rx.producer.?, .acquire);
+        const consumer = @atomicLoad(u32, queue.rx.consumer.?, .relaxed);
+        if (consumer == producer) return null;
+        const descriptor = queue.rx.descriptor(consumer).*;
+        @atomicStore(u32, queue.rx.consumer.?, consumer + 1, .release);
+        const end = std.math.add(u64, descriptor.address, @as(u64, descriptor.length)) catch {
+            self.stats.invalid_descriptor += 1;
+            return null;
+        };
+        if (end > @as(u64, @intCast(self.umem.?.len)) or descriptor.address % @as(u64, @intCast(self.frame_size)) != 0) {
+            self.stats.invalid_descriptor += 1;
+            if (descriptor.address % @as(u64, @intCast(self.frame_size)) == 0) {
+                self.recycleAddress(queue_index, descriptor.address) catch {};
+            }
+            return null;
+        }
+        self.stats.rx += 1;
+        return .{ .queue = queue_index, .address = descriptor.address, .length = descriptor.length, .options = descriptor.options };
+    }
+
+    fn recycleAddress(self: *Adapter, queue_index: u32, address: u64) AdapterError!void {
+        if (queue_index >= self.queue_count or address % @as(u64, @intCast(self.frame_size)) != 0) return error.InvalidFrame;
+        const queue = &self.queues[queue_index];
+        if (queue.fill.free() == 0) {
+            self.stats.fill_starved += 1;
+            return error.FillRingFull;
+        }
+        const producer = @atomicLoad(u32, queue.fill.producer.?, .relaxed);
+        queue.fill.address(producer).* = address;
+        @atomicStore(u32, queue.fill.producer.?, producer + 1, .release);
+        self.stats.recycled += 1;
+    }
+
+    pub fn recycle(self: *Adapter, frame: CFrame) AdapterError!void {
+        if (frame.queue >= self.queue_count) return error.InvalidFrame;
+        try self.recycleAddress(frame.queue, frame.address);
+    }
+
+    pub fn transmit(self: *Adapter, frame: CFrame, queue_index: u32) AdapterError!void {
+        if (!self.ready or queue_index >= self.queue_count or frame.address % @as(u64, @intCast(self.frame_size)) != 0 or self.frameBytes(frame) == null) return error.InvalidFrame;
+        const queue = &self.queues[queue_index];
+        const producer = @atomicLoad(u32, queue.tx.producer.?, .relaxed);
+        const consumer = @atomicLoad(u32, queue.tx.consumer.?, .acquire);
+        if (producer -% consumer >= queue.tx.entries) {
+            self.stats.tx_full += 1;
+            return error.TxRingFull;
+        }
+        const descriptor = queue.tx.descriptor(producer);
+        descriptor.* = .{ .address = frame.address, .length = frame.length, .options = frame.options };
+        @atomicStore(u32, queue.tx.producer.?, producer + 1, .release);
+        self.stats.tx += 1;
+        const flags = @atomicLoad(u32, queue.tx.flags.?, .acquire);
+        if ((flags & 1) != 0) _ = send(queue.fd, null, 0, msg_dontwait);
+    }
+
+    pub fn drainCompletions(self: *Adapter, queue_index: u32, limit: u32) AdapterError!u32 {
+        if (!self.ready or queue_index >= self.queue_count) return error.InvalidConfig;
+        const queue = &self.queues[queue_index];
+        const producer = @atomicLoad(u32, queue.completion.producer.?, .acquire);
+        var consumer = @atomicLoad(u32, queue.completion.consumer.?, .relaxed);
+        var drained: u32 = 0;
+        const max_count = @min(limit, producer -% consumer);
+        while (drained < max_count) : (drained += 1) {
+            const address = queue.completion.address(consumer).*;
+            @atomicStore(u32, queue.completion.consumer.?, consumer + 1, .release);
+            consumer += 1;
+            const owner = @as(u32, @intCast(address / @as(u64, @intCast(self.frame_size)) / @as(u64, @intCast(self.frames_per_queue))));
+            self.recycleAddress(if (owner < self.queue_count) owner else queue_index, address) catch {
+                self.stats.fill_starved += 1;
+                break;
+            };
+            self.stats.completed += 1;
+        }
+        return drained;
+    }
+
+    pub fn getStats(self: *const Adapter) Stats {
+        return self.stats;
+    }
+
+};
+
+pub export fn sb_xdp_adapter_open(config: ?*const Config) callconv(.c) ?*Adapter {
+    if (config == null) return null;
+    const allocator = std.heap.c_allocator;
+    const adapter = allocator.create(Adapter) catch return null;
+    adapter.* = Adapter.init(allocator, config.?.*) catch {
+        allocator.destroy(adapter);
+        return null;
+    };
+    return adapter;
+}
+
+pub export fn sb_xdp_adapter_queue_fd(adapter: ?*Adapter, queue: u32) callconv(.c) c_int {
+    return if (adapter) |value| value.queueFd(queue) else -1;
+}
+
+pub export fn sb_xdp_adapter_ready(adapter: ?*const Adapter) callconv(.c) bool {
+    return if (adapter) |value| value.isReady() else false;
+}
+
+pub export fn sb_xdp_adapter_poll(adapter: ?*Adapter, timeout_ms: c_int, ready_mask: ?*u64) callconv(.c) c_int {
+    if (adapter == null or ready_mask == null) return -1;
+    ready_mask.?.* = adapter.?.pollQueues(timeout_ms) catch |err| {
+        _ = err;
+        return -1;
+    };
+    return 0;
+}
+
+pub export fn sb_xdp_adapter_rx(adapter: ?*Adapter, queue: u32, frame: ?*CFrame) callconv(.c) c_int {
+    if (adapter == null or frame == null) return -1;
+    if (adapter.?.receive(queue)) |value| {
+        frame.?.* = value;
+        return 1;
+    }
+    return 0;
+}
+
+pub export fn sb_xdp_adapter_recycle(adapter: ?*Adapter, frame: ?*const CFrame) callconv(.c) c_int {
+    if (adapter == null or frame == null) return -1;
+    adapter.?.recycle(frame.?.*) catch return -1;
+    return 0;
+}
+
+pub export fn sb_xdp_adapter_tx(adapter: ?*Adapter, frame: ?*const CFrame, queue: u32) callconv(.c) c_int {
+    if (adapter == null or frame == null) return -1;
+    adapter.?.transmit(frame.?.*, queue) catch return -1;
+    return 0;
+}
+
+pub export fn sb_xdp_adapter_drain_completions(adapter: ?*Adapter, queue: u32, limit: u32) callconv(.c) c_int {
+    if (adapter == null) return -1;
+    return @intCast(adapter.?.drainCompletions(queue, limit) catch return -1);
+}
+
+pub export fn sb_xdp_adapter_stats(adapter: ?*const Adapter, stats: ?*Stats) callconv(.c) c_int {
+    if (adapter == null or stats == null) return -1;
+    stats.?.* = adapter.?.getStats();
+    return 0;
+}
+
+pub export fn sb_xdp_adapter_close(adapter: ?*Adapter) callconv(.c) void {
+    if (adapter) |value| {
+        const allocator = value.allocator;
+        value.deinit();
+        allocator.destroy(value);
+    }
+}
+
+test "adapter config clamps memory and partitions frames" {
+    var adapter = Adapter{
+        .allocator = std.testing.allocator,
+        .config = .{},
+        .bind_mode = .copy,
+        .frame_size = 0,
+        .frame_count = 0,
+        .ring_size = 0,
+        .frames_per_queue = 0,
+        .queue_count = 0,
+    };
+    for (&adapter.queues) |*queue| queue.* = .{};
+    try adapter.normalize(.{ .ifindex = 2, .queue_count = 2, .frame_size = 1025, .frame_count = 513, .mode = 1 });
+    try std.testing.expectEqual(@as(u32, model.umem_frame_size_min), adapter.frame_size);
+    try std.testing.expectEqual(@as(u32, 256), adapter.frames_per_queue);
+    try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
+    try std.testing.expectEqual(@as(u32, 1024), adapter.ring_size);
+}
+
+test "zero copy refuses a single queue" {
+    var adapter = Adapter{
+        .allocator = std.testing.allocator,
+        .config = .{},
+        .bind_mode = .zero_copy,
+        .frame_size = 0,
+        .frame_count = 0,
+        .ring_size = 0,
+        .frames_per_queue = 0,
+        .queue_count = 0,
+    };
+    for (&adapter.queues) |*queue| queue.* = .{};
+    try std.testing.expectError(error.SingleQueue, adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .mode = 0 }));
+}
+
+test "copy mode may use one queue but remains explicit" {
+    var adapter = Adapter{
+        .allocator = std.testing.allocator,
+        .config = .{},
+        .bind_mode = .copy,
+        .frame_size = 0,
+        .frame_count = 0,
+        .ring_size = 0,
+        .frames_per_queue = 0,
+        .queue_count = 0,
+    };
+    for (&adapter.queues) |*queue| queue.* = .{};
+    try adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .mode = 1 });
+    try std.testing.expectEqual(BindMode.copy, adapter.bind_mode);
+    try std.testing.expectEqual(@as(u32, 1), adapter.queue_count);
+}

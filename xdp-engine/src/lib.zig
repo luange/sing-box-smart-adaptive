@@ -1,4 +1,4 @@
-//! Next-gen XDP policy core. Host-neutral: no netlink, UMEM, or Go FFI yet.
+//! Next-gen XDP policy core and optional Linux AF_XDP host adapter.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -6,6 +6,10 @@ const classify = @import("classify.zig");
 const probe = @import("probe.zig");
 const lifecycle = @import("lifecycle.zig");
 pub const afxdp = @import("afxdp.zig");
+pub const host = if (@import("builtin").os.tag == .linux)
+    @import("linux_adapter.zig")
+else
+    @import("host_adapter_stub.zig");
 
 pub const abi_version = model.abi_version;
 pub const Verdict = model.Verdict;
@@ -27,6 +31,7 @@ comptime {
     _ = probe;
     _ = lifecycle;
     _ = afxdp;
+    _ = host;
 }
 
 test "abi version is stable" {

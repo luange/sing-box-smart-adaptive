@@ -122,7 +122,7 @@ TC v3                unchanged production path
 | L2.5 classify | yes, pure | verdict + reason. Unit-tested without a kernel. |
 | L3 XDP actions | no | `XDP_PASS` / `DROP` / `REDIRECT`. No mark. |
 | L3 TC actions | no | existing v3 `hook` / `sk_assign`. |
-| L4 AF_XDP runtime | no | UMEM, four rings, per-queue XSK, poll, return. Zig/Rust later; not Go. |
+| L4 AF_XDP runtime | no | `xdp-engine/src/linux_adapter.zig`: bounded UMEM, four rings, per-queue XSK, poll, TX and completion return. The host still owns policy-map publication and attach ordering. |
 
 ## 5. Probe (zero driver knowledge)
 
@@ -213,14 +213,17 @@ fails open to TC instead of selecting a different mode.
 |-------|-------------|-------------|
 | 0 | Design + acceptance matrix + Zig classify/probe/lifecycle skeleton | **yes** |
 | 1 | Shared parser/policy ABI plus original XDP kernel object and Linux mode-aware loader (no default behavior change) | **yes** |
-| 2 | Linux-only probe syscalls behind the Zig matrix | **loader surface yes; host integration pending** |
-| 3 | UMEM / rings / poll (Linux, lab NIC) | **ownership model yes; syscall/poll adapter pending** |
+| 2 | Linux-only probe syscalls behind the Zig matrix | **mode-aware loader + real XSK bind adapter; privileged attach remains host-owned** |
+| 3 | UMEM / rings / poll (Linux, lab NIC) | **Zig Linux adapter implemented; privileged lab forwarding evidence pending** |
 | 4 | `hook_xdp.bpf.c` + verifier load on lab kernels | **object + CI verifier surface yes; privileged lab load pending** |
 | 5 | Multi-queue physical A/B: bandwidth **and** 64B/128B PPS | no |
 
 The checked-in loader still leaves XDP disabled until a host has bound every
-selected queue. CI builds and inspects the object; a privileged multi-queue
-lab is required before enabling the forwarding adapter.
+selected queue. The standalone Zig adapter now performs bounded UMEM/ring
+setup and exposes a C ABI, but sing-box integration must still publish all
+XSK FDs and enable the control record only after the adapter reports ready.
+CI builds and inspects the object; a privileged multi-queue lab is required
+before enabling the forwarding adapter.
 
 ## 10. Hard prohibitions
 
