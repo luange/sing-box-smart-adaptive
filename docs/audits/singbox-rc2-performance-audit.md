@@ -34,6 +34,19 @@ rc2 的 QUIC 拥塞控制、FakeIP UDP 回程映射、异步 DNS/本地缓存分
    导致清理路径空指针 panic，并避免并发健康检查修改共享 Header；异常网络
    分支也会关闭已建立连接。
 
+### 107 transparent-huge-page regression (2026-08-30)
+
+The RC4.1 process on VM 107 had only about 30 MiB of live memory at the
+Clash `/memory` endpoint, but RSS had climbed to 260 MiB. `/proc/$pid/smaps`
+showed a 181 MiB anonymous heap region backed by about 158 MiB of
+`AnonHugePages`; the process had only 34 TCP and 9 UDP sockets. This was
+retained transparent huge-page backing, not a DNS/session leak. The OpenRC
+service now exports `GODEBUG=disablethp=1` (and the systemd unit does the same)
+so released arenas can return to the kernel. After an atomic restart the same
+binary stayed on version `1.14.0-rc.4-official-smart-ebpf-v3.45.1-stall-context`;
+RSS was 73 MiB immediately and 82 MiB after 65 seconds, `AnonHugePages` was
+4–8 MiB, both 9090/9091 remained listening, and Google/YouTube returned 204.
+
 ## 验证门
 
 本分支不在 macOS 编译。提交 `0ef5c910` 已通过 Smart/Zig/C ABI CI 及

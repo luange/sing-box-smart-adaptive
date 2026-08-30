@@ -4,6 +4,10 @@ name=$RC_SVCNAME
 description="sing-box service"
 supervisor="supervise-daemon"
 command="/usr/bin/sing-box"
+# Go's transparent huge pages can keep released heap arenas resident on
+# small Alpine guests. Disable them so RSS follows the live heap instead of
+# retaining multi-megabyte THP regions after DNS/provider bursts.
+export GODEBUG="${GODEBUG:+$GODEBUG,}disablethp=1"
 extra_commands="checkconfig"
 extra_started_commands="reload"
 

@@ -13,6 +13,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
+# Keep released Go heap pages reclaimable on small Linux guests.
+Environment=GODEBUG=disablethp=1
 
 [Install]
 WantedBy=multi-user.target
