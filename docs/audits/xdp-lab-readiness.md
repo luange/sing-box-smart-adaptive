@@ -26,11 +26,17 @@ The PVE definition for 115 has `net0`/`net1` as virtio devices and no
 `queues=` setting. No PCI device is passed through. Changing this on a live
 gateway would be a maintenance operation and is not part of XDP enablement.
 
+The PVE host's physical `ens9` (tg3) reports a maximum of four RX channels and
+currently uses two. That host capability is not inherited by a guest
+automatically: the guest still reports one virtio queue until QEMU is started
+with an explicit `queues=` value and enough vCPUs.
+
 ## Admission and rollback
 
-At startup, `mode=auto` probes offload, native, then generic/SKB in that order.
-Each candidate must pass the real verifier/attach path and an AF_XDP bind for
-every selected queue. A missing feature, queue count below two, bind failure,
+At startup, `mode=auto` reads the kernel `netdev` generic-netlink XDP feature
+bitmap, then probes offload, native, and generic/SKB in that order. Each
+candidate must pass the real verifier/attach path and an AF_XDP bind for every
+selected queue. A missing feature, queue count below two, bind failure,
 link/MTU change, or ring starvation leaves `xdp.enabled` false and keeps TC
 active. Explicit modes fail closed to TC; they never silently downgrade.
 

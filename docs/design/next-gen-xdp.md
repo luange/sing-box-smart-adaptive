@@ -18,7 +18,7 @@ production routing plane. AF_XDP is an opt-in DIRECT-only accelerator.
 | C-4 | `bpf_sk_assign`, `skb->mark`, and conntrack do not exist in XDP. Do not emulate them. |
 | C-5 | Empty XSKMAP slots must fall back with `bpf_redirect_map(..., XDP_PASS)`. Never drop on a missing socket. |
 | C-6 | Gain is small-packet PPS and tail latency, not bandwidth and not proxy throughput. Do not claim otherwise. |
-| C-7 | Capability comes from `IFLA_XDP_FEATURES`, a real mode-specific program load/attach, and `bind()`. No driver or kind allow/deny list. |
+| C-7 | Capability comes from the kernel `netdev` generic-netlink `NETDEV_A_DEV_XDP_FEATURES` attribute (or an equivalent kernel query), a real mode-specific program load/attach, and `bind()`. No driver or kind allow/deny list. |
 | C-8 | Every probe or attach failure **falls back to TC**. Failure is never a process-exit or inbound-start error. |
 | C-9 | Native zero-copy requires at least two queues. Generic/SKB copy mode may be selected only with `allow_copy_mode`; it is never silently substituted for an explicit mode. |
 | C-10 | New modules are **Zig** (or Rust if a crate already existed). Do not add Go packages for this path. Do not compile eBPF/XDP on macOS. Linux CI or an isolated PVE lab only. |
@@ -130,7 +130,7 @@ Four tiers. Kind/driver names appear only in diagnostic logs.
 
 | Tier | Input | Fail action |
 |------|-------|-------------|
-| 0 | `IFLA_XDP_FEATURES` | missing `REDIRECT` or `XSK_ZEROCOPY` → fallback TC. Absent bitmap (old kernel) → skip to Tier 1. `RX_SG` set → multi-buffer `XDP_PASS` until parser supports it. |
+| 0 | `netdev` generic-netlink `NETDEV_A_DEV_XDP_FEATURES` | missing `REDIRECT` or `XSK_ZEROCOPY` → fallback TC. Absent family/attribute (old kernel) → skip to Tier 1. `RX_SG` set → multi-buffer `XDP_PASS` until parser supports it. |
 | 1 | `bind(XDP_ZEROCOPY)` then optional `XDP_COPY` | both fail → fallback TC. Copy-only succeeds → fallback TC unless `allow_copy_mode`. |
 | 2 | RX queue count | `< 2` → fallback TC. |
 | 3 | `RTM_NEWLINK` | queue/MTU/driver reset → detach + re-probe. |

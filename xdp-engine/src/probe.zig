@@ -1,4 +1,5 @@
-//! Capability matrix for AF_XDP admission. Inputs are already-observed bits;
+//! Capability matrix for AF_XDP admission. Inputs are already-observed bits
+//! (normally from the Linux `netdev` generic-netlink XDP feature attribute);
 //! this module does not call netlink, ioctl, or bind.
 
 const model = @import("model.zig");
