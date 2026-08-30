@@ -43,6 +43,7 @@ const xdp_shared_umem: u16 = 1 << 0;
 const xdp_copy: u16 = 1 << 1;
 const xdp_zerocopy: u16 = 1 << 2;
 const xdp_use_need_wakeup: u16 = 1 << 3;
+const xdp_need_wakeup: u32 = 1;
 const xdp_pgoff_rx_ring: i64 = 0;
 const xdp_pgoff_tx_ring: i64 = 0x80000000;
 const xdp_umem_pgoff_fill_ring: i64 = 0x100000000;
@@ -573,6 +574,20 @@ pub const Adapter = struct {
         @atomicStore(u32, fill.producer.?, producer + 1, .release);
         states[frame_index] = .in_kernel;
         self.stats.recycled += 1;
+        self.wakeRxIfNeeded();
+    }
+
+    /// XDP_USE_NEED_WAKEUP applies to the FILL ring as well as TX.  Once the
+    /// kernel has stopped polling RX because the fill ring was empty, merely
+    /// returning a descriptor is not sufficient; poll() must be issued to
+    /// restart the driver.  Only do this on the flagged slow path so normal
+    /// recycling remains syscall-free.
+    fn wakeRxIfNeeded(self: *Adapter) void {
+        if (self.queue_count == 0) return;
+        const fill = &self.queues[0].fill;
+        if ((@atomicLoad(u32, fill.flags.?, .acquire) & xdp_need_wakeup) == 0) return;
+        var fd = PollFd{ .fd = self.queues[0].fd, .events = poll_in, .revents = 0 };
+        _ = poll(&fd, 1, 0);
     }
 
     pub fn recycle(self: *Adapter, frame: CFrame) AdapterError!void {
@@ -802,4 +817,9 @@ test "copy mode may use one queue but remains explicit" {
     try adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 1 });
     try std.testing.expectEqual(BindMode.copy, adapter.bind_mode);
     try std.testing.expectEqual(@as(u32, 1), adapter.queue_count);
+}
+
+test "need wakeup flag is a single bit" {
+    try std.testing.expectEqual(@as(u32, 1), xdp_need_wakeup);
+    try std.testing.expect((xdp_need_wakeup & 1) != 0);
 }

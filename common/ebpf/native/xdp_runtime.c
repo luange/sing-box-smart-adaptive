@@ -415,6 +415,18 @@ int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifinde
 		errno = EINVAL;
 		return -1;
 	}
+	/* This adapter is intentionally exclusive.  libxdp can coordinate
+	 * multiple XDP programs through its dispatcher protocol, but our object is
+	 * not a dispatcher component and must never replace an unrelated program.
+	 * Check before the native BPF_LINK_CREATE path as well as the rtnetlink
+	 * paths, whose UPDATE_IF_NOEXIST flag provides only an implicit guard. */
+	int existing_mode = xdp_get_attached_mode(ifindex);
+	if (existing_mode < 0)
+		return -1;
+	if (existing_mode != XDP_ATTACHED_NONE) {
+		errno = EBUSY;
+		return -1;
+	}
 	int link = -1;
 	if (mode == SB_EBPF_XDP_MODE_NATIVE) {
 		link = xdp_link_create(ifindex, runtime->program_fd);
