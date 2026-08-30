@@ -54,3 +54,21 @@ amd64/arm64 glibc/musl Linux 构建；提交 `ef21d5e4` 追加了 WebSocket type
 回归测试。107 已在生产以 `0ef5c910` 产物运行，启动、9091 API、Google/YouTube
 204 和 65 秒稳定性观察均通过，未出现新的 panic。eBPF 仍由内核 fast path
 负责，代理节点流量不会错误套用 DNS prefill 的直连判定。
+
+### RC4 fifth-round global audit (2026-08-30)
+
+The fifth scheduled review rechecked Smart/Zig selection, eBPF v3 and the
+XDP policy boundary, DNS prefill, connection-history retention, provider and
+Clash API snapshots, and shutdown paths. No additional production defect was
+confirmed. The one unsafe configuration path was fixed in `8855b7f4`: v3 now
+rejects `xdp.enabled=true` until the Linux AF_XDP host adapter (UMEM, poll,
+and bidirectional forwarding) is wired, instead of accepting a no-op setting.
+The migration regression test and a Linux CI job were added in `4c43c3d8`.
+
+Evidence: XDP workflow `33311048912` passed Go migration tests, Zig unit and
+cross-build tests, BPF syntax/section checks, and policy-boundary checks. No
+AF_XDP was mounted or deployed to VM 107/115; the existing TC/eBPF v3 path is
+unchanged. The earlier Build workflow `33310899896` was intentionally not
+used as a release gate because its desktop version-update step requires a
+version commit and failed before compilation; it does not indicate a source
+compile failure. Rollback point: `6d5796fe`.
