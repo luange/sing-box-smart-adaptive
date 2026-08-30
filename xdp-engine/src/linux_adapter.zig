@@ -23,7 +23,7 @@ extern fn socket(domain: CInt, socket_type: CInt, protocol: CInt) callconv(.c) C
 extern fn setsockopt(fd: CInt, level: CInt, name: CInt, value: *const anyopaque, value_len: CUint) callconv(.c) CInt;
 extern fn getsockopt(fd: CInt, level: CInt, name: CInt, value: *anyopaque, value_len: *CUint) callconv(.c) CInt;
 extern fn bind(fd: CInt, address: *const anyopaque, address_len: CUint) callconv(.c) CInt;
-extern fn close(fd: CInt) callconv(.c) CInt;
+extern fn c_close(fd: CInt) callconv(.c) CInt;
 extern fn mmap(address: ?*anyopaque, length: usize, protection: CInt, flags: CInt, fd: CInt, offset: i64) callconv(.c) ?*anyopaque;
 extern fn munmap(address: *anyopaque, length: usize) callconv(.c) CInt;
 extern fn poll(fds: [*]PollFd, count: usize, timeout_ms: CInt) callconv(.c) CInt;
@@ -184,7 +184,7 @@ const RingView = struct {
     }
 
     fn pending(self: *const RingView) u32 {
-        return @atomicLoad(u32, self.producer.?, .acquire) -% @atomicLoad(u32, self.consumer.?, .relaxed);
+        return @atomicLoad(u32, self.producer.?, .acquire) -% @atomicLoad(u32, self.consumer.?, .monotonic);
     }
 
     fn free(self: *const RingView) u32 {
@@ -193,13 +193,13 @@ const RingView = struct {
     }
 
     fn descriptor(self: *const RingView, index: u32) *XdpDesc {
-        const address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
-        return @ptrFromInt(address);
+        const ptr_address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
+        return @ptrFromInt(ptr_address);
     }
 
     fn address(self: *const RingView, index: u32) *u64 {
-        const address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
-        return @ptrFromInt(address);
+        const ptr_address = @intFromPtr(self.descriptors.?) + @as(usize, @intCast((index & (self.entries - 1)) * self.stride));
+        return @ptrFromInt(ptr_address);
     }
 };
 
@@ -218,7 +218,7 @@ const Queue = struct {
         self.tx.unmap();
         self.fill.unmap();
         self.completion.unmap();
-        if (self.fd >= 0) _ = close(self.fd);
+        if (self.fd >= 0) _ = c_close(self.fd);
         self.* = .{};
     }
 };
@@ -358,7 +358,7 @@ pub const Adapter = struct {
     fn prefill(self: *Adapter, queue: *Queue) AdapterError!void {
         const count = @min(queue.frame_limit - queue.frame_base, queue.fill.entries);
         if (queue.fill.free() < count) return error.FillRingFull;
-        const producer = @atomicLoad(u32, queue.fill.producer.?, .relaxed);
+        const producer = @atomicLoad(u32, queue.fill.producer.?, .monotonic);
         var index: u32 = 0;
         while (index < count) : (index += 1) {
             const frame = queue.frame_base + index;
@@ -419,7 +419,7 @@ pub const Adapter = struct {
         if (!self.ready or queue_index >= self.queue_count) return null;
         const queue = &self.queues[queue_index];
         const producer = @atomicLoad(u32, queue.rx.producer.?, .acquire);
-        const consumer = @atomicLoad(u32, queue.rx.consumer.?, .relaxed);
+        const consumer = @atomicLoad(u32, queue.rx.consumer.?, .monotonic);
         if (consumer == producer) return null;
         const descriptor = queue.rx.descriptor(consumer).*;
         @atomicStore(u32, queue.rx.consumer.?, consumer + 1, .release);
@@ -445,7 +445,7 @@ pub const Adapter = struct {
             self.stats.fill_starved += 1;
             return error.FillRingFull;
         }
-        const producer = @atomicLoad(u32, queue.fill.producer.?, .relaxed);
+        const producer = @atomicLoad(u32, queue.fill.producer.?, .monotonic);
         queue.fill.address(producer).* = address;
         @atomicStore(u32, queue.fill.producer.?, producer + 1, .release);
         self.stats.recycled += 1;
@@ -459,7 +459,7 @@ pub const Adapter = struct {
     pub fn transmit(self: *Adapter, frame: CFrame, queue_index: u32) AdapterError!void {
         if (!self.ready or queue_index >= self.queue_count or frame.address % @as(u64, @intCast(self.frame_size)) != 0 or self.frameBytes(frame) == null) return error.InvalidFrame;
         const queue = &self.queues[queue_index];
-        const producer = @atomicLoad(u32, queue.tx.producer.?, .relaxed);
+        const producer = @atomicLoad(u32, queue.tx.producer.?, .monotonic);
         const consumer = @atomicLoad(u32, queue.tx.consumer.?, .acquire);
         if (producer -% consumer >= queue.tx.entries) {
             self.stats.tx_full += 1;
@@ -477,7 +477,7 @@ pub const Adapter = struct {
         if (!self.ready or queue_index >= self.queue_count) return error.InvalidConfig;
         const queue = &self.queues[queue_index];
         const producer = @atomicLoad(u32, queue.completion.producer.?, .acquire);
-        var consumer = @atomicLoad(u32, queue.completion.consumer.?, .relaxed);
+        var consumer = @atomicLoad(u32, queue.completion.consumer.?, .monotonic);
         var drained: u32 = 0;
         const max_count = @min(limit, producer -% consumer);
         while (drained < max_count) : (drained += 1) {
@@ -521,10 +521,7 @@ pub export fn sb_xdp_adapter_ready(adapter: ?*const Adapter) callconv(.c) bool {
 
 pub export fn sb_xdp_adapter_poll(adapter: ?*Adapter, timeout_ms: CInt, ready_mask: ?*u64) callconv(.c) CInt {
     if (adapter == null or ready_mask == null) return -1;
-    ready_mask.?.* = adapter.?.pollQueues(timeout_ms) catch |err| {
-        _ = err;
-        return -1;
-    };
+    ready_mask.?.* = adapter.?.pollQueues(timeout_ms) catch return -1;
     return 0;
 }
 
@@ -571,7 +568,7 @@ pub export fn sb_xdp_adapter_close(adapter: ?*Adapter) callconv(.c) void {
 test "adapter config clamps memory and partitions frames" {
     var adapter = Adapter{
         .allocator = std.testing.allocator,
-        .config = .{},
+        .config = .{ .ifindex = 0, .queue_count = 0, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 0 },
         .bind_mode = .copy,
         .frame_size = 0,
         .frame_count = 0,
@@ -590,7 +587,7 @@ test "adapter config clamps memory and partitions frames" {
 test "zero copy refuses a single queue" {
     var adapter = Adapter{
         .allocator = std.testing.allocator,
-        .config = .{},
+        .config = .{ .ifindex = 0, .queue_count = 0, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 0 },
         .bind_mode = .zero_copy,
         .frame_size = 0,
         .frame_count = 0,
@@ -605,7 +602,7 @@ test "zero copy refuses a single queue" {
 test "copy mode may use one queue but remains explicit" {
     var adapter = Adapter{
         .allocator = std.testing.allocator,
-        .config = .{},
+        .config = .{ .ifindex = 0, .queue_count = 0, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 0 },
         .bind_mode = .copy,
         .frame_size = 0,
         .frame_count = 0,
