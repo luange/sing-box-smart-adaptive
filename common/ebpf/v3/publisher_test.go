@@ -79,6 +79,44 @@ func TestFlowLearnBareDirectOnly(t *testing.T) {
 	}
 }
 
+func TestFlowModelReleasedOnGenerationChange(t *testing.T) {
+	b := NewMemoryBackend()
+	client := netip.MustParseAddrPort("10.0.0.2:12345")
+	dest := netip.MustParseAddrPort("8.8.8.8:443")
+	if err := b.PublishFlow(FlowPublishRequest{
+		Client: client, Destination: dest, Protocol: ProtocolTCP,
+		Verdict: VerdictDirect, LeafIsBareDirect: true,
+	}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Flows) != 2 {
+		t.Fatalf("expected bidirectional flow entries, got %d", len(b.Flows))
+	}
+	if err := b.PublishStatic(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Flows) != 0 {
+		t.Fatalf("stale flow entries retained after generation change: %d", len(b.Flows))
+	}
+}
+
+func TestFlowModelBounded(t *testing.T) {
+	b := NewMemoryBackend()
+	for i := 0; i < maxMemoryFlowEntries/2+64; i++ {
+		client := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), uint16(1000+i))
+		dest := netip.AddrPortFrom(netip.AddrFrom4([4]byte{8, 8, 8, byte(i)}), 443)
+		if err := b.PublishFlow(FlowPublishRequest{
+			Client: client, Destination: dest, Protocol: ProtocolTCP,
+			Verdict: VerdictDirect, LeafIsBareDirect: true,
+		}, uint64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(b.Flows) > maxMemoryFlowEntries {
+		t.Fatalf("flow model exceeded bound: got=%d max=%d", len(b.Flows), maxMemoryFlowEntries)
+	}
+}
+
 func TestFlowRevokeOnFailure(t *testing.T) {
 	b := NewMemoryBackend()
 	client := netip.MustParseAddrPort("10.0.0.2:12345")

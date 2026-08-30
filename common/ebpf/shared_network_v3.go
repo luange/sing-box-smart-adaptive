@@ -903,13 +903,20 @@ func (b *V3Backend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8,
 	}
 	var cur v3DNSValue
 	_ = lookupMap(int(b.runtime.dns_hint_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&cur))
-	if cur.Generation != generation {
+	// Expired hints must start a fresh evidence epoch.  Carrying an old
+	// proxy/direct ref across TTL turns transient CDN address reuse into a
+	// permanent conflict and prevents the direct fast path from recovering.
+	if cur.Generation != generation || (cur.ExpiresNs != 0 && cur.ExpiresNs <= now) {
 		cur = v3DNSValue{Generation: generation, Evidence: evidence}
 	}
 	if direct {
-		cur.DirectRefs++
+		if cur.DirectRefs != ^uint32(0) {
+			cur.DirectRefs++
+		}
 	} else {
-		cur.ProxyRefs++
+		if cur.ProxyRefs != ^uint32(0) {
+			cur.ProxyRefs++
+		}
 	}
 	// Conflict isolation (design §8.2): both refs → weak, never DIRECT in TC.
 	if cur.ProxyRefs > 0 && cur.DirectRefs > 0 {

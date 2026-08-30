@@ -16,9 +16,15 @@
 4. socket assignment 被关闭时不再执行 `skc_lookup_tcp`，控制面的 feature mask
    对数据面保持一致。
 5. v3 ABI 升为 2，旧的 stats map 布局拒绝热接管，避免静默读错指标。
+6. DNS hint 在 TTL 到期后开启新的证据 epoch，并把用户态镜像限制在 8192 条；
+   旧的 proxy/direct 冲突不会永久污染复用的 CDN 地址，长期运行也不会无界增长。
+7. exact-flow 用户态镜像按 8192 条双向 entry 限制，周期清理过期项，并在策略
+   generation 提交/失效时同步删除旧 flow 与 DNS 镜像；内核仍使用自身 LRU 和
+   generation 检查。
 
-这些改动只改变 telemetry 的存储方式和无效路径开销，不改变静态策略、Smart、
-DNS 冲突隔离、socket assign、失败回落或策略 generation 语义。
+这些改动只回收已过期或已失效的用户态镜像，并改变 telemetry 的存储方式和无效
+路径开销，不改变静态策略、Smart、DNS 冲突隔离、socket assign、失败回落或策略
+generation 语义。
 
 ## 对照成熟项目后的保留边界
 
@@ -47,4 +53,3 @@ perf stat -e cycles,instructions,cache-misses ./sing-box check -c <isolated-conf
 对比整改前后：每包 cycles、instructions、cache-misses、首包 p95、吞吐、丢包、
 `socket_assign` 失败、map capacity reject 和内存。只有在行为门全部通过且性能
 基线不回退时，才进入测试实例部署；本记录不授权生产 VM 变更。
-

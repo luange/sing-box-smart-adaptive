@@ -135,13 +135,15 @@ func addrBytes(addr netip.Addr) (family uint8, out [16]byte, err error) {
 
 // MemoryBackend is a test double for kernel maps (no cgo).
 type MemoryBackend struct {
-	Control   Control
-	Policy4   [2]map[LPM4Key]PolicyValue
-	Policy6   [2]map[LPM6Key]PolicyValue
-	Flows     map[FlowKey]FlowValue
-	DNS       *DNSHintTable
-	Publisher *BankPublisher
-	Stats     [StatsCount]uint64
+	Control         Control
+	Policy4         [2]map[LPM4Key]PolicyValue
+	Policy6         [2]map[LPM6Key]PolicyValue
+	Flows           map[FlowKey]FlowValue
+	DNS             *DNSHintTable
+	Publisher       *BankPublisher
+	Stats           [StatsCount]uint64
+	flowLimit       int
+	nextFlowPruneNs uint64
 }
 
 func NewMemoryBackend() *MemoryBackend {
@@ -149,6 +151,7 @@ func NewMemoryBackend() *MemoryBackend {
 		Publisher: NewBankPublisher(),
 		Flows:     make(map[FlowKey]FlowValue),
 		DNS:       NewDNSHintTable(),
+		flowLimit: maxMemoryFlowEntries,
 	}
 	b.Policy4[0] = make(map[LPM4Key]PolicyValue)
 	b.Policy4[1] = make(map[LPM4Key]PolicyValue)
@@ -201,6 +204,7 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	gen, bank := b.Publisher.Commit()
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen
+	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
 	return nil
 }
@@ -208,14 +212,101 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 // PublishFlow writes bidirectional flow verdicts.
 func (b *MemoryBackend) PublishFlow(req FlowPublishRequest, nowNs uint64) error {
 	ttl := DefaultFlowTTL(req.Protocol, req.TimeoutClass, req.TTL)
-	expire := nowNs + uint64(ttl)
+	expire := nowNs
+	if ttlNs := uint64(ttl); ttlNs > ^uint64(0)-nowNs {
+		expire = ^uint64(0)
+	} else {
+		expire += ttlNs
+	}
 	pair, err := BuildFlowPair(req, b.Control.PolicyGeneration, expire)
 	if err != nil {
 		return err
 	}
+	if b.Flows == nil {
+		b.Flows = make(map[FlowKey]FlowValue)
+	}
+	if nowNs != 0 && (b.nextFlowPruneNs == 0 || nowNs >= b.nextFlowPruneNs) {
+		b.pruneExpiredFlows(nowNs)
+		b.nextFlowPruneNs = nowNs + flowPruneIntervalNs
+	}
+	limit := b.flowLimit
+	if limit <= 0 {
+		limit = maxMemoryFlowEntries
+	}
+	missing := 0
+	if _, ok := b.Flows[pair.Forward]; !ok {
+		missing++
+	}
+	if _, ok := b.Flows[pair.Reverse]; !ok {
+		missing++
+	}
+	for len(b.Flows)+missing > limit {
+		if !b.evictOldestFlowPair() {
+			break
+		}
+	}
 	b.Flows[pair.Forward] = pair.Value
 	b.Flows[pair.Reverse] = pair.Value
 	return nil
+}
+
+const (
+	maxMemoryFlowEntries = DefaultFlowEntries
+	flowPruneIntervalNs  = 30 * 1_000_000_000
+)
+
+func (b *MemoryBackend) pruneExpiredFlows(nowNs uint64) {
+	for key, value := range b.Flows {
+		if value.ExpiresNs != 0 && value.ExpiresNs <= nowNs {
+			delete(b.Flows, key)
+		}
+	}
+}
+
+func (b *MemoryBackend) evictOldestFlowPair() bool {
+	var oldestKey FlowKey
+	var oldest uint64
+	first := true
+	for key, value := range b.Flows {
+		if first || value.ExpiresNs < oldest {
+			oldestKey, oldest = key, value.ExpiresNs
+			first = false
+		}
+	}
+	if first {
+		return false
+	}
+	delete(b.Flows, oldestKey)
+	reverse := oldestKey
+	reverse.SPort, reverse.DPort = oldestKey.DPort, oldestKey.SPort
+	reverse.SAddr, reverse.DAddr = oldestKey.DAddr, oldestKey.SAddr
+	delete(b.Flows, reverse)
+	return true
+}
+
+func (b *MemoryBackend) invalidateGenerationMaps(generation uint32) {
+	if b == nil || generation == 0 {
+		return
+	}
+	for key, value := range b.Flows {
+		if value.Generation != generation {
+			delete(b.Flows, key)
+		}
+	}
+	if b.DNS != nil {
+		b.DNS.InvalidateGeneration(generation)
+	}
+	b.nextFlowPruneNs = 0
+}
+
+// InvalidateGeneration drops exact-flow and DNS evidence from older policy
+// epochs. The kernel maps use generation checks for correctness; the memory
+// model also removes stale entries so those checks do not become a leak.
+func (b *MemoryBackend) InvalidateGeneration(generation uint32) {
+	if b == nil {
+		return
+	}
+	b.invalidateGenerationMaps(generation)
 }
 
 // RevokeFlow removes both directions after a real proxy/route failure.

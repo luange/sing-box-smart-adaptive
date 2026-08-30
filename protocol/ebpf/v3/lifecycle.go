@@ -72,6 +72,7 @@ func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	defer l.mu.Unlock()
 	if l.backend != nil {
 		l.backend.Control.PolicyGeneration = generation
+		l.backend.InvalidateGeneration(generation)
 	}
 }
 
@@ -267,6 +268,7 @@ func (l *Lifecycle) InvalidateGeneration() error {
 		if l.backend.Control.PolicyGeneration == 0 {
 			l.backend.Control.PolicyGeneration = 1
 		}
+		l.backend.InvalidateGeneration(l.backend.Control.PolicyGeneration)
 	}
 	if l.sink != nil {
 		return l.sink.InvalidateFlowDirect()
