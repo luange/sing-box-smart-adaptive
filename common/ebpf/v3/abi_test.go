@@ -15,6 +15,7 @@ func TestABISizes(t *testing.T) {
 	assertSize(t, "DNSIPValue", unsafe.Sizeof(DNSIPValue{}), 40)
 	assertSize(t, "LPM4Key", unsafe.Sizeof(LPM4Key{}), 8)
 	assertSize(t, "LPM6Key", unsafe.Sizeof(LPM6Key{}), 20)
+	assertSize(t, "StatsValue", unsafe.Sizeof(StatsValue{}), 32*8)
 }
 
 func assertSize(t *testing.T, name string, got, want uintptr) {

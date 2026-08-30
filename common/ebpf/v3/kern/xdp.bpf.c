@@ -26,10 +26,25 @@ static void *(*map_lookup)(void *, const void *) = (void *)BPF_FUNC_map_lookup_e
 static long (*map_redirect)(void *, __u64, __u64) = (void *)BPF_FUNC_redirect_map;
 static __u64 (*monotonic_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 
+static __attribute__((always_inline)) struct sb_v3_stats_value *stats_lookup(void) {
+	__u32 zero = 0;
+	return map_lookup(&v3_stats, &zero);
+}
+
 static __attribute__((always_inline)) void count_stat(__u32 key) {
-	__u64 *value = map_lookup(&v3_stats, &key);
-	if (value)
-		__sync_fetch_and_add(value, 1);
+	struct sb_v3_stats_value *stats = stats_lookup();
+	if (stats && key < SB_V3_STATS_COUNT)
+		/* v3_stats is PERCPU, so this increment is CPU-local. */
+		stats->values[key] += 1;
+}
+
+static __attribute__((always_inline)) void count_direct(__u32 reason) {
+	struct sb_v3_stats_value *stats = stats_lookup();
+	if (!stats)
+		return;
+	if (reason < SB_V3_STATS_COUNT)
+		stats->values[reason] += 1;
+	stats->values[SB_V3_STAT_PACKETS_DIRECT] += 1;
 }
 
 static __attribute__((always_inline)) bool policy_port_match(const struct sb_v3_policy_value *policy,
@@ -155,7 +170,7 @@ static __attribute__((always_inline)) int redirect_direct(struct xdp_md *ctx,
 	__u32 queue = ctx->rx_queue_index;
 	if (queue >= SB_XDP_MAX_QUEUES || queue >= xdp->queue_count)
 		return XDP_PASS;
-	count_stat(reason);
+	count_direct(reason);
 	/* XDP_PASS is the explicit map-miss action.  It keeps TC as the live
 	 * fallback when UMEM is full or a queue has not been bound. */
 	return (int)map_redirect(&v3_xsk_map, queue, XDP_PASS);

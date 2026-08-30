@@ -139,7 +139,7 @@ enum sb_v3_verdict {
 | `v3_dns_ip_hint` | LRU_HASH | DNS/FakeIP 弱关联、冲突数和 TTL |
 | `v3_listener_sockets` | SOCKMAP | TCP4/UDP4/TCP6/UDP6 透明 listener |
 | `v3_socket_identity` | LRU_HASH | cookie → UID/cgroup/process class，仅本机 |
-| `v3_stats` | PERCPU_ARRAY | reason/action/error counters |
+| `v3_stats` | PERCPU_ARRAY[1] | one 32-counter vector per possible CPU; userspace aggregates |
 | `v3_events` | RINGBUF | 低频异常与采样事件，不传 payload |
 
 ### 6.2 ABI 规则
@@ -460,4 +460,3 @@ protocol/ebpf/v3/
 8. 不允许 map miss 时错误直连。
 9. 不允许 reload 原地逐条更新 active policy。
 10. 所有代码完成后先部署 117；通过门槛前不得推 115/107。
-

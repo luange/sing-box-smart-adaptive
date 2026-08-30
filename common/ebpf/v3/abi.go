@@ -6,7 +6,7 @@ package v3
 import "fmt"
 
 // ABIVersion must match SB_V3_ABI_VERSION in abi.h.
-const ABIVersion = 1
+const ABIVersion = 2
 
 const (
 	AFInet  = 2
@@ -109,6 +109,9 @@ const (
 	StatsCount         = 32
 	ListenerCount      = 4
 )
+
+// StatsValue mirrors the per-CPU telemetry vector used by the kernel ABI.
+type StatsValue [StatsCount]uint64
 
 // Control mirrors struct sb_v3_control (32 bytes).
 type Control struct {

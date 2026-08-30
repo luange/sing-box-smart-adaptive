@@ -56,6 +56,9 @@ type V3Backend struct {
 	control  v3Control
 	hostIPv4 []netip.Prefix
 	hostIPv6 []netip.Prefix
+	// statsPossibleCPUs is the kernel's possible-CPU count, not the current
+	// online count. PERCPU map values are laid out for every possible CPU.
+	statsPossibleCPUs int
 	// lastStatic tracks the last full snapshot so inactive-bank rewrite can
 	// delete removed keys (LPM_TRIE has no clear-all).
 	lastStatic      []netip.Prefix
@@ -74,6 +77,12 @@ type v3Control struct {
 	Reserved1        uint16
 	Reserved2        uint32
 }
+
+const v3StatsCount = 32
+
+// v3StatsValue mirrors sb_v3_stats_value. One value is allocated per possible
+// CPU by the kernel PERCPU_ARRAY, so userspace must aggregate all slots.
+type v3StatsValue [v3StatsCount]uint64
 
 type v3PolicyValue struct {
 	Verdict       uint8
@@ -206,6 +215,13 @@ func PrepareSharedNetworkV3(
 	if routingMark == 0 {
 		return nil, E.New("missing shared-network socket-assignment routing mark")
 	}
+	statsCPUs, cpuErr := possibleCPUCount()
+	if cpuErr != nil || statsCPUs < 1 {
+		if cpuErr == nil {
+			cpuErr = E.New("possible CPU count must be >= 1")
+		}
+		return nil, E.Cause(cpuErr, "detect possible CPUs for eBPF v3 stats")
+	}
 	// Match inbound Prepare: large LPM/LRU maps need unlocked RLIMIT_MEMLOCK.
 	memlockErr := raiseMemlockLimit()
 	runtimeState := (*C.struct_sb_ebpf_v3_runtime)(C.calloc(1, C.size_t(C.sizeof_struct_sb_ebpf_v3_runtime)))
@@ -231,8 +247,14 @@ func PrepareSharedNetworkV3(
 		return nil, prepareErr
 	}
 	_ = memlockErr
-	b := &V3Backend{runtime: runtimeState, flowEnabled: policyOffloadFlow}
-	b.control.ABIVersion = 1
+	b := &V3Backend{
+		runtime:           runtimeState,
+		flowEnabled:       policyOffloadFlow,
+		statsPossibleCPUs: statsCPUs,
+	}
+	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version bump covers
+	// the PERCPU stats-vector map layout.
+	b.control.ABIVersion = 2
 	b.control.PolicyGeneration = 1
 	b.control.ActiveBank = 0
 	b.control.RoutingMark = routingMark
@@ -439,12 +461,9 @@ func (b *V3Backend) InvalidateFlowDirect() error {
 	if b.control.PolicyGeneration == 0 {
 		b.control.PolicyGeneration = 1
 	}
-	// Also bump reload counter for soak observability.
-	idx := uint32(25) // SB_V3_STAT_RELOAD_GENERATION
-	var cur uint64
-	_ = lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&cur))
-	cur++
-	_ = updateMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&cur))
+	// The reload generation is already carried in the control record.  Do not
+	// perform a userspace read-modify-write on the PERCPU stats map: it would
+	// overwrite the per-CPU counter for one CPU and reintroduce contention.
 	return b.writeControl(b.control.Enabled != 0)
 }
 
@@ -457,7 +476,27 @@ func (b *V3Backend) PolicyGeneration() uint32 {
 	return b.control.PolicyGeneration
 }
 
-// V3Stats reads the kernel reason counter array (SB_V3_STAT_* indices).
+// readStatsLocked aggregates the PERCPU reason counters with one map lookup.
+// The caller must hold b.access.RLock or b.access.Lock.
+func (b *V3Backend) readStatsLocked() ([]uint64, error) {
+	if b == nil || b.runtime == nil || b.statsPossibleCPUs < 1 {
+		return nil, osErrClosed
+	}
+	stats := make([]uint64, v3StatsCount)
+	perCPU := make([]v3StatsValue, b.statsPossibleCPUs)
+	key := uint32(0)
+	if err := lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&perCPU[0])); err != nil {
+		return nil, err
+	}
+	for _, value := range perCPU {
+		for index, count := range value {
+			stats[index] += count
+		}
+	}
+	return stats, nil
+}
+
+// V3Stats reads and aggregates the kernel reason counters.
 func (b *V3Backend) V3Stats() (stats []uint64, generation uint32, activeBank uint32) {
 	if b == nil {
 		return nil, 0, 0
@@ -467,14 +506,7 @@ func (b *V3Backend) V3Stats() (stats []uint64, generation uint32, activeBank uin
 	if b.runtime == nil {
 		return nil, 0, 0
 	}
-	const n = 32 // SB_V3_STATS_COUNT
-	stats = make([]uint64, n)
-	for i := uint32(0); i < n; i++ {
-		var v uint64
-		idx := i
-		_ = lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&v))
-		stats[i] = v
-	}
+	stats, _ = b.readStatsLocked()
 	return stats, b.control.PolicyGeneration, b.control.ActiveBank & 1
 }
 
@@ -536,12 +568,11 @@ func (b *V3Backend) RuntimeStats() (SharedNetworkRuntimeStats, error) {
 	if b.runtime == nil {
 		return SharedNetworkRuntimeStats{}, osErrClosed
 	}
-	// Map v3 reason counters onto the shared stats surface for soak logs.
-	read := func(idx uint32) uint64 {
-		var v uint64
-		_ = lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&idx), unsafe.Pointer(&v))
-		return v
+	stats, err := b.readStatsLocked()
+	if err != nil {
+		return SharedNetworkRuntimeStats{}, err
 	}
+	read := func(idx uint32) uint64 { return stats[idx] }
 	staticDirect := read(0)
 	flowDirect := read(1)
 	fakeIPDirect := read(2)

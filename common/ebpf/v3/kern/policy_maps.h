@@ -52,8 +52,10 @@ SB_V3_MAP(v3_listener_sockets, BPF_MAP_TYPE_SOCKMAP, __u32, __u64, SB_V3_LISTENE
 SB_V3_MAP(v3_socket_identity, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_socket_identity_key,
 	  struct sb_v3_socket_identity_value, SB_V3_MAX_SOCKET_IDENTITY, 0U);
 
-/* ARRAY (not PERCPU) keeps loader/stat reads simple and matches v2 shared_stats. */
-SB_V3_MAP(v3_stats, BPF_MAP_TYPE_ARRAY, __u32, __u64, SB_V3_STATS_COUNT, 0U);
+/* Counters are write-hot on every packet. Keep policy truth in shared maps,
+ * but put one complete telemetry vector in a PERCPU array. This avoids both
+ * cross-CPU cache contention and a second map lookup for byte accounting. */
+SB_V3_MAP(v3_stats, BPF_MAP_TYPE_PERCPU_ARRAY, __u32, struct sb_v3_stats_value, 1U, 0U);
 
 /* Ringbuf deferred: first ship uses stats only (design §14 counters). */
 

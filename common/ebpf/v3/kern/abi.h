@@ -10,7 +10,7 @@
 #include <linux/types.h>
 
 /* Bump only on incompatible layout changes. Hot take-over must refuse mismatch. */
-#define SB_V3_ABI_VERSION 1U
+#define SB_V3_ABI_VERSION 2U
 
 #define SB_V3_AF_INET 2U
 #define SB_V3_AF_INET6 10U
@@ -101,6 +101,16 @@ enum sb_v3_stat_index {
 	SB_V3_STAT_RELOAD_GENERATION,
 	SB_V3_STAT_COUNT = SB_V3_STATS_COUNT,
 };
+
+/* One per-CPU value contains the complete counter vector.  Keeping the
+ * vector together lets the packet path perform one map lookup for telemetry
+ * even when an action records both a reason and a byte count. */
+struct sb_v3_stats_value {
+	__u64 values[SB_V3_STATS_COUNT];
+};
+
+_Static_assert(sizeof(struct sb_v3_stats_value) == (SB_V3_STATS_COUNT * sizeof(__u64)),
+	       "sb_v3_stats_value size");
 
 enum sb_v3_listener_key {
 	SB_V3_LISTENER_TCP4 = 0,

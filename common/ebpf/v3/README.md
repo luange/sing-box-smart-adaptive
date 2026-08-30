@@ -18,6 +18,12 @@ Design: `Documents/Codex/2026-07-17/new-chat-3/outputs/EBPF-DATAPLANE-V3-DESIGN-
 | `dns_hint.go` | CDN conflict isolation (§8) |
 | `generation.go` | Atomic bank + generation flip |
 
+The v3 telemetry map is a `PERCPU_ARRAY` with one value containing all 32
+counters. Kernel actions update the CPU-local vector without atomic RMW or a
+second lookup for byte accounting; the Go backend aggregates all possible CPU
+slots when exporting metrics. Policy maps remain shared so routing decisions
+are consistent across CPUs.
+
 Control-plane wiring: `protocol/ebpf/v3` (`Lifecycle` + `DataplaneSink`).
 Kernel sink: `common/ebpf.V3Backend` (sole writer of TC maps).
 

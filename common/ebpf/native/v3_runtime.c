@@ -176,10 +176,10 @@ int sb_ebpf_v3_prepare(
 		0U);
 	stage = "create stats map";
 	runtime->stats_map_fd = sb_ebpf_create_map(
-		BPF_MAP_TYPE_ARRAY,
+		BPF_MAP_TYPE_PERCPU_ARRAY,
 		sizeof(uint32_t),
-		sizeof(uint64_t),
-		SB_V3_STATS_COUNT,
+		sizeof(struct sb_v3_stats_value),
+		1U,
 		0U);
 
 	if (runtime->control_map_fd < 0 || runtime->policy4_bank0_fd < 0 ||

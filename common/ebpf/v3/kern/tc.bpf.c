@@ -29,16 +29,36 @@ static struct bpf_sock *(*lookup_tcp)(void *, struct bpf_sock_tuple *, __u32, __
 	(void *)BPF_FUNC_skc_lookup_tcp;
 static __u64 (*monotonic_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 
-static __attribute__((always_inline)) void count_stat(__u32 key) {
-	__u64 *value = map_lookup(&v3_stats, &key);
-	if (value)
-		__sync_fetch_and_add(value, 1);
+static __attribute__((always_inline)) struct sb_v3_stats_value *stats_lookup(void) {
+	__u32 zero = 0;
+	return map_lookup(&v3_stats, &zero);
 }
 
-static __attribute__((always_inline)) void count_bytes(__u32 key, __u32 len) {
-	__u64 *value = map_lookup(&v3_stats, &key);
-	if (value)
-		__sync_fetch_and_add(value, len);
+static __attribute__((always_inline)) void count_stat(__u32 key) {
+	struct sb_v3_stats_value *stats = stats_lookup();
+	if (stats && key < SB_V3_STATS_COUNT)
+		/* v3_stats is PERCPU: the pointer belongs to this CPU, so no atomic
+		 * RMW is needed on the packet hot path. */
+		stats->values[key] += 1;
+}
+
+static __attribute__((always_inline)) void count_proxy(__u32 reason, __u32 len) {
+	struct sb_v3_stats_value *stats = stats_lookup();
+	if (!stats)
+		return;
+	if (reason < SB_V3_STATS_COUNT)
+		stats->values[reason] += 1;
+	stats->values[SB_V3_STAT_PACKETS_PROXY] += 1;
+	stats->values[SB_V3_STAT_BYTES_PROXY] += len;
+}
+
+static __attribute__((always_inline)) void count_direct(__u32 reason) {
+	struct sb_v3_stats_value *stats = stats_lookup();
+	if (!stats)
+		return;
+	if (reason < SB_V3_STATS_COUNT)
+		stats->values[reason] += 1;
+	stats->values[SB_V3_STAT_PACKETS_DIRECT] += 1;
 }
 
 static __attribute__((always_inline)) bool policy_port_match(const struct sb_v3_policy_value *policy,
@@ -262,9 +282,8 @@ static __attribute__((always_inline)) int handoff_proxy(struct __sk_buff *skb,
 							__u32 reason,
 							__u32 ifindex,
 							__u32 pkt_len) {
-	count_stat(reason);
-	count_stat(SB_V3_STAT_PACKETS_PROXY);
-	count_bytes(SB_V3_STAT_BYTES_PROXY, pkt_len);
+	/* One lookup records the reason, packet and byte counters together. */
+	count_proxy(reason, pkt_len);
 
 	if (!(control->flags & SB_V3_FLAG_SOCKET_ASSIGN))
 		return TC_ACT_OK;
@@ -300,8 +319,7 @@ static __attribute__((always_inline)) int handoff_proxy(struct __sk_buff *skb,
 static __attribute__((always_inline)) int action_direct(struct __sk_buff *skb, __u32 reason) {
 	/* DIRECT: leave mark alone; Linux L3 forwards without PBR mark. */
 	(void)skb;
-	count_stat(reason);
-	count_stat(SB_V3_STAT_PACKETS_DIRECT);
+	count_direct(reason);
 	return TC_ACT_OK;
 }
 
@@ -403,7 +421,9 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 	if (dns_hint_allows_direct(control, &packet, &dns_reason))
 		return action_direct(skb, dns_reason);
 
-	if (assign_established(skb, &packet) > 0) {
+	/* Do not pay for skc_lookup_tcp when socket assignment was explicitly
+	 * disabled.  This also keeps WriteControlV3's feature mask authoritative. */
+	if ((control->flags & SB_V3_FLAG_SOCKET_ASSIGN) != 0 && assign_established(skb, &packet) > 0) {
 		skb->mark = routing_mark;
 		count_stat(SB_V3_STAT_ESTABLISHED_BYPASS);
 		return TC_ACT_OK;
