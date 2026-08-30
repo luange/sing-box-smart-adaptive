@@ -47,7 +47,7 @@ test "proxy traffic cannot ride an attached session" {
     const decision = classify.classify(.{
         .generation = 1,
         .xdp_attached = session.attached(),
-        .packet = .{ .dport = 443 },
+        .packet = .{ .dport = 443, .tcp_flags = 0x02 },
         .static_hit = .{ .verdict = .proxy, .generation = 1 },
     });
     try std.testing.expectEqual(model.XdpAction.pass, decision.action);
