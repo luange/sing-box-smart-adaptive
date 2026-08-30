@@ -4,3 +4,4 @@
 #include "native/shared_network_loader.c"
 #include "native/shared_network_runtime.c"
 #include "native/v3_runtime.c"
+#include "native/xdp_runtime.c"

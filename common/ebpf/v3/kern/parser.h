@@ -117,6 +117,9 @@ static __attribute__((always_inline)) int sb_v3_parse(void *data, void *data_end
 			return -1;
 		packet->sport = __builtin_bswap16(tcp->source);
 		packet->dport = __builtin_bswap16(tcp->dest);
+		/* The flags byte is stable across endian/bitfield layouts and is
+		 * sufficient for the XDP first-packet gate. */
+		packet->tcp_flags = *((__u8 *)tcp + 13U);
 	} else if (packet->protocol == IPPROTO_UDP) {
 		struct udphdr *udp = data + transport_offset;
 		if ((void *)(udp + 1) > data_end)

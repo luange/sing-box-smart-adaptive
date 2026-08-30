@@ -123,6 +123,14 @@ enum sb_v3_listener_key {
 #define SB_V3_FLAG_MAC_SOURCE (1U << 11)
 #define SB_V3_FLAG_FAILURE_PROXY (1U << 12) /* failure_mode=proxy (default) */
 
+/* XDP control is intentionally a separate ABI.  TC readers must not infer
+ * AF_XDP state from the TC control block, and an XDP attach must be able to
+ * fail closed without changing socket-assignment behaviour. */
+#define SB_XDP_ABI_VERSION 1U
+#define SB_XDP_MAX_QUEUES 64U
+#define SB_XDP_CTRL_ENABLED (1U << 0)
+#define SB_XDP_CTRL_ALLOW_MULTIBUFFER (1U << 1)
+
 /* Confidence: higher means safer for kernel DIRECT. */
 #define SB_V3_CONF_NONE 0U
 #define SB_V3_CONF_WEAK 1U
@@ -306,9 +314,27 @@ struct sb_v3_packet {
 	__u8 dmac[6];
 	__u32 ifindex;
 	__u32 mark;
+	/* TCP flags from the first byte of the TCP flags field.  XDP uses this
+	 * only to avoid redirecting established TCP; TC keeps the field purely
+	 * observational and does not change its ABI-visible decisions. */
+	__u8 tcp_flags;
+	__u8 reserved3[3];
 };
 
-_Static_assert(sizeof(struct sb_v3_packet) == 60U, "sb_v3_packet size");
+_Static_assert(sizeof(struct sb_v3_packet) == 64U, "sb_v3_packet size");
+
+struct sb_xdp_control {
+	__u32 abi_version;
+	__u32 flags;
+	__u32 policy_generation;
+	__u32 active_bank;
+	__u32 queue_count;
+	__u32 max_frame_size;
+	__u32 reserved0;
+	__u64 attached_since_ns;
+};
+
+_Static_assert(sizeof(struct sb_xdp_control) == 40U, "sb_xdp_control size");
 
 struct sb_v3_event {
 	__u32 reason_code;

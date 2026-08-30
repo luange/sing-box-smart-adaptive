@@ -224,6 +224,39 @@ int sb_ebpf_v3_prepare(
 	struct sb_ebpf_v3_runtime *runtime);
 int sb_ebpf_v3_close(struct sb_ebpf_v3_runtime *runtime);
 
+/* Optional AF_XDP DIRECT accelerator.  It shares the v3 policy-map FDs but
+ * has its own control and XSK map.  Preparing the object never enables it;
+ * callers must attach, bind every queue, and then publish control. */
+struct sb_ebpf_xdp_runtime {
+	int control_map_fd;
+	int xsk_map_fd;
+	int program_fd;
+	int link_fd;
+	uint32_t ifindex;
+	uint32_t queue_count;
+};
+
+int sb_ebpf_xdp_prepare(
+	const uint8_t *object,
+	size_t object_size,
+	const struct sb_ebpf_v3_runtime *v3,
+	uint32_t max_queues,
+	struct sb_ebpf_xdp_runtime *runtime);
+int sb_ebpf_xdp_attach(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex);
+int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime);
+int sb_ebpf_xdp_set_control(
+	struct sb_ebpf_xdp_runtime *runtime,
+	bool enabled,
+	uint32_t policy_generation,
+	uint32_t active_bank,
+	uint32_t queue_count,
+	uint32_t max_frame_size,
+	bool allow_multibuffer,
+	uint64_t attached_since_ns);
+int sb_ebpf_xdp_set_xsk(struct sb_ebpf_xdp_runtime *runtime, uint32_t queue, int xsk_fd);
+int sb_ebpf_xdp_clear_xsk(struct sb_ebpf_xdp_runtime *runtime, uint32_t queue);
+int sb_ebpf_xdp_close(struct sb_ebpf_xdp_runtime *runtime);
+
 int sb_ebpf_create_map(
     enum bpf_map_type type,
     uint32_t key_size,
