@@ -577,7 +577,7 @@ test "adapter config clamps memory and partitions frames" {
         .queue_count = 0,
     };
     for (&adapter.queues) |*queue| queue.* = .{};
-    try adapter.normalize(.{ .ifindex = 2, .queue_count = 2, .frame_size = 1025, .frame_count = 513, .mode = 1 });
+    try adapter.normalize(.{ .ifindex = 2, .queue_count = 2, .ring_size = 0, .frame_size = 1025, .frame_count = 513, .mode = 1 });
     try std.testing.expectEqual(@as(u32, model.umem_frame_size_min), adapter.frame_size);
     try std.testing.expectEqual(@as(u32, 256), adapter.frames_per_queue);
     try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
@@ -596,7 +596,7 @@ test "zero copy refuses a single queue" {
         .queue_count = 0,
     };
     for (&adapter.queues) |*queue| queue.* = .{};
-    try std.testing.expectError(error.SingleQueue, adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .mode = 0 }));
+    try std.testing.expectError(error.SingleQueue, adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 0 }));
 }
 
 test "copy mode may use one queue but remains explicit" {
@@ -611,7 +611,7 @@ test "copy mode may use one queue but remains explicit" {
         .queue_count = 0,
     };
     for (&adapter.queues) |*queue| queue.* = .{};
-    try adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .mode = 1 });
+    try adapter.normalize(.{ .ifindex = 2, .queue_count = 1, .ring_size = 0, .frame_size = 0, .frame_count = 0, .mode = 1 });
     try std.testing.expectEqual(BindMode.copy, adapter.bind_mode);
     try std.testing.expectEqual(@as(u32, 1), adapter.queue_count);
 }
