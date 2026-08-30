@@ -23,7 +23,7 @@ extern fn socket(domain: CInt, socket_type: CInt, protocol: CInt) callconv(.c) C
 extern fn setsockopt(fd: CInt, level: CInt, name: CInt, value: *const anyopaque, value_len: CUint) callconv(.c) CInt;
 extern fn getsockopt(fd: CInt, level: CInt, name: CInt, value: *anyopaque, value_len: *CUint) callconv(.c) CInt;
 extern fn bind(fd: CInt, address: *const anyopaque, address_len: CUint) callconv(.c) CInt;
-extern fn c_close(fd: CInt) callconv(.c) CInt;
+extern fn close(fd: CInt) callconv(.c) CInt;
 extern fn mmap(address: ?*anyopaque, length: usize, protection: CInt, flags: CInt, fd: CInt, offset: i64) callconv(.c) ?*anyopaque;
 extern fn munmap(address: *anyopaque, length: usize) callconv(.c) CInt;
 extern fn poll(fds: [*]PollFd, count: usize, timeout_ms: CInt) callconv(.c) CInt;
@@ -213,12 +213,12 @@ const Queue = struct {
     frame_limit: u32 = 0,
     bound: bool = false,
 
-    fn close(self: *Queue) void {
+    fn release(self: *Queue) void {
         self.rx.unmap();
         self.tx.unmap();
         self.fill.unmap();
         self.completion.unmap();
-        if (self.fd >= 0) _ = c_close(self.fd);
+        if (self.fd >= 0) _ = close(self.fd);
         self.* = .{};
     }
 };
@@ -374,7 +374,7 @@ pub const Adapter = struct {
     pub fn close(self: *Adapter) void {
         self.ready = false;
         var index: u32 = 0;
-        while (index < self.queue_count) : (index += 1) self.queues[index].close();
+        while (index < self.queue_count) : (index += 1) self.queues[index].release();
         if (self.umem) |memory| _ = munmap(memory.ptr, memory.len);
         self.umem = null;
         self.queue_count = 0;
