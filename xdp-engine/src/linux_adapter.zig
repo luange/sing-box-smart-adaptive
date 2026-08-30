@@ -576,7 +576,7 @@ pub export fn sb_xdp_adapter_frame_data(adapter: ?*Adapter, frame: ?*const CFram
     if (adapter == null or frame == null or length == null) return null;
     const bytes = adapter.?.frameBytes(frame.?.*) orelse return null;
     length.?.* = @intCast(bytes.len);
-    return bytes.ptr;
+    return &bytes[0];
 }
 
 pub export fn sb_xdp_adapter_recycle(adapter: ?*Adapter, frame: ?*const CFrame) callconv(.c) CInt {
