@@ -14,16 +14,18 @@ EndpointProfile/Smart behavior.
 
 ## Gates
 
-- RC5 Smart/eBPF global audit: GitHub Actions run `33319832757` — passed on
-  commit `4c9aa192`.
-- XDP engine: GitHub Actions run `33319591473` — passed (Zig tests,
-  x86_64/aarch64 libraries, C ABI, object policy scan); no XDP source changed
-  after that run.
-- Linux release matrix: GitHub Actions run `33319914440` — passed on commit
-  `4c9aa192` for amd64/arm64 × glibc/musl; release publication was disabled
+- RC5 Smart/eBPF global audit: GitHub Actions run `33320488475` — passed on
+  commit `ba372d46`.
+- XDP engine: GitHub Actions run `33320488469` — passed on commit `ba372d46`
+  (Zig tests, x86_64/aarch64 libraries, C ABI, object policy scan).
+- Linux release matrix: GitHub Actions run `33320567889` — passed on commit
+  `ba372d46` for amd64/arm64 × glibc/musl; release publication was disabled
   for this gate. Artifacts were retained by Actions.
 - The follow-up AF_XDP ring hardening is in commit `d18d13c3`: checked ring
   offsets, overflow-safe pointer construction, and partial shared-ring cleanup.
+- XDP backpressure hardening is in commit `ba372d46`: the host-neutral queue
+  model reserves peer TX capacity before consuming RX, so a full peer ring
+  keeps the frame available for TC/kernel fallback instead of losing it.
 - Embedded v2 eBPF provenance is checked before regeneration in commit
   `fd6d45cc`.
 
