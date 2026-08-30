@@ -304,7 +304,7 @@ change.
 | L-6 | Session is a value type; no heap, no global. | `lifecycle.zig` |
 | L-7 | Host must serialize attach/detach (documented; core is not thread-safe). | this section + README |
 | L-8 | RX/TX/completion ownership is bounded; full peer TX returns to kernel. | `afxdp.zig` ring tests |
-| L-9 | Shared UMEM has one fill/completion ring; frames can be received by any queue and are recycled through the shared ring without duplicate descriptors. | `linux_adapter.zig` ownership table + Linux CI build |
+| L-9 | Shared UMEM has one fill/completion ring sized for the bounded total frame budget; frames can be received by any queue and are recycled through the shared ring without duplicate descriptors or double-unmap on close. | `linux_adapter.zig` ownership table + Linux CI build |
 
 ### 11.4 Portability (`lock` + `ci`)
 

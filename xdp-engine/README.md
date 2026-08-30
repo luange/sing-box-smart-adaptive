@@ -16,7 +16,9 @@ sing-box or mihomo integration. Proxy traffic is never mapped to
 `XDP_REDIRECT`.
 
 The adapter uses one shared UMEM fill/completion ring for all queues and
-separate RX/TX rings per XSK. Frame addresses are therefore not queue-owned:
+separate RX/TX rings per XSK. The shared rings are sized for the total bounded
+frame budget (up to the configured ring limit), while RX/TX rings remain
+per-queue. Frame addresses are therefore not queue-owned:
 the bounded ownership table (`in_kernel` → `rx_owned` → `tx_owned`) is the
 source of truth and every recycle returns to the shared fill ring. This avoids
 duplicate descriptors and the cross-queue frame rejection that can otherwise

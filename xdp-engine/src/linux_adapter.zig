@@ -228,12 +228,22 @@ const Queue = struct {
     frame_base: u32 = 0,
     frame_limit: u32 = 0,
     bound: bool = false,
+    owns_shared_rings: bool = false,
 
     fn release(self: *Queue) void {
         self.rx.unmap();
         self.tx.unmap();
-        self.fill.unmap();
-        self.completion.unmap();
+        // The fill/completion rings are UMEM-wide and are aliased by every
+        // queue after XDP_SHARED_UMEM bind.  Only queue 0 owns their mmap;
+        // unmapping an alias here would invalidate queue 0 and make close
+        // double-unmap the same virtual range.
+        if (self.owns_shared_rings) {
+            self.fill.unmap();
+            self.completion.unmap();
+        } else {
+            self.fill = .{};
+            self.completion = .{};
+        }
         if (self.fd >= 0) _ = close(self.fd);
         self.* = .{};
     }
@@ -246,6 +256,7 @@ pub const Adapter = struct {
     frame_size: u32,
     frame_count: u32,
     ring_size: u32,
+    umem_ring_size: u32,
     frames_per_queue: u32,
     umem: ?[]u8 = null,
     queues: [model.max_queues]Queue = undefined,
@@ -263,6 +274,7 @@ pub const Adapter = struct {
             .frame_size = 0,
             .frame_count = 0,
             .ring_size = 0,
+            .umem_ring_size = 0,
             .frames_per_queue = 0,
             .queue_count = 0,
         };
@@ -297,6 +309,12 @@ pub const Adapter = struct {
         if (self.frames_per_queue < afxdp.min_ring_size) return error.FrameBudget;
         self.frame_count = self.frames_per_queue * queues;
         self.ring_size = afxdp.clampRingSize(if (input.ring_size == 0) 2048 else input.ring_size);
+        // Fill/completion are UMEM-wide.  Size them for the total bounded
+        // frame budget, while keeping per-queue RX/TX rings at ring_size.
+        // Without this, a multi-queue adapter can advertise 4096 frames but
+        // initially expose only one queue's 2048 descriptors to the kernel.
+        const total_ring_target = @min(self.frame_count, self.ring_size * queues);
+        self.umem_ring_size = afxdp.clampRingSize(total_ring_target);
         self.config = input;
         self.config.queue_count = queues;
         self.config.frame_size = self.frame_size;
@@ -351,8 +369,8 @@ pub const Adapter = struct {
             // subsequent sockets get their own RX/TX rings and alias the
             // first socket's UMEM rings below.
             if (queue_index == 0) {
-                try setOptionU32(fd, xdp_umem_fill_ring, self.ring_size);
-                try setOptionU32(fd, xdp_umem_completion_ring, self.ring_size);
+                try setOptionU32(fd, xdp_umem_fill_ring, self.umem_ring_size);
+                try setOptionU32(fd, xdp_umem_completion_ring, self.umem_ring_size);
             }
             try setOptionU32(fd, xdp_rx_ring, self.ring_size);
             try setOptionU32(fd, xdp_tx_ring, self.ring_size);
@@ -361,8 +379,9 @@ pub const Adapter = struct {
             queue.rx = try RingView.map(fd, self.offsets.rx, xdp_pgoff_rx_ring, self.ring_size, @sizeOf(XdpDesc));
             queue.tx = try RingView.map(fd, self.offsets.tx, xdp_pgoff_tx_ring, self.ring_size, @sizeOf(XdpDesc));
             if (queue_index == 0) {
-                queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.ring_size, @sizeOf(u64));
-                queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.ring_size, @sizeOf(u64));
+                queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.umem_ring_size, @sizeOf(u64));
+                queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.umem_ring_size, @sizeOf(u64));
+                queue.owns_shared_rings = true;
             } else {
                 queue.fill = self.queues[0].fill;
                 queue.completion = self.queues[0].completion;
@@ -440,6 +459,7 @@ pub const Adapter = struct {
         if (frame.address >= @as(u64, @intCast(memory.len))) return null;
         const end = std.math.add(usize, @intCast(frame.address), @as(usize, @intCast(frame.length))) catch return null;
         if (end > memory.len) return null;
+        if (frame.length == 0) return &[_]u8{};
         const base = @intFromPtr(memory.ptr) + @as(usize, @intCast(frame.address));
         return @as([*]u8, @ptrFromInt(base))[0..@as(usize, @intCast(frame.length))];
     }
@@ -639,6 +659,7 @@ pub export fn sb_xdp_adapter_frame_data(adapter: ?*Adapter, frame: ?*const CFram
     if (adapter == null or frame == null or length == null) return null;
     const bytes = adapter.?.frameBytes(frame.?.*) orelse return null;
     length.?.* = @intCast(bytes.len);
+    if (bytes.len == 0) return null;
     return &bytes[0];
 }
 
@@ -681,6 +702,7 @@ test "adapter config clamps memory and partitions frames" {
         .frame_size = 0,
         .frame_count = 0,
         .ring_size = 0,
+        .umem_ring_size = 0,
         .frames_per_queue = 0,
         .queue_count = 0,
     };
@@ -690,6 +712,7 @@ test "adapter config clamps memory and partitions frames" {
     try std.testing.expectEqual(@as(u32, 256), adapter.frames_per_queue);
     try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
     try std.testing.expectEqual(@as(u32, 1024), adapter.ring_size);
+    try std.testing.expectEqual(@as(u32, 512), adapter.umem_ring_size);
 }
 
 test "C ABI records stay fixed width" {
@@ -706,6 +729,7 @@ test "zero copy refuses a single queue" {
         .frame_size = 0,
         .frame_count = 0,
         .ring_size = 0,
+        .umem_ring_size = 0,
         .frames_per_queue = 0,
         .queue_count = 0,
     };
@@ -721,6 +745,7 @@ test "copy mode may use one queue but remains explicit" {
         .frame_size = 0,
         .frame_count = 0,
         .ring_size = 0,
+        .umem_ring_size = 0,
         .frames_per_queue = 0,
         .queue_count = 0,
     };
