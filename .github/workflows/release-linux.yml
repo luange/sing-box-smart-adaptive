@@ -213,7 +213,7 @@ jobs:
           notes="$(cat <<EOF
           ## sing-box adaptive ${ver}
 
-          Pure **SagerNet 1.14.0-rc.4** base + first-party Smart / eBPF v3 / provider / connection_history.
+          Pure **SagerNet 1.14.0-rc.5** base + first-party Smart / eBPF v3 / provider / connection_history.
 
           ### Assets
 

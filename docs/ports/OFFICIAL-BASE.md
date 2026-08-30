@@ -9,9 +9,9 @@
    - Connection history (`with_connection_history`)
 3. **Never port**: reF1nd cilium eBPF stack as a whole-tree overlay.
 
-## Branch `adaptive/official-rc4-smart-ebpf-audit`
-- Base: official tag `v1.14.0-rc.4` commit `193aba27f722028bc7cdc4e2b096522e11b12964`
-- Version: `1.14.0-rc.4-official-smart-ebpf-v3.44-audit`
+## Branch `adaptive/official-rc5-smart-ebpf-audit`
+- Base: official tag `v1.14.0-rc.5` commit `c881f561e9304ac7a2662d27d80394b3fec1b96c`
+- Version: `1.14.0-rc.5-official-smart-ebpf-v3.46-prod-gate`
 - Default tags include `with_ebpf` and `with_connection_history`
 
 ## Coherence model (must stay true)

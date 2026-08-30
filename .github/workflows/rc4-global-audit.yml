@@ -40,7 +40,7 @@ jobs:
       - name: Publish regenerated object
         uses: actions/upload-artifact@v4
         with:
-          name: rc4-v2-ebpf-object
+          name: rc5-v2-ebpf-object
           path: common/ebpf/native/shared_network_v2.bpf.o
           if-no-files-found: error
 
