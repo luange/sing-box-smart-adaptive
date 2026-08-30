@@ -31,6 +31,14 @@ currently uses two. That host capability is not inherited by a guest
 automatically: the guest still reports one virtio queue until QEMU is started
 with an explicit `queues=` value and enough vCPUs.
 
+PCI passthrough is not currently an option on this host: the Intel IOMMU is
+not enabled, and the only Ethernet controller (`0000:0a:00.0`, Broadcom
+BCM57762) is in the same IOMMU group as its Thunderbolt PCI bridges. It is also
+the `ens9` port backing `vmbr0`, which carries the PVE management address and
+the default route. Detaching it for VM115 would therefore take the host and
+other `vmbr0` guests offline. Enabling IOMMU or changing the bridge requires a
+separate maintenance plan and a dedicated NIC; neither is an XDP prerequisite.
+
 ## Admission and rollback
 
 At startup, `mode=auto` reads the kernel `netdev` generic-netlink XDP feature
