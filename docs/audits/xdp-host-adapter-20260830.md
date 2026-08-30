@@ -15,6 +15,9 @@
   unsupported scatter-gather mode.
 - The XDP program and probe matrix now keep RX scatter-gather on TC until a
   bounded segment walker exists.
+- The shared UMEM fill/completion mmap is owned and released exactly once;
+  its ring capacity covers the bounded aggregate frame budget instead of only
+  one queue's RX/TX ring.
 
 ## Verification
 
@@ -22,6 +25,10 @@ GitHub Actions run `33316181921` passed all jobs: Zig tests, Linux
 x86_64/aarch64 cross-builds, C ABI smoke check, Go migration tests, BPF syntax,
 sections, provenance, and policy-boundary scans. No macOS compilation was
 used.
+
+The RC4 follow-up gates also passed: global audit `33318217594`, XDP engine
+`33318217568`, and Linux release matrix `33318296212` (amd64/arm64, glibc/musl,
+release publication disabled).
 
 ## 115 boundary
 

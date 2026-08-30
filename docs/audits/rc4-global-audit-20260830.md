@@ -23,6 +23,18 @@ is enabled only after mode-specific attach, every XSK queue binding, and
 generation/bank agreement. Any failed probe, link/queue change, or ring
 backpressure returns to TC.
 
+The RC4 Linux gate was rerun after the shared-ring lifecycle fix. Global audit
+run `33318217594`, XDP engine run `33318217568`, and release build run
+`33318296212` passed. The release matrix produced amd64/arm64 glibc and musl
+artifacts with `publish_release=false`; no unreviewed release tag or production
+deployment was created.
+
+The latest adapter correction sizes the UMEM-wide fill/completion rings for the
+bounded total frame budget and marks only queue 0 as their mmap owner. Closing
+any multi-queue adapter therefore cannot unmap an alias twice or invalidate a
+ring still being released by the owner. Empty frame data is also returned as
+an explicit null pointer instead of indexing a zero-length slice.
+
 Remaining acceptance is environmental, not an unguarded code path: a separate
 multi-queue physical/virtio lab must demonstrate native/copy/offload attach,
 bidirectional DIRECT forwarding, no fill starvation, link-change rollback,
