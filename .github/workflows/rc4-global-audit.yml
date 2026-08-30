@@ -1,4 +1,4 @@
-name: RC4 global audit
+name: RC5 global audit
 
 on:
   workflow_dispatch:

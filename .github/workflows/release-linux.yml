@@ -6,9 +6,9 @@ name: Release Linux Binaries
 on:
   push:
     tags:
-      # Keep the gateway release workflow aligned with the official rc4
+      # Keep the gateway release workflow aligned with the official rc5
       # baseline.  The wildcard also permits our dated smart/eBPF suffixes.
-      - "v1.14.0-rc.4-official-smart-ebpf*"
+      - "v1.14.0-rc.5-official-smart-ebpf*"
   workflow_dispatch:
     inputs:
       version:
