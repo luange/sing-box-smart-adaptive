@@ -12,6 +12,7 @@ on:
       - "protocol/ebpf/v3/**"
       - "docs/design/next-gen-xdp.md"
       - "docs/audits/xdp-originality.md"
+      - "docs/audits/xdp-host-adapter-20260830.md"
       - ".github/workflows/xdp-engine.yml"
   pull_request:
     paths:
@@ -24,6 +25,7 @@ on:
       - "protocol/ebpf/v3/**"
       - "docs/design/next-gen-xdp.md"
       - "docs/audits/xdp-originality.md"
+      - "docs/audits/xdp-host-adapter-20260830.md"
       - ".github/workflows/xdp-engine.yml"
   workflow_dispatch:
 
