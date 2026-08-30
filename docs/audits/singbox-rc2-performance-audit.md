@@ -25,10 +25,19 @@ rc2 的 QUIC 拥塞控制、FakeIP UDP 回程映射、异步 DNS/本地缓存分
    `dns_prefill_queue_drops`。
 3. **发布漂移**：Linux 发布工作流已改为匹配 rc4 gateway 标签，避免 rc4 核心
    推送后不触发精简 eBPF 构建。
+4. **已建立连接卡住**：Smart 现在只在真实首个写入后启动单个有界计时器；
+   首字节在 `established_stall_timeout`（默认 10s，5s–2m）内未到达时记一次
+   失败并唤醒共享探测，首字节/关闭会取消计时，不主动制造流量。
+5. **Smart 状态混淆**：Clash 扩展新增最多 32 个独立
+   `network/site/transport` 上下文快照，旧的顶层字段仍保留为兼容视图。
+6. **VMess WebSocket 崩溃**：修复失败升级返回 typed-nil `*WebsocketConn`
+   导致清理路径空指针 panic，并避免并发健康检查修改共享 Header；异常网络
+   分支也会关闭已建立连接。
 
 ## 验证门
 
-本分支不在 macOS 编译。合并后必须在 Linux CI 运行 Go 全量测试、Smart race
-测试、eBPF verifier/数据面测试及 amd64/arm64 glibc/musl 构建；通过后才允许
-替换生产 VM。eBPF 仍由内核 fast path 负责，代理节点流量不会错误套用 DNS
-prefill 的直连判定。
+本分支不在 macOS 编译。提交 `0ef5c910` 已通过 Smart/Zig/C ABI CI 及
+amd64/arm64 glibc/musl Linux 构建；提交 `ef21d5e4` 追加了 WebSocket typed-nil
+回归测试。107 已在生产以 `0ef5c910` 产物运行，启动、9091 API、Google/YouTube
+204 和 65 秒稳定性观察均通过，未出现新的 panic。eBPF 仍由内核 fast path
+负责，代理节点流量不会错误套用 DNS prefill 的直连判定。
