@@ -1,0 +1,40 @@
+name: XDP engine
+
+on:
+  push:
+    paths:
+      - "xdp-engine/**"
+      - "docs/design/next-gen-xdp.md"
+      - ".github/workflows/xdp-engine.yml"
+  pull_request:
+    paths:
+      - "xdp-engine/**"
+      - "docs/design/next-gen-xdp.md"
+      - ".github/workflows/xdp-engine.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zig:
+    name: Zig XDP policy core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Test
+        working-directory: xdp-engine
+        run: zig build test -Dcpu=baseline
+      - name: Build release library
+        working-directory: xdp-engine
+        run: zig build -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Cross-build Linux libraries
+        working-directory: xdp-engine
+        run: |
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast

@@ -20,6 +20,8 @@
 /venv/
 smart-engine/zig-out/
 smart-engine/.zig-cache/
+xdp-engine/zig-out/
+xdp-engine/.zig-cache/
 CLAUDE.md
 AGENTS.md
 /.claude/
