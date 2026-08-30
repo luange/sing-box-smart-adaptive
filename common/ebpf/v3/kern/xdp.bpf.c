@@ -3,7 +3,7 @@
 //
 // Original XDP ingress accelerator for the v3 policy ABI.  This program is
 // deliberately smaller than the TC hook: XDP can only make an L2 decision;
-// it cannot assign a socket, set skb->mark, or consult conntrack.  Proxy and
+// it cannot assign a socket, set a TC packet mark, or consult conntrack.  Proxy and
 // uncertain traffic therefore returns XDP_PASS and is handled by TC.
 
 #define SEC(name) __attribute__((section(name), used))
