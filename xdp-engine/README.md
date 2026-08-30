@@ -4,9 +4,25 @@ Host-neutral Zig module for the optional AF_XDP DIRECT fast path.
 
 Design: `docs/design/next-gen-xdp.md`.
 
-This directory classifies packets, evaluates NIC capability samples, and
-tracks attach/fallback state. It does not open sockets, bind AF_XDP, load BPF,
-or talk to sing-box. Proxy traffic is never mapped to `XDP_REDIRECT`.
+This directory classifies packets, evaluates NIC capability samples, selects
+hardware/native/generic XDP mode only after a real program probe, and tracks
+attach/fallback state. `afxdp.zig` owns bounded RX/TX/completion ring
+ownership; a host adapter supplies Linux syscalls and the v3 map FDs. Proxy
+traffic is never mapped to `XDP_REDIRECT`.
+
+Mode selection is conservative:
+
+- `auto`: verified hardware offload → verified native/zero-copy → verified
+  generic/SKB; otherwise TC.
+- `skb`, `native`, `offload`: explicit mode, no silent downgrade.
+- Every empty XSK slot, ring-starvation event, verifier failure, link change,
+  or queue mismatch returns traffic to TC/kernel forwarding.
+
+The kernel object is `common/ebpf/v3/kern/xdp.bpf.c`; its loader is the
+Linux-only `common/ebpf/native/xdp_runtime.c`. There is no XDP egress hook:
+"outbound" means frames received on the opposite interface are classified by
+the same ingress program and transmitted by the host's paired TX ring. A
+userspace TCP/UDP stack is intentionally not part of this project.
 
 The host must serialize `Session` methods. The core holds no locks and no
 global mutable session.

@@ -6,14 +6,24 @@ on:
       - "xdp-engine/**"
       - "common/ebpf/Makefile"
       - "common/ebpf/v3/kern/**"
+      - "common/ebpf/native/xdp_runtime.c"
+      - "common/ebpf/native/singbox_ebpf.h"
+      - "option/ebpf.go"
+      - "protocol/ebpf/v3/**"
       - "docs/design/next-gen-xdp.md"
+      - "docs/audits/xdp-originality.md"
       - ".github/workflows/xdp-engine.yml"
   pull_request:
     paths:
       - "xdp-engine/**"
       - "common/ebpf/Makefile"
       - "common/ebpf/v3/kern/**"
+      - "common/ebpf/native/xdp_runtime.c"
+      - "common/ebpf/native/singbox_ebpf.h"
+      - "option/ebpf.go"
+      - "protocol/ebpf/v3/**"
       - "docs/design/next-gen-xdp.md"
+      - "docs/audits/xdp-originality.md"
       - ".github/workflows/xdp-engine.yml"
   workflow_dispatch:
 
@@ -55,6 +65,8 @@ jobs:
           set -euo pipefail
           make xdp-generate
           make xdp-check check-xdp-source
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+            -I native -I v3/kern native/xdp_runtime.c
           readelf -h v3/kern/xdp.bpf.o | grep -E 'Class:.*ELF64|Machine:.*BPF'
           readelf -S v3/kern/xdp.bpf.o | grep -E '\.(maps|BTF|BTF\.ext|xdp|license|sb\.source)'
       - name: Verify policy boundaries in the object

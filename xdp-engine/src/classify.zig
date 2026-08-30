@@ -12,6 +12,9 @@ pub const Packet = struct {
     fragmented: bool = false,
     multicast: bool = false,
     broadcast: bool = false,
+    /// The on-wire TCP flags byte.  XDP can only accelerate a clean SYN;
+    /// ACK/FIN/RST and an absent parse stay in the kernel.  UDP ignores it.
+    tcp_flags: u8 = 0,
 };
 
 pub const StaticHit = struct {
@@ -95,6 +98,11 @@ fn generationOk(hit_generation: u32, active: u32) bool {
     return hit_generation != 0 and hit_generation == active;
 }
 
+fn tcpFirstPacket(p: Packet) bool {
+    if (p.protocol != model.proto_tcp) return true;
+    return (p.tcp_flags & 0x02) != 0 and (p.tcp_flags & 0x15) == 0;
+}
+
 fn dnsAllowsDirect(hint: DnsHint, generation: u32, now_ns: u64) bool {
     if (!generationOk(hint.generation, generation)) return false;
     if (hint.expires_ns != 0 and now_ns >= hint.expires_ns) return false;
@@ -125,6 +133,9 @@ pub fn classify(in: Input) Decision {
     // static/flow/DNS hits so a stale DIRECT hint cannot redirect an existing
     // connection into AF_XDP.
     if (in.established_tcp and p.protocol == model.proto_tcp) {
+        return pass(.unseen, .established_bypass);
+    }
+    if (!tcpFirstPacket(p)) {
         return pass(.unseen, .established_bypass);
     }
     if (in.drop_udp_443 and p.protocol == model.proto_udp and p.dport == 443) {
@@ -176,7 +187,7 @@ pub fn classify(in: Input) Decision {
 const std = @import("std");
 
 fn tcp(dport: u16) Packet {
-    return .{ .protocol = model.proto_tcp, .sport = 12345, .dport = dport };
+    return .{ .protocol = model.proto_tcp, .sport = 12345, .dport = dport, .tcp_flags = 0x02 };
 }
 
 fn base(packet: Packet) Input {
@@ -335,7 +346,7 @@ test "ipv4 ipv6 tcp udp share mapping" {
                 .generation = 1,
                 .xdp_attached = true,
                 .xsk_slot_present = true,
-                .packet = .{ .family = family, .protocol = protocol, .dport = 443 },
+                .packet = .{ .family = family, .protocol = protocol, .dport = 443, .tcp_flags = if (protocol == model.proto_tcp) 0x02 else 0 },
             });
             try std.testing.expectEqual(model.Verdict.proxy, miss.verdict);
             try std.testing.expectEqual(model.XdpAction.pass, miss.action);
@@ -344,7 +355,7 @@ test "ipv4 ipv6 tcp udp share mapping" {
                 .generation = 1,
                 .xdp_attached = true,
                 .xsk_slot_present = true,
-                .packet = .{ .family = family, .protocol = protocol, .dport = 443 },
+                .packet = .{ .family = family, .protocol = protocol, .dport = 443, .tcp_flags = if (protocol == model.proto_tcp) 0x02 else 0 },
                 .static_hit = .{ .verdict = .direct, .generation = 1 },
             });
             try std.testing.expectEqual(model.Verdict.direct, direct.verdict);
@@ -401,6 +412,19 @@ test "established tcp wins over direct hit" {
         .xsk_slot_present = true,
         .packet = tcp(443),
         .established_tcp = true,
+        .static_hit = .{ .verdict = .direct, .generation = 1 },
+    });
+    try std.testing.expectEqual(model.Verdict.unseen, d.verdict);
+    try std.testing.expectEqual(model.XdpAction.pass, d.action);
+    try std.testing.expectEqual(model.Reason.established_bypass, d.reason);
+}
+
+test "tcp ack stays in kernel even with direct policy" {
+    const d = classify(.{
+        .generation = 1,
+        .xdp_attached = true,
+        .xsk_slot_present = true,
+        .packet = .{ .protocol = model.proto_tcp, .sport = 12345, .dport = 443, .tcp_flags = 0x10 },
         .static_hit = .{ .verdict = .direct, .generation = 1 },
     });
     try std.testing.expectEqual(model.Verdict.unseen, d.verdict);

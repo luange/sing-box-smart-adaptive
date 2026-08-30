@@ -88,6 +88,18 @@ type EBPFSharedNetworkOptions struct {
 	// FailureMode controls map-miss / assign-failure behavior for v3.
 	// Only "proxy" (NEED_USERSPACE) is supported — never silent DIRECT.
 	FailureMode string `json:"failure_mode,omitempty" enum:"proxy"`
+	// XDP is an opt-in DIRECT accelerator layered beside TC v3.  It never
+	// replaces socket assignment and defaults to disabled for compatibility.
+	XDP EBPFXDPOptions `json:"xdp,omitempty"`
+}
+
+// EBPFXDPOptions controls attach-mode selection.  "auto" probes the actual
+// program in hardware, native, then generic/SKB mode.  Explicit modes fail
+// open to TC instead of silently downgrading to a different dataplane.
+type EBPFXDPOptions struct {
+	Enabled       bool   `json:"enabled,omitempty"`
+	Mode          string `json:"mode,omitempty" enum:"auto,skb,native,offload"`
+	AllowCopyMode bool   `json:"allow_copy_mode,omitempty"`
 }
 
 // EBPFPolicyOffloadOptions is the v3 policy compiler surface (design §13).

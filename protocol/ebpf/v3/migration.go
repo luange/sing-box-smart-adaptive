@@ -16,6 +16,18 @@ const (
 // Unspecified engine keeps v2 (design §13 compatibility).
 func NormalizeSharedNetwork(options option.EBPFSharedNetworkOptions) (option.EBPFSharedNetworkOptions, error) {
 	engine := strings.TrimSpace(strings.ToLower(options.Engine))
+	if options.XDP.Mode == "" {
+		options.XDP.Mode = "auto"
+	}
+	switch strings.ToLower(strings.TrimSpace(options.XDP.Mode)) {
+	case "auto", "skb", "native", "offload":
+		options.XDP.Mode = strings.ToLower(strings.TrimSpace(options.XDP.Mode))
+	default:
+		return options, E.New("shared_network.xdp.mode must be auto|skb|native|offload")
+	}
+	if options.XDP.Enabled && engine != EngineV3 {
+		return options, E.New("shared_network.xdp requires engine=v3")
+	}
 	switch engine {
 	case "", EngineV2:
 		options.Engine = EngineV2

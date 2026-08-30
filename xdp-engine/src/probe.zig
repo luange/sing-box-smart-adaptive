@@ -24,6 +24,53 @@ pub const Outcome = enum(u8) {
     fallback_tc = 3,
 };
 
+/// Linux XDP attach modes, ordered from the most capable to the most
+/// compatible.  `skb` is generic XDP; `native` is driver/zero-copy XDP; and
+/// `offload` asks the NIC to verify and run the program in hardware.
+pub const Mode = enum(u8) { auto = 0, skb = 1, native = 2, offload = 3 };
+
+pub const ModeCapabilities = struct {
+    skb: bool = false,
+    native: bool = false,
+    offload: bool = false,
+    /// The probe must include the actual program load/attach result.  A
+    /// feature bitmap alone is not enough because drivers can reject maps or
+    /// helpers at verifier time.
+    skb_program_ok: bool = false,
+    native_program_ok: bool = false,
+    offload_program_ok: bool = false,
+};
+
+pub const ModeDecision = struct {
+    selected: ?Mode,
+    reason: FallbackReason,
+};
+
+/// Select a mode only after the program has been loaded in that mode.  Auto
+/// prefers hardware, then native, then generic; explicit modes never silently
+/// change the requested mode.  A null result is always a TC fallback.
+pub fn selectMode(requested: Mode, capabilities: ModeCapabilities) ModeDecision {
+    if (requested != .auto) {
+        const ok = switch (requested) {
+            .skb => capabilities.skb and capabilities.skb_program_ok,
+            .native => capabilities.native and capabilities.native_program_ok,
+            .offload => capabilities.offload and capabilities.offload_program_ok,
+            .auto => unreachable,
+        };
+        return if (ok) .{ .selected = requested, .reason = .none } else .{ .selected = null, .reason = .bind_failed };
+    }
+    if (capabilities.offload and capabilities.offload_program_ok) {
+        return .{ .selected = .offload, .reason = .none };
+    }
+    if (capabilities.native and capabilities.native_program_ok) {
+        return .{ .selected = .native, .reason = .none };
+    }
+    if (capabilities.skb and capabilities.skb_program_ok) {
+        return .{ .selected = .skb, .reason = .none };
+    }
+    return .{ .selected = null, .reason = .bind_failed };
+}
+
 pub const FallbackReason = enum(u8) {
     none = 0,
     missing_redirect = 1,
@@ -170,4 +217,33 @@ test "probe sample has no driver or kind fields" {
     const r = evaluate(sample);
     try std.testing.expectEqual(Outcome.attach_zerocopy, r.outcome);
     _ = model.abi_version;
+}
+
+test "auto mode prefers verified offload then native then skb" {
+    const all = selectMode(.auto, .{
+        .skb = true,
+        .native = true,
+        .offload = true,
+        .skb_program_ok = true,
+        .native_program_ok = true,
+        .offload_program_ok = true,
+    });
+    try std.testing.expectEqual(Mode.offload, all.selected.?);
+    const native = selectMode(.auto, .{
+        .skb = true,
+        .native = true,
+        .offload = true,
+        .skb_program_ok = true,
+        .native_program_ok = true,
+        .offload_program_ok = false,
+    });
+    try std.testing.expectEqual(Mode.native, native.selected.?);
+    const skb = selectMode(.auto, .{ .skb = true, .skb_program_ok = true });
+    try std.testing.expectEqual(Mode.skb, skb.selected.?);
+}
+
+test "explicit mode failure never silently downgrades" {
+    const decision = selectMode(.native, .{ .skb = true, .skb_program_ok = true });
+    try std.testing.expect(decision.selected == null);
+    try std.testing.expectEqual(FallbackReason.bind_failed, decision.reason);
 }

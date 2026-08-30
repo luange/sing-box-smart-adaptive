@@ -234,6 +234,13 @@ struct sb_ebpf_xdp_runtime {
 	int link_fd;
 	uint32_t ifindex;
 	uint32_t queue_count;
+	uint32_t mode;
+};
+
+enum sb_ebpf_xdp_mode {
+	SB_EBPF_XDP_MODE_SKB = 1,
+	SB_EBPF_XDP_MODE_NATIVE = 2,
+	SB_EBPF_XDP_MODE_OFFLOAD = 3,
 };
 
 int sb_ebpf_xdp_prepare(
@@ -243,6 +250,7 @@ int sb_ebpf_xdp_prepare(
 	uint32_t max_queues,
 	struct sb_ebpf_xdp_runtime *runtime);
 int sb_ebpf_xdp_attach(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex);
+int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode);
 int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime);
 int sb_ebpf_xdp_set_control(
 	struct sb_ebpf_xdp_runtime *runtime,

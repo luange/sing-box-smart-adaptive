@@ -12,14 +12,58 @@
 
 #include <errno.h>
 #include <linux/bpf.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifndef BPF_F_NO_PREALLOC
 #define BPF_F_NO_PREALLOC 1U
+#endif
+#ifndef BPF_LINK_CREATE
+#define BPF_LINK_CREATE 28
+#endif
+#ifndef BPF_XDP
+#define BPF_XDP 37
+#endif
+#ifndef XDP_FLAGS_UPDATE_IF_NOEXIST
+#define XDP_FLAGS_UPDATE_IF_NOEXIST (1U << 0)
+#endif
+#ifndef XDP_FLAGS_SKB_MODE
+#define XDP_FLAGS_SKB_MODE (1U << 1)
+#endif
+#ifndef XDP_FLAGS_DRV_MODE
+#define XDP_FLAGS_DRV_MODE (1U << 2)
+#endif
+#ifndef XDP_FLAGS_HW_MODE
+#define XDP_FLAGS_HW_MODE (1U << 3)
+#endif
+#ifndef XDP_FLAGS_REPLACE
+#define XDP_FLAGS_REPLACE (1U << 4)
+#endif
+#ifndef IFLA_XDP_FD
+#define IFLA_XDP_FD 1
+#endif
+#ifndef IFLA_XDP_FLAGS
+#define IFLA_XDP_FLAGS 3
+#endif
+#ifndef NLA_F_NESTED
+#define NLA_F_NESTED (1U << 15)
+#endif
+#ifndef NLA_ALIGNTO
+#define NLA_ALIGNTO 4U
+#endif
+#ifndef NLA_ALIGN
+#define NLA_ALIGN(length) (((length) + NLA_ALIGNTO - 1U) & ~(NLA_ALIGNTO - 1U))
+#endif
+#ifndef NLA_HDRLEN
+#define NLA_HDRLEN ((int)NLA_ALIGN(sizeof(struct nlattr)))
 #endif
 
 #ifndef __NR_bpf
@@ -79,6 +123,80 @@ static int xdp_link_create(uint32_t ifindex, int program_fd) {
 	attr.link_create.target_ifindex = ifindex;
 	attr.link_create.attach_type = BPF_XDP;
 	return (int)xdp_bpf_sys(BPF_LINK_CREATE, &attr);
+}
+
+static int xdp_addattr(struct nlmsghdr *message, size_t capacity, uint16_t type,
+			       const void *data, size_t data_size) {
+	size_t length = NLMSG_ALIGN(message->nlmsg_len) + NLA_ALIGN(NLA_HDRLEN + data_size);
+	if (length > capacity || data_size > UINT16_MAX - NLA_HDRLEN) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	struct nlattr *attribute = (struct nlattr *)((uint8_t *)message + NLMSG_ALIGN(message->nlmsg_len));
+	attribute->nla_type = type;
+	attribute->nla_len = (uint16_t)(NLA_HDRLEN + data_size);
+	memcpy((uint8_t *)attribute + NLA_HDRLEN, data, data_size);
+	message->nlmsg_len = (uint32_t)length;
+	return 0;
+}
+
+static int xdp_set_link_fd(uint32_t ifindex, int program_fd, uint32_t mode_flags) {
+	struct {
+		struct nlmsghdr header;
+		struct ifinfomsg interface;
+		uint8_t attributes[128];
+	} request;
+	memset(&request, 0, sizeof(request));
+	request.header.nlmsg_len = NLMSG_LENGTH(sizeof(request.interface));
+	request.header.nlmsg_type = RTM_SETLINK;
+	request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	request.header.nlmsg_seq = 1U;
+	request.interface.ifi_family = AF_UNSPEC;
+	request.interface.ifi_index = (int)ifindex;
+	struct nlattr *nested = (struct nlattr *)((uint8_t *)&request + NLMSG_ALIGN(request.header.nlmsg_len));
+	nested->nla_type = (uint16_t)(IFLA_XDP | NLA_F_NESTED);
+	nested->nla_len = NLA_HDRLEN;
+	request.header.nlmsg_len = NLMSG_ALIGN(request.header.nlmsg_len) + NLA_HDRLEN;
+	int fd_value = program_fd;
+	if (xdp_addattr(&request.header, sizeof(request), IFLA_XDP_FD, &fd_value, sizeof(fd_value)) != 0)
+		return -1;
+	if (xdp_addattr(&request.header, sizeof(request), IFLA_XDP_FLAGS, &mode_flags, sizeof(mode_flags)) != 0)
+		return -1;
+	/* Fix the nested length after adding children. */
+	nested->nla_len = (uint16_t)(request.header.nlmsg_len - ((uint8_t *)nested - (uint8_t *)&request));
+	int netlink = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (netlink < 0)
+		return -1;
+	struct sockaddr_nl address = {.nl_family = AF_NETLINK};
+	struct iovec vector = {.iov_base = &request, .iov_len = request.header.nlmsg_len};
+	struct msghdr message = {.msg_name = &address, .msg_namelen = sizeof(address), .msg_iov = &vector, .msg_iovlen = 1};
+	int result = (int)sendmsg(netlink, &message, 0);
+	if (result >= 0) {
+		uint8_t response[256];
+		struct iovec receive_vector = {.iov_base = response, .iov_len = sizeof(response)};
+		struct msghdr receive_message = {.msg_name = &address, .msg_namelen = sizeof(address),
+			.msg_iov = &receive_vector, .msg_iovlen = 1};
+		result = (int)recvmsg(netlink, &receive_message, 0);
+		if (result >= 0) {
+			struct nlmsghdr *ack = (struct nlmsghdr *)response;
+			if (ack->nlmsg_len >= NLMSG_LENGTH(sizeof(struct nlmsgerr)) && ack->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *error = (struct nlmsgerr *)NLMSG_DATA(ack);
+				if (error->error != 0) {
+					errno = -error->error;
+					result = -1;
+				} else {
+					result = 0;
+				}
+			} else {
+				errno = EBADMSG;
+				result = -1;
+			}
+		}
+	}
+	int saved_errno = errno;
+	(void)close(netlink);
+	errno = saved_errno;
+	return result < 0 ? -1 : 0;
 }
 
 int sb_ebpf_xdp_prepare(
@@ -147,6 +265,10 @@ fail: {
 }
 
 int sb_ebpf_xdp_attach(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex) {
+	return sb_ebpf_xdp_attach_mode(runtime, ifindex, SB_EBPF_XDP_MODE_NATIVE);
+}
+
+int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode) {
 	if (runtime == NULL || runtime->program_fd < 0 || ifindex == 0U) {
 		errno = EINVAL;
 		return -1;
@@ -157,11 +279,27 @@ int sb_ebpf_xdp_attach(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex) {
 		errno = EBUSY;
 		return -1;
 	}
-	int link = xdp_link_create(ifindex, runtime->program_fd);
-	if (link < 0)
+	if (mode < SB_EBPF_XDP_MODE_SKB || mode > SB_EBPF_XDP_MODE_OFFLOAD) {
+		errno = EINVAL;
 		return -1;
+	}
+	int link = -1;
+	if (mode == SB_EBPF_XDP_MODE_NATIVE) {
+		link = xdp_link_create(ifindex, runtime->program_fd);
+		if (link < 0)
+			return -1;
+	} else {
+		uint32_t mode_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
+		if (mode == SB_EBPF_XDP_MODE_SKB)
+			mode_flags |= XDP_FLAGS_SKB_MODE;
+		else
+			mode_flags |= XDP_FLAGS_HW_MODE;
+		if (xdp_set_link_fd(ifindex, runtime->program_fd, mode_flags) != 0)
+			return -1;
+	}
 	runtime->link_fd = link;
 	runtime->ifindex = ifindex;
+	runtime->mode = mode;
 	return 0;
 }
 
@@ -169,7 +307,13 @@ int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime) {
 	if (runtime == NULL)
 		return 0;
 	int result = xdp_close_fd(&runtime->link_fd);
+	if (runtime->ifindex != 0U && runtime->mode != SB_EBPF_XDP_MODE_NATIVE) {
+		if (xdp_set_link_fd(runtime->ifindex, -1,
+				      runtime->mode == SB_EBPF_XDP_MODE_SKB ? XDP_FLAGS_SKB_MODE : XDP_FLAGS_HW_MODE) != 0 && result == 0)
+			result = -1;
+	}
 	runtime->ifindex = 0U;
+	runtime->mode = 0U;
 	/* A detached program must never leave redirect enabled. */
 	(void)sb_ebpf_xdp_set_control(runtime, false, 0U, 0U, 0U, 0U, false, 0U);
 	return result;

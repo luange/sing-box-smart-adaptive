@@ -5,12 +5,16 @@ const model = @import("model.zig");
 const classify = @import("classify.zig");
 const probe = @import("probe.zig");
 const lifecycle = @import("lifecycle.zig");
+pub const afxdp = @import("afxdp.zig");
 
 pub const abi_version = model.abi_version;
 pub const Verdict = model.Verdict;
 pub const XdpAction = model.XdpAction;
 pub const classifyPacket = classify.classify;
 pub const evaluateProbe = probe.evaluate;
+pub const XdpMode = probe.Mode;
+pub const XdpModeCapabilities = probe.ModeCapabilities;
+pub const selectXdpMode = probe.selectMode;
 pub const Session = lifecycle.Session;
 
 pub fn version() u32 {
@@ -22,6 +26,7 @@ comptime {
     _ = classify;
     _ = probe;
     _ = lifecycle;
+    _ = afxdp;
 }
 
 test "abi version is stable" {

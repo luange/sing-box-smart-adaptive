@@ -18,9 +18,9 @@ production routing plane. AF_XDP is an opt-in DIRECT-only accelerator.
 | C-4 | `bpf_sk_assign`, `skb->mark`, and conntrack do not exist in XDP. Do not emulate them. |
 | C-5 | Empty XSKMAP slots must fall back with `bpf_redirect_map(..., XDP_PASS)`. Never drop on a missing socket. |
 | C-6 | Gain is small-packet PPS and tail latency, not bandwidth and not proxy throughput. Do not claim otherwise. |
-| C-7 | Capability comes from `IFLA_XDP_FEATURES` plus `bind()`. No driver or kind allow/deny list. |
+| C-7 | Capability comes from `IFLA_XDP_FEATURES`, a real mode-specific program load/attach, and `bind()`. No driver or kind allow/deny list. |
 | C-8 | Every probe or attach failure **falls back to TC**. Failure is never a process-exit or inbound-start error. |
-| C-9 | Single-queue NICs are ineligible. Copy mode is off unless `allow_copy_mode` is explicit. |
+| C-9 | Native zero-copy requires at least two queues. Generic/SKB copy mode may be selected only with `allow_copy_mode`; it is never silently substituted for an explicit mode. |
 | C-10 | New modules are **Zig** (or Rust if a crate already existed). Do not add Go packages for this path. Do not compile eBPF/XDP on macOS. Linux CI or an isolated PVE lab only. |
 | C-11 | **Never deploy this path to hosts 107 or 115.** Those machines are macvlan + single-queue and are production/canary gateways, not AF_XDP labs. |
 | C-12 | Classify `HANDOFF` must not mean “userspace” for both hooks. Proxy handoff is TC-only. XDP redirect is DIRECT-only. |
@@ -135,9 +135,11 @@ Four tiers. Kind/driver names appear only in diagnostic logs.
 | 2 | RX queue count | `< 2` → fallback TC. |
 | 3 | `RTM_NEWLINK` | queue/MTU/driver reset → detach + re-probe. |
 
-Admission for zero-copy attach: `REDIRECT | XSK_ZEROCOPY`, queues ≥ 2, ZC bind
-OK. No hardcoded macvlan/veth blacklist: those devices already report 0 bits
-or fail `bind()`.
+Admission for native zero-copy attach: `REDIRECT | XSK_ZEROCOPY`, queues ≥ 2,
+ZC bind OK. Generic/SKB admission is a separate copy-mode probe and requires
+`allow_copy_mode`. Hardware/offload admission requires the same object to pass
+the NIC's offload verifier; feature bits alone never enable it. No hardcoded
+macvlan/veth blacklist: those devices already report 0 bits or fail `bind()`.
 
 ## 6. Lifecycle
 
@@ -202,16 +204,18 @@ proxy, never instead of it.
 
 ## 9. Phasing
 
-| Phase | Deliverable | This change |
+| Phase | Deliverable | Status |
 |-------|-------------|-------------|
 | 0 | Design + acceptance matrix + Zig classify/probe/lifecycle skeleton | **yes** |
-| 1 | Shared parser/policy C extraction used by TC (no behavior change) | no |
-| 2 | Linux-only probe syscalls behind the Zig matrix | no |
-| 3 | UMEM / rings / poll (Linux, lab NIC) | no |
-| 4 | `hook_xdp.bpf.c` + verifier load on lab kernels | no |
+| 1 | Shared parser/policy ABI plus original XDP kernel object and Linux mode-aware loader (no default behavior change) | **yes** |
+| 2 | Linux-only probe syscalls behind the Zig matrix | **loader surface yes; host integration pending** |
+| 3 | UMEM / rings / poll (Linux, lab NIC) | **ownership model yes; syscall/poll adapter pending** |
+| 4 | `hook_xdp.bpf.c` + verifier load on lab kernels | **object + CI verifier surface yes; privileged lab load pending** |
 | 5 | Multi-queue physical A/B: bandwidth **and** 64B/128B PPS | no |
 
-Phase 0 must not attach, bind, or deploy. It only locks the decision model.
+The checked-in loader still leaves XDP disabled until a host has bound every
+selected queue. CI builds and inspects the object; a privileged multi-queue
+lab is required before enabling the forwarding adapter.
 
 ## 10. Hard prohibitions
 
@@ -233,11 +237,11 @@ Phase 0 must not attach, bind, or deploy. It only locks the decision model.
 
 ## 11. Acceptance matrix
 
-Status values: `lock` = encoded in Phase 0 tests; `lab` = Linux kernel/NIC;
+Status values: `lock` = encoded in Zig tests; `ci` = Linux build/object gate; `lab` = Linux kernel/NIC;
 `gate` = isolated PVE canary that is **not** 107/115; `out` = not this repo
 change.
 
-### 11.1 Boundary and classify (Phase 0 `lock`)
+### 11.1 Boundary and classify (`lock` + `ci`)
 
 | ID | Requirement | Evidence |
 |----|-------------|----------|
@@ -255,8 +259,10 @@ change.
 | A-12 | Empty-slot redirect flags equal `XDP_PASS` (2), not DROP/ABORTED. | `redirect empty slot uses xdp pass` |
 | A-13 | IPv4/IPv6 and TCP/UDP share the same verdict mapping. | table tests in `classify.zig` |
 | A-14 | Classify allocates nothing and uses no locks. | code inspection + no allocator in `classify.zig` |
+| A-15 | A clean TCP SYN may redirect; ACK/FIN/RST always PASS. | Zig model + `xdp.bpf.c` flags gate |
+| A-16 | XDP ABI/control generation and active bank must match TC before redirect. | `xdp.bpf.c` |
 
-### 11.2 Probe and fallback (Phase 0 `lock`)
+### 11.2 Probe and fallback (`lock`)
 
 | ID | Requirement | Evidence |
 |----|-------------|----------|
@@ -269,8 +275,9 @@ change.
 | P-7 | Absent feature bitmap skips Tier 0 and uses bind + queues. | `probe.zig` |
 | P-8 | No probe result is “fatal/exit”. | `ProbeResult.fatal == false` always |
 | P-9 | Kind/driver strings are not consulted. | no such fields on `ProbeSample` |
+| P-10 | Auto mode prefers verified offload, then native, then generic; no silent downgrade for explicit modes. | `selectMode` tests |
 
-### 11.3 Lifecycle and memory (Phase 0 `lock`)
+### 11.3 Lifecycle and memory (`lock` + `ci`)
 
 | ID | Requirement | Evidence |
 |----|-------------|----------|
@@ -281,8 +288,9 @@ change.
 | L-5 | UMEM bounds are constants and do not grow with node/session count. | `model.zig` |
 | L-6 | Session is a value type; no heap, no global. | `lifecycle.zig` |
 | L-7 | Host must serialize attach/detach (documented; core is not thread-safe). | this section + README |
+| L-8 | RX/TX/completion ownership is bounded; full peer TX returns to kernel. | `afxdp.zig` ring tests |
 
-### 11.4 Portability (Phase 0 `lock` + CI)
+### 11.4 Portability (`lock` + `ci`)
 
 | ID | Requirement | Evidence |
 |----|-------------|----------|
@@ -290,9 +298,10 @@ change.
 | O-2 | Linux CI runs `zig build test -Dcpu=baseline` on Ubuntu only. | `.github/workflows/xdp-engine.yml` |
 | O-3 | Workflow does not run on macOS or Windows. | `runs-on: ubuntu-latest` |
 | O-4 | Baseline CPU, matching `smart-engine`. | `build.zig` |
-| O-5 | No BPF `.o` generate on Darwin. | no macOS job, no generate step in Phase 0 |
+| O-5 | No BPF `.o` generate on Darwin. | Linux-only `bpf` workflow job |
+| O-6 | XDP object has BTF/maps and a provenance hash; stale object fails. | `xdp-generate`, `xdp-check`, `check-xdp-source` |
 
-### 11.5 Lab / gate (later; not Phase 0)
+### 11.5 Lab / gate (required before production)
 
 | ID | Requirement | Evidence |
 |----|-------------|----------|
@@ -304,6 +313,9 @@ change.
 | K-6 | `fill_starved == 0` for 10 minutes on the lab NIC. | `lab` |
 | K-7 | Proxy path p95 does not regress > 5% vs TC-only. | `lab` |
 | K-8 | **Do not run K-* on 107 or 115.** | ops rule |
+| K-9 | Exercise generic, native and (when hardware accepts it) offload attach on the same policy object. | privileged lab |
+| K-10 | Attach both interfaces and forward both directions; link/queue change detaches and TC continues. | privileged lab |
+| K-11 | XSK fill/completion starvation, MTU, VLAN, IPv4/IPv6 and malformed frames all fail open. | privileged lab |
 
 ### 11.6 Explicit non-acceptance
 
@@ -314,7 +326,7 @@ change.
 | N-3 | Deploy to 107/115 because kernel ≥ 6.11 | rejected (macvlan + 1 queue) |
 | N-4 | macOS compile validates XDP | rejected |
 
-## 12. Code layout (Phase 0)
+## 12. Code layout (Phase 1)
 
 ```
 docs/design/next-gen-xdp.md     this file
@@ -325,11 +337,16 @@ xdp-engine/
   src/classify.zig              hook-neutral classify + XDP mapping
   src/probe.zig                 Tier 0–2 matrix
   src/lifecycle.zig             state machine
+  src/afxdp.zig                 bounded RX/TX/completion ownership
   src/lib.zig                   facade + test root
 .github/workflows/xdp-engine.yml
+
+common/ebpf/v3/kern/xdp.bpf.c   original XDP ingress policy hook
+common/ebpf/v3/kern/xdp_*.h    XDP-only ABI and map declarations
+common/ebpf/native/xdp_runtime.c Linux loader/mode attach lifecycle
 ```
 
-No Go files, no kernel objects, no host deploy scripts.
+No Go XDP policy code and no production host deploy script are permitted.
 
 ## 13. Relationship to v3 TC tests
 
