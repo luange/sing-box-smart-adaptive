@@ -171,22 +171,50 @@ const RingView = struct {
     entries: u32 = 0,
     stride: u32 = 0,
 
-    fn map(fd: CInt, offset: RingOffset, mmap_offset: i64, entries: u32, stride: u32) AdapterError!RingView {
-        if (entries == 0 or stride == 0) return error.InvalidConfig;
-        const desc_bytes = @as(u64, @intCast(entries)) * @as(u64, @intCast(stride));
-        const length_u64 = offset.desc + desc_bytes;
+    fn mappingLength(offset: RingOffset, entries: u32, stride: u32) AdapterError!usize {
+        if (entries == 0 or stride == 0 or (entries & (entries - 1)) != 0) return error.InvalidConfig;
+
+        const desc_bytes = std.math.mul(u64, @as(u64, @intCast(entries)), @as(u64, @intCast(stride))) catch return error.RingMapFailed;
+        var length_u64 = std.math.add(u64, offset.desc, desc_bytes) catch return error.RingMapFailed;
+        const control_offsets = [_]u64{ offset.producer, offset.consumer, offset.flags };
+        for (control_offsets) |control| {
+            if ((control & 3) != 0) return error.RingMapFailed;
+            const control_end = std.math.add(u64, control, @sizeOf(u32)) catch return error.RingMapFailed;
+            if (control_end > length_u64) length_u64 = control_end;
+        }
         if (length_u64 > @as(u64, @intCast(max_usize))) return error.RingMapFailed;
-        const length: usize = @intCast(length_u64);
+        return @intCast(length_u64);
+    }
+
+    fn map(fd: CInt, offset: RingOffset, mmap_offset: i64, entries: u32, stride: u32) AdapterError!RingView {
+        if (mmap_offset < 0) return error.RingMapFailed;
+        const length = try mappingLength(offset, entries, stride);
         const pointer = mmap(null, length, prot_read | prot_write, map_shared, fd, mmap_offset);
         if (pointer == null or @intFromPtr(pointer.?) == max_usize) return error.RingMapFailed;
         const bytes = @as([*]u8, @ptrCast(pointer.?))[0..length];
         const base = @intFromPtr(bytes.ptr);
+        const producer = std.math.add(usize, base, @intCast(offset.producer)) catch {
+            _ = munmap(bytes.ptr, bytes.len);
+            return error.RingMapFailed;
+        };
+        const consumer = std.math.add(usize, base, @intCast(offset.consumer)) catch {
+            _ = munmap(bytes.ptr, bytes.len);
+            return error.RingMapFailed;
+        };
+        const flags = std.math.add(usize, base, @intCast(offset.flags)) catch {
+            _ = munmap(bytes.ptr, bytes.len);
+            return error.RingMapFailed;
+        };
+        const descriptors = std.math.add(usize, base, @intCast(offset.desc)) catch {
+            _ = munmap(bytes.ptr, bytes.len);
+            return error.RingMapFailed;
+        };
         return .{
             .mapping = bytes,
-            .producer = @ptrFromInt(base + @as(usize, @intCast(offset.producer))),
-            .consumer = @ptrFromInt(base + @as(usize, @intCast(offset.consumer))),
-            .flags = @ptrFromInt(base + @as(usize, @intCast(offset.flags))),
-            .descriptors = @ptrFromInt(base + @as(usize, @intCast(offset.desc))),
+            .producer = @ptrFromInt(producer),
+            .consumer = @ptrFromInt(consumer),
+            .flags = @ptrFromInt(flags),
+            .descriptors = @ptrFromInt(descriptors),
             .entries = entries,
             .stride = stride,
         };
@@ -379,9 +407,12 @@ pub const Adapter = struct {
             queue.rx = try RingView.map(fd, self.offsets.rx, xdp_pgoff_rx_ring, self.ring_size, @sizeOf(XdpDesc));
             queue.tx = try RingView.map(fd, self.offsets.tx, xdp_pgoff_tx_ring, self.ring_size, @sizeOf(XdpDesc));
             if (queue_index == 0) {
+                // Mark ownership before either mmap call. If the second map
+                // fails after the first succeeds, Queue.release must reclaim
+                // the partially initialized shared ring as well.
+                queue.owns_shared_rings = true;
                 queue.fill = try RingView.map(fd, self.offsets.fill, xdp_umem_pgoff_fill_ring, self.umem_ring_size, @sizeOf(u64));
                 queue.completion = try RingView.map(fd, self.offsets.completion, xdp_umem_pgoff_completion_ring, self.umem_ring_size, @sizeOf(u64));
-                queue.owns_shared_rings = true;
             } else {
                 queue.fill = self.queues[0].fill;
                 queue.completion = self.queues[0].completion;
@@ -713,6 +744,24 @@ test "adapter config clamps memory and partitions frames" {
     try std.testing.expectEqual(@as(u32, 512), adapter.frame_count);
     try std.testing.expectEqual(@as(u32, 1024), adapter.ring_size);
     try std.testing.expectEqual(@as(u32, 512), adapter.umem_ring_size);
+}
+
+test "ring mapping validates control offsets and checked arithmetic" {
+    const offset = RingOffset{ .producer = 0, .consumer = 4, .desc = 64, .flags = 8 };
+    try std.testing.expectEqual(@as(usize, 128), try RingView.mappingLength(offset, 4, @sizeOf(XdpDesc)));
+
+    try std.testing.expectError(
+        error.RingMapFailed,
+        RingView.mappingLength(.{ .producer = 0, .consumer = 4, .desc = std.math.maxInt(u64), .flags = 8 }, 4, @sizeOf(XdpDesc)),
+    );
+    try std.testing.expectError(
+        error.RingMapFailed,
+        RingView.mappingLength(.{ .producer = 0, .consumer = 4, .desc = 64, .flags = 2 }, 4, @sizeOf(XdpDesc)),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        RingView.mappingLength(offset, 3, @sizeOf(XdpDesc)),
+    );
 }
 
 test "C ABI records stay fixed width" {
