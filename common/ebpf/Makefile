@@ -80,7 +80,8 @@ xdp-generate:
 	@set -eu; \
 	temporary="$$(mktemp "$(XDP_OBJECT).XXXXXX")"; \
 	trap 'rm -f "$$temporary"' EXIT; \
-	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -DSB_XDP_SOURCE_HASH="$(XDP_SOURCE_HASH)" -c "$(XDP_SOURCE)" -o "$$temporary"; \
+	extra_flags='-DSB_XDP_SOURCE_HASH="$(XDP_SOURCE_HASH)"'; \
+	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) $$extra_flags -c "$(XDP_SOURCE)" -o "$$temporary"; \
 	mv "$$temporary" "$(XDP_OBJECT)"; \
 	trap - EXIT
 
@@ -89,7 +90,8 @@ xdp-check:
 	if [ ! -f "$(XDP_OBJECT)" ]; then echo "$(XDP_OBJECT) missing" >&2; exit 1; fi; \
 	temporary="$$(mktemp "$(XDP_OBJECT).XXXXXX")"; \
 	trap 'rm -f "$$temporary"' EXIT; \
-	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -DSB_XDP_SOURCE_HASH="$(XDP_SOURCE_HASH)" -c "$(XDP_SOURCE)" -o "$$temporary"; \
+	extra_flags='-DSB_XDP_SOURCE_HASH="$(XDP_SOURCE_HASH)"'; \
+	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) $$extra_flags -c "$(XDP_SOURCE)" -o "$$temporary"; \
 	cmp -s "$(XDP_OBJECT)" "$$temporary" || { echo "$(XDP_OBJECT) stale" >&2; exit 1; }; \
 	rm -f "$$temporary"; trap - EXIT
 
