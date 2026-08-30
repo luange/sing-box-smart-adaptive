@@ -34,6 +34,9 @@ func NormalizeSharedNetwork(options option.EBPFSharedNetworkOptions) (option.EBP
 		return options, nil
 	case EngineV3:
 		options.Engine = EngineV3
+		if options.XDP.Enabled {
+			return options, E.New("shared_network.xdp.enabled is reserved until the Linux AF_XDP host adapter is available; keep xdp.enabled=false")
+		}
 	default:
 		return options, E.New("shared_network.engine must be v2 or v3, got ", options.Engine)
 	}

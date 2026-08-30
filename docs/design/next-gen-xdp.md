@@ -199,7 +199,8 @@ Suggested bounds (skeleton constants, overridable later):
 }
 ```
 
-Default `xdp.enabled` is false. `data_plane` stays `socket_assign`. A later
+Default `xdp.enabled` is false, and v3 migration rejects `true` until the
+Linux host adapter is wired. `data_plane` stays `socket_assign`. A later
 `data_plane: "afxdp"` may enable the DIRECT accelerator **in addition to** TC
 proxy, never instead of it. `mode: "auto"` probes hardware offload first,
 then native/driver, then generic/SKB; each candidate must pass the real

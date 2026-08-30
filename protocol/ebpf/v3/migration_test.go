@@ -35,3 +35,13 @@ func TestNormalizeXDPRejectsUnknownMode(t *testing.T) {
 		t.Fatal("unknown xdp mode must be rejected")
 	}
 }
+
+func TestNormalizeXDPRejectsEnabledUntilHostAdapter(t *testing.T) {
+	_, err := NormalizeSharedNetwork(option.EBPFSharedNetworkOptions{
+		Engine: EngineV3,
+		XDP:    option.EBPFXDPOptions{Enabled: true},
+	})
+	if err == nil {
+		t.Fatal("xdp.enabled must not be accepted before the AF_XDP host adapter is wired")
+	}
+}

@@ -8,7 +8,9 @@ This directory classifies packets, evaluates NIC capability samples, selects
 hardware/native/generic XDP mode only after a real program probe, and tracks
 attach/fallback state. `afxdp.zig` owns bounded RX/TX/completion ring
 ownership; a host adapter supplies Linux syscalls and the v3 map FDs. Proxy
-traffic is never mapped to `XDP_REDIRECT`.
+traffic is never mapped to `XDP_REDIRECT`. The sing-box option remains
+rejected until that adapter is wired, so this library cannot be mistaken for
+a live production path.
 
 Mode selection is conservative:
 
