@@ -6,9 +6,9 @@ name: Release Linux Binaries
 on:
   push:
     tags:
-      # Keep the gateway release workflow aligned with the official rc5
-      # baseline.  The wildcard also permits our dated smart/eBPF suffixes.
-      - "v1.14.0-rc.5-official-smart-ebpf*"
+      # Keep the gateway release workflow aligned with the official stable
+      # baseline. The wildcard permits our dated smart/eBPF suffixes.
+      - "v1.14.0-official-smart-ebpf*"
   workflow_dispatch:
     inputs:
       version:
@@ -213,7 +213,7 @@ jobs:
           notes="$(cat <<EOF
           ## sing-box adaptive ${ver}
 
-          Pure **SagerNet 1.14.0-rc.5** base + first-party Smart / eBPF v3 / provider / connection_history.
+          Pure **SagerNet 1.14.0** base + first-party Smart / eBPF v3 / provider / connection_history.
 
           ### Assets
 
