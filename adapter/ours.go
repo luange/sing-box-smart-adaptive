@@ -44,20 +44,21 @@ type DirectOffload interface {
 
 // SmartCandidateStatus is a snapshot of one smart leaf candidate.
 type SmartCandidateStatus struct {
-	Tag            string  `json:"tag"`
-	State          string  `json:"state"`
-	Score          float64 `json:"score"`
-	Weight         float64 `json:"weight,omitempty"`
-	WeightRule     string  `json:"weight_rule,omitempty"`
-	WeightExact    bool    `json:"weight_rule_exact,omitempty"`
-	Reliability    float64 `json:"reliability"`
-	ConnectMS      float64 `json:"connect_ms,omitempty"`
-	ConnectP95MS   float64 `json:"connect_p95_ms,omitempty"`
-	FirstByteMS    float64 `json:"first_byte_ms,omitempty"`
-	FirstByteP95MS float64 `json:"first_byte_p95_ms,omitempty"`
-	ThroughputBPS  float64 `json:"throughput_bps,omitempty"`
-	Samples        float64 `json:"samples"`
-	Reason         string  `json:"reason,omitempty"`
+	Tag             string  `json:"tag"`
+	State           string  `json:"state"`
+	Score           float64 `json:"score"`
+	Weight          float64 `json:"weight,omitempty"`
+	WeightRule      string  `json:"weight_rule,omitempty"`
+	WeightExact     bool    `json:"weight_rule_exact,omitempty"`
+	Reliability     float64 `json:"reliability"`
+	ConnectMS       float64 `json:"connect_ms,omitempty"`
+	ConnectP95MS    float64 `json:"connect_p95_ms,omitempty"`
+	FirstByteMS     float64 `json:"first_byte_ms,omitempty"`
+	FirstByteP95MS  float64 `json:"first_byte_p95_ms,omitempty"`
+	ThroughputBPS   float64 `json:"throughput_bps,omitempty"`
+	RetransmitRatio float64 `json:"tcp_retransmit_ratio,omitempty"`
+	Samples         float64 `json:"samples"`
+	Reason          string  `json:"reason,omitempty"`
 }
 
 // SmartContextStatus is a bounded snapshot for one network/site/transport
@@ -67,6 +68,7 @@ type SmartContextStatus struct {
 	Network                   string                 `json:"network,omitempty"`
 	Site                      string                 `json:"site,omitempty"`
 	Transport                 string                 `json:"transport,omitempty"`
+	Phase                     string                 `json:"phase,omitempty"`
 	Selected                  string                 `json:"selected,omitempty"`
 	Reason                    string                 `json:"reason,omitempty"`
 	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
@@ -83,6 +85,7 @@ type SmartGroupStatus struct {
 	Pinned                    string                 `json:"pinned,omitempty"`
 	Network                   string                 `json:"network,omitempty"`
 	Site                      string                 `json:"site,omitempty"`
+	Phase                     string                 `json:"phase,omitempty"`
 	Reason                    string                 `json:"reason,omitempty"`
 	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
 	CandidateCount            int                    `json:"candidate_count"`

@@ -45,6 +45,8 @@ type smartMetric struct {
 	ConnectSamples      float64   `json:"connect_samples,omitempty"`
 	FirstByteSamples    float64   `json:"first_byte_samples,omitempty"`
 	ThroughputSamples   float64   `json:"throughput_samples,omitempty"`
+	RetransmitRatio     float64   `json:"tcp_retransmit_ratio,omitempty"`
+	RetransmitSamples   float64   `json:"tcp_retransmit_samples,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
 	CircuitUntil        time.Time `json:"circuit_until,omitempty"`
 	LastUpdated         time.Time `json:"last_updated"`
@@ -63,6 +65,8 @@ type smartEstimate struct {
 	FirstByteP95MS         float64
 	ThroughputBPS          float64
 	ThroughputSamples      float64
+	RetransmitRatio        float64
+	RetransmitSamples      float64
 	LocalThroughputBPS     float64
 	LocalThroughputSamples float64
 	JitterMS               float64
@@ -75,6 +79,7 @@ type smartEstimate struct {
 	HasFirstByte           bool
 	HasFirstByteP95        bool
 	HasThroughput          bool
+	HasRetransmit          bool
 }
 
 type smartStore struct {
@@ -320,6 +325,32 @@ func (s *smartStore) observeThroughputLocked(now time.Time, key smartMetricKey, 
 	metric.LastUpdated = now
 }
 
+// observeRetransmit records a kernel TCP_INFO retransmitted-byte ratio. It is
+// advisory only: unsupported platforms simply never call it, and a single
+// socket's loss cannot open a circuit by itself.
+func (s *smartStore) observeRetransmit(now time.Time, network, site, candidate, transport string, ratio float64) {
+	if ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.observeRetransmitLocked(now, smartMetricKey{Network: network, Candidate: candidate, Transport: transport}, ratio)
+	if site != "" {
+		s.observeRetransmitLocked(now, smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport}, ratio)
+	}
+}
+
+func (s *smartStore) observeRetransmitLocked(now time.Time, key smartMetricKey, ratio float64) {
+	metric := s.metric(key, now)
+	metric.decay(now, s.halfLife)
+	metric.RetransmitRatio = updateEWMA(metric.RetransmitRatio, ratio, metric.RetransmitSamples)
+	metric.RetransmitSamples++
+	metric.LastUpdated = now
+}
+
 func (s *smartStore) estimate(now time.Time, network, site, candidate, transport string, minSamples int) smartEstimate {
 	s.access.RLock()
 	defer s.access.RUnlock()
@@ -414,6 +445,7 @@ func (m *smartMetric) decay(now time.Time, halfLife time.Duration) {
 	m.ConnectSamples *= factor
 	m.FirstByteSamples *= factor
 	m.ThroughputSamples *= factor
+	m.RetransmitSamples *= factor
 }
 
 func (m *smartMetric) updateConnect(value float64) {
@@ -489,6 +521,8 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 		FirstByteP95MS:         blendOptional(globalEstimate.FirstByteP95MS, localEstimate.FirstByteP95MS, globalEstimate.HasFirstByteP95, localEstimate.HasFirstByteP95, localWeight),
 		ThroughputBPS:          blendOptional(globalEstimate.ThroughputBPS, localEstimate.ThroughputBPS, globalEstimate.HasThroughput, localEstimate.HasThroughput, localWeight),
 		ThroughputSamples:      math.Max(globalEstimate.ThroughputSamples, localEstimate.ThroughputSamples),
+		RetransmitRatio:        blendOptional(globalEstimate.RetransmitRatio, localEstimate.RetransmitRatio, globalEstimate.HasRetransmit, localEstimate.HasRetransmit, localWeight),
+		RetransmitSamples:      math.Max(globalEstimate.RetransmitSamples, localEstimate.RetransmitSamples),
 		LocalThroughputBPS:     localEstimate.ThroughputBPS,
 		LocalThroughputSamples: localEstimate.ThroughputSamples,
 		JitterMS:               blendOptional(globalEstimate.JitterMS, localEstimate.JitterMS, globalEstimate.HasConnect, localEstimate.HasConnect, localWeight),
@@ -501,6 +535,7 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 		HasFirstByte:           globalEstimate.HasFirstByte || localEstimate.HasFirstByte,
 		HasFirstByteP95:        globalEstimate.HasFirstByteP95 || localEstimate.HasFirstByteP95,
 		HasThroughput:          globalEstimate.HasThroughput || localEstimate.HasThroughput,
+		HasRetransmit:          globalEstimate.HasRetransmit || localEstimate.HasRetransmit,
 	}
 }
 
@@ -532,6 +567,8 @@ func estimateMetric(metric *smartMetric, now time.Time, minSamples int) smartEst
 		FirstByteP95MS:    firstNonZero(metric.FirstByteP95MS, metric.FirstByteMS),
 		ThroughputBPS:     math.Expm1(metric.ThroughputLog),
 		ThroughputSamples: metric.ThroughputSamples,
+		RetransmitRatio:   metric.RetransmitRatio,
+		RetransmitSamples: metric.RetransmitSamples,
 		JitterMS:          metric.JitterMS,
 		Samples:           samples,
 		State:             state,
@@ -542,6 +579,7 @@ func estimateMetric(metric *smartMetric, now time.Time, minSamples int) smartEst
 		HasFirstByte:      metric.FirstByteSamples > 0,
 		HasFirstByteP95:   metric.FirstByteSamples > 0,
 		HasThroughput:     metric.ThroughputSamples > 0,
+		HasRetransmit:     metric.RetransmitSamples > 0,
 	}
 }
 
@@ -668,6 +706,17 @@ func normalizedLogCost(value, ceiling float64) float64 {
 		return 0
 	}
 	return math.Min(1, math.Log1p(value)/math.Log1p(ceiling))
+}
+
+// smartRetransmitPenaltyMS follows Surge's useful intuition without making
+// loss a hard circuit failure: one percent retransmitted bytes contributes
+// roughly 50ms to the score, capped so a pathological socket cannot dominate
+// all other evidence.
+func smartRetransmitPenaltyMS(ratio float64) float64 {
+	if ratio <= 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return 0
+	}
+	return math.Min(5000, ratio*5000)
 }
 
 func blendValue(global, local, localWeight float64) float64 {

@@ -215,6 +215,64 @@ func TestSmartScoreUsesTailLatencyForInteractiveTraffic(t *testing.T) {
 	}
 }
 
+func TestSmartRetransmitPenaltyIsBoundedAndAdditive(t *testing.T) {
+	if got := smartRetransmitPenaltyMS(0.01); got != 50 {
+		t.Fatalf("one percent retransmit penalty = %vms, want 50ms", got)
+	}
+	if got := smartRetransmitPenaltyMS(2); got != 5000 {
+		t.Fatalf("pathological retransmit penalty = %vms, want cap 5000ms", got)
+	}
+	if got := smartRetransmitPenaltyMS(-1); got != 0 {
+		t.Fatalf("negative retransmit penalty = %vms, want 0", got)
+	}
+}
+
+func TestSmartRetransmitEvidenceIsScopedAndDecayed(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Unix(1750, 0)
+	store.observeRetransmit(now, "ethernet", "video.example", "node-a", N.NetworkTCP, 0.02)
+	estimate := store.estimate(now, "ethernet", "video.example", "node-a", N.NetworkTCP, 3)
+	if !estimate.HasRetransmit || estimate.RetransmitRatio != 0.02 {
+		t.Fatalf("retransmit evidence not recorded: %+v", estimate)
+	}
+	other := store.estimate(now, "ethernet", "video.example", "node-b", N.NetworkTCP, 3)
+	if other.HasRetransmit {
+		t.Fatalf("retransmit evidence leaked to another candidate: %+v", other)
+	}
+	aged := store.estimate(now.Add(4*time.Hour), "ethernet", "video.example", "node-a", N.NetworkTCP, 3)
+	if aged.RetransmitSamples >= estimate.RetransmitSamples {
+		t.Fatalf("retransmit samples did not decay: now=%f aged=%f", estimate.RetransmitSamples, aged.RetransmitSamples)
+	}
+}
+
+func TestSmartCoarseAffinityOnlyHashesNearTies(t *testing.T) {
+	smart := &Smart{switchMargin: 0.15}
+	ranks := make([]smartRank, 20)
+	for index := range ranks {
+		ranks[index].eligible = true
+		ranks[index].status.Score = 0.40
+	}
+	ranks[19].status.Score = 0.90
+	first := smart.coarseAffinityIndex(ranks, "network\x00example.com\x00tcp")
+	second := smart.coarseAffinityIndex(ranks, "network\x00example.com\x00tcp")
+	if first < 0 || first != second || first == 19 {
+		t.Fatalf("coarse affinity was not stable and near-tie bounded: first=%d second=%d", first, second)
+	}
+}
+
+func TestSmartColdPhaseUsesFastHedgeAndSteadyPhaseDampsIt(t *testing.T) {
+	smart := &Smart{maxAttempts: 3, attemptTimeout: 4 * time.Second}
+	smart.phaseInitialized.Store(true)
+	smart.phase.Store(uint32(smartPhaseCold))
+	if got := smart.smartHedgeDelay(); got != minSmartHedgeDelay {
+		t.Fatalf("cold hedge delay = %v, want %v", got, minSmartHedgeDelay)
+	}
+	smart.phase.Store(uint32(smartPhaseSteady))
+	if got := smart.smartHedgeDelay(); got <= minSmartHedgeDelay {
+		t.Fatalf("steady hedge delay = %v, want longer than cold delay", got)
+	}
+}
+
 func TestSmartAbsoluteImprovementRequiresComparableLatency(t *testing.T) {
 	best := smartRank{status: adapter.SmartCandidateStatus{FirstByteP95MS: 700}}
 	current := smartRank{status: adapter.SmartCandidateStatus{FirstByteP95MS: 850}}

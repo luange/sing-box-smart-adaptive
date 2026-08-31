@@ -48,6 +48,38 @@ next new connection; the normal bounded candidate list then provides the
 failover opportunity. Service-local throughput takes precedence over global
 history, so a slow YouTube path cannot be hidden by unrelated traffic.
 
+## Phased startup and coarse stability
+
+Smart does not block the first user connection on a full candidate test. The
+worker moves through `cold` → `baseline` → `profiling` → `steady`: the first
+successful basic probe (or real dial) publishes a usable candidate immediately;
+subsequent bounded cycles build the remaining portraits; performance-driven
+switches are enabled only after profiling evidence exists. Hard dial failures
+still fail over immediately in every phase. During cold/baseline, the hedge
+delay is shortened to 250 ms so a bad first guess is abandoned quickly without
+starting a full parallel probe storm; a well-sampled steady path keeps the
+longer delay to protect keep-alive traffic.
+
+Large provider groups automatically use a stable hash only among candidates
+inside the normal quality margin. This gives coarse consistent-hashing behavior
+for users who do not need per-service affinity, while never selecting a
+materially slower candidate merely for stickiness. Small groups retain the
+service/site affinity path. Selection timestamps expire with site stickiness,
+so an idle path cannot remain pinned forever.
+
+The normal configuration does not require any of these policy details: a Smart
+group with only `outbounds`/`providers` uses the built-in probe budget, phase
+transitions, margins, confirmation and cooldown defaults. Advanced fields remain
+compatibility overrides for operators who already use them; the coarse hash and
+staged startup are intentionally internal so a new deployment does not need to
+guess a “correct” tuning value. When the Zig policy backend is enabled it keeps
+ownership of the decision state, and the host hash never short-circuits it.
+
+On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
+bounded retransmitted-byte ratio. It contributes an additive latency penalty
+(1% ≈ 50 ms, capped) rather than opening a circuit; unsupported platforms and
+non-TCP transports simply omit this evidence.
+
 ## Established stream stall observation
 
 After a successful dial, Smart arms one runtime timer only when the caller
