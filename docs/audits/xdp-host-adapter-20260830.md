@@ -63,6 +63,16 @@ clone after a no-op attach test (and any required virtio offload constraints),
 but native zero-copy and hardware offload require a separately supported NIC or
 SR-IOV/VF. Until that test exists, the safe production choice is TC v3.
 
+### Subtraction audit (2026-08-31)
+
+The XDP surface was checked for duplicate or unreachable runtime paths. The C
+loader functions are all consumed by the public ABI or by close/rollback paths;
+the Zig `Session` (adapter lifetime) and `Controller` (kernel hand-off gate)
+hold different state and are both exported, so deleting either would remove a
+cross-core integration contract. No safe runtime deletion was found. The only
+confirmed cleanup in this audit is the Smart-side duplicate metadata state;
+XDP behavior and its TC fallback remain unchanged.
+
 ## Rollback
 
 Do not publish the XDP control record. Leaving `xdp.enabled=false` keeps the

@@ -11,12 +11,13 @@ data-plane forwarding path.
 
 ## Changes
 
-- Provider refresh now builds one immutable metadata snapshot per candidate:
-  canonical endpoint identity, profile id, probe key, policy id and weight
-  match. Ranking reuses this snapshot instead of allocating an identity map,
-  hashing every candidate and matching weight rules for every connection.
-- Ranking scratch buffers include metadata and remain bounded by the existing
-  pool limit. Test-only Smart instances still use a safe fallback snapshot.
+- Provider refresh now builds one immutable `tag -> metadata` snapshot per
+  candidate: canonical endpoint identity, profile id, probe key, policy id and
+  weight match. Ranking reuses this map instead of retaining a second identity
+  map plus a parallel metadata slice.
+- Ranking scratch buffers contain only candidates and final ranks; they remain
+  bounded by the existing pool limit. Test-only Smart instances still use a
+  safe fallback snapshot.
 - `smartStore.estimate` copies metrics by value and returns presence flags;
   temporary metric pointers no longer escape from the ranking hot path.
 - Identical Smart status decisions are coalesced for 200ms. Selection changes,
@@ -27,8 +28,8 @@ data-plane forwarding path.
 ## Safety and compatibility
 
 Provider rebuilds replace candidates and metadata together under one read-side
-snapshot boundary. Existing tag-to-identity maps remain for API and observation
-compatibility. The status throttle only delays repeated dashboard snapshots;
+snapshot boundary; the old metadata map is never mutated after publication.
+The status throttle only delays repeated dashboard snapshots;
 it never delays dialing, probing or failover.
 
 ## Verification

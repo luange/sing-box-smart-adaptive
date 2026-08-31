@@ -42,12 +42,12 @@ func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
 		probeRegistry:     registry,
 		candidates:        []adapter.Outbound{leaf},
 		candidateByTag:    map[string]adapter.Outbound{"leaf": leaf},
-		candidateProbeKey: map[string]string{"leaf": "endpoint-id"},
 		lastSelected:      make(map[string]string),
 		affinity:          make(map[string]smartAffinity),
 		switchChallenges:  make(map[string]smartSwitchChallenge),
 		halfOpen:          make(map[string]struct{}),
 	}
+	setSmartCandidateIdentities(smart, map[string]string{"leaf": "endpoint-id"})
 	delays, err := smart.probe(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -137,21 +137,21 @@ func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
 		probeKeys[tag] = tag
 	}
 	smart := &Smart{
-		ctx:               context.Background(),
-		control:           &smartControlState{},
-		store:             newSmartStore(time.Hour, 3, time.Minute),
-		probeURL:          probe.GoogleConnectivityURL,
-		probeInterval:     time.Minute,
-		probeTimeout:      time.Second,
-		probeRegistry:     registry,
-		candidates:        candidates,
-		candidateByTag:    byTag,
-		candidateProbeKey: probeKeys,
-		lastSelected:      make(map[string]string),
-		affinity:          make(map[string]smartAffinity),
-		switchChallenges:  make(map[string]smartSwitchChallenge),
-		halfOpen:          make(map[string]struct{}),
+		ctx:              context.Background(),
+		control:          &smartControlState{},
+		store:            newSmartStore(time.Hour, 3, time.Minute),
+		probeURL:         probe.GoogleConnectivityURL,
+		probeInterval:    time.Minute,
+		probeTimeout:     time.Second,
+		probeRegistry:    registry,
+		candidates:       candidates,
+		candidateByTag:   byTag,
+		lastSelected:     make(map[string]string),
+		affinity:         make(map[string]smartAffinity),
+		switchChallenges: make(map[string]smartSwitchChallenge),
+		halfOpen:         make(map[string]struct{}),
 	}
+	setSmartCandidateIdentities(smart, probeKeys)
 	first, err := smart.probeWithBudget(context.Background(), 4)
 	if err != nil {
 		t.Fatal(err)
@@ -691,8 +691,8 @@ func TestSmartCloseDoesNotBlockIndefinitely(t *testing.T) {
 		probeRegistry:     registry,
 		candidates:        []adapter.Outbound{leaf},
 		candidateByTag:    map[string]adapter.Outbound{"leaf": leaf},
-		candidateProbeKey: map[string]string{"leaf": "leaf-id"},
 	}
+	setSmartCandidateIdentities(smart, map[string]string{"leaf": "leaf-id"})
 	if err := smart.PostStart(); err != nil {
 		t.Fatal(err)
 	}

@@ -176,6 +176,13 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 	}
 }
 
+func setSmartCandidateIdentities(s *Smart, identities map[string]string) {
+	s.candidateMetadataByTag = make(map[string]smartCandidateMetadata, len(identities))
+	for tag, identity := range identities {
+		s.candidateMetadataByTag[tag] = s.buildCandidateMetadata(tag, identity)
+	}
+}
+
 func interruptGroupForTest() *interrupt.Group {
 	return interrupt.NewGroup()
 }
@@ -423,10 +430,10 @@ func TestSmartProbeDeadlineCommitsCompletedObservations(t *testing.T) {
 		return 0, ctx.Err()
 	}
 	smart.probeRegistry = registry
-	smart.candidateProbeKey = map[string]string{
+	setSmartCandidateIdentities(smart, map[string]string{
 		fast.Tag(): fast.Tag(),
 		slow.Tag(): slow.Tag(),
-	}
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -462,7 +469,7 @@ func TestSmartBasicProbeRequiresConfirmedFailure(t *testing.T) {
 	registry := newSmartProbeRegistry(context.Background())
 	defer registry.close()
 	smart.probeRegistry = registry
-	smart.candidateProbeKey = map[string]string{candidate.Tag(): candidate.Tag()}
+	setSmartCandidateIdentities(smart, map[string]string{candidate.Tag(): candidate.Tag()})
 	key := smartProbeKey(candidate.Tag(), smart.probeURL, smart.probeTimeout)
 	registry.entries[key] = &smartProbeEntry{result: smartProbeResult{
 		success: false, failures: 1, nextProbeAt: time.Now().Add(time.Minute),
@@ -493,7 +500,7 @@ func TestSmartProbePublishesFirstSuccessBeforeCycleCompletes(t *testing.T) {
 		return 10, nil
 	}
 	smart.probeRegistry = registry
-	smart.candidateProbeKey = map[string]string{fast.Tag(): fast.Tag(), slow.Tag(): slow.Tag()}
+	setSmartCandidateIdentities(smart, map[string]string{fast.Tag(): fast.Tag(), slow.Tag(): slow.Tag()})
 	done := make(chan struct{})
 	go func() {
 		_, _ = smart.probe(context.Background())
