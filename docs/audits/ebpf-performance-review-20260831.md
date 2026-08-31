@@ -55,3 +55,18 @@ perf stat -e cycles,instructions,cache-misses ./sing-box check -c <isolated-conf
 对比整改前后：每包 cycles、instructions、cache-misses、首包 p95、吞吐、丢包、
 `socket_assign` 失败、map capacity reject 和内存。只有在行为门全部通过且性能
 基线不回退时，才进入测试实例部署；本记录不授权生产 VM 变更。
+
+## 本轮 Linux 证据与部署记录
+
+- 提交：`173f6e642bd0429d707d75410acb404c7d36f3df`。
+- 全局审查：GitHub Actions `33343881157`，eBPF provenance、聚焦测试、竞态、
+  `go vet` 和 Zig conformance 全部通过。
+- 构建矩阵：GitHub Actions `33343890576`，amd64/arm64 × glibc/musl 全部通过；
+  产物 SHA-256 位于 `/Volumes/WeChat/CodexBuild/artifacts/173f6e64-stats-scratch-1/`。
+- 已按原子替换部署到 107（amd64-musl）和 115（amd64-glibc），版本均为
+  `1.14.0-rc.5-official-smart-ebpf-v3.47-stats-scratch`。
+- 部署后只读验收：两台服务均 `started`；9090=200，9091/9092 为预期 3xx；
+  115 的 pa-hk/pa-us/pa-jp/pa-sg/pa-other 均保持 TC v3 ingress，未启用 XDP。
+  采样 RSS 约 86.9 MiB（107）/87.8 MiB（115），线程 7/8；重启后错误关键词为空。
+- 回滚副本：`/Volumes/WeChat/CodexBuild/rollback/2026-08-31-173f6e64/`，并在两台
+  VM 的 `/root/singbox/sing-box.before-173f6e64` 保留同一份校验过的旧核心。
