@@ -26,7 +26,7 @@ type recentParent struct {
 // flow lineage. Unknown sites are classified automatically by registrable
 // domain; encrypted payloads are never inspected.
 type Resolver struct {
-	access  sync.Mutex
+	access  sync.RWMutex
 	recent  map[string]recentParent
 	lineage time.Duration
 }
@@ -40,24 +40,32 @@ func (r *Resolver) Resolve(host, client string, now time.Time) Match {
 	if r == nil || client == "" {
 		return withGenericSite(match, host)
 	}
-	r.access.Lock()
-	defer r.access.Unlock()
+	// Most domains are independent sites and do not participate in client
+	// lineage. Avoid taking the global lineage lock on this hot path.
+	if !match.InheritParent && !match.ParentCandidate {
+		return withGenericSite(match, host)
+	}
 	if match.InheritParent {
+		r.access.RLock()
 		if parent, loaded := r.recent[client]; loaded && parent.expiresAt.After(now) {
+			r.access.RUnlock()
 			match.ID = parent.family
 			match.StrictAffinity = true
 			return match
 		}
+		r.access.RUnlock()
 	}
 	if match.ParentCandidate {
+		r.access.Lock()
 		r.recent[client] = recentParent{family: match.ID, expiresAt: now.Add(r.lineage)}
-	}
-	if len(r.recent) > 4096 {
-		for key, parent := range r.recent {
-			if !parent.expiresAt.After(now) {
-				delete(r.recent, key)
+		if len(r.recent) > 4096 {
+			for key, parent := range r.recent {
+				if !parent.expiresAt.After(now) {
+					delete(r.recent, key)
+				}
 			}
 		}
+		r.access.Unlock()
 	}
 	return withGenericSite(match, host)
 }

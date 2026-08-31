@@ -1126,6 +1126,24 @@ func TestSmartStatusTracksIndependentContexts(t *testing.T) {
 	}
 }
 
+func TestSmartStatusCoalescesIdenticalDecision(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	smart := newTestSmart(first)
+	ranks := []smartRank{{outbound: first, status: adapter.SmartCandidateStatus{Tag: "first", State: "healthy"}, profile: smartProfileInteractive}}
+	smart.updateStatusSelected("network", "site-a", N.NetworkTCP, ranks, "first", "tcp ok")
+	initial := smart.SmartStatus().UpdatedAt
+	smart.updateStatusSelected("network", "site-a", N.NetworkTCP, ranks, "first", "tcp ok")
+	coalesced := smart.SmartStatus().UpdatedAt
+	if !coalesced.Equal(initial) {
+		t.Fatalf("identical status update was republished: initial=%v current=%v", initial, coalesced)
+	}
+	smart.updateStatusSelected("network", "site-a", N.NetworkTCP, ranks, "first", "tcp recovered")
+	changed := smart.SmartStatus().UpdatedAt
+	if !changed.After(initial) {
+		t.Fatalf("changed status update was not published: initial=%v current=%v", initial, changed)
+	}
+}
+
 func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
 	local, peer := net.Pipe()
 	var failures atomic.Int32

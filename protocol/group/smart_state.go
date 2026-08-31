@@ -354,19 +354,19 @@ func (s *smartStore) observeRetransmitLocked(now time.Time, key smartMetricKey, 
 func (s *smartStore) estimate(now time.Time, network, site, candidate, transport string, minSamples int) smartEstimate {
 	s.access.RLock()
 	defer s.access.RUnlock()
-	global := s.metricCopy(smartMetricKey{Network: network, Candidate: candidate, Transport: transport}, now)
-	local := s.metricCopy(smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport}, now)
-	return blendSmartEstimate(global, local, minSamples, now)
+	global, globalOK := s.metricCopy(smartMetricKey{Network: network, Candidate: candidate, Transport: transport}, now)
+	local, localOK := s.metricCopy(smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport}, now)
+	return blendSmartEstimate(global, globalOK, local, localOK, minSamples, now)
 }
 
-func (s *smartStore) metricCopy(key smartMetricKey, now time.Time) *smartMetric {
+func (s *smartStore) metricCopy(key smartMetricKey, now time.Time) (smartMetric, bool) {
 	metric := s.metrics[key]
 	if metric == nil {
-		return nil
+		return smartMetric{}, false
 	}
 	copyMetric := *metric
 	copyMetric.decay(now, s.halfLife)
-	return &copyMetric
+	return copyMetric, true
 }
 
 func (s *smartStore) snapshot(now time.Time, retention time.Duration, maxEntries int) smartStoreSnapshot {
@@ -497,20 +497,23 @@ func updateEWMA(current, value, samples float64) float64 {
 	return current + alpha*(value-current)
 }
 
-func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Time) smartEstimate {
+func blendSmartEstimate(global smartMetric, globalOK bool, local smartMetric, localOK bool, minSamples int, now time.Time) smartEstimate {
 	if minSamples <= 0 {
 		minSamples = 3
 	}
-	if global == nil && local == nil {
+	if !globalOK && !localOK {
 		return smartEstimate{Reliability: 0.13, State: "unknown"}
 	}
-	globalEstimate := estimateMetric(global, now, minSamples)
-	if local == nil || local.Site == "" {
+	var globalEstimate smartEstimate
+	if globalOK {
+		globalEstimate = estimateMetric(global, now, minSamples)
+	}
+	if !localOK || local.Site == "" {
 		return globalEstimate
 	}
 	localEstimate := estimateMetric(local, now, minSamples)
 	localWeight := math.Min(0.85, localEstimate.Samples/float64(minSamples)*0.85)
-	if global == nil {
+	if !globalOK {
 		localWeight = 1
 	}
 	return smartEstimate{
@@ -539,10 +542,7 @@ func blendSmartEstimate(global, local *smartMetric, minSamples int, now time.Tim
 	}
 }
 
-func estimateMetric(metric *smartMetric, now time.Time, minSamples int) smartEstimate {
-	if metric == nil {
-		return smartEstimate{Reliability: 0.13, State: "unknown"}
-	}
+func estimateMetric(metric smartMetric, now time.Time, minSamples int) smartEstimate {
 	alpha := 1 + metric.Successes
 	beta := 1 + metric.Failures
 	mean := alpha / (alpha + beta)

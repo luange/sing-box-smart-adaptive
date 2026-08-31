@@ -89,6 +89,10 @@ const (
 	defaultSmartIdleProbeInterval = 30 * time.Minute
 	defaultSmartColdProbeBudget   = 4
 	defaultSmartActiveProbeBudget = 16
+	// Status is a control-plane view, not a per-connection accounting stream.
+	// Coalesce identical updates briefly so browser asset fan-out does not make
+	// every dial clone the full candidate snapshot under statusAccess.
+	smartStatusMinPublishInterval = 200 * time.Millisecond
 	// Large provider groups use a coarse near-tie hash automatically. This is
 	// deliberately internal: most users should not need to tune stickiness.
 	smartCoarseAffinityThreshold = 16
@@ -148,6 +152,10 @@ type smartAffinity struct {
 
 type smartRank struct {
 	outbound             adapter.Outbound
+	identity             string
+	probeKey             string
+	policyID             uint64
+	weight               nodeweight.Match
 	status               adapter.SmartCandidateStatus
 	profile              smartTrafficProfile
 	estimate             smartEstimate
@@ -156,11 +164,24 @@ type smartRank struct {
 	passiveThroughputLow bool
 }
 
+// smartCandidateMetadata is built when providers refresh, not while ranking
+// each new connection. Endpoint identity, probe key, policy id and weight
+// rules are immutable until the candidate catalog changes.
+type smartCandidateMetadata struct {
+	identity  string
+	profileID string
+	probeKey  string
+	policyID  uint64
+	weight    nodeweight.Match
+}
+
 type smartRanking struct {
 	ranks           []smartRank
 	candidates      []adapter.Outbound
+	metadata        []smartCandidateMetadata
 	rankBuffer      *[]smartRank
 	candidateBuffer *[]adapter.Outbound
+	metadataBuffer  *[]smartCandidateMetadata
 }
 
 type smartDialAttempt struct {
@@ -189,6 +210,11 @@ var smartCandidatePool = sync.Pool{New: func() any {
 	return &buffer
 }}
 
+var smartCandidateMetadataPool = sync.Pool{New: func() any {
+	buffer := make([]smartCandidateMetadata, 0, 64)
+	return &buffer
+}}
+
 func acquireSmartRanking(candidateCount int) *smartRanking {
 	rankBuffer := smartRankPool.Get().(*[]smartRank)
 	ranks := *rankBuffer
@@ -200,11 +226,18 @@ func acquireSmartRanking(candidateCount int) *smartRanking {
 	if cap(candidates) < candidateCount {
 		candidates = make([]adapter.Outbound, 0, candidateCount)
 	}
+	metadataBuffer := smartCandidateMetadataPool.Get().(*[]smartCandidateMetadata)
+	metadata := *metadataBuffer
+	if cap(metadata) < candidateCount {
+		metadata = make([]smartCandidateMetadata, 0, candidateCount)
+	}
 	return &smartRanking{
 		ranks:           ranks[:0],
 		candidates:      candidates[:0],
+		metadata:        metadata[:0],
 		rankBuffer:      rankBuffer,
 		candidateBuffer: candidateBuffer,
+		metadataBuffer:  metadataBuffer,
 	}
 }
 
@@ -214,6 +247,7 @@ func (r *smartRanking) Release() {
 	}
 	clear(r.ranks)
 	clear(r.candidates)
+	clear(r.metadata)
 	if cap(r.ranks) <= 4096 {
 		*r.rankBuffer = r.ranks[:0]
 		smartRankPool.Put(r.rankBuffer)
@@ -222,10 +256,16 @@ func (r *smartRanking) Release() {
 		*r.candidateBuffer = r.candidates[:0]
 		smartCandidatePool.Put(r.candidateBuffer)
 	}
+	if cap(r.metadata) <= 4096 {
+		*r.metadataBuffer = r.metadata[:0]
+		smartCandidateMetadataPool.Put(r.metadataBuffer)
+	}
 	r.ranks = nil
 	r.candidates = nil
+	r.metadata = nil
 	r.rankBuffer = nil
 	r.candidateBuffer = nil
+	r.metadataBuffer = nil
 }
 
 type smartFingerprintCache struct {
@@ -264,6 +304,7 @@ type Smart struct {
 
 	access              sync.RWMutex
 	candidates          []adapter.Outbound
+	candidateMetadata   []smartCandidateMetadata
 	candidateByTag      map[string]adapter.Outbound
 	candidateProbeKey   map[string]string
 	control             *smartControlState
@@ -281,6 +322,11 @@ type Smart struct {
 	status             adapter.SmartGroupStatus
 	statusContexts     map[string]adapter.SmartContextStatus
 	statusContextOrder []string
+	statusLastAt       time.Time
+	statusLastContext  string
+	statusLastSelected string
+	statusLastReason   string
+	statusLastPhase    string
 
 	store                     *smartStore
 	policyBackend             smartPolicyBackend
@@ -680,6 +726,7 @@ func (s *Smart) Close() error {
 	clear(s.performanceCooldown)
 	clear(s.halfOpen)
 	s.candidates = nil
+	s.candidateMetadata = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
 	s.candidateProbeKey = make(map[string]string)
 	s.lastSelected = make(map[string]string)
@@ -1703,43 +1750,55 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	s.access.RLock()
 	ranking := acquireSmartRanking(len(s.candidates))
 	ranking.candidates = append(ranking.candidates, s.candidates...)
+	if len(s.candidateMetadata) == len(ranking.candidates) {
+		ranking.metadata = append(ranking.metadata, s.candidateMetadata...)
+	} else {
+		// Embedded/test constructors may not have gone through provider refresh.
+		// Build the same immutable snapshot once for this ranking pass without
+		// reintroducing the old per-candidate identity map.
+		for _, candidate := range ranking.candidates {
+			tag := candidate.Tag()
+			identity := s.candidateProbeKey[tag]
+			metadata := smartCandidateMetadata{
+				identity:  identity,
+				profileID: tag,
+				probeKey:  smartProbeKey(identity, s.probeURL, s.probeTimeout),
+				weight:    s.nodeWeights.Explain(tag),
+			}
+			if identity != "" && identity != tag {
+				metadata.profileID = "endpoint:" + identity
+			}
+			if identity != "" {
+				metadata.policyID = smartPolicyID(identity)
+			}
+			ranking.metadata = append(ranking.metadata, metadata)
+		}
+	}
 	selectionKey := smartSelectionKey(networkKey, siteKey, transport)
 	lastSelected := s.lastSelected[selectionKey]
 	if selectedAt := s.lastSelectedAt[selectionKey]; lastSelected != "" && !selectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(selectedAt) > s.siteStickiness {
 		lastSelected = ""
 	}
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
-	// Keep one immutable identity snapshot for this ranking pass.  Provider
-	// refreshes may replace candidateProbeKey concurrently, but each candidate
-	// used to take up to three separate RLocks here (profile lookup, probe-dead
-	// lookup and policy selection).  A single bounded copy makes ranking scale
-	// with candidate count instead of lock round-trips while preserving the
-	// refresh boundary and the existing fallback-to-tag semantics.
-	candidateProbeKeys := make(map[string]string, len(ranking.candidates))
-	for _, candidate := range ranking.candidates {
-		if identity := s.candidateProbeKey[candidate.Tag()]; identity != "" {
-			candidateProbeKeys[candidate.Tag()] = identity
-		}
-	}
 	s.access.RUnlock()
 
 	totalSamples := 0.0
-	policyCandidates := make([]smartPolicyCandidate, 0, len(ranking.candidates))
-	policyIDs := make(map[uint64]struct{}, len(ranking.candidates))
+	var policyCandidates []smartPolicyCandidate
+	var policyIDs map[uint64]struct{}
+	if s.policyBackend != nil {
+		policyCandidates = make([]smartPolicyCandidate, 0, len(ranking.candidates))
+		policyIDs = make(map[uint64]struct{}, len(ranking.candidates))
+	}
 	profile := smartProfileInteractive
 	if transport == N.NetworkUDP {
 		profile = smartProfileUDP
 	}
-	for _, candidate := range ranking.candidates {
+	for index, candidate := range ranking.candidates {
 		if !common.Contains(candidate.Network(), transport) {
 			continue
 		}
-		identity := candidateProbeKeys[candidate.Tag()]
-		profileID := candidate.Tag()
-		if identity != "" && identity != profileID {
-			profileID = "endpoint:" + identity
-		}
-		estimate := s.store.estimate(now, networkKey, siteKey, profileID, transport, s.minSamples)
+		metadata := ranking.metadata[index]
+		estimate := s.store.estimate(now, networkKey, siteKey, metadata.profileID, transport, s.minSamples)
 		scoreEstimate := estimate
 		if transport == N.NetworkTCP && estimate.HasRetransmit {
 			// Surge models TCP loss as an additive latency penalty. Keep the raw
@@ -1753,12 +1812,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
-			sharedProbeDead = s.probeRegistry.dead(smartProbeKey(identity, s.probeURL, s.probeTimeout))
+			sharedProbeDead = s.probeRegistry.dead(metadata.probeKey)
 		}
 		if sharedProbeDead {
 			estimate.State = "open"
 		}
-		policyID := smartPolicyID(identity)
 		totalSamples += estimate.Samples
 		profileThroughputSamples := estimate.ThroughputSamples
 		if siteKey != "" {
@@ -1769,6 +1827,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 		ranking.ranks = append(ranking.ranks, smartRank{
 			outbound:      candidate,
+			identity:      metadata.identity,
+			probeKey:      metadata.probeKey,
+			policyID:      metadata.policyID,
+			weight:        metadata.weight,
 			estimate:      estimate,
 			scoreEstimate: scoreEstimate,
 			// Hard health gates run before weights and soft score. A circuit-open
@@ -1788,17 +1850,17 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				Samples:         estimate.Samples,
 			},
 		})
-		if s.policyBackend != nil && identity != "" {
+		if s.policyBackend != nil && metadata.identity != "" {
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
-			if _, exists := policyIDs[policyID]; !exists {
-				policyIDs[policyID] = struct{}{}
+			if _, exists := policyIDs[metadata.policyID]; !exists {
+				policyIDs[metadata.policyID] = struct{}{}
 				policyCandidates = append(policyCandidates, smartPolicyCandidate{
-					ID: policyID, Reliability: scoreEstimate.Reliability, ConnectMS: smartConnectScoreMS(scoreEstimate),
+					ID: metadata.policyID, Reliability: scoreEstimate.Reliability, ConnectMS: smartConnectScoreMS(scoreEstimate),
 					FirstByteMS: smartFirstByteScoreMS(scoreEstimate), JitterMS: scoreEstimate.JitterMS,
 					Throughput: scoreEstimate.ThroughputBPS, Samples: scoreEstimate.Samples,
-					Weight: s.nodeWeights.Explain(candidate.Tag()).Weight,
+					Weight: metadata.weight.Weight,
 					State:  smartPolicyState(estimate.State), Eligible: estimate.State != "open",
 				})
 			}
@@ -1817,8 +1879,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			ranking.ranks[index].eligible = false
 			ranking.ranks[index].status.Reason = "passive throughput below floor"
 			ranking.ranks[index].passiveThroughputLow = true
-			identity := candidateProbeKeys[ranking.ranks[index].outbound.Tag()]
-			policyID := smartPolicyID(identity)
+			policyID := ranking.ranks[index].policyID
 			for policyIndex := range policyCandidates {
 				if policyCandidates[policyIndex].ID == policyID {
 					policyCandidates[policyIndex].State = smartPolicyState("open")
@@ -1828,7 +1889,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 	}
 	for index := range ranking.ranks {
-		weightMatch := s.nodeWeights.Explain(ranking.ranks[index].outbound.Tag())
+		weightMatch := ranking.ranks[index].weight
 		weight := weightMatch.Weight
 		ranking.ranks[index].profile = profile
 		ranking.ranks[index].status.Score = smartScoreForProfile(ranking.ranks[index].scoreEstimate, profile, s.exploration, totalSamples) / weight
@@ -1906,8 +1967,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if decision.SelectedID != 0 {
 			selectedIndex := -1
 			for index := range ranks {
-				identity := candidateProbeKeys[ranks[index].outbound.Tag()]
-				if smartPolicyID(identity) != decision.SelectedID {
+				if ranks[index].policyID != decision.SelectedID {
 					continue
 				}
 				selectedIndex = index
@@ -2282,9 +2342,21 @@ func (s *Smart) updateStatus(networkKey, siteDisplay, transport string, ranks []
 }
 
 func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, ranks []smartRank, selected, reason string) {
-	pinned, _, _, _ := s.controlSnapshot(time.Now())
+	now := time.Now()
+	phase := s.currentPhase().String()
+	contextKey := smartSelectionKey(networkKey, siteDisplay, transport)
+	pinned, _, _, _ := s.controlSnapshot(now)
 	statusCount := min(len(ranks), smartStatusCandidateLimit)
 	s.statusAccess.Lock()
+	// Identical decisions within a short window are coalesced. Selection and
+	// failure reasons are still published immediately; only repeated healthy
+	// ranking snapshots from connection fan-out take the fast path.
+	if !s.statusLastAt.IsZero() && now.Sub(s.statusLastAt) < smartStatusMinPublishInterval &&
+		s.statusLastContext == contextKey && s.statusLastSelected == selected &&
+		s.statusLastReason == reason && s.statusLastPhase == phase {
+		s.statusAccess.Unlock()
+		return
+	}
 	statuses := s.status.Candidates[:0]
 	if cap(statuses) < statusCount {
 		statuses = make([]adapter.SmartCandidateStatus, 0, statusCount)
@@ -2321,7 +2393,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		Site:                      siteDisplay,
 		Phase:                     s.currentPhase().String(),
 		Reason:                    transport + "/" + profile.String() + ": " + reason,
-		UpdatedAt:                 time.Now(),
+		UpdatedAt:                 now,
 		CandidateCount:            len(ranks),
 		CandidateDetailsCount:     len(statuses),
 		CandidateDetailsTruncated: len(statuses) < len(ranks),
@@ -2331,7 +2403,6 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	if s.statusContexts == nil {
 		s.statusContexts = make(map[string]adapter.SmartContextStatus)
 	}
-	contextKey := smartSelectionKey(networkKey, siteDisplay, transport)
 	if _, loaded := s.statusContexts[contextKey]; !loaded {
 		s.statusContextOrder = append(s.statusContextOrder, contextKey)
 		if len(s.statusContextOrder) > smartStatusContextLimit {
@@ -2354,11 +2425,21 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		StateCounts:               cloneSmartStateCounts(stateCounts),
 		Candidates:                append([]adapter.SmartCandidateStatus(nil), statuses...),
 	}
+	s.statusLastAt = now
+	s.statusLastContext = contextKey
+	s.statusLastSelected = selected
+	s.statusLastReason = reason
+	s.statusLastPhase = phase
 	s.statusAccess.Unlock()
 }
 
 func (s *Smart) setWarmingStatus(reason string) {
 	s.statusAccess.Lock()
+	s.statusLastAt = time.Time{}
+	s.statusLastContext = ""
+	s.statusLastSelected = ""
+	s.statusLastReason = ""
+	s.statusLastPhase = ""
 	s.status = adapter.SmartGroupStatus{
 		Phase:       s.currentPhase().String(),
 		Reason:      "warming: " + reason,
@@ -2529,12 +2610,29 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	}
 	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
 	candidateProbeKey := make(map[string]string, len(candidates))
+	candidateMetadata := make([]smartCandidateMetadata, 0, len(candidates))
 	for _, candidate := range candidates {
-		candidateByTag[candidate.Tag()] = candidate
-		candidateProbeKey[candidate.Tag()] = s.probeIdentityLocked(candidate)
+		tag := candidate.Tag()
+		identity := s.probeIdentityLocked(candidate)
+		candidateByTag[tag] = candidate
+		candidateProbeKey[tag] = identity
+		metadata := smartCandidateMetadata{
+			identity:  identity,
+			profileID: tag,
+			probeKey:  smartProbeKey(identity, s.probeURL, s.probeTimeout),
+			weight:    s.nodeWeights.Explain(tag),
+		}
+		if identity != "" && identity != tag {
+			metadata.profileID = "endpoint:" + identity
+		}
+		if identity != "" {
+			metadata.policyID = smartPolicyID(identity)
+		}
+		candidateMetadata = append(candidateMetadata, metadata)
 	}
 	s.access.Lock()
 	s.candidates = candidates
+	s.candidateMetadata = candidateMetadata
 	s.candidateByTag = candidateByTag
 	s.candidateProbeKey = candidateProbeKey
 	s.access.Unlock()
@@ -2561,6 +2659,11 @@ func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {
 		}
 	}
 	s.statusAccess.Lock()
+	s.statusLastAt = time.Time{}
+	s.statusLastContext = ""
+	s.statusLastSelected = ""
+	s.statusLastReason = ""
+	s.statusLastPhase = ""
 	s.status = adapter.SmartGroupStatus{
 		Phase:                     s.currentPhase().String(),
 		Reason:                    "warming: candidates loaded, awaiting observations",
