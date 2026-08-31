@@ -21,6 +21,8 @@
 7. exact-flow 用户态镜像按 8192 条双向 entry 限制，周期清理过期项，并在策略
    generation 提交/失效时同步删除旧 flow 与 DNS 镜像；内核仍使用自身 LRU 和
    generation 检查。
+8. v3 统计读取复用按 possible-CPU 数量分配的 scratch 缓冲，并用独立锁保护
+   并发读取；周期 `RuntimeStats` 不再为整块 per-CPU 向量反复创建短命切片。
 
 这些改动只回收已过期或已失效的用户态镜像，并改变 telemetry 的存储方式和无效
 路径开销，不改变静态策略、Smart、DNS 冲突隔离、socket assign、失败回落或策略

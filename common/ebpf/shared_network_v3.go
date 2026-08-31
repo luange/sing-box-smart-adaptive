@@ -59,6 +59,11 @@ type V3Backend struct {
 	// statsPossibleCPUs is the kernel's possible-CPU count, not the current
 	// online count. PERCPU map values are laid out for every possible CPU.
 	statsPossibleCPUs int
+	// statsAccess protects the reusable read buffer below. RuntimeStats and
+	// V3Stats may be called concurrently while b.access is only an outer
+	// lifecycle lock, so sharing the buffer without a second lock would race.
+	statsAccess  sync.Mutex
+	statsScratch []v3StatsValue
 	// lastStatic tracks the last full snapshot so inactive-bank rewrite can
 	// delete removed keys (LPM_TRIE has no clear-all).
 	lastStatic      []netip.Prefix
@@ -251,6 +256,7 @@ func PrepareSharedNetworkV3(
 		runtime:           runtimeState,
 		flowEnabled:       policyOffloadFlow,
 		statsPossibleCPUs: statsCPUs,
+		statsScratch:      make([]v3StatsValue, statsCPUs),
 	}
 	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version bump covers
 	// the PERCPU stats-vector map layout.
@@ -478,17 +484,21 @@ func (b *V3Backend) PolicyGeneration() uint32 {
 
 // readStatsLocked aggregates the PERCPU reason counters with one map lookup.
 // The caller must hold b.access.RLock or b.access.Lock.
-func (b *V3Backend) readStatsLocked() ([]uint64, error) {
+func (b *V3Backend) readStatsLocked() (v3StatsValue, error) {
 	if b == nil || b.runtime == nil || b.statsPossibleCPUs < 1 {
-		return nil, osErrClosed
+		return v3StatsValue{}, osErrClosed
 	}
-	stats := make([]uint64, v3StatsCount)
-	perCPU := make([]v3StatsValue, b.statsPossibleCPUs)
+	b.statsAccess.Lock()
+	defer b.statsAccess.Unlock()
+	if len(b.statsScratch) != b.statsPossibleCPUs {
+		b.statsScratch = make([]v3StatsValue, b.statsPossibleCPUs)
+	}
 	key := uint32(0)
-	if err := lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&perCPU[0])); err != nil {
-		return nil, err
+	if err := lookupMap(int(b.runtime.stats_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&b.statsScratch[0])); err != nil {
+		return v3StatsValue{}, err
 	}
-	for _, value := range perCPU {
+	var stats v3StatsValue
+	for _, value := range b.statsScratch {
 		for index, count := range value {
 			stats[index] += count
 		}
@@ -506,7 +516,11 @@ func (b *V3Backend) V3Stats() (stats []uint64, generation uint32, activeBank uin
 	if b.runtime == nil {
 		return nil, 0, 0
 	}
-	stats, _ = b.readStatsLocked()
+	raw, err := b.readStatsLocked()
+	if err != nil {
+		return nil, b.control.PolicyGeneration, b.control.ActiveBank & 1
+	}
+	stats = append([]uint64(nil), raw[:]...)
 	return stats, b.control.PolicyGeneration, b.control.ActiveBank & 1
 }
 
@@ -568,11 +582,11 @@ func (b *V3Backend) RuntimeStats() (SharedNetworkRuntimeStats, error) {
 	if b.runtime == nil {
 		return SharedNetworkRuntimeStats{}, osErrClosed
 	}
-	stats, err := b.readStatsLocked()
+	raw, err := b.readStatsLocked()
 	if err != nil {
 		return SharedNetworkRuntimeStats{}, err
 	}
-	read := func(idx uint32) uint64 { return stats[idx] }
+	read := func(idx uint32) uint64 { return raw[idx] }
 	staticDirect := read(0)
 	flowDirect := read(1)
 	fakeIPDirect := read(2)
