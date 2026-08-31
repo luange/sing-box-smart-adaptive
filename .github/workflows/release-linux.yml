@@ -225,8 +225,11 @@ jobs:
           See \`CHANGELOG.adaptive.md\` and \`README.md\`.
 
           ### Tags baked in
-          - glibc: \`release/DEFAULT_BUILD_TAGS_OTHERS\` + \`with_ebpf\`
-          - musl: above + \`with_musl\`
+          - Both libc variants: \`with_gvisor\`, \`with_quic\`, \`with_dhcp\`,
+            \`with_wireguard\`, \`with_utls\`, \`with_clash_api\`,
+            \`with_connection_history\`, \`with_tailscale\`, \`with_ebpf\`,
+            and \`smart_zig\` (plus the required linkname tags).
+          - musl: the same feature set plus \`with_musl\` and static linking.
           EOF
           )"
           if gh release view "$tag" >/dev/null 2>&1; then
