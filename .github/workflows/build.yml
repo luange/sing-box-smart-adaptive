@@ -1016,7 +1016,7 @@ jobs:
           }
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Update version
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/testing' || github.ref == 'refs/heads/oldstable')
         run: |-
           go run -v ./cmd/internal/update_desktop_version --ci
       - name: Update nightly version
@@ -1112,7 +1112,7 @@ jobs:
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Update version
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/testing' || github.ref == 'refs/heads/oldstable')
         run: |-
           go run -v ./cmd/internal/update_desktop_version --ci
       - name: Update nightly version
