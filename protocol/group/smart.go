@@ -1361,6 +1361,13 @@ func (s *Smart) smartHedgeDelay() time.Duration {
 	if s.maxAttempts <= 1 {
 		return 0
 	}
+	if s.currentPhase() <= smartPhaseBaseline {
+		// During cold/baseline startup the first candidate is often only an
+		// unprofiled guess. Start the backup after 250ms so first use is fast;
+		// once profiling is established the longer delay protects keep-alive
+		// paths from needless parallel dials.
+		return minSmartHedgeDelay
+	}
 	if s.attemptTimeout <= 0 {
 		return defaultSmartHedgeDelay
 	}
@@ -1370,13 +1377,6 @@ func (s *Smart) smartHedgeDelay() time.Duration {
 	}
 	if delay > maxSmartHedgeDelay {
 		return maxSmartHedgeDelay
-	}
-	if s.currentPhase() <= smartPhaseBaseline && delay > minSmartHedgeDelay {
-		// During cold/baseline startup the first candidate is often only an
-		// unprofiled guess. Start the backup after 250ms so first use is fast;
-		// once profiling is established the longer delay protects keep-alive
-		// paths from needless parallel dials.
-		return minSmartHedgeDelay
 	}
 	return delay
 }
