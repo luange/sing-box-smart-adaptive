@@ -34,6 +34,6 @@ notes. The `v` prefix is used only on Git tags (`v1.14.1`).
 - YAML parsing, shell syntax, and `git diff --check` pass locally.
 - The full legacy Linux matrix (11 architectures) passed in GitHub Actions run
   `33363217502` with unsigned packages and Fury publication disabled.
-- The dedicated gateway release matrix had already passed for the four target
-  artifacts (amd64/arm64 × glibc/musl); the SemVer validation is now an
-  additional pre-build gate.
+- The dedicated gateway release matrix passed for the four target artifacts
+  (amd64/arm64 × glibc/musl) in run `33363693963` using `1.14.1`; the release
+  publication step was intentionally disabled for this validation run.
