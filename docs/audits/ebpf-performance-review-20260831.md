@@ -70,3 +70,11 @@ perf stat -e cycles,instructions,cache-misses ./sing-box check -c <isolated-conf
   采样 RSS 约 86.9 MiB（107）/87.8 MiB（115），线程 7/8；重启后错误关键词为空。
 - 回滚副本：`/Volumes/WeChat/CodexBuild/rollback/2026-08-31-173f6e64/`，并在两台
   VM 的 `/root/singbox/sing-box.before-173f6e64` 保留同一份校验过的旧核心。
+
+### 画像工具边界
+
+115 的内核已确认程序为 JIT `sb_v3_ingress`（13,801B），但自有 ELF loader 不把
+调试 BTF 绑定到已加载程序，因此该主机上的 `bpftool prog profile` 会返回
+`prog ... doesn't have valid btf`。这不是数据面加载失败，也不应为了画像强行引入
+libbpf 运行时依赖；当前采用 `perf stat -p <sing-box-pid>`、TC/map 计数和 RSS/Heap
+时间序列作为兼容的观测路径。107 未安装 `bpftool`，本轮不改系统补装工具。
