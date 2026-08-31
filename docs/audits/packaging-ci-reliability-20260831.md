@@ -37,3 +37,5 @@ notes. The `v` prefix is used only on Git tags (`v1.14.1`).
 - The dedicated gateway release matrix passed for the four target artifacts
   (amd64/arm64 × glibc/musl) in run `33363693963` using `1.14.1`; the release
   publication step was intentionally disabled for this validation run.
+- The same matrix was then published as release `v1.14.1` by run
+  `33364389597`; the release is non-draft and non-prerelease.
