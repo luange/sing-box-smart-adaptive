@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version name"
+        description: "SemVer without v (for example 1.14.1 or 1.14.0-rc.5)"
         required: true
         type: string
       build:
@@ -70,9 +70,12 @@ jobs:
           restore-keys: go-build-tools-linux-
       - name: Check input version
         if: github.event_name == 'workflow_dispatch'
-        run: |-
-          echo "version=${{ inputs.version }}"
-          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          .github/validate-version.sh "$REQUESTED_VERSION"
+          echo "version=$REQUESTED_VERSION" >> "$GITHUB_ENV"
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-

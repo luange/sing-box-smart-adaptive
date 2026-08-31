@@ -11,17 +11,14 @@ elif echo "$branches" | grep -q 'origin/oldstable'; then
   track=oldstable
 fi
 
-# The adaptive fork publishes its own tagged gateway releases from feature
-# branches. They are beta-track artifacts, not upstream stable packages. Keep
-# this helper usable for manual Docker/package runs without pretending that the
-# feature branch is an upstream release branch.
+# The adaptive fork may run package jobs from its development branch or a
+# SemVer prerelease tag. They are beta-track artifacts, not upstream stable
+# packages. Capabilities belong to build tags, never to the version string.
 if [[ -z "$track" ]]; then
   ref="${GITHUB_REF_NAME:-}"
-  case "$ref" in
-    adaptive/*|v*-official-smart-ebpf*|v*-smart-*|v*-rc*|v*-beta*|v*-alpha*)
-      track=beta
-      ;;
-  esac
+  if [[ "$ref" == adaptive/* || "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+    track=beta
+  fi
 fi
 
 if [[ -z "$track" ]]; then
