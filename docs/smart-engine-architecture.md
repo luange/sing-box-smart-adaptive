@@ -82,14 +82,16 @@ non-TCP transports simply omit this evidence.
 
 ## Established stream stall observation
 
-After a successful dial, Smart arms one runtime timer only when the caller
-actually writes. If no response byte arrives before
+After a successful dial, Smart arms one runtime timer for each request phase
+only when the caller actually writes. This continues after the first response,
+so an established keep-alive connection that accepts a new request but stops
+responding is observable. If no response byte arrives before
 `established_stall_timeout` (default 10s, bounded to 5s–2m), the connection
-contributes one failure observation and wakes the shared probe registry. The
-timer is cancelled on the first byte or close, so idle WebSockets and normal
-long-lived streams are not penalized. This is passive and does not generate
-traffic; the existing per-connection failure-once gate also coalesces a later
-socket error.
+contributes one failure observation and wakes the shared probe registry. Any
+response byte or close cancels the pending phase timer; idle WebSockets and
+normal long-lived streams are therefore not penalized. This is passive and
+does not generate traffic; the existing per-connection failure-once gate also
+coalesces a later socket error.
 
 The Clash status extension exposes a bounded `contexts` array (at most 32)
 with independent network/site/transport snapshots. Legacy top-level fields

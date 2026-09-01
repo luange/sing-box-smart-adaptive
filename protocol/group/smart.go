@@ -2851,9 +2851,12 @@ type smartObservedConn struct {
 	onRetransmit     func(float64)
 	onFailure        func()
 	stallOnce        sync.Once
+	failureNotified  atomic.Bool
 	stallTimeout     time.Duration
 	stallTimerAccess sync.Mutex
 	stallTimer       *time.Timer
+	stallGeneration  uint64
+	stallPending     bool
 	closed           atomic.Bool
 }
 
@@ -2943,8 +2946,11 @@ func (c *smartObservedConn) observeRead(n int64) {
 		return
 	}
 	c.readBytes.Add(n)
+	// A response, including one on an already-established stream, completes
+	// the current request phase.  Clearing the timer here keeps idle keep-alive
+	// and streaming connections from being treated as failures.
+	c.stopStallTimer()
 	if c.firstRead.CompareAndSwap(false, true) {
-		c.stopStallTimer()
 		if c.onFirstByte != nil {
 			c.onFirstByte(time.Since(c.startedAt))
 		}
@@ -2959,34 +2965,53 @@ func (c *smartObservedConn) observeWrite(n int64) {
 }
 
 func (c *smartObservedConn) armStallTimer() {
-	if c.stallTimeout <= 0 || c.firstRead.Load() || c.closed.Load() {
+	if c.stallTimeout <= 0 || c.closed.Load() || c.failureNotified.Load() {
 		return
 	}
 	c.stallTimerAccess.Lock()
-	if c.stallTimer == nil && !c.firstRead.Load() && !c.closed.Load() {
-		c.stallTimer = time.AfterFunc(c.stallTimeout, c.observeStall)
+	if c.stallTimer == nil && !c.stallPending && !c.closed.Load() && !c.failureNotified.Load() {
+		c.stallGeneration++
+		generation := c.stallGeneration
+		c.stallPending = true
+		c.stallTimer = time.AfterFunc(c.stallTimeout, func() {
+			c.observeStall(generation)
+		})
 	}
 	c.stallTimerAccess.Unlock()
 }
 
 func (c *smartObservedConn) stopStallTimer() {
 	c.stallTimerAccess.Lock()
+	c.stallGeneration++
 	if c.stallTimer != nil {
 		c.stallTimer.Stop()
+		c.stallTimer = nil
 	}
+	c.stallPending = false
 	c.stallTimerAccess.Unlock()
 }
 
-func (c *smartObservedConn) observeStall() {
-	if c.closed.Load() || c.firstRead.Load() || c.writeBytes.Load() == 0 {
+func (c *smartObservedConn) observeStall(generation uint64) {
+	c.stallTimerAccess.Lock()
+	if c.closed.Load() || !c.stallPending || generation != c.stallGeneration {
+		c.stallTimerAccess.Unlock()
 		return
 	}
+	c.stallTimer = nil
+	c.stallPending = false
+	c.stallTimerAccess.Unlock()
 	c.stallOnce.Do(func() {
 		c.notifyFailure()
 	})
 }
 
 func (c *smartObservedConn) observeFailure(err error) {
+	if err != nil {
+		// A terminal or classified read/write error ends the current request
+		// phase.  Do not leave its timer behind to report a second, synthetic
+		// stall after the transport has already told us what happened.
+		c.stopStallTimer()
+	}
 	if !isSmartStreamFailure(err) {
 		return
 	}
@@ -2995,6 +3020,7 @@ func (c *smartObservedConn) observeFailure(err error) {
 
 func (c *smartObservedConn) notifyFailure() {
 	c.failureOnce.Do(func() {
+		c.failureNotified.Store(true)
 		if c.onFailure != nil {
 			c.onFailure()
 		}

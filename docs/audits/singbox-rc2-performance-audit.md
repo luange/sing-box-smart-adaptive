@@ -25,9 +25,10 @@ rc2 的 QUIC 拥塞控制、FakeIP UDP 回程映射、异步 DNS/本地缓存分
    `dns_prefill_queue_drops`。
 3. **发布漂移**：Linux 发布工作流已改为匹配 rc4 gateway 标签，避免 rc4 核心
    推送后不触发精简 eBPF 构建。
-4. **已建立连接卡住**：Smart 现在只在真实首个写入后启动单个有界计时器；
-   首字节在 `established_stall_timeout`（默认 10s，5s–2m）内未到达时记一次
-   失败并唤醒共享探测，首字节/关闭会取消计时，不主动制造流量。
+4. **已建立连接卡住**：Smart 在每个真实请求写入后启动一个有界响应计时器，
+   即使连接已经收到过首字节也继续观察后续请求；响应或关闭会取消当前计时，
+   `established_stall_timeout`（默认 10s，5s–2m）内无响应才记一次失败并唤醒
+   共享探测，不主动制造流量，空闲长连接不会被惩罚。
 5. **Smart 状态混淆**：Clash 扩展新增最多 32 个独立
    `network/site/transport` 上下文快照，旧的顶层字段仍保留为兼容视图。
 6. **VMess WebSocket 崩溃**：修复失败升级返回 typed-nil `*WebsocketConn`

@@ -1118,6 +1118,88 @@ func TestSmartObservedConnCancelsStallAfterFirstByte(t *testing.T) {
 	_ = observed.Close()
 }
 
+func TestSmartObservedConnWakesOnEstablishedResponseStall(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithStall(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	}, 30*time.Millisecond)
+	go func() {
+		request := make([]byte, len("request-1"))
+		_, _ = peer.Read(request)
+		_, _ = peer.Write([]byte("reply-1"))
+		request = make([]byte, len("request-2"))
+		_, _ = peer.Read(request)
+	}()
+	if _, err := observed.Write([]byte("request-1")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len("reply-1"))
+	if _, err := observed.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observed.Write([]byte("request-2")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(90 * time.Millisecond)
+	if failures.Load() != 1 {
+		t.Fatalf("expected one established response stall wake, got %d", failures.Load())
+	}
+	_ = observed.Close()
+}
+
+func TestSmartObservedConnDoesNotWakeOnEstablishedIdle(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithStall(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	}, 30*time.Millisecond)
+	go func() {
+		request := make([]byte, len("request"))
+		_, _ = peer.Read(request)
+		_, _ = peer.Write([]byte("reply"))
+	}()
+	if _, err := observed.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len("reply"))
+	if _, err := observed.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(90 * time.Millisecond)
+	if failures.Load() != 0 {
+		t.Fatalf("idle established connection incorrectly woke recovery, got %d", failures.Load())
+	}
+	_ = observed.Close()
+}
+
+func TestSmartObservedConnCancelsStallOnTerminalRead(t *testing.T) {
+	local, peer := net.Pipe()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithStall(local, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	}, 30*time.Millisecond)
+	go func() {
+		request := make([]byte, len("request"))
+		_, _ = peer.Read(request)
+		_ = peer.Close()
+	}()
+	if _, err := observed.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 1)
+	if _, err := observed.Read(buffer); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected terminal EOF, got %v", err)
+	}
+	time.Sleep(90 * time.Millisecond)
+	if failures.Load() != 0 {
+		t.Fatalf("terminal read incorrectly woke recovery, got %d", failures.Load())
+	}
+	_ = observed.Close()
+}
+
 func TestSmartStatusTracksIndependentContexts(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	smart := newTestSmart(first)
