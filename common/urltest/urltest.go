@@ -135,8 +135,9 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 				return instance, nil
 			},
 			TLSClientConfig: &tls.Config{
-				Time:    ntp.TimeFuncFromContext(ctx),
-				RootCAs: adapter.RootPoolFromContext(ctx),
+				Time:       ntp.TimeFuncFromContext(ctx),
+				RootCAs:    adapter.RootPoolFromContext(ctx),
+				ServerName: probeTLSServerName(hostname),
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -145,11 +146,28 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		Timeout: clientTimeout,
 	}
 	defer client.CloseIdleConnections()
-	resp, err := client.Do(req.WithContext(ctx))
+	request := req.WithContext(ctx)
+	if serverName := probeTLSServerName(hostname); serverName != hostname {
+		// Keep the probe endpoint literal so bootstrap never performs a DNS
+		// lookup through the Smart group, while still routing Cloudflare's
+		// virtual host to a valid certificate and response handler.
+		request.Host = serverName
+	}
+	resp, err := client.Do(request)
 	if err != nil {
 		return
 	}
 	resp.Body.Close()
 	t = uint16(time.Since(start) / time.Millisecond)
 	return
+}
+
+func probeTLSServerName(hostname string) string {
+	if ip := net.ParseIP(hostname); ip != nil {
+		switch ip.String() {
+		case "1.1.1.1", "1.0.0.1":
+			return "cloudflare-dns.com"
+		}
+	}
+	return hostname
 }

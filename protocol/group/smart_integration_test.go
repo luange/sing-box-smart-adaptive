@@ -23,6 +23,19 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 )
 
+func TestNormalizeSmartProbeURLAvoidsRecursiveDNS(t *testing.T) {
+	if got := normalizeSmartProbeURL(""); got != defaultSmartProbeURL {
+		t.Fatalf("empty probe URL = %q, want %q", got, defaultSmartProbeURL)
+	}
+	if got := normalizeSmartProbeURL("https://www.gstatic.com/generate_204"); got != defaultSmartProbeURL {
+		t.Fatalf("legacy gstatic probe URL = %q, want %q", got, defaultSmartProbeURL)
+	}
+	const custom = "https://probe.example.invalid/health"
+	if got := normalizeSmartProbeURL(custom); got != custom {
+		t.Fatalf("custom probe URL = %q, want %q", got, custom)
+	}
+}
+
 type smartFakeOutbound struct {
 	outbound.Adapter
 	dialError error

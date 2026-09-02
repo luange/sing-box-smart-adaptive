@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -39,7 +40,11 @@ import (
 )
 
 const (
-	defaultSmartProbeInterval           = 10 * time.Minute
+	defaultSmartProbeInterval = 10 * time.Minute
+	// The probe must not depend on a hostname whose DNS is routed through the
+	// very Smart group being measured.  A literal Cloudflare address keeps the
+	// first probe bootstrap-safe; urltest supplies the matching TLS SNI.
+	defaultSmartProbeURL                = "https://1.1.1.1/cdn-cgi/trace"
 	defaultSmartProbeCycleTimeout       = 30 * time.Second
 	defaultSmartProbeTimeout            = 5 * time.Second
 	defaultSmartProbeConcurrency        = 2
@@ -403,6 +408,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if err != nil {
 		return nil, err
 	}
+	probeURL := normalizeSmartProbeURL(options.URL)
+	if probeURL != options.URL && logger != nil {
+		logger.Warn("smart probe URL uses a recursive DNS hostname; using bootstrap-safe probe endpoint")
+	}
 	probeInterval := time.Duration(options.ProbeInterval)
 	if probeInterval <= 0 {
 		probeInterval = defaultSmartProbeInterval
@@ -594,7 +603,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		store:                  store,
 		policyBackend:          policyBackend,
 
-		probeURL:                  options.URL,
+		probeURL:                  probeURL,
 		probeInterval:             probeInterval,
 		probeCycleTimeout:         probeCycleTimeout,
 		probeTimeout:              probeTimeout,
@@ -630,6 +639,23 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		families:                  trafficfamily.NewResolver(),
 	}
 	return smart, nil
+}
+
+// normalizeSmartProbeURL prevents a cold-start dependency cycle. The legacy
+// gstatic probe is commonly resolved by dns-proxy through Smart itself; when
+// the cache is cold that leaves both the resolver and the health worker waiting
+// on one another. Only the legacy/default target is rewritten. Explicit
+// operator targets remain untouched.
+func normalizeSmartProbeURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return defaultSmartProbeURL
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), "www.gstatic.com") {
+		return trimmed
+	}
+	return defaultSmartProbeURL
 }
 
 func (s *Smart) Start() error {
