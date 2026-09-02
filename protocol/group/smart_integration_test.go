@@ -586,6 +586,29 @@ func TestSmartTransactionalUDPNoResponseReportsOnce(t *testing.T) {
 	}
 }
 
+func TestSmartTransactionalUDPWatchdogReportsInFlightBlackhole(t *testing.T) {
+	var failures atomic.Int64
+	conn := newSmartObservedPacketConnWithWatchdog(&smartObservedTestPacketConn{}, time.Now(), true, 20*time.Millisecond, func(time.Duration) {
+		failures.Add(1)
+	})
+	if _, err := conn.WriteTo([]byte("quic"), &net.UDPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for failures.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("in-flight UDP failure count=%d, want 1", failures.Load())
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("watchdog failure was reported more than once: %d", failures.Load())
+	}
+}
+
 func TestSmartUDPResponseAndOneWayTrafficDoNotFail(t *testing.T) {
 	for _, test := range []struct {
 		name           string

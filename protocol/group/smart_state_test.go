@@ -89,8 +89,15 @@ func TestSmartProbeScheduleFollowsTrafficActivity(t *testing.T) {
 	if interval := smart.nextProbeInterval(now); interval != smart.probeInterval {
 		t.Fatalf("active interval = %v, want %v", interval, smart.probeInterval)
 	}
+	if budget := smart.requestedProbeBudget(now); budget != defaultSmartColdProbeBudget {
+		t.Fatalf("cold active requested budget = %d, want %d", budget, defaultSmartColdProbeBudget)
+	}
 	if budget := smart.scheduledProbeBudget(now); budget != defaultSmartActiveProbeBudget {
 		t.Fatalf("active scheduled budget = %d, want %d", budget, defaultSmartActiveProbeBudget)
+	}
+	smart.phase.Store(uint32(smartPhaseProfiling))
+	if budget := smart.requestedProbeBudget(now); budget != defaultSmartActiveProbeBudget {
+		t.Fatalf("profiling active requested budget = %d, want %d", budget, defaultSmartActiveProbeBudget)
 	}
 	select {
 	case <-smart.probeNow:

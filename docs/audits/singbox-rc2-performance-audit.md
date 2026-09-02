@@ -73,3 +73,17 @@ unchanged. The earlier Build workflow `33310899896` was intentionally not
 used as a release gate because its desktop version-update step requires a
 version commit and failed before compilation; it does not indicate a source
 compile failure. Rollback point: `6d5796fe`.
+
+### UDP failure-observation correction (2026-09-02)
+
+Live NAS checks showed that TCP control probes can succeed while a real
+UDP/QUIC flow remains half-open. The previous observer only reported that
+condition when the caller closed its socket, so Smart could retain a broken
+candidate indefinitely. UDP observation now arms a bounded watchdog on the
+first successful write for response-oriented destinations (DNS, QUIC and
+STUN), cancels it on the first response, and reports a classified write error
+immediately. One-way UDP is still ignored and every flow reports at most one
+failure. The timeout reuses `established_stall_timeout` (default 10s, bounded
+5s–2m), so this is passive data-plane evidence rather than an extra business
+probe. Regression coverage includes an in-flight blackhole and exactly-once
+notification check.

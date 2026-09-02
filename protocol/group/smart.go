@@ -946,6 +946,15 @@ func (s *Smart) scheduledProbeBudget(now time.Time) int {
 }
 
 func (s *Smart) requestedProbeBudget(now time.Time) int {
+	// The first real request after a restart must not promote a cold group to
+	// the active budget. noteTrafficActivity records activity before waking the
+	// worker, so checking activeAt alone turns the first request into a large
+	// five-group probe burst and competes with the request being served. Keep
+	// the cold budget until the group has completed at least one baseline cycle;
+	// profiling/steady phases can use the larger activity-driven budget.
+	if s.currentPhase() <= smartPhaseBaseline {
+		return defaultSmartColdProbeBudget
+	}
 	if s.activeAt(now) {
 		return defaultSmartActiveProbeBudget
 	}
@@ -1471,7 +1480,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex, attemptIndex > 0)
-		observed := newSmartObservedPacketConn(conn, startedAt, smartUDPExpectsResponse(destination), func(flowElapsed time.Duration) {
+		observed := newSmartObservedPacketConnWithWatchdog(conn, startedAt, smartUDPExpectsResponse(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
 			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
@@ -3046,22 +3055,37 @@ func isSmartStreamFailure(err error) bool {
 // smartObservedPacketConn turns real transactional UDP blackholes into Smart
 // node evidence. It deliberately ignores one-way UDP and idle timeouts after
 // any response, so telemetry and long-lived QUIC sessions are not penalized.
+// A response watchdog is armed by the first successful write for protocols
+// that require a reply (DNS, QUIC and STUN). This closes the old gap where a
+// half-open UDP/QUIC flow was only reported when its owner happened to close.
 type smartObservedPacketConn struct {
 	net.PacketConn
-	startedAt      time.Time
-	expectResponse bool
-	writePackets   atomic.Uint64
-	readPackets    atomic.Uint64
-	closeOnce      sync.Once
-	onNoResponse   func(time.Duration)
+	startedAt          time.Time
+	expectResponse     bool
+	watchdogTimeout    time.Duration
+	writePackets       atomic.Uint64
+	readPackets        atomic.Uint64
+	closeOnce          sync.Once
+	noResponseOnce     sync.Once
+	onNoResponse       func(time.Duration)
+	closed             atomic.Bool
+	watchdogAccess     sync.Mutex
+	watchdogTimer      *time.Timer
+	watchdogGeneration uint64
+	watchdogPending    bool
 }
 
 func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expectResponse bool, onNoResponse func(time.Duration)) net.PacketConn {
+	return newSmartObservedPacketConnWithWatchdog(conn, startedAt, expectResponse, 0, onNoResponse)
+}
+
+func newSmartObservedPacketConnWithWatchdog(conn net.PacketConn, startedAt time.Time, expectResponse bool, watchdogTimeout time.Duration, onNoResponse func(time.Duration)) net.PacketConn {
 	base := &smartObservedPacketConn{
-		PacketConn:     conn,
-		startedAt:      startedAt,
-		expectResponse: expectResponse,
-		onNoResponse:   onNoResponse,
+		PacketConn:      conn,
+		startedAt:       startedAt,
+		expectResponse:  expectResponse,
+		watchdogTimeout: watchdogTimeout,
+		onNoResponse:    onNoResponse,
 	}
 	reader, hasReader := conn.(N.PacketReader)
 	writer, hasWriter := conn.(N.PacketWriter)
@@ -3080,12 +3104,14 @@ func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expect
 func (c *smartObservedPacketConn) observeRead(count int) {
 	if count > 0 {
 		c.readPackets.Add(1)
+		c.stopWatchdog()
 	}
 }
 
 func (c *smartObservedPacketConn) observeWrite(count int) {
 	if count > 0 {
 		c.writePackets.Add(1)
+		c.armWatchdog()
 	}
 }
 
@@ -3099,18 +3125,87 @@ func (c *smartObservedPacketConn) WriteTo(payload []byte, destination net.Addr) 
 	count, err := c.PacketConn.WriteTo(payload, destination)
 	if err == nil {
 		c.observeWrite(count)
+	} else if c.expectResponse && isSmartPacketFailure(err) {
+		c.stopWatchdog()
+		c.notifyNoResponse(time.Since(c.startedAt))
 	}
 	return count, err
 }
 
 func (c *smartObservedPacketConn) Close() error {
 	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.stopWatchdog()
 		elapsed := time.Since(c.startedAt)
 		if c.expectResponse && c.writePackets.Load() > 0 && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
-			c.onNoResponse(elapsed)
+			c.notifyNoResponse(elapsed)
 		}
 	})
 	return c.PacketConn.Close()
+}
+
+func (c *smartObservedPacketConn) armWatchdog() {
+	if !c.expectResponse || c.watchdogTimeout <= 0 || c.closed.Load() {
+		return
+	}
+	c.watchdogAccess.Lock()
+	if c.watchdogTimer == nil && !c.watchdogPending && !c.closed.Load() {
+		c.watchdogGeneration++
+		generation := c.watchdogGeneration
+		c.watchdogPending = true
+		c.watchdogTimer = time.AfterFunc(c.watchdogTimeout, func() {
+			c.observeWatchdog(generation)
+		})
+	}
+	c.watchdogAccess.Unlock()
+}
+
+func (c *smartObservedPacketConn) stopWatchdog() {
+	c.watchdogAccess.Lock()
+	c.watchdogGeneration++
+	if c.watchdogTimer != nil {
+		c.watchdogTimer.Stop()
+		c.watchdogTimer = nil
+	}
+	c.watchdogPending = false
+	c.watchdogAccess.Unlock()
+}
+
+func (c *smartObservedPacketConn) observeWatchdog(generation uint64) {
+	c.watchdogAccess.Lock()
+	if c.closed.Load() || !c.watchdogPending || generation != c.watchdogGeneration {
+		c.watchdogAccess.Unlock()
+		return
+	}
+	c.watchdogTimer = nil
+	c.watchdogPending = false
+	c.watchdogAccess.Unlock()
+	c.notifyNoResponse(time.Since(c.startedAt))
+}
+
+func (c *smartObservedPacketConn) notifyNoResponse(elapsed time.Duration) {
+	c.noResponseOnce.Do(func() {
+		if c.onNoResponse != nil {
+			c.onNoResponse(elapsed)
+		}
+	})
+}
+
+func isSmartPacketFailure(err error) bool {
+	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ETIMEDOUT)
 }
 
 func (c *smartObservedPacketConn) Upstream() any         { return c.PacketConn }
@@ -3139,6 +3234,9 @@ func (c *smartObservedPacketWriterConn) WritePacket(buffer *buf.Buffer, destinat
 	err := c.writer.WritePacket(buffer, destination)
 	if err == nil {
 		c.observeWrite(count)
+	} else if c.expectResponse && isSmartPacketFailure(err) {
+		c.stopWatchdog()
+		c.notifyNoResponse(time.Since(c.startedAt))
 	}
 	return err
 }
@@ -3161,6 +3259,9 @@ func (c *smartObservedExtendedPacketConn) WritePacket(buffer *buf.Buffer, destin
 	err := c.writer.WritePacket(buffer, destination)
 	if err == nil {
 		c.observeWrite(count)
+	} else if c.expectResponse && isSmartPacketFailure(err) {
+		c.stopWatchdog()
+		c.notifyNoResponse(time.Since(c.startedAt))
 	}
 	return err
 }
