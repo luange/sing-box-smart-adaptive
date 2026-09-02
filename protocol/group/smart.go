@@ -2,6 +2,8 @@ package group
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"hash/fnv"
@@ -35,6 +37,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
+	"golang.org/x/net/dns/dnsmessage"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -48,6 +51,8 @@ const (
 	defaultSmartProbeCycleTimeout       = 30 * time.Second
 	defaultSmartProbeTimeout            = 5 * time.Second
 	defaultSmartProbeConcurrency        = 2
+	defaultSmartUDPProbeTimeout         = 2 * time.Second
+	defaultSmartUDPProbeTargetCount     = 2
 	defaultSmartAttemptTimeout          = 4 * time.Second
 	defaultSmartEstablishedStallTimeout = 10 * time.Second
 	minSmartEstablishedStallTimeout     = 5 * time.Second
@@ -1695,6 +1700,14 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	waitGroup.Wait()
 	close(results)
 	summary := <-summaryDone
+	if ctx.Err() == nil && !s.closing.Load() {
+		// TCP probes establish reachability; a small, serialized UDP DNS sample
+		// establishes that the same candidate can carry transactional datagrams.
+		// Keep this separate from the TCP result map so URLTest callers retain
+		// their historical latency contract while UDP evidence enters its own
+		// profile and cannot poison TCP ranking.
+		s.probeUDPWithBudget(ctx, candidates, budget)
+	}
 	if s.closing.Load() {
 		// Shutdown: skip store mutations so Close can clear maps safely.  A
 		// probe-cycle deadline is different: completed observations remain
@@ -1732,6 +1745,169 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	// completed before it.  Scheduled callers intentionally ignore this error;
 	// explicit URLTest callers can still distinguish a partial cycle.
 	return result, ctx.Err()
+}
+
+type smartUDPProbeResult struct {
+	candidate adapter.Outbound
+	elapsed   time.Duration
+	err       error
+}
+
+var smartUDPProbeTargets = [...]M.Socksaddr{
+	M.ParseSocksaddr("1.1.1.1:53"),
+	M.ParseSocksaddr("8.8.8.8:53"),
+}
+
+func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Outbound, budget int) {
+	if ctx.Err() != nil || s.closing.Load() || len(candidates) == 0 {
+		return
+	}
+	udpCandidates := make([]adapter.Outbound, 0, len(candidates))
+	for _, candidate := range candidates {
+		if common.Contains(candidate.Network(), N.NetworkUDP) {
+			udpCandidates = append(udpCandidates, candidate)
+		}
+	}
+	if len(udpCandidates) == 0 {
+		return
+	}
+	if budget <= 0 || budget > defaultSmartUDPProbeTargetCount {
+		budget = defaultSmartUDPProbeTargetCount
+	}
+	if budget > len(udpCandidates) {
+		budget = len(udpCandidates)
+	}
+	udpCandidates = udpCandidates[:budget]
+	results := make(chan smartUDPProbeResult, len(udpCandidates))
+	jobs := make(chan adapter.Outbound)
+	var waitGroup sync.WaitGroup
+	// One UDP probe at a time is intentional: the test is a reachability gate,
+	// not a throughput benchmark, and this keeps a cold five-region start from
+	// creating a burst of NAT sessions.
+	waitGroup.Add(1)
+	go func() {
+		defer waitGroup.Done()
+		for candidate := range jobs {
+			probeCtx, cancel := context.WithTimeout(ctx, defaultSmartUDPProbeTimeout)
+			startedAt := time.Now()
+			err := runSmartUDPHealthProbe(probeCtx, candidate)
+			cancel()
+			results <- smartUDPProbeResult{candidate: candidate, elapsed: time.Since(startedAt), err: err}
+		}
+	}()
+dispatch:
+	for _, candidate := range udpCandidates {
+		select {
+		case jobs <- candidate:
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	waitGroup.Wait()
+	close(results)
+
+	networkKey := s.networkFingerprint()
+	completed := make([]smartUDPProbeResult, 0, len(udpCandidates))
+	successes := 0
+	for result := range results {
+		if s.closing.Load() || ctx.Err() != nil {
+			return
+		}
+		completed = append(completed, result)
+		if result.err == nil {
+			successes++
+			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+		}
+	}
+	if successes == 0 {
+		// If every sampled candidate fails, the destination itself may be
+		// filtered. Keep the evidence out of the breaker in that case; the
+		// normal per-flow watchdog remains authoritative for real traffic.
+		return
+	}
+	for _, result := range completed {
+		if result.err != nil {
+			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), N.NetworkUDP, false, result.elapsed)
+		}
+	}
+}
+
+func runSmartUDPHealthProbe(ctx context.Context, candidate adapter.Outbound) error {
+	query, id, question, err := buildSmartDNSHealthQuery()
+	if err != nil {
+		return err
+	}
+	for _, target := range smartUDPProbeTargets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		packetConn, err := candidate.ListenPacket(ctx, target)
+		if err != nil {
+			continue
+		}
+		deadline := time.Now().Add(defaultSmartUDPProbeTimeout)
+		if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
+			deadline = contextDeadline
+		}
+		if err = packetConn.SetDeadline(deadline); err == nil {
+			_, err = packetConn.WriteTo(query, target.UDPAddr())
+		}
+		if err == nil {
+			response := make([]byte, 2048)
+			var count int
+			count, _, err = packetConn.ReadFrom(response)
+			if err == nil {
+				err = validateSmartDNSHealthResponse(response[:count], id, question)
+			}
+		}
+		_ = packetConn.Close()
+		if err == nil {
+			return nil
+		}
+	}
+	return errors.New("smart UDP DNS health probe failed")
+}
+
+func buildSmartDNSHealthQuery() ([]byte, uint16, dnsmessage.Question, error) {
+	var randomID [2]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return nil, 0, dnsmessage.Question{}, err
+	}
+	id := binary.BigEndian.Uint16(randomID[:])
+	name, err := dnsmessage.NewName("example.com.")
+	if err != nil {
+		return nil, 0, dnsmessage.Question{}, err
+	}
+	question := dnsmessage.Question{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}
+	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: id, RecursionDesired: true})
+	if err = builder.StartQuestions(); err != nil {
+		return nil, 0, dnsmessage.Question{}, err
+	}
+	if err = builder.Question(question); err != nil {
+		return nil, 0, dnsmessage.Question{}, err
+	}
+	message, err := builder.Finish()
+	return message, id, question, err
+}
+
+func validateSmartDNSHealthResponse(message []byte, id uint16, expected dnsmessage.Question) error {
+	var parser dnsmessage.Parser
+	header, err := parser.Start(message)
+	if err != nil {
+		return err
+	}
+	if !header.Response || header.ID != id || header.RCode != dnsmessage.RCodeSuccess {
+		return errors.New("unexpected smart UDP DNS response")
+	}
+	question, err := parser.Question()
+	if err != nil {
+		return err
+	}
+	if question != expected {
+		return errors.New("smart UDP DNS response question mismatch")
+	}
+	return nil
 }
 
 func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksaddr) ([]smartRank, string, string, string) {
