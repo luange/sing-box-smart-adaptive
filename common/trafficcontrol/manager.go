@@ -128,6 +128,7 @@ func (m *Manager) leave(tracker Tracker) {
 	// a slice header. The copy keeps the finalized leaf for history without
 	// changing the object visible to active-connection readers.
 	metadataCopy := cloneTrackerMetadata(metadata)
+	metadataCopy.CloseReason = metadataCopy.LoadCloseReason()
 	metadataCopy.FinalizeChain()
 	closedAt := time.Now()
 	metadataCopy.ClosedAt = closedAt

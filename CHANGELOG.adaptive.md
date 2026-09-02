@@ -2,6 +2,14 @@
 
 只记录相对 **SagerNet 官方 tag** 的本仓库变更。上游 changelog 见 `docs/changelog.md`。
 
+## Unreleased — connection close diagnostics
+
+- Record a bounded, race-safe `closeReason` for routed TCP/UDP history entries.
+- Distinguish clean client/remote EOF, reset, dial/handshake timeout and idle
+  timeout without changing routing or connection lifetime semantics.
+- Preserve existing history queue-drop counters; no sensitive payload or URL is
+  recorded.
+
 ## Unreleased — Zig Smart production backend
 
 ### Score evolution (v3.42)

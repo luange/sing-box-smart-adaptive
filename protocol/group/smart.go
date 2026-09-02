@@ -334,6 +334,7 @@ type Smart struct {
 
 	store                     *smartStore
 	policyBackend             smartPolicyBackend
+	policyBackendAccess       sync.RWMutex
 	probeURL                  string
 	probeInterval             time.Duration
 	probeCycleTimeout         time.Duration
@@ -768,15 +769,62 @@ func (s *Smart) Close() error {
 	s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
 	s.providerAccess.Unlock()
 	s.store.clear()
-	if s.policyBackend != nil {
-		s.policyBackend.Close()
-		s.policyBackend = nil
-	}
+	s.closePolicyBackend()
 	if s.releaseProbeRegistry != nil {
 		s.releaseProbeRegistry()
 		s.releaseProbeRegistry = nil
 	}
 	return nil
+}
+
+// policyBackendEnabled snapshots only whether the optional policy kernel is
+// available. Calls into the backend itself must use the helpers below so
+// Smart.Close cannot destroy a Zig engine while another goroutine is inside
+// its C ABI.
+func (s *Smart) policyBackendEnabled() bool {
+	s.policyBackendAccess.RLock()
+	enabled := s.policyBackend != nil
+	s.policyBackendAccess.RUnlock()
+	return enabled
+}
+
+func (s *Smart) resetPolicyBackend() {
+	s.policyBackendAccess.RLock()
+	if s.policyBackend != nil {
+		s.policyBackend.Reset()
+	}
+	s.policyBackendAccess.RUnlock()
+}
+
+func (s *Smart) closePolicyBackend() {
+	s.policyBackendAccess.Lock()
+	if s.policyBackend != nil {
+		s.policyBackend.Close()
+		s.policyBackend = nil
+	}
+	s.policyBackendAccess.Unlock()
+}
+
+func (s *Smart) observePolicyBackend(key string, id uint64, success bool, elapsed time.Duration, now time.Time) bool {
+	s.policyBackendAccess.RLock()
+	if s.policyBackend == nil {
+		s.policyBackendAccess.RUnlock()
+		return false
+	}
+	s.policyBackend.Observe(key, id, success, elapsed, now)
+	s.policyBackendAccess.RUnlock()
+	return true
+}
+
+func (s *Smart) choosePolicyBackend(key string, candidates []smartPolicyCandidate, profile smartTrafficProfile, now time.Time) (smartPolicyDecision, bool) {
+	s.policyBackendAccess.RLock()
+	if s.policyBackend == nil {
+		s.policyBackendAccess.RUnlock()
+		return smartPolicyDecision{}, false
+	}
+	decision := s.policyBackend.Choose(key, candidates, profile, now)
+	s.policyBackendAccess.RUnlock()
+	return decision, true
 }
 
 // waitWorkerStop waits for the probe worker up to timeout after cancel.
@@ -1136,9 +1184,7 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	s.control.access.Lock()
 	s.control.pinned = tag
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.resetPolicyBackend()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil {
 			s.logger.Error("store smart pin: ", err)
@@ -1151,9 +1197,7 @@ func (s *Smart) ClearSelection() {
 	s.control.access.Lock()
 	s.control.pinned = ""
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.resetPolicyBackend()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
 		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil {
 			s.logger.Error("clear smart pin: ", err)
@@ -1923,14 +1967,13 @@ func (s *Smart) rank(ctx context.Context, transport string, destination M.Socksa
 func (s *Smart) observeDial(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
 	profileID := s.candidateProfileID(candidate)
 	s.store.observeDial(now, network, site, profileID, transport, success, elapsed)
-	if s.policyBackend == nil {
-		return
-	}
+	// The backend observes the canonical endpoint identity. Metadata is read
+	// under the catalog lock so provider refresh cannot race this callback.
 	s.access.RLock()
 	metadata := s.candidateMetadataByTag[candidate]
 	s.access.RUnlock()
 	if metadata.identity != "" {
-		s.policyBackend.Observe(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
+		s.observePolicyBackend(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
 	}
 }
 
@@ -1972,7 +2015,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	totalSamples := 0.0
 	var policyCandidates []smartPolicyCandidate
 	var policyIDs map[uint64]struct{}
-	if s.policyBackend != nil {
+	usePolicyBackend := s.policyBackendEnabled()
+	if usePolicyBackend {
 		policyCandidates = make([]smartPolicyCandidate, 0, len(ranking.candidates))
 		policyIDs = make(map[uint64]struct{}, len(ranking.candidates))
 	}
@@ -2040,7 +2084,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				Samples:         estimate.Samples,
 			},
 		})
-		if s.policyBackend != nil && metadata.identity != "" {
+		if usePolicyBackend && metadata.identity != "" {
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
@@ -2144,7 +2188,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	// The portable Zig backend owns confirmation/cooldown state when enabled.
 	// Do not bypass it with the host-side coarse hash; the hash is only the
 	// default fallback for the reference Go policy path.
-	if s.policyBackend == nil && lastSelected == "" && (affinity.Candidate == "" || !affinity.ExpiresAt.After(now)) {
+	if !usePolicyBackend && lastSelected == "" && (affinity.Candidate == "" || !affinity.ExpiresAt.After(now)) {
 		if index := s.coarseAffinityIndex(ranks, networkKey+"\x00"+siteDisplay+"\x00"+transport); index >= 0 {
 			ranks[index].status.Reason = "coarse affinity hash retained near-tied candidate"
 			moveSmartRankFirst(ranks, index)
@@ -2152,52 +2196,59 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
-	if s.policyBackend != nil {
-		decision := s.policyBackend.Choose(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
-		if decision.SelectedID != 0 {
-			selectedIndex := -1
-			for index := range ranks {
-				if ranks[index].policyID != decision.SelectedID {
-					continue
+	if usePolicyBackend {
+		decision, backendAvailable := s.choosePolicyBackend(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
+		if !backendAvailable {
+			// Close can retire the optional backend while a ranking snapshot is
+			// still being assembled. Fall through to the reference Go policy
+			// instead of dereferencing a retired engine.
+			usePolicyBackend = false
+		} else {
+			if decision.SelectedID != 0 {
+				selectedIndex := -1
+				for index := range ranks {
+					if ranks[index].policyID != decision.SelectedID {
+						continue
+					}
+					selectedIndex = index
+					break
 				}
-				selectedIndex = index
-				break
-			}
-			if selectedIndex >= 0 {
-				currentIndex := smartRankIndex(ranks, lastSelected)
-				if currentIndex >= 0 && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
-					ranks[currentIndex].status.Reason = "baseline retained current candidate"
-					moveSmartRankFirst(ranks, currentIndex)
-					s.updateStatus(networkKey, siteDisplay, transport, ranks, "baseline retained current candidate")
+				if selectedIndex >= 0 {
+					currentIndex := smartRankIndex(ranks, lastSelected)
+					if currentIndex >= 0 && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
+						ranks[currentIndex].status.Reason = "baseline retained current candidate"
+						moveSmartRankFirst(ranks, currentIndex)
+						s.updateStatus(networkKey, siteDisplay, transport, ranks, "baseline retained current candidate")
+						return ranking, networkKey, siteKey, siteDisplay
+					}
+					if currentIndex >= 0 && currentIndex != selectedIndex &&
+						!smartAbsoluteImprovement(ranks[selectedIndex], ranks[currentIndex], s.switchMinImprovement) {
+						// The Zig kernel already applies relative margin, confirmation,
+						// and cooldown. This additional absolute floor prevents a tiny
+						// score change from moving a healthy browser path when the p95
+						// latency gain is below the user-visible threshold.
+						ranks[currentIndex].status.Reason = "healthy current candidate retained below latency floor"
+						moveSmartRankFirst(ranks, currentIndex)
+						s.updateStatus(networkKey, siteDisplay, transport, ranks, "healthy current candidate retained below latency floor")
+						return ranking, networkKey, siteKey, siteDisplay
+					}
+				}
+				if selectedIndex >= 0 {
+					reason := "zig policy retained candidate"
+					if decision.Switched {
+						reason = "zig policy confirmed candidate"
+					}
+					ranks[selectedIndex].status.Reason = reason
+					moveSmartRankFirst(ranks, selectedIndex)
+					s.updateStatus(networkKey, siteDisplay, transport, ranks, reason)
 					return ranking, networkKey, siteKey, siteDisplay
 				}
-				if currentIndex >= 0 && currentIndex != selectedIndex &&
-					!smartAbsoluteImprovement(ranks[selectedIndex], ranks[currentIndex], s.switchMinImprovement) {
-					// The Zig kernel already applies relative margin, confirmation,
-					// and cooldown. This additional absolute floor prevents a tiny
-					// score change from moving a healthy browser path when the p95
-					// latency gain is below the user-visible threshold.
-					ranks[currentIndex].status.Reason = "healthy current candidate retained below latency floor"
-					moveSmartRankFirst(ranks, currentIndex)
-					s.updateStatus(networkKey, siteDisplay, transport, ranks, "healthy current candidate retained below latency floor")
-					return ranking, networkKey, siteKey, siteDisplay
-				}
 			}
-			if selectedIndex >= 0 {
-				reason := "zig policy retained candidate"
-				if decision.Switched {
-					reason = "zig policy confirmed candidate"
-				}
-				ranks[selectedIndex].status.Reason = reason
-				moveSmartRankFirst(ranks, selectedIndex)
-				s.updateStatus(networkKey, siteDisplay, transport, ranks, reason)
-				return ranking, networkKey, siteKey, siteDisplay
-			}
+			// A corrupt/unsupported backend decision must fail safe to the best
+			// host-ranked candidate, without re-entering the Go confirmation FSM.
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy fallback to host ranking")
+			return ranking, networkKey, siteKey, siteDisplay
 		}
-		// A corrupt/unsupported backend decision must fail safe to the best
-		// host-ranked candidate, without re-entering the Go confirmation FSM.
-		s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy fallback to host ranking")
-		return ranking, networkKey, siteKey, siteDisplay
 	}
 	bestScore := ranks[0].status.Score
 	current := lastSelected
@@ -2254,6 +2305,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
+	usePolicyBackend := s.policyBackendEnabled()
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
@@ -2265,7 +2317,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
-	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !usePolicyBackend && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		coolingDown := s.performanceCooldown[key].After(now)
 		materiallyBetter := previousFound && currentFound &&
 			smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin) &&
@@ -2282,7 +2334,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	s.lastSelectedAt[key] = now
 	delete(s.switchChallenges, key)
-	if s.policyBackend == nil && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !usePolicyBackend && previous != "" && previous != candidate.Tag() && !failureSwitch {
 		if s.performanceCooldown == nil {
 			s.performanceCooldown = make(map[string]time.Time)
 		}
@@ -2715,9 +2767,7 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 	}
 	s.control.pinned = ""
 	s.control.access.Unlock()
-	if s.policyBackend != nil {
-		s.policyBackend.Reset()
-	}
+	s.resetPolicyBackend()
 	if s.logger != nil {
 		s.logger.Warn("smart manual pin released: ", reason, " tag=", candidate)
 	}

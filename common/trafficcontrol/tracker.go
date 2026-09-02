@@ -26,6 +26,7 @@ type TrackerMetadata struct {
 	Rule            adapter.Rule
 	Outbound        string
 	OutboundType    string
+	CloseReason     adapter.ConnectionCloseReason
 	outboundManager adapter.OutboundManager
 }
 
@@ -95,6 +96,28 @@ func (t *TrackerMetadata) FinalizeChain() {
 	if len(chain) > 0 {
 		t.Chain = common.Reverse(chain)
 	}
+}
+
+func (t *TrackerMetadata) SetCloseReason(reason adapter.ConnectionCloseReason) {
+	if t == nil || reason == "" {
+		return
+	}
+	if t.Metadata.Extended != nil {
+		t.Metadata.Extended.SetCloseReason(reason)
+	}
+}
+
+func (t *TrackerMetadata) LoadCloseReason() adapter.ConnectionCloseReason {
+	if t == nil {
+		return adapter.CloseReasonUnknown
+	}
+	if reason := t.Metadata.Extended.CloseReason(); reason != "" {
+		return reason
+	}
+	if t.CloseReason != "" {
+		return t.CloseReason
+	}
+	return adapter.CloseReasonUnknown
 }
 
 // EffectiveChain returns the finalized display chain (leaf first).

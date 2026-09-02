@@ -31,6 +31,7 @@ type Record struct {
 	User            string    `json:"user,omitempty"`
 	Outbound        string    `json:"outbound,omitempty"`
 	OutboundType    string    `json:"outboundType,omitempty"`
+	CloseReason     string    `json:"closeReason,omitempty"`
 	Chain           []string  `json:"chain,omitempty"`
 	Rule            string    `json:"rule,omitempty"`
 	StartedAt       time.Time `json:"startedAt"`

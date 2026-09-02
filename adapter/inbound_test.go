@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"context"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -42,4 +44,26 @@ func TestDNSResponseAddressesUnmapsHTTPSIPv4Hints(t *testing.T) {
 	addresses := DNSResponseAddresses(response)
 	require.Equal(t, []netip.Addr{netip.MustParseAddr("1.1.1.1")}, addresses)
 	require.True(t, addresses[0].Is4())
+}
+
+func TestConnectionCloseReasonClassification(t *testing.T) {
+	t.Parallel()
+
+	if got := ClassifyDialError(context.DeadlineExceeded); got != CloseReasonDialTimeout {
+		t.Fatalf("dial timeout reason = %q", got)
+	}
+	if got := ClassifyStreamError(io.EOF, true); got != CloseReasonClientEOF {
+		t.Fatalf("client EOF reason = %q", got)
+	}
+	if got := ClassifyStreamError(io.EOF, false); got != CloseReasonRemoteEOF {
+		t.Fatalf("remote EOF reason = %q", got)
+	}
+
+	var extended InboundContextExtended
+	extended.SetCloseReason(CloseReasonClientEOF)
+	extended.SetCloseReason(CloseReasonRemoteReset)
+	extended.SetCloseReason(CloseReasonRemoteEOF)
+	if got := extended.CloseReason(); got != CloseReasonRemoteReset {
+		t.Fatalf("priority reason = %q", got)
+	}
 }

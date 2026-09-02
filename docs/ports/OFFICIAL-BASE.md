@@ -78,6 +78,11 @@ Smart/selector/urltest/loadbalance implement `PreMatchOutboundGroup`.
 ```
 API: `GET /history` (status), `/history/summary|trend|connections|domains|...`
 
+Closed records returned by `/history/connections` include a best-effort
+`closeReason`. Clean client/remote EOF, reset, dial/handshake timeout, idle
+timeout and unknown termination are kept distinct; `history.status` continues
+to expose dropped open/close events separately.
+
 The path is a compatibility anchor. SBH2 data lives in `<path>.segments`; a
 legacy BoltDB at `<path>` is reported as `legacyDatabaseSize` but is never mmaped.
 Expiry unlinks immutable segments, so deleted history immediately returns disk space.

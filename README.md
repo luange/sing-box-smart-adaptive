@@ -58,6 +58,7 @@
 
 - Clash API：`GET /history`、`/summary`、`/connections`…  
 - 关闭时 `FinalizeChain`：记 **真实叶子**（如 `airport/…` + `HK`），不是只有组 tag  
+- 关闭记录包含 `closeReason`（`client_eof`、`remote_eof`、`remote_rst`、`dial_timeout`、`handshake_timeout`、`idle_timeout` 等），用于区分正常短连接与真正失败。
 - SBH2 使用无 mmap 的 Zstd 不可变分段：明细默认 6h、聚合按配置保留，默认硬上限 256 MiB。
 - 活跃长连接每分钟 checkpoint；建立、关闭、失败及 Smart 切换仍走即时事件，不再每 5 秒全量写库。
 

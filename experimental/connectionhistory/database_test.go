@@ -53,11 +53,12 @@ func TestConnectionDeltaAndCloseRecord(t *testing.T) {
 			},
 			Domain: "example.com",
 		},
-		CreatedAt: startedAt,
-		Upload:    upload,
-		Download:  download,
-		Outbound:  "proxy-a",
-		Chain:     []string{"proxy-a", "selector"},
+		CreatedAt:   startedAt,
+		Upload:      upload,
+		Download:    download,
+		Outbound:    "proxy-a",
+		CloseReason: adapter.CloseReasonRemoteReset,
+		Chain:       []string{"proxy-a", "selector"},
 	}
 
 	manager.processOpen(metadata)
@@ -84,6 +85,7 @@ func TestConnectionDeltaAndCloseRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, connections.Total)
 	require.Equal(t, "proxy-a", connections.Data[0].Outbound)
+	require.Equal(t, string(adapter.CloseReasonRemoteReset), connections.Data[0].CloseReason)
 	require.Equal(t, int64(160), connections.Data[0].Upload)
 
 	domains, err := database.Dimensions("domains", query)

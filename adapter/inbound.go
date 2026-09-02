@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
@@ -125,6 +126,7 @@ type InboundContext struct {
 // InboundContextExtended holds optional chain diagnostics (loadbalance/smart).
 type InboundContextExtended struct {
 	RealOutboundChain []string
+	closeReason       atomic.Pointer[closeReasonState]
 }
 
 func (c *InboundContext) InitExtended() {

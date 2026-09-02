@@ -93,7 +93,6 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 	}
 }
 
-
 // TrackCloser registers an arbitrary closer (e.g. eBPF splice pair) so CloseAll
 // releases it. Returns a wrapper that unregisters on Close.
 func (m *ConnectionManager) TrackCloser(closer io.Closer) io.Closer {
@@ -141,6 +140,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
 	}
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyDialError(err))
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {
 			remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
@@ -161,6 +161,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	}
 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 		err = E.Cause(err, "report handshake success")
 		remoteConn.Close()
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -181,6 +182,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if metadata.TLSSpoof != "" {
 		spoofConn, spoofErr := tlsspoof.NewConn(remoteConn, metadata.TLSSpoofMethod, metadata.TLSSpoof)
 		if spoofErr != nil {
+			noteCloseReason(ctx, adapter.ClassifyHandshakeError(spoofErr))
 			spoofErr = E.Cause(spoofErr, "tls_spoof setup")
 			remoteConn.Close()
 			N.CloseOnHandshakeFailure(conn, onClose, spoofErr)
@@ -235,6 +237,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			remoteConn, err = this.DialContext(ctx, N.NetworkUDP, metadata.Destination)
 		}
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyDialError(err))
 			var remoteString string
 			if len(metadata.DestinationAddresses) > 0 {
 				remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
@@ -267,6 +270,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			remotePacketConn, err = this.ListenPacket(ctx, metadata.Destination)
 		}
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyDialError(err))
 			var dialerString string
 			if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
@@ -282,6 +286,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 		conn.Close()
 		remotePacketConn.Close()
 		m.logger.ErrorContext(ctx, "report handshake success: ", err)
@@ -350,11 +355,13 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 
 func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
 	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	noteCloseReason(ctx, adapter.ClassifyStreamError(err, !direction))
 	if err != nil {
 		common.Close(source, destination)
 	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
 		err = duplexDst.CloseWrite()
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyStreamError(err, !direction))
 			common.Close(source, destination)
 		}
 	} else {
@@ -427,8 +434,13 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		return false
 	}
 	if !wrotePayload && (E.IsMulti(err, os.ErrInvalid, context.DeadlineExceeded, io.EOF) || E.IsTimeout(err)) {
+		// A probe-style write can time out before any payload is available. The
+		// caller deliberately continues with the normal copy path, so this is
+		// not a closed connection and must not be recorded as a handshake
+		// failure in history.
 		return false
 	}
+	noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 	if !done.Swap(true) {
 		if onClose != nil {
 			onClose(err)
@@ -445,6 +457,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
 	_, err := bufio.CopyPacket(destination, source)
+	noteCloseReason(ctx, classifyPacketCloseError(err, !direction))
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")
@@ -468,6 +481,25 @@ func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.P
 		}
 	}
 	common.Close(source, destination)
+}
+
+func noteCloseReason(ctx context.Context, reason adapter.ConnectionCloseReason) {
+	if reason == "" {
+		return
+	}
+	if metadata := adapter.ContextFrom(ctx); metadata != nil && metadata.Extended != nil {
+		metadata.Extended.SetCloseReason(reason)
+	}
+}
+
+func classifyPacketCloseError(err error, clientDirection bool) adapter.ConnectionCloseReason {
+	if err == nil {
+		if clientDirection {
+			return adapter.CloseReasonClientEOF
+		}
+		return adapter.CloseReasonRemoteEOF
+	}
+	return adapter.ClassifyStreamError(err, clientDirection)
 }
 
 type trackedConn struct {

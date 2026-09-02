@@ -447,6 +447,7 @@ func recordFromMetadata(metadata trafficcontrol.TrackerMetadata) Record {
 		User:            metadata.Metadata.User,
 		Outbound:        outboundTag,
 		OutboundType:    metadata.OutboundType,
+		CloseReason:     string(metadata.LoadCloseReason()),
 		Chain:           chain,
 		Rule:            rule,
 		StartedAt:       metadata.CreatedAt,
