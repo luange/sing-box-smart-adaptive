@@ -45,6 +45,19 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	if i == nil || len(addresses) == 0 {
 		return
 	}
+	// FakeIP answers use the shared-network backend synchronously, but they
+	// still need to participate in the same lifecycle barrier as asynchronous
+	// real-DNS prefill work.  Without admission here, Close could clear
+	// sharedNetwork while this callback is publishing hints.
+	if !i.acquireDNSPrefillSlot() {
+		return
+	}
+	release := true
+	defer func() {
+		if release {
+			i.releaseDNSPrefillWorker()
+		}
+	}()
 	if fromFakeIP {
 		if i.dnsPrefillClosed.Load() {
 			return
@@ -55,15 +68,6 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	// Admit before filtering or allocating. Answers are advisory hints, so a
 	// full worker budget is safely fail-open and cannot create one goroutine per
 	// DNS response during browser/messenger bursts.
-	if !i.acquireDNSPrefillSlot() {
-		return
-	}
-	release := true
-	defer func() {
-		if release {
-			i.releaseDNSPrefillWorker()
-		}
-	}()
 	v3DNS := i.v3DNSHintEnabled()
 	if !i.dnsPrefill.enabled && !v3DNS {
 		return
@@ -233,20 +237,36 @@ func (i *Inbound) wireDNSPrefill() {
 	if !needObserver {
 		return
 	}
-	routeRouter, ok := i.router.(adapter.Router)
-	if !ok || routeRouter == nil {
-		if i.dnsPrefill.enabled {
-			i.logger.Warn("eBPF dns_prefill disabled: router does not implement adapter.Router")
-			i.dnsPrefill.enabled = false
+	// FakeIP answers are authoritative v3 hints and do not require a route
+	// walk or outbound manager.  Only real-DNS prefill/strong-hint paths need
+	// these dependencies; requiring them for FakeIP alone silently disabled the
+	// observer on minimal/embedded routers.
+	needRoutePrefill := i.dnsPrefill.enabled || i.v3DNSHintEnabled()
+	var routeRouter adapter.Router
+	var outbounds adapter.OutboundManager
+	if needRoutePrefill {
+		var ok bool
+		routeRouter, ok = i.router.(adapter.Router)
+		if !ok || routeRouter == nil {
+			if i.dnsPrefill.enabled {
+				i.logger.Warn("eBPF dns_prefill disabled: router does not implement adapter.Router")
+				i.dnsPrefill.enabled = false
+			}
+			routeRouter = nil
 		}
-		return
+		if routeRouter != nil {
+			outbounds = service.FromContext[adapter.OutboundManager](i.ctx)
+		}
+		if routeRouter == nil || outbounds == nil {
+			if i.dnsPrefill.enabled {
+				i.logger.Warn("eBPF dns_prefill disabled: missing outbound manager")
+				i.dnsPrefill.enabled = false
+			}
+			routeRouter = nil
+			outbounds = nil
+		}
 	}
-	outbounds := service.FromContext[adapter.OutboundManager](i.ctx)
-	if outbounds == nil {
-		if i.dnsPrefill.enabled {
-			i.logger.Warn("eBPF dns_prefill disabled: missing outbound manager")
-			i.dnsPrefill.enabled = false
-		}
+	if routeRouter == nil && outbounds == nil && !i.v3FakeIPEnabled() {
 		return
 	}
 	i.dnsPrefillRouter = routeRouter

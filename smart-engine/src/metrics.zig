@@ -9,6 +9,10 @@ const index_mask = index_capacity - 1;
 const empty_slot: u16 = std.math.maxInt(u16);
 const tombstone_slot: u16 = empty_slot - 1;
 
+fn isFinite(value: f64) bool {
+    return value == value and value != std.math.inf(f64) and value != -std.math.inf(f64);
+}
+
 fn initialFreeSlots() [max_entries]u16 {
     @setEvalBranchQuota(10000);
     var slots = [_]u16{0} ** max_entries;
@@ -52,8 +56,15 @@ pub const Store = struct {
         if (slot == null) return;
         var metric = &self.entries[slot.?];
         if (success) metric.successes +|= 1 else metric.failures +|= 1;
-        if (elapsed_ms > 0 and elapsed_ms == elapsed_ms) {
-            if (metric.samples == 0) {
+        // The Go adapter normally supplies a finite duration, but the C ABI is
+        // also callable by foreign hosts.  Do not let an infinite sample poison
+        // the EWMA/jitter state for every later decision.
+        if (elapsed_ms > 0 and isFinite(elapsed_ms)) {
+            // Reliability samples can be recorded without a latency value (for
+            // example a failed probe).  Use the latency field itself as the
+            // first-valid-sample marker so those events do not dilute the first
+            // usable timing observation.
+            if (metric.connect_ms <= 0 or !isFinite(metric.connect_ms)) {
                 metric.connect_ms = elapsed_ms;
             } else {
                 const delta = elapsed_ms - metric.connect_ms;
@@ -66,6 +77,18 @@ pub const Store = struct {
         metric.last_updated = now_ms;
     }
 
+    test "non-finite latency samples do not poison the metric" {
+        var store = Store{};
+        store.observe(1, true, std.math.inf(f64), 1);
+        store.observe(1, true, std.math.nan(f64), 2);
+        var metric = store.get(1).?;
+        try std.testing.expectEqual(@as(u64, 2), metric.samples);
+        try std.testing.expectEqual(@as(f64, 0), metric.connect_ms);
+        store.observe(1, true, 10, 3);
+        metric = store.get(1).?;
+        try std.testing.expectEqual(@as(f64, 10), metric.connect_ms);
+    }
+
     pub fn get(self: *const Store, id: u64) ?Metrics {
         if (self.findConst(id)) |index| return self.entries[index];
         return null;
@@ -74,13 +97,13 @@ pub const Store = struct {
     pub fn enrich(self: *const Store, candidate: anytype) @TypeOf(candidate) {
         const observed = self.get(candidate.id) orelse return candidate;
         var result = candidate;
-        if (result.samples <= 0 and observed.samples > 0) {
+        if ((!isFinite(result.samples) or result.samples <= 0) and observed.samples > 0) {
             const total = observed.successes + observed.failures;
             result.samples = @floatFromInt(observed.samples);
             if (total > 0) result.reliability = @as(f64, @floatFromInt(observed.successes)) / @as(f64, @floatFromInt(total));
         }
-        if (result.connect_ms <= 0 and observed.connect_ms > 0) result.connect_ms = observed.connect_ms;
-        if (result.jitter_ms <= 0 and observed.jitter_ms > 0) result.jitter_ms = observed.jitter_ms;
+        if ((!isFinite(result.connect_ms) or result.connect_ms <= 0) and observed.connect_ms > 0) result.connect_ms = observed.connect_ms;
+        if ((!isFinite(result.jitter_ms) or result.jitter_ms <= 0) and observed.jitter_ms > 0) result.jitter_ms = observed.jitter_ms;
         return result;
     }
 

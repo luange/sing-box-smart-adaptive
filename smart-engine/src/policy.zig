@@ -19,6 +19,7 @@ pub fn choose(state: *State, config: model.Config, observations: *const metrics.
 }
 
 pub fn chooseProfile(state: *State, config: model.Config, observations: *const metrics.Store, candidates: []const model.Candidate, now_ms: u64, profile: scoring.TrafficProfile) model.Decision {
+    const switch_margin = if (config.switch_margin >= 0 and scoring.isFinite(config.switch_margin)) @min(config.switch_margin, 0.95) else 0.0;
     var decision = model.Decision{ .selected_id = 0, .score = 100.0, .switched = 0, .reason = @intFromEnum(model.DecisionReason.no_candidate) };
     var best: ?model.Candidate = null;
     var best_score: f64 = 100.0;
@@ -34,14 +35,16 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
         if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4 and healthTier(candidate.state) == best_tier) {
-            total_samples += @max(candidate.samples, 0.0);
+            if (candidate.samples > 0 and scoring.isFinite(candidate.samples)) {
+                total_samples += candidate.samples;
+            }
         }
     }
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
         if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
         const value = scoring.score(config, candidate, total_samples, profile);
-        if (best == null or value < best_score) {
+        if (scoring.isFinite(value) and (best == null or value < best_score)) {
             best = candidate;
             best_score = value;
         }
@@ -78,7 +81,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         }
         const current_score = scoring.score(config, current, total_samples, profile);
         const improvement = if (current_score > 0) (current_score - best_score) / current_score else 0;
-        if (improvement < config.switch_margin or now_ms < state.cooldown_until) {
+        if (improvement < switch_margin or now_ms < state.cooldown_until) {
             decision.selected_id = current.id;
             decision.score = current_score;
             decision.reason = @intFromEnum(model.DecisionReason.retained);

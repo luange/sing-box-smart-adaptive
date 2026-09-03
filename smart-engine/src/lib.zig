@@ -7,6 +7,10 @@ const adaptive = @import("adaptive.zig");
 
 const max_candidates = 8192;
 
+fn isFinite(value: f64) bool {
+    return value == value and value != std.math.inf(f64) and value != -std.math.inf(f64);
+}
+
 pub const Candidate = model.Candidate;
 pub const Config = model.Config;
 pub const Decision = model.Decision;
@@ -18,8 +22,8 @@ const Engine = struct {
 
     fn init(config: Config) Engine {
         var normalized = config;
-        if (!(normalized.exploration >= 0) or normalized.exploration != normalized.exploration) normalized.exploration = 0;
-        if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0;
+        if (!(normalized.exploration >= 0) or !isFinite(normalized.exploration)) normalized.exploration = 0;
+        if (!(normalized.switch_margin >= 0) or !isFinite(normalized.switch_margin)) normalized.switch_margin = 0;
         if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
         if (normalized.switch_confirm_samples == 0) normalized.switch_confirm_samples = 1;
         return .{ .config = normalized };
@@ -95,7 +99,7 @@ export fn adaptive_engine_abi_version() u32 {
 export fn adaptive_engine_create(config: adaptive.Config) ?*AdaptiveEngine {
     const engine = std.heap.page_allocator.create(AdaptiveEngine) catch return null;
     var normalized = config;
-    if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
+    if (!(normalized.switch_margin >= 0) or !isFinite(normalized.switch_margin)) normalized.switch_margin = 0.15;
     if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
     engine.* = .{ .config = normalized };
     return engine;
@@ -104,7 +108,7 @@ export fn adaptive_engine_create(config: adaptive.Config) ?*AdaptiveEngine {
 export fn adaptive_engine_configure(engine: ?*AdaptiveEngine, config: adaptive.Config) void {
     if (engine) |value| {
         var normalized = config;
-        if (!(normalized.switch_margin >= 0) or normalized.switch_margin != normalized.switch_margin) normalized.switch_margin = 0.15;
+        if (!(normalized.switch_margin >= 0) or !isFinite(normalized.switch_margin)) normalized.switch_margin = 0.15;
         if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
         value.config = normalized;
     }
@@ -155,6 +159,28 @@ test "retains incumbent until confirmation" {
     try std.testing.expectEqual(@as(u64, 1), policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..1], 0).selected_id);
     try std.testing.expectEqual(@as(u8, 0), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 1000).switched);
     try std.testing.expectEqual(@as(u8, 1), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 2000).switched);
+}
+
+test "ABI configuration rejects non-finite limits" {
+    const smart = Engine.init(.{
+        .exploration = std.math.inf(f64),
+        .switch_margin = -std.math.inf(f64),
+        .switch_confirm_samples = 0,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+    });
+    try std.testing.expectEqual(@as(f64, 0), smart.config.exploration);
+    try std.testing.expectEqual(@as(f64, 0), smart.config.switch_margin);
+    try std.testing.expectEqual(@as(u32, 1), smart.config.switch_confirm_samples);
+
+    const adaptive_engine = adaptive_engine_create(.{
+        .switch_margin = std.math.inf(f64),
+        .switch_cooldown_ms = 0,
+        .mode = 1,
+        .manual_failure = 0,
+    }) orelse return error.OutOfMemory;
+    defer adaptive_engine_destroy(adaptive_engine);
+    try std.testing.expectEqual(@as(f64, 0.15), adaptive_engine.config.switch_margin);
 }
 
 test "hard-open incumbent fails over without confirmation" {

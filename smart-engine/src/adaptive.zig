@@ -45,18 +45,34 @@ pub const Decision = extern struct {
     score: f64,
 };
 
+fn isFinite(value: f64) bool {
+    return value == value and value != std.math.inf(f64) and value != -std.math.inf(f64);
+}
+
+fn normalizedDelay(value: f64) f64 {
+    // A foreign caller can provide NaN/Inf through the C ABI. Treat those as
+    // unknown latency, matching the existing <= 0 unknown ordering, instead
+    // of making the insertion comparator non-transitive.
+    if (!isFinite(value)) return 0;
+    return value;
+}
+
 fn better(left: Candidate, right: Candidate, mode: u8) bool {
     if (left.health_priority != right.health_priority) return left.health_priority < right.health_priority;
     if (mode == 3) {
-        const left_known = left.throughput_samples >= 2 and left.throughput_bps > 0;
-        const right_known = right.throughput_samples >= 2 and right.throughput_bps > 0;
+        const left_known = left.throughput_samples >= 2 and isFinite(left.throughput_samples) and
+            left.throughput_bps > 0 and isFinite(left.throughput_bps);
+        const right_known = right.throughput_samples >= 2 and isFinite(right.throughput_samples) and
+            right.throughput_bps > 0 and isFinite(right.throughput_bps);
         if (left_known != right_known) return left_known;
         if (left_known and left.throughput_bps != right.throughput_bps) return left.throughput_bps > right.throughput_bps;
     }
-    if (left.weighted_delay_ms != right.weighted_delay_ms) {
-        if (left.weighted_delay_ms <= 0) return false;
-        if (right.weighted_delay_ms <= 0) return true;
-        return left.weighted_delay_ms < right.weighted_delay_ms;
+    const left_delay = normalizedDelay(left.weighted_delay_ms);
+    const right_delay = normalizedDelay(right.weighted_delay_ms);
+    if (left_delay != right_delay) {
+        if (left_delay <= 0) return false;
+        if (right_delay <= 0) return true;
+        return left_delay < right_delay;
     }
     if (left.sort_key_hi != right.sort_key_hi) return left.sort_key_hi < right.sort_key_hi;
     if (left.sort_key_lo != right.sort_key_lo) return left.sort_key_lo < right.sort_key_lo;
@@ -115,7 +131,8 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
         if (ordered > 0) {
             var trusted = false;
             for (candidates) |candidate| {
-                if (candidate.eligible != 0 and candidate.throughput_samples >= 2) {
+                if (candidate.eligible != 0 and isFinite(candidate.throughput_samples) and candidate.throughput_samples >= 2 and
+                    isFinite(candidate.throughput_bps) and candidate.throughput_bps > 0) {
                     trusted = true;
                     break;
                 }
@@ -167,7 +184,8 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
                     var keep = cooldown;
                     if (!keep and challenger.health_priority == incumbent.health_priority) {
                         const margin = std.math.clamp(config.switch_margin, 0.0, 0.95);
-                        if (incumbent.weighted_delay_ms > 0 and challenger.weighted_delay_ms > 0) {
+                        if (isFinite(incumbent.weighted_delay_ms) and incumbent.weighted_delay_ms > 0 and
+                            isFinite(challenger.weighted_delay_ms) and challenger.weighted_delay_ms > 0) {
                             keep = challenger.weighted_delay_ms > incumbent.weighted_delay_ms * (1.0 - margin);
                         }
                     }
@@ -187,7 +205,8 @@ pub fn choose(state: *State, config: Config, candidates: []const Candidate, now_
         state.sticky_id = selected.?.id;
         state.sticky_until = if (config.switch_cooldown_ms > 0) now_ms +| config.switch_cooldown_ms else 0;
     }
-    const score = @as(f64, @floatFromInt(@max(selected.?.health_priority, 0))) * 1_000_000_000_000.0 + @max(selected.?.weighted_delay_ms, 0);
+    const delay_score = normalizedDelay(selected.?.weighted_delay_ms);
+    const score = @as(f64, @floatFromInt(@max(selected.?.health_priority, 0))) * 1_000_000_000_000.0 + @max(delay_score, 0);
     return .{ .selected_id = selected.?.id, .switched = switched, .reason = reason, .score = score };
 }
 
@@ -214,4 +233,14 @@ test "adaptive kernel keeps sticky incumbent within margin" {
         .{ .id = 2, .health_priority = 0, .weighted_delay_ms = 90, .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 },
     };
     try std.testing.expectEqual(@as(u64, 1), choose(&state, config, close[0..], 1).selected_id);
+}
+
+test "adaptive kernel treats non-finite delay as unknown" {
+    var state = State{};
+    const config = Config{ .switch_margin = 0, .switch_cooldown_ms = 0, .mode = 2, .manual_failure = 0 };
+    const candidates = [_]Candidate{
+        .{ .id = 1, .health_priority = 0, .weighted_delay_ms = std.math.nan(f64), .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 },
+        .{ .id = 2, .health_priority = 0, .weighted_delay_ms = 25, .throughput_bps = 0, .throughput_samples = 0, .supported = 1, .eligible = 1, .pinned = 0, .leased = 0 },
+    };
+    try std.testing.expectEqual(@as(u64, 2), choose(&state, config, candidates[0..], 0).selected_id);
 }

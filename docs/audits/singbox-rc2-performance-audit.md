@@ -236,3 +236,25 @@ samples. TCP/UDP probe-cycle accounting now coalesces observations, success
 counters and failure penalties by EndpointProfile, so aliases cannot inflate
 confidence or accelerate phase transitions. UDP probe candidates are
 deduplicated before the bounded budget is applied.
+
+### Lifecycle and ABI hardening (2026-09-03)
+
+The follow-up review found two boundary cases that were not visible in the
+steady-state path. A provider callback copied before shutdown could pass the
+initial `closing` check and repopulate a catalog after `Smart.Close` had cleared
+it. Provider-map access is now locked, and catalog rebuilds re-check the close
+flag before and after taking the catalog lock; a late callback therefore cannot
+resurrect a retired group. DNS FakeIP callbacks now share the same bounded
+admission and `WaitGroup` barrier as real-DNS prefill work, so the eBPF shared
+network cannot be cleared while a hint is being published. FakeIP-only setups
+also register without requiring a Router or OutboundManager, while real-DNS
+prefill still fails open when either dependency is absent.
+
+The Zig C ABI now treats non-finite values and negative counters/latencies,
+throughput or weights as unknown/neutral; reliability remains bounded to
+`[0,1]`, and positive infinity is a worst cost where appropriate. This keeps
+EWMA state, confidence costs, throughput mode detection and ordering
+comparisons finite and transitive. Regression tests cover invalid latency,
+sample counts, delay and configuration values. Local validation for this pass
+was limited to `gofmt` and `git diff --check`; Linux Zig/Go/eBPF builds remain
+CI-only because eBPF cannot be validated by a macOS toolchain.

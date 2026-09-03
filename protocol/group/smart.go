@@ -1411,6 +1411,9 @@ func (s *Smart) noteTrafficActivity() {
 }
 
 func (s *Smart) requestProbe() {
+	if s == nil || s.closing.Load() {
+		return
+	}
 	select {
 	case s.probeNow <- struct{}{}:
 	default:
@@ -3908,17 +3911,27 @@ func (s *Smart) onProviderUpdated(tag string) error {
 	if retired {
 		return nil
 	}
-	if _, loaded := s.providers[tag]; !loaded {
+	// Provider callbacks may race with Close, which unregisters callbacks and
+	// clears the provider map under providerAccess.  Keep this lookup under the
+	// same lock as rebuildCandidates/unregisterProviderCallbacks so a late
+	// callback cannot read a map while it is being replaced.
+	s.providerAccess.Lock()
+	_, loaded := s.providers[tag]
+	s.providerAccess.Unlock()
+	if s.closing.Load() {
+		return nil
+	}
+	if !loaded {
 		return E.New("outbound provider not found: ", tag)
 	}
 	err := s.rebuildCandidates(tag)
-	if err == nil {
+	if err == nil && !s.closing.Load() {
 		// Providers commonly publish after PostStart.  The cold-start probe may
 		// therefore have observed an empty catalog; do not leave a traffic-idle
 		// group unprofiled until the next periodic interval.
 		s.requestProbe()
 	}
-	if errors.Is(err, errSmartNoCandidates) {
+	if errors.Is(err, errSmartNoCandidates) && !s.closing.Load() {
 		s.setWarmingStatus("provider " + tag + " has no matching candidates")
 	}
 	if err != nil && s.logger != nil {
@@ -3928,8 +3941,14 @@ func (s *Smart) onProviderUpdated(tag string) error {
 }
 
 func (s *Smart) rebuildCandidates(updatedProvider string) error {
+	if s.closing.Load() {
+		return nil
+	}
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
+	if s.closing.Load() {
+		return nil
+	}
 	var roots []adapter.Outbound
 	for index, tag := range s.tags {
 		candidate, loaded := s.outbound.Outbound(tag)
@@ -3980,7 +3999,17 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 		candidateByTag[tag] = candidate
 		candidateMetadataByTag[tag] = s.buildCandidateMetadata(tag, identity)
 	}
+	// Close can begin after the provider snapshot above. Check before and after
+	// taking the catalog lock so a late callback cannot repopulate a retired
+	// Smart group after Close has cleared its candidates.
+	if s.closing.Load() {
+		return nil
+	}
 	s.access.Lock()
+	if s.closing.Load() {
+		s.access.Unlock()
+		return nil
+	}
 	oldMetadataByTag := s.candidateMetadataByTag
 	for key, selected := range s.lastSelected {
 		s.lastSelected[key] = smartRemapCandidateAlias(selected, oldMetadataByTag, candidateMetadataByTag, candidates)
@@ -3993,6 +4022,9 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.candidateByTag = candidateByTag
 	s.candidateMetadataByTag = candidateMetadataByTag
 	s.access.Unlock()
+	if s.closing.Load() {
+		return nil
+	}
 	if latest := s.latest.Load(); latest != nil && candidateByTag[latest.Tag()] == nil {
 		s.latest.Store(nil)
 	}
