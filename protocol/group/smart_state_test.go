@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,6 +202,152 @@ func TestSmartProbeRegistryFullDefersWithoutBypassingBounds(t *testing.T) {
 	}
 	if called {
 		t.Fatal("full registry bypassed the bounded single-flight path")
+	}
+}
+
+func TestSmartProbeRegistryDistinguishesFreshAndCachedResults(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	var calls atomic.Int32
+	registry.probe = func(context.Context, string, adapter.Outbound) (uint16, error) {
+		calls.Add(1)
+		return 12, nil
+	}
+
+	if _, err, fresh := registry.runWithMeta(context.Background(), "node", "https://probe", time.Second, time.Hour, nil); err != nil || !fresh {
+		t.Fatalf("first probe = err %v, fresh %v; want fresh success", err, fresh)
+	}
+	if _, err, fresh := registry.runWithMeta(context.Background(), "node", "https://probe", time.Second, time.Hour, nil); err != nil || fresh {
+		t.Fatalf("cached probe = err %v, fresh %v; want cached success", err, fresh)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("probe executed %d times, want once", got)
+	}
+
+	failureRegistry := newSmartProbeRegistry(context.Background())
+	defer failureRegistry.close()
+	var failureCalls atomic.Int32
+	failureRegistry.probe = func(context.Context, string, adapter.Outbound) (uint16, error) {
+		failureCalls.Add(1)
+		return 0, errors.New("offline")
+	}
+	if _, err, fresh := failureRegistry.runWithMeta(context.Background(), "node", "https://probe", time.Second, time.Hour, nil); err == nil || !fresh {
+		t.Fatalf("first failed probe = err %v, fresh %v; want fresh failure", err, fresh)
+	}
+	if _, err, fresh := failureRegistry.runWithMeta(context.Background(), "node", "https://probe", time.Second, time.Hour, nil); err == nil || fresh {
+		t.Fatalf("cached failed probe = err %v, fresh %v; want cached failure", err, fresh)
+	}
+	if got := failureCalls.Load(); got != 1 {
+		t.Fatalf("failed probe executed %d times, want once", got)
+	}
+}
+
+func TestSmartProbeRegistrySerializesTracksPerEndpoint(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := registry.runProbeForEndpoint(context.Background(), "endpoint", "tcp", time.Second, time.Minute, func(context.Context) (uint16, error) {
+			close(started)
+			<-release
+			return 1, nil
+		})
+		firstDone <- err
+	}()
+	<-started
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := registry.runProbeForEndpoint(context.Background(), "endpoint", "udp", time.Second, time.Minute, func(context.Context) (uint16, error) {
+			close(secondStarted)
+			return 2, nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("different probe tracks ran concurrently for one endpoint")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second endpoint track did not run after the first completed")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSmartProbeRegistryRecoveryKeepsEndpointLock(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := registry.runProbeForEndpoint(context.Background(), "endpoint", "tcp", time.Second, time.Minute, func(context.Context) (uint16, error) {
+			close(firstStarted)
+			<-firstRelease
+			return 0, errors.New("first probe failed")
+		})
+		firstDone <- err
+	}()
+	<-firstStarted
+
+	recoveryStarted := make(chan struct{})
+	recoveryRelease := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	go func() {
+		_, err := registry.runRecoveryForEndpoint(context.Background(), "endpoint", "tcp", time.Second, time.Minute, func(context.Context) (uint16, error) {
+			close(recoveryStarted)
+			<-recoveryRelease
+			return 2, nil
+		})
+		recoveryDone <- err
+	}()
+
+	close(firstRelease)
+	if err := <-firstDone; err == nil {
+		t.Fatal("first probe unexpectedly succeeded")
+	}
+	select {
+	case <-recoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("forced recovery did not start")
+	}
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := registry.runProbeForEndpoint(context.Background(), "endpoint", "udp", time.Second, time.Minute, func(context.Context) (uint16, error) {
+			close(secondStarted)
+			return 3, nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("different track ran while forced recovery owned the endpoint")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(recoveryRelease)
+	if err := <-recoveryDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("different track did not run after recovery released the endpoint")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

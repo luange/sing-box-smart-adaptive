@@ -35,10 +35,14 @@ type smartProbeEntry struct {
 }
 
 type smartProbeRegistry struct {
-	ctx             context.Context
-	cancel          context.CancelFunc
-	access          sync.Mutex
-	entries         map[string]*smartProbeEntry
+	ctx     context.Context
+	cancel  context.CancelFunc
+	access  sync.Mutex
+	entries map[string]*smartProbeEntry
+	// active serializes different probe tracks for the same endpoint. The
+	// result cache remains track-specific, but TCP and UDP must not create
+	// simultaneous upstream health traffic for one physical node.
+	active          map[string]chan struct{}
 	probe           func(context.Context, string, adapter.Outbound) (uint16, error)
 	slots           chan struct{}
 	activeGroups    atomic.Uint32
@@ -105,6 +109,7 @@ func newSmartProbeRegistry(parent context.Context) *smartProbeRegistry {
 		ctx:     ctx,
 		cancel:  cancel,
 		entries: make(map[string]*smartProbeEntry),
+		active:  make(map[string]chan struct{}),
 		slots:   make(chan struct{}, 4),
 		probe: func(ctx context.Context, link string, outbound adapter.Outbound) (uint16, error) {
 			return urltest.URLTest(ctx, link, outbound)
@@ -182,10 +187,24 @@ func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
 }
 
 func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error) {
+	delay, err, _ := r.runWithMetaForEndpoint(ctx, key, key, probeURL, timeout, ttl, candidate)
+	return delay, err
+}
+
+// runWithMeta is the normal URLTest path with an observation freshness bit.
+// A cached result is useful for answering a caller, but it is not a new
+// network sample and must not reset a local breaker or inflate confidence.
+// A waiter joined to an in-flight probe receives fresh=true because that
+// probe completed during this call and may be recorded once by its group.
+func (r *smartProbeRegistry) runWithMeta(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error, bool) {
+	return r.runWithMetaForEndpoint(ctx, key, key, probeURL, timeout, ttl, candidate)
+}
+
+func (r *smartProbeRegistry) runWithMetaForEndpoint(ctx context.Context, endpointKey, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error, bool) {
 	if r == nil {
-		return 0, errSharedSmartProbeFailed
+		return 0, errSharedSmartProbeFailed, false
 	}
-	return r.runProbeMode(ctx, key, timeout, ttl, false, func(probeCtx context.Context) (uint16, error) {
+	return r.runProbeMode(ctx, endpointKey, key, timeout, ttl, false, func(probeCtx context.Context) (uint16, error) {
 		return r.probe(probeCtx, probeURL, candidate)
 	})
 }
@@ -194,95 +213,127 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 // Smart context is currently open. It bypasses the normal cadence cache, but
 // still shares the per-endpoint single-flight lock and admission slots.
 func (r *smartProbeRegistry) runRecovery(ctx context.Context, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
-	return r.runProbeMode(ctx, key, timeout, ttl, true, probe)
+	delay, err, _ := r.runProbeMode(ctx, key, key, timeout, ttl, true, probe)
+	return delay, err
+}
+
+func (r *smartProbeRegistry) runRecoveryForEndpoint(ctx context.Context, endpointKey, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
+	delay, err, _ := r.runProbeMode(ctx, endpointKey, key, timeout, ttl, true, probe)
+	return delay, err
 }
 
 // runProbe is the shared single-flight admission path for every probe kind.
 // URLTest and UDP reachability use the same endpoint key, so aliases and
 // multiple Smart groups cannot open duplicate probes for one endpoint.
 func (r *smartProbeRegistry) runProbe(ctx context.Context, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
-	return r.runProbeMode(ctx, key, timeout, ttl, false, probe)
+	delay, err, _ := r.runProbeMode(ctx, key, key, timeout, ttl, false, probe)
+	return delay, err
 }
 
-func (r *smartProbeRegistry) runProbeMode(ctx context.Context, key string, timeout, ttl time.Duration, force bool, probe func(context.Context) (uint16, error)) (uint16, error) {
+func (r *smartProbeRegistry) runProbeForEndpoint(ctx context.Context, endpointKey, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
+	delay, err, _ := r.runProbeMode(ctx, endpointKey, key, timeout, ttl, false, probe)
+	return delay, err
+}
+
+func (r *smartProbeRegistry) runProbeMode(ctx context.Context, endpointKey, key string, timeout, ttl time.Duration, force bool, probe func(context.Context) (uint16, error)) (uint16, error, bool) {
 	if r == nil || probe == nil {
-		return 0, errSharedSmartProbeFailed
+		return 0, errSharedSmartProbeFailed, false
 	}
 	if ctx.Err() != nil {
-		return 0, ctx.Err()
+		return 0, ctx.Err(), false
 	}
 	if r.ctx.Err() != nil {
-		return 0, r.ctx.Err()
+		return 0, r.ctx.Err(), false
 	}
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
 	now := time.Now()
 	r.access.Lock()
+	if r.active == nil {
+		r.active = make(map[string]chan struct{})
+	}
 	entry := r.entries[key]
 	if entry != nil && entry.inflight {
 		done := entry.done
 		r.access.Unlock()
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, ctx.Err(), false
 		case <-r.ctx.Done():
-			return 0, r.ctx.Err()
+			return 0, r.ctx.Err(), false
 		case <-done:
 		}
 		r.access.Lock()
 		result := entry.result
 		r.access.Unlock()
 		if result.success {
-			return result.delay, nil
+			return result.delay, nil, !result.deferred
 		}
 		if !force && result.deferred {
-			return 0, errSharedSmartProbeDeferred
+			return 0, errSharedSmartProbeDeferred, false
 		}
 		if !force {
-			return 0, errSharedSmartProbeFailed
+			return 0, errSharedSmartProbeFailed, !result.deferred
 		}
 		// A forced recovery caller is allowed to become the next owner after
-		// the previous single-flight attempt completes. Re-check the entry
-		// under the lock so concurrent recoveries still serialize.
+		// the previous single-flight attempt completes. Re-enter the admission
+		// path so it claims the endpoint lock together with the entry. Claiming
+		// only the entry here would let a different track probe the same endpoint
+		// concurrently during the recovery attempt.
 		r.access.Lock()
 		if current := r.entries[key]; current == entry && !current.inflight {
-			entry = current
-			entry.inflight = true
-			entry.done = make(chan struct{})
 			r.access.Unlock()
-			goto admitted
+			return r.runProbeMode(ctx, endpointKey, key, timeout, ttl, force, probe)
 		}
 		r.access.Unlock()
-		return 0, errSharedSmartProbeFailed
+		return 0, errSharedSmartProbeFailed, false
 	}
 	if entry != nil && !force && now.Before(entry.result.nextProbeAt) {
 		result := entry.result
 		r.access.Unlock()
 		if result.success {
-			return result.delay, nil
+			return result.delay, nil, false
 		}
 		if result.deferred {
-			return 0, errSharedSmartProbeDeferred
+			return 0, errSharedSmartProbeDeferred, false
 		}
-		return 0, errSharedSmartProbeFailed
+		return 0, errSharedSmartProbeFailed, false
+	}
+	if endpointKey != "" {
+		if done := r.active[endpointKey]; done != nil {
+			r.access.Unlock()
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err(), false
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err(), false
+			case <-done:
+			}
+			return r.runProbeMode(ctx, endpointKey, key, timeout, ttl, force, probe)
+		}
+		r.active[endpointKey] = make(chan struct{})
 	}
 	if len(r.entries) >= smartProbeRegistryLimit {
 		r.pruneLocked(now)
 		if len(r.entries) >= smartProbeRegistryLimit {
+			if endpointKey != "" {
+				done := r.active[endpointKey]
+				delete(r.active, endpointKey)
+				close(done)
+			}
 			r.access.Unlock()
 			// Do not bypass the registry when every slot is occupied. An
 			// unregistered probe would defeat both endpoint single-flight and the
 			// global admission bound precisely during the churn it is meant to
 			// contain. The caller can retry on the next scheduled cycle.
-			return 0, errSharedSmartProbeDeferred
+			return 0, errSharedSmartProbeDeferred, false
 		}
 	}
 	entry = &smartProbeEntry{inflight: true, done: make(chan struct{})}
 	r.entries[key] = entry
 	r.access.Unlock()
 
-admitted:
 	select {
 	case r.slots <- struct{}{}:
 	case <-ctx.Done():
@@ -291,16 +342,26 @@ admitted:
 		entry.inflight = false
 		close(entry.done)
 		entry.done = nil
+		if endpointKey != "" {
+			done := r.active[endpointKey]
+			delete(r.active, endpointKey)
+			close(done)
+		}
 		r.access.Unlock()
-		return 0, errSharedSmartProbeDeferred
+		return 0, errSharedSmartProbeDeferred, false
 	case <-r.ctx.Done():
 		r.access.Lock()
 		entry.result = smartProbeResult{completedAt: time.Now(), nextProbeAt: time.Now(), deferred: true}
 		entry.inflight = false
 		close(entry.done)
 		entry.done = nil
+		if endpointKey != "" {
+			done := r.active[endpointKey]
+			delete(r.active, endpointKey)
+			close(done)
+		}
 		r.access.Unlock()
-		return 0, errSharedSmartProbeDeferred
+		return 0, errSharedSmartProbeDeferred, false
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -329,11 +390,16 @@ admitted:
 	entry.inflight = false
 	close(entry.done)
 	entry.done = nil
+	if endpointKey != "" {
+		done := r.active[endpointKey]
+		delete(r.active, endpointKey)
+		close(done)
+	}
 	r.access.Unlock()
 	if err != nil {
-		return 0, errSharedSmartProbeFailed
+		return 0, errSharedSmartProbeFailed, true
 	}
-	return delay, nil
+	return delay, nil, true
 }
 
 func (r *smartProbeRegistry) pruneLocked(now time.Time) {

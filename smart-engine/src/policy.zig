@@ -22,14 +22,24 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     var decision = model.Decision{ .selected_id = 0, .score = 100.0, .switched = 0, .reason = @intFromEnum(model.DecisionReason.no_candidate) };
     var best: ?model.Candidate = null;
     var best_score: f64 = 100.0;
+    var best_tier: u8 = 255;
     var total_samples: f64 = 0;
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
-        if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4) total_samples += @max(candidate.samples, 0.0);
+        if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4) continue;
+        const tier = healthTier(candidate.state);
+        if (tier < best_tier) best_tier = tier;
+    }
+    if (best_tier == 255) return decision;
+    for (candidates) |raw_candidate| {
+        const candidate = observations.enrich(raw_candidate);
+        if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4 and healthTier(candidate.state) == best_tier) {
+            total_samples += @max(candidate.samples, 0.0);
+        }
     }
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
-        if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4) continue;
+        if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
         const value = scoring.score(config, candidate, total_samples, profile);
         if (best == null or value < best_score) {
             best = candidate;
@@ -113,4 +123,18 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     decision.switched = 1;
     decision.reason = @intFromEnum(model.DecisionReason.confirmed);
     return decision;
+}
+
+// Health is a hard ordering boundary. Latency and throughput may choose the
+// primary inside the best available tier, but a suspect or half-open node must
+// never displace a healthy incumbent merely because its current sample is
+// faster. Open nodes are excluded before this function is called.
+fn healthTier(state: u8) u8 {
+    return switch (state) {
+        1 => 0, // healthy
+        2, 0 => 1, // warming/unknown
+        3 => 2, // suspect/half-open
+        4 => 3, // defensive: open is filtered above
+        else => 2,
+    };
 }

@@ -92,8 +92,11 @@ notification check.
 
 Smart combines URLTest evidence with a bounded primary/backup selector; it is
 not a latency-only race and it does not continuously round-robin healthy
-nodes. URLTest and passive data-plane observations update one endpoint profile
-shared by all Smart groups. Ranking first applies the health tier
+nodes. The process-wide probe registry shares URLTest cadence, cached results,
+and endpoint single-flight admission across Smart groups. Each Smart group
+still owns its business score, breaker, and service/site context so group
+boundaries remain authoritative; this is deliberately not a claim that every
+group has one mutable global score. Ranking first applies the health tier
 (`healthy` → `warming`/`unknown` → `suspect` → `half_open` → `open`), then a
 confidence-adjusted score using reliability, connect/first-byte tails,
 throughput, jitter and retransmit evidence. The first eligible candidate is
@@ -115,3 +118,23 @@ normal ranking; failures keep the recovery ladder (30s, 1m, 5m) and the
 10-second per-group recovery gate. Suspect but still usable candidates are not
 preemptively probed or replaced: the real dial/first-byte result is the
 authoritative trigger for fast failover.
+
+### Follow-up hardening (2026-09-03)
+
+The process-wide probe registry now marks whether a caller received a fresh
+network result. Cached answers remain available for the caller but no longer
+reset a group breaker, inflate sample counts, or suppress a later real failure.
+TCP, UDP, and recovery tracks also share an endpoint-scoped single-flight lock;
+forced recovery re-enters the same admission path so it cannot race a second
+track between two cache entries. The Zig policy kernel applies the same hard
+health ordering as the Go host (`healthy` before `warming`/`unknown`, then
+`suspect`, with `open` excluded) before comparing latency or throughput. These
+changes are covered by freshness, cross-track, recovery-lock, and Zig policy
+regression tests.
+
+The current ABI still reports one health state for a candidate (`state=3`
+combines `suspect` and `half_open`), and Smart's active probe implementation
+does not yet expose independent IPv4/IPv6 or active data-UDP/QUIC tracks. Those
+are explicit follow-up design items, not silently approximated by the TCP or
+DNS probe, because doing so would make a healthy TCP path mask a broken data
+plane.

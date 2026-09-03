@@ -169,6 +169,16 @@ test "hard-open incumbent fails over without confirmation" {
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
 }
 
+test "healthy tier wins over faster suspect candidate" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 });
+    const candidates = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 800, .first_byte_ms = 800, .jitter_ms = 10, .throughput_bps = 0, .samples = 12, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.65, .connect_ms = 10, .first_byte_ms = 10, .jitter_ms = 1, .throughput_bps = 0, .samples = 12, .weight = 1, .state = 3, .eligible = 1 },
+    };
+    const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 0, .interactive);
+    try std.testing.expectEqual(@as(u64, 1), decision.selected_id);
+}
+
 test "removed incumbent is replaced immediately after provider refresh" {
     var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0.95, .switch_confirm_samples = 3, .switch_confirm_ms = 60000, .switch_cooldown_ms = 2000 });
     const initial = [_]Candidate{.{

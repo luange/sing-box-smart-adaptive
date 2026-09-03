@@ -1466,7 +1466,7 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 						key = smartProbeKey(identity, s.probeURL, probeTimeout)
 					}
 					var delay uint16
-					delay, err = s.probeRegistry.runRecovery(probeCtx, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
+					delay, err = s.probeRegistry.runRecoveryForEndpoint(probeCtx, identity, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
 						performed = true
 						if transport == N.NetworkUDP {
 							return 0, runSmartUDPHealthProbe(probeContext, candidate)
@@ -1521,9 +1521,9 @@ dispatch:
 		}
 		if result.err == nil {
 			successes++
-			s.observeDial(time.Now(), networkKey, "", s.candidateProfileID(result.candidate.Tag()), transport, true, result.measured)
+			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), transport, true, result.measured)
 		} else if result.performed {
-			s.observeDial(time.Now(), networkKey, "", s.candidateProfileID(result.candidate.Tag()), transport, false, result.measured)
+			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), transport, false, result.measured)
 		}
 	}
 	if successes > 0 {
@@ -1838,6 +1838,9 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		delay     uint16
 		err       error
 		penalize  bool
+		// performed is false for a registry cache hit.  Cached answers are
+		// usable for the caller, but must not be counted as fresh evidence.
+		performed bool
 	}
 	results := make(chan probeResult, len(candidates))
 	jobs := make(chan adapter.Outbound)
@@ -1869,27 +1872,30 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 				key := metadata.probeKey
 				var delay uint16
 				var err error
+				performed := false
 				if s.probeRegistry != nil {
 					// Admission is process-wide and may legitimately wait behind
 					// another group. Apply the per-node timeout only after a slot is
 					// acquired inside the registry; otherwise a healthy node can be
 					// mislabeled merely because the shared queue took five seconds.
-					delay, err = s.probeRegistry.run(ctx, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
+					delay, err, performed = s.probeRegistry.runWithMetaForEndpoint(ctx, metadata.identity, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
 				} else {
 					// Test/embedded constructors created before the shared registry
 					// contract retain the stock direct probe path.
 					testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
 					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
 					cancel()
+					performed = true
 				}
 				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
-				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize}
+				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize, performed: performed}
 			}
 		}()
 	}
 	type probeSummary struct {
 		collected []probeResult
 		successes int
+		performed int
 	}
 	networkKey := s.networkFingerprint()
 	summaryDone := make(chan probeSummary, 1)
@@ -1898,11 +1904,17 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		published := false
 		for probe := range results {
 			summary.collected = append(summary.collected, probe)
+			if probe.performed {
+				summary.performed++
+			}
 			if probe.err != nil {
 				continue
 			}
-			summary.successes++
 			result[probe.candidate.Tag()] = probe.delay
+			if !probe.performed {
+				continue
+			}
+			summary.successes++
 			if s.closing.Load() {
 				continue
 			}
@@ -1949,9 +1961,9 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		// build a baseline over multiple bounded cycles.
 		return result, ctx.Err()
 	}
-	commonFailure := len(summary.collected) > 1 && summary.successes == 0
+	commonFailure := summary.performed > 1 && summary.successes == 0
 	for _, probe := range summary.collected {
-		if probe.err != nil && probe.penalize && !commonFailure {
+		if probe.err != nil && probe.penalize && probe.performed && !commonFailure {
 			metadata, ok := metadataByTag[probe.candidate.Tag()]
 			if !ok {
 				metadata = s.buildCandidateMetadata(probe.candidate.Tag(), "")
@@ -2040,7 +2052,7 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 					probeTimeout = defaultSmartUDPProbeTimeout
 				}
 				key := smartProbeKey(identity, "udp://dns-health", probeTimeout)
-				_, err = s.probeRegistry.runProbe(probeCtx, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
+				_, err = s.probeRegistry.runProbeForEndpoint(probeCtx, identity, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
 					performed = true
 					return 0, runSmartUDPHealthProbe(probeContext, candidate)
 				})
@@ -2076,7 +2088,7 @@ dispatch:
 			// waiting on the same canonical endpoint.  Record it locally even when
 			// this caller was not the registry owner; only failures are owner-only
 			// so a single outage does not multiply breaker penalties.
-			s.observeDial(time.Now(), networkKey, "__udp_probe__", s.candidateProfileID(result.candidate.Tag()), N.NetworkUDP, true, result.elapsed)
+			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
 		}
 	}
 	for _, result := range completed {
@@ -2085,7 +2097,7 @@ dispatch:
 			// dedicated low-weight site so a filtered public DNS target cannot
 			// hard-open the endpoint, while repeated real UDP failures still use
 			// the normal transport breaker.
-			s.observeDial(time.Now(), networkKey, "__udp_probe__", s.candidateProfileID(result.candidate.Tag()), N.NetworkUDP, false, result.elapsed)
+			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, false, result.elapsed)
 		}
 	}
 }
