@@ -179,3 +179,15 @@ keep-alive churn; an incumbent remains selected while it stays inside the
 pool. The `random` value is accepted only as a backwards-readable alias for
 `balanced`. Balanced mode is host-side and skips the optional Zig decision
 engine, keeping the policy portable and avoiding a new ABI revision.
+
+### Portrait freshness correction (2026-09-03)
+
+The audit of field consumers found that reliability/sample counters were
+half-life decayed, while the associated connect, first-byte, throughput,
+jitter and retransmit values retained their old EWMA indefinitely. A quiet
+endpoint could therefore keep stale latency evidence in the ranking after its
+confidence had effectively vanished. Commit `a2f35d94` clears each evidence
+class when its effective sample count falls below 0.25, while retaining the
+success/failure counts as the neutral Bayesian prior. The new regression test
+covers all four evidence classes and the normal short-interval EWMA test still
+passes.
