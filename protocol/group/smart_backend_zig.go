@@ -20,6 +20,7 @@ type smartPolicyBackendConfig struct {
 	SwitchConfirm       int
 	SwitchConfirmWindow int64
 	SwitchCooldown      int64
+	SelectionMode       uint8
 }
 
 type zigSmartPolicyBackend struct {
@@ -47,8 +48,9 @@ func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 		switch_confirm_samples: C.uint32_t(config.SwitchConfirm),
 		switch_confirm_ms:      C.uint64_t(maxInt64(config.SwitchConfirmWindow)),
 		switch_cooldown_ms:     C.uint64_t(maxInt64(config.SwitchCooldown)),
+		selection_mode:         C.uint8_t(config.SelectionMode),
 	}
-	if C.smart_engine_abi_version() != 1 {
+	if C.smart_engine_abi_version() != 2 {
 		return nil
 	}
 	backend := &zigSmartPolicyBackend{config: cfg}
@@ -144,7 +146,13 @@ func (b *zigSmartPolicyBackend) engineForLocked(shard *zigSmartPolicyShard, key 
 			delete(shard.engines, oldestKey)
 		}
 	}
-	engine := C.smart_engine_create(b.config)
+	config := b.config
+	// The engine is keyed by the full network/site/transport context. Feeding
+	// the same canonical hash into the policy kernel gives balanced mode a
+	// stable rendezvous choice without retaining the unbounded string key in
+	// the Zig state.
+	config.affinity_seed = C.uint64_t(smartPolicyID(key))
+	engine := C.smart_engine_create(config)
 	if engine == nil {
 		return nil
 	}

@@ -26,6 +26,7 @@ const Engine = struct {
         if (!(normalized.switch_margin >= 0) or !isFinite(normalized.switch_margin)) normalized.switch_margin = 0;
         if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
         if (normalized.switch_confirm_samples == 0) normalized.switch_confirm_samples = 1;
+        if (normalized.selection_mode > 1) normalized.selection_mode = 0;
         return .{ .config = normalized };
     }
 
@@ -46,7 +47,7 @@ export fn smart_engine_create(config: Config) ?*Engine {
 }
 
 export fn smart_engine_abi_version() u32 {
-    return 1;
+    return 2;
 }
 
 export fn smart_engine_destroy(engine: ?*Engine) void {
@@ -181,10 +182,12 @@ test "ABI configuration rejects non-finite limits" {
         .switch_confirm_samples = 0,
         .switch_confirm_ms = 0,
         .switch_cooldown_ms = 0,
+        .selection_mode = 99,
     });
     try std.testing.expectEqual(@as(f64, 0), smart.config.exploration);
     try std.testing.expectEqual(@as(f64, 0), smart.config.switch_margin);
     try std.testing.expectEqual(@as(u32, 1), smart.config.switch_confirm_samples);
+    try std.testing.expectEqual(@as(u8, 0), smart.config.selection_mode);
 
     const adaptive_engine = adaptive_engine_create(.{
         .switch_margin = std.math.inf(f64),
@@ -216,6 +219,42 @@ test "healthy tier wins over faster suspect candidate" {
     };
     const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 0, .interactive);
     try std.testing.expectEqual(@as(u64, 1), decision.selected_id);
+}
+
+test "balanced selection is stable and health bounded" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0.20,
+        .switch_confirm_samples = 2,
+        .switch_confirm_ms = 1000,
+        .switch_cooldown_ms = 2000,
+        .affinity_seed = 0x1234,
+        .selection_mode = 1,
+    });
+    const candidates = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.98, .connect_ms = 21, .first_byte_ms = 21, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    const first = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 0, .interactive);
+    const second = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 1, .interactive);
+    try std.testing.expect(first.selected_id == 1 or first.selected_id == 2);
+    try std.testing.expectEqual(first.selected_id, second.selected_id);
+
+    var health_engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0.20,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .affinity_seed = 0x5678,
+        .selection_mode = 1,
+    });
+    const health_bounded = [_]Candidate{
+        .{ .id = 11, .reliability = 0.90, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 12, .reliability = 0.99, .connect_ms = 1, .first_byte_ms = 1, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 3, .eligible = 1 },
+    };
+    const bounded = policy.chooseProfile(&health_engine.state, health_engine.config, &health_engine.observations, health_bounded[0..], 0, .interactive);
+    try std.testing.expectEqual(@as(u64, 11), bounded.selected_id);
 }
 
 test "suspect remains ahead of half-open during recovery" {

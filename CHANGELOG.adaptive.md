@@ -12,6 +12,17 @@
 
 ## Unreleased — Zig Smart production backend
 
+### Balanced dispersion in Zig ABI
+
+- Move the stable Surge-like `balanced`/`random` selection mode into the
+  versioned Zig policy ABI instead of rejecting it in Zig-only builds.
+- Keep health tiers, score margin, incumbent retention, confirmation and
+  immediate hard-failure failover in one policy kernel; no second Go selector
+  is used.
+- Add a context seed to the ABI and a deterministic rendezvous hash so
+  independent network/site/transport contexts spread without per-connection
+  churn.
+
 ### Score evolution (v3.42)
 
 - Add bounded tail-EWMA latency portraits exposed as `connect_p95_ms` and

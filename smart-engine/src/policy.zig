@@ -49,21 +49,61 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             best_score = value;
         }
     }
-    const selected = best orelse return decision;
+    var selected = best orelse return decision;
+    var selected_score = best_score;
+    // Balanced mode is deliberately implemented in the policy kernel rather
+    // than in the sing-box host.  The host may be replaced by mihomo or
+    // another core, while the health tier, score margin and confirmation FSM
+    // remain identical.  A context seed is supplied when the engine is
+    // created, so rendezvous selection is stable without retaining a string
+    // key in the Zig state.
+    var incumbent: ?model.Candidate = null;
+    if (state.selected_id != 0) {
+        for (candidates) |raw_candidate| {
+            const candidate = observations.enrich(raw_candidate);
+            if (candidate.id == state.selected_id) {
+                incumbent = candidate;
+                break;
+            }
+        }
+    }
+    if (config.selection_mode == 1) {
+        const threshold = if (best_score > 0) best_score * (1.0 + switch_margin) else 0.05;
+        var retained_incumbent = false;
+        if (incumbent) |current| {
+            const current_score = scoring.score(config, current, total_samples, profile);
+            if (current.id != 0 and current.eligible != 0 and current.state != 4 and
+                healthTier(current.state) == best_tier and scoring.isFinite(current_score) and current_score <= threshold)
+            {
+                retained_incumbent = true;
+                selected = current;
+                selected_score = current_score;
+            }
+        }
+        if (!retained_incumbent) {
+            var selected_hash: u64 = 0;
+            var found = false;
+            for (candidates) |raw_candidate| {
+                const candidate = observations.enrich(raw_candidate);
+                if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
+                const value = scoring.score(config, candidate, total_samples, profile);
+                if (!scoring.isFinite(value) or value > threshold) continue;
+                const hash = rendezvousHash(config.affinity_seed, candidate.id);
+                if (!found or hash > selected_hash) {
+                    found = true;
+                    selected_hash = hash;
+                    selected = candidate;
+                    selected_score = value;
+                }
+            }
+        }
+    }
     decision.selected_id = selected.id;
-    decision.score = best_score;
+    decision.score = selected_score;
     if (state.selected_id == 0 or state.selected_id == selected.id) {
         state.selected_id = selected.id;
         decision.reason = @intFromEnum(model.DecisionReason.best);
         return decision;
-    }
-    var incumbent: ?model.Candidate = null;
-    for (candidates) |raw_candidate| {
-        const candidate = observations.enrich(raw_candidate);
-        if (candidate.id == state.selected_id) {
-            incumbent = candidate;
-            break;
-        }
     }
     if (incumbent) |current| {
         // A hard-open incumbent is unavailable (for example after the host's
@@ -80,7 +120,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             return decision;
         }
         const current_score = scoring.score(config, current, total_samples, profile);
-        const improvement = if (current_score > 0) (current_score - best_score) / current_score else 0;
+        const improvement = if (current_score > 0) (current_score - selected_score) / current_score else 0;
         if (improvement < switch_margin or now_ms < state.cooldown_until) {
             decision.selected_id = current.id;
             decision.score = current_score;
@@ -126,6 +166,17 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     decision.switched = 1;
     decision.reason = @intFromEnum(model.DecisionReason.confirmed);
     return decision;
+}
+
+// splitmix64 gives a stable, cheap rendezvous metric for the pair
+// (context-seed, canonical endpoint id).  It intentionally has no process
+// randomness: the same service context keeps the same line across reloads,
+// while independent contexts spread across the near-tied healthy pool.
+fn rendezvousHash(seed: u64, id: u64) u64 {
+    var value = seed ^ (id +% 0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)) *% 0xbf58476d1ce4e5b9;
+    value = (value ^ (value >> 27)) *% 0x94d049bb133111eb;
+    return value ^ (value >> 31);
 }
 
 // Health is a hard ordering boundary. Latency and throughput may choose the

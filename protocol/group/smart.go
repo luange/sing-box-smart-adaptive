@@ -683,29 +683,20 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
-	if selectionMode == smartSelectionBalanced && smartPolicyBackendRequired() {
-		return nil, E.New("smart selection_mode balanced is not available in Zig-only release builds")
+	policyBackend := newSmartPolicyBackend(smartPolicyBackendConfig{
+		Exploration: exploration, SwitchMargin: switchMargin,
+		SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
+		SwitchCooldown: switchCooldown.Milliseconds(), SelectionMode: uint8(selectionMode),
+	})
+	if policyBackend == nil && smartPolicyBackendRequired() {
+		return nil, E.New("smart Zig policy backend unavailable; refusing Go policy fallback")
 	}
-	var policyBackend smartPolicyBackend
-	if selectionMode == smartSelectionPrimaryBackup {
-		policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
-			Exploration: exploration, SwitchMargin: switchMargin,
-			SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
-			SwitchCooldown: switchCooldown.Milliseconds(),
-		})
-		if policyBackend == nil && smartPolicyBackendRequired() {
-			return nil, E.New("smart Zig policy backend unavailable; refusing Go policy fallback")
-		}
-		if policyBackend == nil && logger != nil {
+	if logger != nil {
+		if policyBackend == nil {
 			logger.Warn("smart policy backend unavailable; using reference Go policy")
-		} else if policyBackend != nil && logger != nil {
-			logger.Info("smart policy backend: zig")
+		} else {
+			logger.Info("smart policy backend: zig, selection mode: ", selectionMode.String())
 		}
-	} else if logger != nil {
-		// Balanced selection is owned by the host adapter so it can remain
-		// portable across sing-box and future mihomo adapters. Avoid allocating
-		// one Zig engine per context when the backend is intentionally bypassed.
-		logger.Info("smart selection mode: ", selectionMode.String())
 	}
 	probeRegistry, releaseProbeRegistry := acquireSmartProbeRegistry(ctx)
 	smart := &Smart{
@@ -2881,7 +2872,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	totalSamples := 0.0
 	var policyCandidates []smartPolicyCandidate
 	var policyIDs map[uint64]struct{}
-	usePolicyBackend := s.policyBackendEnabled() && s.selectionMode == smartSelectionPrimaryBackup
+	usePolicyBackend := s.policyBackendEnabled()
 	if usePolicyBackend {
 		policyCandidates = make([]smartPolicyCandidate, 0, len(ranking.candidates))
 		policyIDs = make(map[uint64]struct{}, len(ranking.candidates))
@@ -3033,7 +3024,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if len(ranks) == 0 {
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	if smartPolicyBackendRequired() && s.selectionMode == smartSelectionPrimaryBackup && !usePolicyBackend {
+	if smartPolicyBackendRequired() && !usePolicyBackend {
 		for index := range ranks {
 			ranks[index].eligible = false
 			ranks[index].status.State = "open"
@@ -3075,7 +3066,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	if s.selectionMode == smartSelectionBalanced {
+	if s.selectionMode == smartSelectionBalanced && !usePolicyBackend {
 		if index := s.balancedAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
 			ranks[index].status.Reason = "balanced stable affinity"
 			moveSmartRankFirst(ranks, index)
@@ -3232,12 +3223,12 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
-	usePolicyBackend := s.policyBackendEnabled() && s.selectionMode == smartSelectionPrimaryBackup
+	usePolicyBackend := s.policyBackendEnabled()
 	// A concurrent Close may retire the Zig engine after rankPooled returned a
 	// candidate but before its dial completed. Do not let this late completion
 	// update host-owned Go switch/cooldown state in a Zig-only release; the
 	// ranking is already invalid and the next request will fail closed.
-	if smartPolicyBackendRequired() && s.selectionMode == smartSelectionPrimaryBackup && !usePolicyBackend {
+	if smartPolicyBackendRequired() && !usePolicyBackend {
 		return
 	}
 	s.access.Lock()

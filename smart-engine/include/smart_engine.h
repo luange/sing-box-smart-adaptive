@@ -10,7 +10,7 @@ extern "C" {
 typedef struct smart_engine smart_engine;
 
 /* Increment only when field order or enum semantics change. */
-#define SMART_ENGINE_ABI_VERSION 1u
+#define SMART_ENGINE_ABI_VERSION 2u
 #define SMART_ENGINE_MAX_CANDIDATES 8192u
 #define ADAPTIVE_ENGINE_ABI_VERSION 2u
 
@@ -33,6 +33,8 @@ typedef struct {
     uint32_t switch_confirm_samples; /* zero is normalized to one */
     uint64_t switch_confirm_ms; /* monotonic milliseconds */
     uint64_t switch_cooldown_ms; /* monotonic milliseconds */
+    uint64_t affinity_seed; /* stable context seed for balanced selection */
+    uint8_t selection_mode; /* 0 primary/backup, 1 balanced dispersion */
 } smart_engine_config;
 
 typedef struct {

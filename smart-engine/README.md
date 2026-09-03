@@ -5,8 +5,9 @@ It has no sing-box, mihomo, Provider, socket, DNS, or platform dependencies.
 The C ABI in `include/smart_engine.h` is the portability boundary for Go,
 Rust, mihomo, or another host core.
 
-The core owns only bounded metrics, score calculation, switch margin,
-confirmation samples/time, cooldown, and deterministic state transitions. The
+The core owns only bounded metrics, score calculation, stable primary/backup or
+balanced rendezvous selection, switch margin, confirmation samples/time,
+cooldown, and deterministic state transitions. The
 implementation is split into `model.zig`, `metrics.zig`, `scoring.zig`, and
 `policy.zig`; `adaptive.zig` contains the AdaptivePool ordering kernel and
 `lib.zig` is only the C ABI facade. The observation store keeps a
@@ -31,7 +32,8 @@ Go adapter reuses a
 candidate batch buffer per lock shard (16 shards, four bounded contexts each),
 so cgo conversion allocations are amortized without retaining a large buffer
 per context. The default developer build keeps the reference Go policy for
-zero-dependency development.
+zero-dependency development; production `smart_zig` builds use the same Zig
+ABI for both selection modes.
 
 Build and test with Zig 0.14+:
 

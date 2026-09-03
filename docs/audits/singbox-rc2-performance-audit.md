@@ -226,9 +226,9 @@ upstream-compatible development and cgo-less platforms.
 
 This does not move socket I/O into Zig: sing-box still owns protocol dialing,
 TCP/UDP probes and connection lifetimes, while Zig receives bounded evidence
-and returns the policy decision. `selection_mode=balanced` is rejected in the
-Zig-only release until its affinity policy is implemented in the ABI; silently
-using the Go host selector would violate the single-kernel invariant.
+and returns the policy decision. `selection_mode=balanced` now uses the same
+versioned Zig ABI as `primary_backup`; silently using a second Go selector is
+still forbidden.
 
 The same audit also found that two provider aliases could join one shared
 probe but both increment the local portrait as if they were fresh network

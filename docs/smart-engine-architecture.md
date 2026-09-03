@@ -38,10 +38,9 @@ This makes Zig the only production decision kernel.
 Zig deliberately does not open sockets or duplicate sing-box protocol code.
 The Go host remains the network-I/O adapter that performs the actual TCP/UDP
 probe and reports observations over the small ABI. “Zig-only” therefore means
-one policy/selection owner, not a second DNS/TLS/proxy stack. The optional
-`balanced` host-affinity mode is rejected in Zig-only releases until that
-affinity policy is implemented inside the ABI; it must never silently run a Go
-selector in a Zig release.
+one policy/selection owner, not a second DNS/TLS/proxy stack. Both
+`primary_backup` and the optional `balanced` host-affinity mode are implemented
+inside the versioned ABI; a Zig release never silently runs a Go selector.
 
 The Go adapter sends candidates through the existing batch ABI entry point and
 reuses one conversion buffer per lock shard (16 shards, four bounded contexts
@@ -82,10 +81,9 @@ independent services across near-tied lines like Surge's intra-tier shuffle,
 while retaining the incumbent for that context and failing over immediately
 when it becomes unhealthy. The accepted `random` spelling is only an alias;
 the implementation is deliberately stable per context, not random per dial.
-Balanced mode is retained for builds without the `smart_zig` tag. It is
-rejected by `smart_zig` production builds until the affinity seed/mode is part
-of the versioned ABI; silently executing the Go selector would violate the
-single-kernel invariant.
+Both `primary_backup` and `balanced` are implemented by the versioned Zig
+policy ABI in production builds; the host does not fall back to a second Go
+selector when balanced is selected.
 
 Example:
 
@@ -103,9 +101,9 @@ group with only `outbounds`/`providers` uses the built-in probe budget, phase
 transitions, margins, confirmation and cooldown defaults. Advanced fields remain
 compatibility overrides for operators who already use them; the staged startup
 is intentionally internal so a new deployment does not need to guess a
-“correct” tuning value. When `primary_backup` is selected, the Zig policy
-backend owns the confirmation state. A production release does not silently
-switch to the host adapter.
+”correct” tuning value. The Zig policy backend owns the confirmation state for
+both selection modes. A production release does not silently switch to the
+host adapter.
 
 On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
 bounded retransmitted-byte ratio. It contributes an additive latency penalty

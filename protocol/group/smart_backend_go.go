@@ -18,4 +18,5 @@ type smartPolicyBackendConfig struct {
 	SwitchConfirm       int
 	SwitchConfirmWindow int64
 	SwitchCooldown      int64
+	SelectionMode       uint8
 }
