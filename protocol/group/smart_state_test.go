@@ -405,6 +405,22 @@ func TestSmartRetransmitPenaltyIsBoundedAndAdditive(t *testing.T) {
 	}
 }
 
+func TestSmartRetransmitPenaltyUsesEvidenceConfidence(t *testing.T) {
+	full := smartRetransmitPenaltyMS(0.12)
+	if got := smartRetransmitPenaltyMSWithConfidence(0.12, 1); got != full/3 {
+		t.Fatalf("one retransmit sample penalty = %vms, want %vms", got, full/3)
+	}
+	if got := smartRetransmitPenaltyMSWithConfidence(0.12, 2); got != full*2/3 {
+		t.Fatalf("two retransmit samples penalty = %vms, want %vms", got, full*2/3)
+	}
+	if got := smartRetransmitPenaltyMSWithConfidence(0.12, 3); got != full {
+		t.Fatalf("settled retransmit penalty = %vms, want %vms", got, full)
+	}
+	if got := smartRetransmitPenaltyMSWithConfidence(0.12, 0); got != 0 {
+		t.Fatalf("missing retransmit samples penalty = %vms, want 0", got)
+	}
+}
+
 func TestSmartRetransmitEvidenceIsScopedAndDecayed(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, time.Minute)
 	now := time.Unix(1750, 0)
@@ -486,6 +502,18 @@ func TestSmartBalancedAffinityIsStableAndHealthBounded(t *testing.T) {
 	ranks[1].eligible = false
 	if got := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got == 1 || got < 0 {
 		t.Fatalf("failed incumbent was retained by balanced affinity: got=%d", got)
+	}
+}
+
+func TestSmartExplorationUsesBestHealthTierSamples(t *testing.T) {
+	ranks := []smartRank{
+		{eligible: true, estimate: smartEstimate{Samples: 2}, status: adapter.SmartCandidateStatus{State: "healthy"}},
+		{eligible: true, estimate: smartEstimate{Samples: 100}, status: adapter.SmartCandidateStatus{State: "warming"}},
+		{eligible: false, estimate: smartEstimate{Samples: 200}, status: adapter.SmartCandidateStatus{State: "healthy"}},
+		{eligible: true, estimate: smartEstimate{Samples: 300}, status: adapter.SmartCandidateStatus{State: "open"}},
+	}
+	if got := smartTotalSamplesForBestTier(ranks); got != 2 {
+		t.Fatalf("exploration samples = %v, want best-tier total 2", got)
 	}
 }
 

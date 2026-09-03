@@ -2790,7 +2790,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			// Surge models TCP loss as an additive latency penalty. Keep the raw
 			// ratio visible in status, but feed the same bounded penalty to both
 			// host and Zig scoring paths so the policy backend cannot ignore it.
-			penalty := smartRetransmitPenaltyMS(estimate.RetransmitRatio)
+			penalty := smartRetransmitPenaltyMSWithConfidence(estimate.RetransmitRatio, estimate.RetransmitSamples)
 			scoreEstimate.ConnectMS += penalty
 			scoreEstimate.ConnectP95MS += penalty
 			scoreEstimate.FirstByteMS += penalty
@@ -2807,7 +2807,6 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if sharedProbeDead {
 			estimate.State = "open"
 		}
-		totalSamples += estimate.Samples
 		profileThroughputSamples := estimate.ThroughputSamples
 		if siteKey != "" {
 			profileThroughputSamples = estimate.LocalThroughputSamples
@@ -2879,6 +2878,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 		}
 	}
+	// Keep the exploration denominator identical to the Zig policy kernel: only
+	// eligible candidates in the best health tier participate. Samples from an
+	// open or lower-tier candidate must not make an uncertain healthy candidate
+	// look artificially well explored.
+	totalSamples = smartTotalSamplesForBestTier(ranking.ranks)
 	for index := range ranking.ranks {
 		weightMatch := ranking.ranks[index].weight
 		weight := weightMatch.Weight

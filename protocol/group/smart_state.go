@@ -24,7 +24,6 @@ type smartCandidateKey struct {
 
 type smartFailureBurst struct {
 	First time.Time
-	Last  time.Time
 	Total int
 	Sites map[string]struct{}
 }
@@ -73,7 +72,6 @@ type smartEstimate struct {
 	Samples                float64
 	State                  string
 	CircuitUntil           time.Time
-	LastUpdated            time.Time
 	HasConnect             bool
 	HasConnectP95          bool
 	HasFirstByte           bool
@@ -225,7 +223,6 @@ func (s *smartStore) observeCrossSiteFailureLocked(now time.Time, key smartCandi
 		burst = &smartFailureBurst{First: now, Sites: make(map[string]struct{})}
 		s.failureBursts[key] = burst
 	}
-	burst.Last = now
 	burst.Total++
 	burst.Sites[site] = struct{}{}
 	// A single incompatible service must remain a site-local failure. Promote
@@ -564,7 +561,6 @@ func blendSmartEstimate(global smartMetric, globalOK bool, local smartMetric, lo
 		Samples:                math.Max(globalEstimate.Samples, localEstimate.Samples),
 		State:                  strongerState(globalEstimate.State, localEstimate.State),
 		CircuitUntil:           laterTime(globalEstimate.CircuitUntil, localEstimate.CircuitUntil),
-		LastUpdated:            laterTime(globalEstimate.LastUpdated, localEstimate.LastUpdated),
 		HasConnect:             globalEstimate.HasConnect || localEstimate.HasConnect,
 		HasConnectP95:          globalEstimate.HasConnectP95 || localEstimate.HasConnectP95,
 		HasFirstByte:           globalEstimate.HasFirstByte || localEstimate.HasFirstByte,
@@ -605,7 +601,6 @@ func estimateMetric(metric smartMetric, now time.Time, minSamples int) smartEsti
 		Samples:           samples,
 		State:             state,
 		CircuitUntil:      metric.CircuitUntil,
-		LastUpdated:       metric.LastUpdated,
 		HasConnect:        metric.ConnectSamples > 0,
 		HasConnectP95:     metric.ConnectSamples > 0,
 		HasFirstByte:      metric.FirstByteSamples > 0,
@@ -659,10 +654,6 @@ func (p smartTrafficProfile) String() string {
 	default:
 		return "interactive"
 	}
-}
-
-func smartScore(estimate smartEstimate, exploration, totalSamples float64) float64 {
-	return smartScoreForProfile(estimate, smartProfileInteractive, exploration, totalSamples)
 }
 
 func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, exploration, totalSamples float64) float64 {
@@ -735,6 +726,28 @@ func smartHealthTier(state string) int {
 	}
 }
 
+func smartTotalSamplesForBestTier(ranks []smartRank) float64 {
+	bestTier := int(^uint(0) >> 1)
+	for _, rank := range ranks {
+		if !rank.eligible {
+			continue
+		}
+		if tier := smartHealthTier(rank.status.State); tier < bestTier {
+			bestTier = tier
+		}
+	}
+	if bestTier == int(^uint(0)>>1) {
+		return 0
+	}
+	var total float64
+	for _, rank := range ranks {
+		if rank.eligible && smartHealthTier(rank.status.State) == bestTier && rank.estimate.Samples > 0 {
+			total += rank.estimate.Samples
+		}
+	}
+	return total
+}
+
 // passiveThroughputBelowFloor is intentionally separate from probing. It is
 // evaluated only from bytes observed on a real connection, so a candidate is
 // never penalized merely because no bulk traffic has used it yet.
@@ -770,6 +783,21 @@ func smartRetransmitPenaltyMS(ratio float64) float64 {
 		return 0
 	}
 	return math.Min(5000, ratio*5000)
+}
+
+// smartRetransmitPenaltyMSWithConfidence prevents one close-time TCP_INFO
+// sample from outweighing a well-established portrait. Retransmit evidence is
+// intentionally advisory: it reaches the score only after a bounded sample
+// ramp, while the raw ratio remains available for diagnostics.
+func smartRetransmitPenaltyMSWithConfidence(ratio, samples float64) float64 {
+	penalty := smartRetransmitPenaltyMS(ratio)
+	if penalty == 0 || samples >= 3 {
+		return penalty
+	}
+	if samples <= 0 || math.IsNaN(samples) || math.IsInf(samples, 0) {
+		return 0
+	}
+	return penalty * samples / 3
 }
 
 func blendValue(global, local, localWeight float64) float64 {

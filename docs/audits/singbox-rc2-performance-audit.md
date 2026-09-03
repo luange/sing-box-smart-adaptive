@@ -191,3 +191,26 @@ class when its effective sample count falls below 0.25, while retaining the
 success/failure counts as the neutral Bayesian prior. The new regression test
 covers all four evidence classes and the normal short-interval EWMA test still
 passes.
+
+### Portrait consumer audit (2026-09-03)
+
+Every stored field is now accounted for in one of three deliberate paths:
+
+| Evidence | Decision consumer | Non-decision consumer |
+| --- | --- | --- |
+| successes/failures | Bayesian reliability, confidence cost, health tier and breaker | persistence |
+| connect/first-byte EWMA and tail | score, absolute switch floor and Zig candidate snapshot | status API fallback |
+| connect/first-byte sample counts | EWMA update, freshness decay and evidence-presence gate | persistence |
+| throughput and sample count | bulk-profile detection, passive floor and bulk score | status/persistence |
+| jitter | interactive/UDP score and Zig candidate snapshot | persistence |
+| retransmit ratio and sample count | bounded TCP score penalty; penalty ramps with 1/3/≥3 effective samples | status/persistence |
+| circuit and last-updated timestamps | eligibility, recovery, decay and pruning | persistence |
+
+`smartEstimate.LastUpdated` and the unused `smartScore` wrapper were removed;
+neither had a consumer. A single TCP_INFO close sample no longer receives the
+full retransmit penalty, so one transient observation cannot trigger a
+performance switch. The raw means and per-class counters remain because they
+are needed for API diagnostics, EWMA maintenance, or freshness gates; they are
+not silently treated as extra score dimensions. The Go exploration denominator
+now includes only eligible candidates in the best health tier, matching the
+Zig kernel instead of letting open/lower-tier history influence ranking.
