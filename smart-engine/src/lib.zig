@@ -232,8 +232,8 @@ test "balanced selection is stable and health bounded" {
         .selection_mode = 1,
     });
     const candidates = [_]Candidate{
-        .{ .id = 1, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
-        .{ .id = 2, .reliability = 0.98, .connect_ms = 21, .first_byte_ms = 21, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.98, .connect_ms = 21, .first_byte_ms = 21, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
     };
     const first = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 0, .interactive);
     const second = policy.chooseProfile(&engine.state, engine.config, &engine.observations, candidates[0..], 1, .interactive);
@@ -250,8 +250,8 @@ test "balanced selection is stable and health bounded" {
         .selection_mode = 1,
     });
     const health_bounded = [_]Candidate{
-        .{ .id = 11, .reliability = 0.90, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
-        .{ .id = 12, .reliability = 0.99, .connect_ms = 1, .first_byte_ms = 1, .jitter_ms = 1, .samples = 8, .weight = 1, .state = 3, .eligible = 1 },
+        .{ .id = 11, .reliability = 0.90, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 12, .reliability = 0.99, .connect_ms = 1, .first_byte_ms = 1, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 3, .eligible = 1 },
     };
     const bounded = policy.chooseProfile(&health_engine.state, health_engine.config, &health_engine.observations, health_bounded[0..], 0, .interactive);
     try std.testing.expectEqual(@as(u64, 11), bounded.selected_id);
