@@ -1,4 +1,4 @@
-name: RC5 global audit
+name: v1.14.0 global audit
 
 on:
   workflow_dispatch:
@@ -44,7 +44,7 @@ jobs:
       - name: Publish regenerated object
         uses: actions/upload-artifact@v4
         with:
-          name: rc5-v2-ebpf-object
+          name: v1.14.0-v2-ebpf-object
           path: common/ebpf/native/shared_network_v2.bpf.o
           if-no-files-found: error
 
@@ -82,7 +82,9 @@ jobs:
       - name: Full static checks
         run: go vet ./...
       - name: Full eBPF-tagged tests
-        run: CGO_ENABLED=1 go test -tags with_ebpf ./...
+        run: |
+          make -C common/ebpf generate
+          CGO_ENABLED=1 go test -tags with_ebpf ./...
 
   smart-zig:
     name: Smart Zig conformance

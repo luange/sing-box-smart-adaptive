@@ -160,7 +160,12 @@ const (
 )
 
 type SharedNetworkBackend struct {
-	access          sync.RWMutex
+	access sync.RWMutex
+	// mapAccess serializes userspace updates to the shared maps while access
+	// keeps the native runtime alive.  In particular, it makes a flow update
+	// and a paired delete/consume operation atomic with respect to each other
+	// without holding the lifecycle writer lock on every packet.
+	mapAccess       sync.RWMutex
 	runtime         *C.struct_sb_ebpf_shared_network_runtime
 	control         sharedNetworkControl
 	hostIPv4        []netip.Prefix
@@ -292,6 +297,8 @@ func (b *SharedNetworkBackend) RegisterListenerSocket(key uint32, fd int) error 
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -368,6 +375,8 @@ func (b *SharedNetworkBackend) PutDirectFlow(protocol uint8, source, destination
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil || b.control.Flags&(1<<7) == 0 {
 		return osErrClosed
 	}
@@ -587,6 +596,13 @@ func (b *SharedNetworkBackend) lookupOriginal(
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	if deleteAfterLookup {
+		b.mapAccess.Lock()
+		defer b.mapAccess.Unlock()
+	} else {
+		b.mapAccess.RLock()
+		defer b.mapAccess.RUnlock()
+	}
 	if b.runtime == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -661,6 +677,8 @@ func (b *SharedNetworkBackend) DeleteRedirect(
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}

@@ -118,6 +118,15 @@ func defaultLaneKey(source M.Socksaddr) string {
 }
 
 func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, userData any) bool {
+	// Close stops the reaper and purges the current table. Reject before
+	// Prepare so a packet racing with shutdown cannot allocate a writer that
+	// will never be completed.
+	select {
+	case <-s.closed:
+		s.rejected.Add(1)
+		return false
+	default:
+	}
 	if len(payload) < 12 {
 		s.rejected.Add(1)
 		s.invalidRejected.Add(1)
@@ -140,6 +149,19 @@ func (s *Service) NewPacket(payload []byte, source, destination M.Socksaddr, use
 	dedupeKey := key + "\x00" + destination.String() + "\x00" + string(payload[2:])
 	queryID := binary.BigEndian.Uint16(payload[:2])
 	s.access.Lock()
+	// Close may have won the race after Prepare returned. Re-check while
+	// holding the admission lock so no transaction can be inserted after the
+	// final purge.
+	select {
+	case <-s.closed:
+		s.access.Unlock()
+		if onClose != nil {
+			onClose(io.ErrClosedPipe)
+		}
+		s.rejected.Add(1)
+		return false
+	default:
+	}
 	if existingID, loaded := s.inflight[dedupeKey]; loaded {
 		currentTransaction, exists := s.transactions[existingID]
 		if exists {

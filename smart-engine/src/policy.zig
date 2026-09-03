@@ -75,6 +75,22 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             return decision;
         }
     }
+    // A provider refresh can remove or rename the incumbent while the engine
+    // still carries its previous selected_id.  That is a catalog change, not
+    // a performance challenge: retaining an ID which cannot be emitted would
+    // make the host fall back on every refresh and could strand the engine in
+    // a stale challenge state.  Adopt the best currently eligible candidate
+    // immediately and clear all confirmation state.
+    if (state.selected_id != 0 and incumbent == null) {
+        state.selected_id = selected.id;
+        state.cooldown_until = now_ms +| config.switch_cooldown_ms;
+        state.challenge_id = 0;
+        state.challenge_count = 0;
+        state.challenge_since = 0;
+        decision.switched = 1;
+        decision.reason = @intFromEnum(model.DecisionReason.confirmed);
+        return decision;
+    }
     if (state.challenge_id != selected.id or state.challenge_since == 0) {
         state.challenge_id = selected.id;
         state.challenge_count = 1;

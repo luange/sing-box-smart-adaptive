@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer without v (for example 1.14.1 or 1.14.0-rc.5)"
+        description: "SemVer without v (for example 1.14.0 or 1.14.1)"
         required: true
         type: string
       build:

@@ -174,3 +174,26 @@ func TestServiceFailureCompletionReleasesCoalescedTransaction(t *testing.T) {
 	require.Equal(t, uint64(1), stats.Coalesced)
 	require.Equal(t, uint64(2), closes.Load())
 }
+
+func TestServiceRejectsPacketsAfterClose(t *testing.T) {
+	var handled atomic.Uint64
+	service := New(Options{
+		Handle: func(context.Context, []byte, N.PacketWriter, M.Socksaddr, M.Socksaddr, any) {
+			handled.Add(1)
+		},
+		Prepare: func(M.Socksaddr, M.Socksaddr, any) (context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			return context.Background(), countingWriter{replies: new(atomic.Uint64)}, nil
+		},
+		Timeout: time.Minute,
+	})
+	service.Close()
+
+	message := make([]byte, 12)
+	source := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 10000}
+	destination := M.Socksaddr{Addr: netip.MustParseAddr("192.0.2.53"), Port: 53}
+	require.False(t, service.NewPacket(message, source, destination, nil))
+	require.Equal(t, uint64(0), handled.Load())
+	stats := service.RuntimeStats()
+	require.Equal(t, uint64(0), stats.Transactions)
+	require.Equal(t, uint64(1), stats.AdmissionRejected)
+}

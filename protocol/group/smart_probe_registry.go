@@ -271,18 +271,11 @@ func (r *smartProbeRegistry) runProbeMode(ctx context.Context, key string, timeo
 		r.pruneLocked(now)
 		if len(r.entries) >= smartProbeRegistryLimit {
 			r.access.Unlock()
-			// Overflow path must honor the caller's ctx so shutdown cancels promptly.
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
-			if probeCtx.Err() != nil {
-				cancel()
-				return 0, probeCtx.Err()
-			}
-			delay, err := probe(probeCtx)
-			cancel()
-			if err != nil {
-				return 0, errSharedSmartProbeFailed
-			}
-			return delay, nil
+			// Do not bypass the registry when every slot is occupied. An
+			// unregistered probe would defeat both endpoint single-flight and the
+			// global admission bound precisely during the churn it is meant to
+			// contain. The caller can retry on the next scheduled cycle.
+			return 0, errSharedSmartProbeDeferred
 		}
 	}
 	entry = &smartProbeEntry{inflight: true, done: make(chan struct{})}

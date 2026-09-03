@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -177,6 +178,29 @@ func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
 	}
 	if cursor := smart.probeCursor.Load(); cursor != 8 {
 		t.Fatalf("probe cursor = %d, want 8", cursor)
+	}
+}
+
+func TestSmartProbeRegistryFullDefersWithoutBypassingBounds(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	busy := &smartProbeEntry{inflight: true, done: make(chan struct{})}
+	registry.access.Lock()
+	for index := 0; index < smartProbeRegistryLimit; index++ {
+		registry.entries["busy-"+itoaSmall(index)] = busy
+	}
+	registry.access.Unlock()
+
+	called := false
+	_, err := registry.runProbe(context.Background(), "overflow", time.Second, time.Minute, func(context.Context) (uint16, error) {
+		called = true
+		return 1, nil
+	})
+	if !errors.Is(err, errSharedSmartProbeDeferred) {
+		t.Fatalf("full registry error = %v, want deferred", err)
+	}
+	if called {
+		t.Fatal("full registry bypassed the bounded single-flight path")
 	}
 }
 
