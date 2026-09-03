@@ -162,7 +162,7 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 	for _, candidate := range candidates {
 		candidateByTag[candidate.Tag()] = candidate
 	}
-	return &Smart{
+	smart := &Smart{
 		Adapter:              outbound.NewAdapter(C.TypeSmart, "smart-test", []string{N.NetworkTCP, N.NetworkUDP}, nil),
 		ctx:                  context.Background(),
 		candidates:           candidates,
@@ -188,6 +188,17 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		interruptGroup:       interruptGroupForTest(),
 		families:             trafficfamily.NewResolver(),
 	}
+	// Keep integration tests on the same policy owner as production builds.
+	// The smart_zig CI tag links the Zig backend; development builds return nil
+	// here and continue to exercise the host-only reference path.
+	smart.policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
+		Exploration:         smart.exploration,
+		SwitchMargin:        smart.switchMargin,
+		SwitchConfirm:       smart.switchConfirmSamples,
+		SwitchConfirmWindow: smart.switchConfirm.Milliseconds(),
+		SwitchCooldown:      smart.switchCooldown.Milliseconds(),
+	})
+	return smart
 }
 
 func setSmartCandidateIdentities(s *Smart, identities map[string]string) {
