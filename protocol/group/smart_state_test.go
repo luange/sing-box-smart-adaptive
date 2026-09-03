@@ -445,6 +445,29 @@ func TestSmartSelectionModeDefaultsAndAliases(t *testing.T) {
 	}
 }
 
+func TestSmartMetricDecayDropsStaleEvidenceClasses(t *testing.T) {
+	metric := smartMetric{
+		ConnectMS: 900, ConnectP95MS: 1200, JitterMS: 80, ConnectSamples: 1,
+		FirstByteMS: 700, FirstByteP95MS: 1000, FirstByteSamples: 1,
+		ThroughputLog: 20, ThroughputSamples: 1,
+		RetransmitRatio: 0.12, RetransmitSamples: 1,
+		Successes: 4, Failures: 1, LastUpdated: time.Unix(1000, 0),
+	}
+	metric.decay(time.Unix(1000, 0).Add(4*time.Hour), time.Hour)
+	if metric.ConnectSamples != 0 || metric.ConnectMS != 0 || metric.ConnectP95MS != 0 || metric.JitterMS != 0 {
+		t.Fatalf("stale connect evidence survived decay: %+v", metric)
+	}
+	if metric.FirstByteSamples != 0 || metric.FirstByteMS != 0 || metric.FirstByteP95MS != 0 {
+		t.Fatalf("stale first-byte evidence survived decay: %+v", metric)
+	}
+	if metric.ThroughputSamples != 0 || metric.ThroughputLog != 0 || metric.RetransmitSamples != 0 || metric.RetransmitRatio != 0 {
+		t.Fatalf("stale bulk/loss evidence survived decay: %+v", metric)
+	}
+	if metric.Successes <= 0 || metric.Failures <= 0 {
+		t.Fatalf("reliability prior was incorrectly discarded: %+v", metric)
+	}
+}
+
 func TestSmartBalancedAffinityIsStableAndHealthBounded(t *testing.T) {
 	smart := &Smart{switchMargin: 0.15}
 	ranks := []smartRank{

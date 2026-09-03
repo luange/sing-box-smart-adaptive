@@ -454,6 +454,30 @@ func (m *smartMetric) decay(now time.Time, halfLife time.Duration) {
 	m.FirstByteSamples *= factor
 	m.ThroughputSamples *= factor
 	m.RetransmitSamples *= factor
+	// The counters above are the confidence carried by each metric. Once an
+	// evidence class has less than a quarter of an effective sample, retaining its old
+	// EWMA/tail value would let stale latency or throughput influence a new
+	// decision as if it were fresh. Drop only that class; reliability counts
+	// remain available as the neutral Bayesian prior in estimateMetric.
+	if m.ConnectSamples < 0.25 {
+		m.ConnectMS = 0
+		m.ConnectP95MS = 0
+		m.JitterMS = 0
+		m.ConnectSamples = 0
+	}
+	if m.FirstByteSamples < 0.25 {
+		m.FirstByteMS = 0
+		m.FirstByteP95MS = 0
+		m.FirstByteSamples = 0
+	}
+	if m.ThroughputSamples < 0.25 {
+		m.ThroughputLog = 0
+		m.ThroughputSamples = 0
+	}
+	if m.RetransmitSamples < 0.25 {
+		m.RetransmitRatio = 0
+		m.RetransmitSamples = 0
+	}
 }
 
 func (m *smartMetric) updateConnect(value float64) {

@@ -1050,6 +1050,24 @@ func TestSmartSiteIdentityUsesSniffHostForIPDestination(t *testing.T) {
 	}
 }
 
+func TestSmartSiteIdentityNormalizesHostSpellings(t *testing.T) {
+	variants := []string{"WWW.Example.COM.", "www.example.com:443", "www.example.com"}
+	var expectedDisplay, expectedKey string
+	for _, variant := range variants {
+		metadata := &adapter.InboundContext{SniffHost: variant}
+		display, key := smartSiteIdentity(metadata, M.ParseSocksaddr("192.0.2.1:443"))
+		if expectedDisplay == "" {
+			expectedDisplay, expectedKey = display, key
+		}
+		if display != expectedDisplay || key != expectedKey {
+			t.Fatalf("host spelling %q split site identity: display=%q key=%q, want %q/%q", variant, display, key, expectedDisplay, expectedKey)
+		}
+	}
+	if got := normalizeSmartHostname("Bücher.Example."); got != "xn--bcher-kva.example" {
+		t.Fatalf("IDN host normalization = %q", got)
+	}
+}
+
 func TestSmartGoogleServiceFamilySharesAffinityIdentity(t *testing.T) {
 	hosts := []string{
 		"www.google.com", "www.googleapis.com",

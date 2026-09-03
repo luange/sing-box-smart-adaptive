@@ -39,6 +39,7 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"golang.org/x/net/dns/dnsmessage"
+	"golang.org/x/net/idna"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -178,6 +179,36 @@ func sniffOrDomain(metadata *adapter.InboundContext) string {
 		return metadata.SniffHost
 	}
 	return metadata.Domain
+}
+
+// normalizeSmartHostname canonicalizes the host obtained from SNI/Host or a
+// destination FQDN before it reaches traffic-family and public-suffix logic.
+// Sniffers may include a port, a trailing root dot, mixed case, or Unicode;
+// treating those spellings as different sites would fragment the portrait and
+// make balanced affinity appear unstable.
+func normalizeSmartHostname(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	} else if strings.Count(host, ":") == 1 {
+		// SplitHostPort rejects an unbracketed hostname with a non-numeric or
+		// missing port in some sniffing paths. Only strip the suffix when it is
+		// unambiguously a host:port form.
+		if index := strings.LastIndexByte(host, ':'); index > 0 && index < len(host)-1 {
+			if _, err := strconv.ParseUint(host[index+1:], 10, 16); err == nil {
+				host = host[:index]
+			}
+		}
+	}
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		host = ascii
+	}
+	return host
 }
 
 func RegisterSmart(registry *outbound.Registry) {
@@ -993,8 +1024,8 @@ func (s *Smart) performanceSwitchAllowed() bool {
 // primary/backup ranking, then uses rendezvous hashing over canonical endpoint
 // identities. The result is pseudo-random across independent contexts but
 // stable for one context, so keep-alive traffic does not bounce between lines.
-// A configured node weight influences the rendezvous metric without allowing a
-// low-health or materially slower candidate into the pool.
+// Node weights have already been applied to the confidence-adjusted score;
+// applying them again here would double-count a priority rule.
 func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag string) int {
 	if s == nil || len(ranks) == 0 || key == "" {
 		return -1
@@ -1039,7 +1070,7 @@ func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag strin
 
 	seen := make(map[string]struct{}, len(ranks))
 	selected := -1
-	var selectedMetric float64
+	var selectedMetric uint64
 	for index := range ranks {
 		if !isInPool(index) {
 			continue
@@ -1062,11 +1093,7 @@ func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag strin
 		_, _ = hash.Write([]byte(key))
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write([]byte(identity))
-		weight := ranks[index].weight.Weight
-		if weight <= 0 {
-			weight = 1
-		}
-		metric := float64(hash.Sum64()) / weight
+		metric := hash.Sum64()
 		if selected < 0 || metric < selectedMetric {
 			selected = index
 			selectedMetric = metric
@@ -2740,7 +2767,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	totalSamples := 0.0
 	var policyCandidates []smartPolicyCandidate
 	var policyIDs map[uint64]struct{}
-	usePolicyBackend := s.policyBackendEnabled()
+	usePolicyBackend := s.policyBackendEnabled() && s.selectionMode == smartSelectionPrimaryBackup
 	if usePolicyBackend {
 		policyCandidates = make([]smartPolicyCandidate, 0, len(ranking.candidates))
 		policyIDs = make(map[uint64]struct{}, len(ranking.candidates))
@@ -2924,8 +2951,6 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		if index := s.balancedAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
 			ranks[index].status.Reason = "balanced stable affinity"
 			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "balanced stable affinity")
-			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
 	if usePolicyBackend {
@@ -3046,7 +3071,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
-	usePolicyBackend := s.policyBackendEnabled()
+	usePolicyBackend := s.policyBackendEnabled() && s.selectionMode == smartSelectionPrimaryBackup
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
@@ -3978,6 +4003,7 @@ func resolveSmartSiteIdentity(families *trafficfamily.Resolver, metadata *adapte
 	if host == "" && destination.IsDomain() {
 		host = destination.Fqdn
 	}
+	host = normalizeSmartHostname(host)
 	if host != "" {
 		if net.ParseIP(host) == nil {
 			family := ""
