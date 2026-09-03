@@ -767,6 +767,49 @@ func TestSmartEquivalentSubscriptionLineRemainsFixedWhileHealthy(t *testing.T) {
 	}
 }
 
+func TestSmartCanonicalEndpointAliasDoesNotCountAsSwitch(t *testing.T) {
+	primary := newSmartFakeOutbound("airport/HK #1", nil)
+	duplicate := newSmartFakeOutbound("airport/HK #2", nil)
+	smart := newTestSmart(primary, duplicate)
+	setSmartCandidateIdentities(smart, map[string]string{
+		primary.Tag():   "trojan://edge.example:443",
+		duplicate.Tag(): "trojan://edge.example:443",
+	})
+	networkKey := smart.networkFingerprint()
+	siteDisplay, siteKey := smartSiteIdentity(nil, M.ParseSocksaddr("search.example:443"))
+	smart.markSelected(primary, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	smart.markSelected(duplicate, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	if got := smart.switchesTotal.Load(); got != 0 {
+		t.Fatalf("canonical alias was counted as a switch: %d", got)
+	}
+	if got := smart.performanceSwitches.Load(); got != 0 {
+		t.Fatalf("canonical alias was counted as a performance switch: %d", got)
+	}
+	smart.switchAuditAccess.Lock()
+	auditCount := len(smart.switchAudit)
+	smart.switchAuditAccess.Unlock()
+	if auditCount != 0 {
+		t.Fatalf("canonical alias produced switch audit entries: %d", auditCount)
+	}
+}
+
+func TestSmartRankIndexForPolicyPrefersCurrentAlias(t *testing.T) {
+	primary := newSmartFakeOutbound("airport/HK #1", nil)
+	duplicate := newSmartFakeOutbound("airport/HK #2", nil)
+	policyID := smartPolicyID("trojan://edge.example:443")
+	ranks := []smartRank{
+		{outbound: primary, policyID: policyID, eligible: true},
+		{outbound: duplicate, policyID: policyID, eligible: true},
+	}
+	if got := smartRankIndexForPolicy(ranks, policyID, duplicate.Tag()); got != 1 {
+		t.Fatalf("current alias index = %d, want 1", got)
+	}
+	ranks[1].eligible = false
+	if got := smartRankIndexForPolicy(ranks, policyID, duplicate.Tag()); got != 0 {
+		t.Fatalf("ineligible alias prevented fallback to eligible endpoint: %d", got)
+	}
+}
+
 func TestSmartLineFamilyOnlyStripsGeneratedDuplicateSuffixes(t *testing.T) {
 	base := "airport/香港-广东专线 NeaRoute"
 	for _, duplicate := range []string{base + " #deadbeef", base + " (2)"} {

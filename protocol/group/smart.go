@@ -2205,20 +2205,29 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			usePolicyBackend = false
 		} else {
 			if decision.SelectedID != 0 {
-				selectedIndex := -1
-				for index := range ranks {
-					if ranks[index].policyID != decision.SelectedID {
-						continue
-					}
-					selectedIndex = index
-					break
-				}
+				// Keep the currently selected provider alias when the Zig
+				// decision points at the same canonical endpoint. Providers
+				// commonly expose one endpoint more than once with generated
+				// suffixes; selecting the first alias on every rank would make
+				// the visible tag (and the dial target) oscillate on refresh.
+				selectedIndex := smartRankIndexForPolicy(ranks, decision.SelectedID, lastSelected)
 				if selectedIndex >= 0 {
 					currentIndex := smartRankIndex(ranks, lastSelected)
 					if currentIndex >= 0 && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
 						ranks[currentIndex].status.Reason = "baseline retained current candidate"
 						moveSmartRankFirst(ranks, currentIndex)
 						s.updateStatus(networkKey, siteDisplay, transport, ranks, "baseline retained current candidate")
+						return ranking, networkKey, siteKey, siteDisplay
+					}
+					if currentIndex >= 0 && currentIndex != selectedIndex && ranks[currentIndex].status.State != "open" && !decision.Switched {
+						// A policy engine can be recreated after a context eviction or
+						// provider refresh. Its first decision is then a cold estimate,
+						// not a confirmed failover. Keep a healthy incumbent until the
+						// backend's confirmation FSM reports Switched, while still
+						// allowing hard-open candidates to fail over immediately.
+						ranks[currentIndex].status.Reason = "zig policy awaiting sustained confirmation"
+						moveSmartRankFirst(ranks, currentIndex)
+						s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy awaiting sustained confirmation")
 						return ranking, networkKey, siteKey, siteDisplay
 					}
 					if currentIndex >= 0 && currentIndex != selectedIndex &&
@@ -2312,12 +2321,18 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	if selectedAt := s.lastSelectedAt[key]; previous != "" && !selectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(selectedAt) > s.siteStickiness {
 		previous = ""
 	}
+	// Compare canonical endpoint identity before accounting for a switch. A
+	// provider refresh can replace one display alias with another while the
+	// underlying server is unchanged; that is not a performance or failure
+	// failover and must not interrupt healthy connections.
+	sameEndpoint := smartSameEndpoint(s.candidateMetadataByTag, previous, candidate.Tag())
+	logicalSwitch := previous != "" && previous != candidate.Tag() && !sameEndpoint
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
-	if !usePolicyBackend && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !usePolicyBackend && logicalSwitch && !failureSwitch {
 		coolingDown := s.performanceCooldown[key].After(now)
 		materiallyBetter := previousFound && currentFound &&
 			smartRelativeImprovement(currentRank.status.Score, previousRank.status.Score, s.switchMargin) &&
@@ -2334,7 +2349,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	s.lastSelectedAt[key] = now
 	delete(s.switchChallenges, key)
-	if !usePolicyBackend && previous != "" && previous != candidate.Tag() && !failureSwitch {
+	if !usePolicyBackend && logicalSwitch && !failureSwitch {
 		if s.performanceCooldown == nil {
 			s.performanceCooldown = make(map[string]time.Time)
 		}
@@ -2368,7 +2383,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	}
 	if previous == "" {
 		s.coldStarts.Add(1)
-	} else if previous != candidate.Tag() {
+	} else if logicalSwitch {
 		if failureSwitch {
 			category = "failure_failover"
 			s.failureFailovers.Add(1)
@@ -2386,7 +2401,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 		})
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, candidate.Tag(), reason)
-	if previous != "" && previous != candidate.Tag() {
+	if logicalSwitch {
 		s.switchesTotal.Add(1)
 		s.interruptPreviousCandidate(networkKey, siteKey, transport, previous, candidate.Tag())
 	}
@@ -2399,6 +2414,51 @@ func smartRankByTag(ranks []smartRank, tag string) (smartRank, bool) {
 		}
 	}
 	return smartRank{}, false
+}
+
+func smartRankIndexForPolicy(ranks []smartRank, policyID uint64, preferredTag string) int {
+	if policyID == 0 {
+		return -1
+	}
+	if preferredTag != "" {
+		if index := smartRankIndex(ranks, preferredTag); index >= 0 && ranks[index].policyID == policyID && ranks[index].eligible {
+			return index
+		}
+	}
+	for index := range ranks {
+		if ranks[index].policyID == policyID && ranks[index].eligible {
+			return index
+		}
+	}
+	// The policy backend should only select eligible candidates. Keep a
+	// defensive fallback for an inconsistent snapshot so the host can still
+	// report the selected policy instead of silently changing endpoints.
+	for index := range ranks {
+		if ranks[index].policyID == policyID {
+			return index
+		}
+	}
+	return -1
+}
+
+func smartSameEndpoint(metadataByTag map[string]smartCandidateMetadata, left, right string) bool {
+	if left == right {
+		return true
+	}
+	leftMetadata, leftFound := metadataByTag[left]
+	rightMetadata, rightFound := metadataByTag[right]
+	if leftFound && rightFound {
+		if leftMetadata.policyID != 0 && leftMetadata.policyID == rightMetadata.policyID {
+			return true
+		}
+		if leftMetadata.profileID != "" && leftMetadata.profileID == rightMetadata.profileID {
+			return true
+		}
+		if leftMetadata.identity != "" && leftMetadata.identity == rightMetadata.identity {
+			return true
+		}
+	}
+	return smartEquivalentLine(left, right)
 }
 
 func smartRelativeImprovement(bestScore, currentScore, margin float64) bool {
