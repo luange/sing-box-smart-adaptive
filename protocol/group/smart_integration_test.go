@@ -1437,6 +1437,25 @@ func TestSmartPreMatchUsesBusinessContextSelection(t *testing.T) {
 	}
 }
 
+func TestSmartBusinessContextCannotSelectOutsideGroup(t *testing.T) {
+	local := newSmartFakeOutbound("group-a/node-1", nil)
+	foreign := newSmartFakeOutbound("group-b/node-1", nil)
+	smart := newTestSmart(local)
+	if smart.SelectOutbound(foreign.Tag()) {
+		t.Fatalf("accepted candidate from another Smart group: %q", foreign.Tag())
+	}
+	destination := M.ParseSocksaddr("search.example:443")
+	metadata := &adapter.InboundContext{Network: N.NetworkTCP, Destination: destination}
+	_, siteKey := resolveSmartSiteIdentity(nil, metadata, destination)
+	contextKey := smartSelectionKey(smart.networkFingerprint(), siteKey, N.NetworkTCP)
+	smart.access.Lock()
+	smart.lastSelected[contextKey] = foreign.Tag()
+	smart.access.Unlock()
+	if got := smart.preMatchLeaf(metadata); got == nil || got.Tag() != local.Tag() {
+		t.Fatalf("pre-match escaped group boundary: %v", got)
+	}
+}
+
 func TestSmartStatusExposesPrimaryBackupAndStandbyRoles(t *testing.T) {
 	primary := newSmartFakeOutbound("primary", nil)
 	backup := newSmartFakeOutbound("backup", nil)
