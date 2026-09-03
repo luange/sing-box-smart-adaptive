@@ -1,8 +1,9 @@
-# sing-box v1.14.0-rc.4 性能与兼容性审查
+# sing-box v1.14.0 性能与兼容性审查
 
 ## 范围
 
-审查基线为官方 `v1.14.0-rc.4`（`193aba27f722028bc7cdc4e2b096522e11b12964`）。
+审查基线为官方 `v1.14.0`（`0b8995879f29a9b98ee027bc17b75e101445b238`）；历史记录中
+保留了 rc4/rc5 阶段的验证证据。
 自有分支在保留 Smart、Zig policy、eBPF v3、
 provider、connection-history、Clash/Zashboard API 和 PBR 适配层。没有把代理协议
 栈重复改写成第二套实现。
@@ -132,9 +133,36 @@ health ordering as the Go host (`healthy` before `warming`/`unknown`, then
 changes are covered by freshness, cross-track, recovery-lock, and Zig policy
 regression tests.
 
-The current ABI still reports one health state for a candidate (`state=3`
-combines `suspect` and `half_open`), and Smart's active probe implementation
-does not yet expose independent IPv4/IPv6 or active data-UDP/QUIC tracks. Those
-are explicit follow-up design items, not silently approximated by the TCP or
-DNS probe, because doing so would make a healthy TCP path mask a broken data
-plane.
+The ABI keeps the historical values (`state=3` suspect and `state=4` open) and
+adds `state=5` for half-open recovery trials. This is additive so older C/FFI
+consumers retain their existing meaning. Smart transport keys now preserve an
+explicit IPv4/IPv6 suffix when the caller or destination provides one; generic
+dual-stack destinations retain the legacy aggregate key until a concrete family
+is known. TCP/DNS probes remain bounded and endpoint-single-flight. Data UDP and
+QUIC continue to use passive response/write-failure evidence only: there is no
+safe universal synthetic payload for arbitrary proxy protocols, so the data
+plane is not falsely declared healthy by a DNS probe.
+
+### Surge design cross-check (2026-09-03)
+
+The attached Surge analysis was compared against the implementation rather than
+copied verbatim. Its useful properties are now covered as follows: service
+history is keyed by registered domain and transport, a successful connection
+clears a local failure stain, and score selection remains primary/backup rather
+than latency-only. Large catalogs additionally keep a bounded, two-hour
+decaying use score; budgeted background cycles first deduplicate aliases by
+canonical endpoint, probe the most-used half, and fill the remainder with the
+stalest endpoints. The score is decayed both when written and when read, so an
+old burst of traffic cannot remain artificially popular. Only successful TCP
+selections contribute to this score; UDP keeps an independent health ledger.
+This supplements the existing activity-aware rotation without adding a
+user-facing knob or making use count override health.
+
+The UDP no-response rule follows the safer part of the reference design: DNS
+transactions can fail after one unanswered datagram, while QUIC/STUN wait for
+three writes before arming the watchdog. A single lost handshake packet thus
+cannot trigger a failover. Family-aware TCP and DNS probes use distinct shared
+registry keys and the same endpoint lock. No synthetic data-UDP/QUIC payload is
+introduced; arbitrary proxy protocols do not share a portable application-level
+health request, so real response/write failures remain the authoritative data
+evidence.

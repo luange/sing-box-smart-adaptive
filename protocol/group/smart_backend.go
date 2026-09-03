@@ -56,10 +56,15 @@ func smartPolicyState(state string) uint8 {
 		return 1
 	case "warming":
 		return 2
-	case "suspect", "half_open":
+	case "suspect":
 		return 3
 	case "open":
 		return 4
+	case "half_open":
+		// Keep the historical values stable: state 4 has always meant open.
+		// Half-open is additive so older C/FFI consumers continue to decode
+		// state 3 as suspect instead of silently changing its meaning.
+		return 5
 	default:
 		return 0
 	}

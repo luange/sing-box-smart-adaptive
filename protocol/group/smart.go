@@ -106,6 +106,10 @@ const (
 	// Coalesce identical updates briefly so browser asset fan-out does not make
 	// every dial clone the full candidate snapshot under statusAccess.
 	smartStatusMinPublishInterval = 200 * time.Millisecond
+	// Surge's use-score is useful for choosing which large catalogs to refresh,
+	// not for overriding health ranking. Keep the decay implicit and bounded so
+	// it cannot become another long-lived per-site state table.
+	smartUseScoreDecayWindow = 2 * time.Hour
 	// Large provider groups use a coarse near-tie hash automatically. This is
 	// deliberately internal: most users should not need to tune stickiness.
 	smartCoarseAffinityThreshold = 16
@@ -161,6 +165,11 @@ var errSmartNoCandidates = errors.New("smart group has no leaf candidates")
 type smartAffinity struct {
 	Candidate string
 	ExpiresAt time.Time
+}
+
+type smartUseScore struct {
+	Score    float64
+	LastUsed time.Time
 }
 
 type smartRank struct {
@@ -234,11 +243,12 @@ type smartDialAttempt struct {
 }
 
 type smartDialResult struct {
-	attempt         smartDialAttempt
-	conn            net.Conn
-	err             error
-	elapsed         time.Duration
-	hadPriorFailure bool
+	attempt           smartDialAttempt
+	conn              net.Conn
+	err               error
+	elapsed           time.Duration
+	hadPriorFailure   bool
+	observedTransport string
 }
 
 var smartRankPool = sync.Pool{New: func() any {
@@ -334,6 +344,8 @@ type Smart struct {
 	affinity               map[string]smartAffinity
 	switchChallenges       map[string]smartSwitchChallenge
 	performanceCooldown    map[string]time.Time
+	useScores              map[string]smartUseScore
+	probeLastAt            map[string]time.Time
 	halfOpen               map[string]struct{}
 	latest                 common.TypedValue[adapter.Outbound]
 	fingerprint            atomic.Pointer[smartFingerprintCache]
@@ -357,6 +369,7 @@ type Smart struct {
 	probeCycleTimeout          time.Duration
 	probeTimeout               time.Duration
 	probeConcurrency           int
+	familyProbeEnabled         bool
 	maxAttempts                int
 	attemptTimeout             time.Duration
 	establishedStallTimeout    time.Duration
@@ -623,6 +636,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		affinity:               make(map[string]smartAffinity),
 		switchChallenges:       make(map[string]smartSwitchChallenge),
 		performanceCooldown:    make(map[string]time.Time),
+		useScores:              make(map[string]smartUseScore),
+		probeLastAt:            make(map[string]time.Time),
 		halfOpen:               make(map[string]struct{}),
 		store:                  store,
 		policyBackend:          policyBackend,
@@ -632,6 +647,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		probeCycleTimeout:         probeCycleTimeout,
 		probeTimeout:              probeTimeout,
 		probeConcurrency:          probeConcurrency,
+		familyProbeEnabled:        true,
 		maxAttempts:               maxAttempts,
 		attemptTimeout:            attemptTimeout,
 		establishedStallTimeout:   establishedStallTimeout,
@@ -768,6 +784,8 @@ func (s *Smart) Close() error {
 	clear(s.affinity)
 	clear(s.switchChallenges)
 	clear(s.performanceCooldown)
+	clear(s.useScores)
+	clear(s.probeLastAt)
 	clear(s.halfOpen)
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
@@ -777,6 +795,8 @@ func (s *Smart) Close() error {
 	s.affinity = make(map[string]smartAffinity)
 	s.switchChallenges = make(map[string]smartSwitchChallenge)
 	s.performanceCooldown = make(map[string]time.Time)
+	s.useScores = make(map[string]smartUseScore)
+	s.probeLastAt = make(map[string]time.Time)
 	s.halfOpen = make(map[string]struct{})
 	s.access.Unlock()
 	s.providerAccess.Lock()
@@ -963,6 +983,187 @@ func (s *Smart) coarseAffinityIndex(ranks []smartRank, key string) int {
 	return pool[hash.Sum64()%uint64(len(pool))]
 }
 
+func (s *Smart) noteCandidateUse(candidate string, now time.Time) {
+	if s == nil || candidate == "" {
+		return
+	}
+	profileID := s.candidateProfileID(candidate)
+	if profileID == "" {
+		profileID = candidate
+	}
+	s.access.Lock()
+	if s.useScores == nil {
+		s.useScores = make(map[string]smartUseScore)
+	}
+	usage := s.useScores[profileID]
+	if !usage.LastUsed.IsZero() {
+		elapsed := now.Sub(usage.LastUsed)
+		if elapsed >= smartUseScoreDecayWindow {
+			usage.Score = 0
+		} else if elapsed > 0 {
+			usage.Score *= 1 - elapsed.Seconds()/smartUseScoreDecayWindow.Seconds()
+		}
+	}
+	usage.Score++
+	usage.LastUsed = now
+	s.useScores[profileID] = usage
+	if len(s.useScores) > defaultSmartMaxHistoryEntries {
+		s.pruneUseScoresLocked(now)
+	}
+	s.access.Unlock()
+}
+
+func decayedSmartUseScore(usage smartUseScore, now time.Time) float64 {
+	if usage.Score <= 0 || usage.LastUsed.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(usage.LastUsed)
+	switch {
+	case elapsed <= 0:
+		return usage.Score
+	case elapsed >= smartUseScoreDecayWindow:
+		return 0
+	default:
+		return usage.Score * (1 - elapsed.Seconds()/smartUseScoreDecayWindow.Seconds())
+	}
+}
+
+func (s *Smart) noteCandidateProbe(candidate string, now time.Time) {
+	if s == nil || candidate == "" {
+		return
+	}
+	profileID := s.candidateProfileID(candidate)
+	if profileID == "" {
+		profileID = candidate
+	}
+	s.access.Lock()
+	if s.probeLastAt == nil {
+		s.probeLastAt = make(map[string]time.Time)
+	}
+	s.probeLastAt[profileID] = now
+	if len(s.probeLastAt) > defaultSmartMaxHistoryEntries {
+		for key, lastProbe := range s.probeLastAt {
+			if lastProbe.IsZero() || now.Sub(lastProbe) > 4*smartUseScoreDecayWindow {
+				delete(s.probeLastAt, key)
+			}
+		}
+		for len(s.probeLastAt) > defaultSmartMaxHistoryEntries {
+			var oldestKey string
+			var oldest time.Time
+			for key, lastProbe := range s.probeLastAt {
+				if oldestKey == "" || lastProbe.Before(oldest) {
+					oldestKey, oldest = key, lastProbe
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(s.probeLastAt, oldestKey)
+		}
+	}
+	s.access.Unlock()
+}
+
+func (s *Smart) pruneUseScoresLocked(now time.Time) {
+	for key, usage := range s.useScores {
+		if usage.LastUsed.IsZero() || now.Sub(usage.LastUsed) > 4*smartUseScoreDecayWindow {
+			delete(s.useScores, key)
+		}
+	}
+	for len(s.useScores) > defaultSmartMaxHistoryEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, usage := range s.useScores {
+			if oldestKey == "" || usage.LastUsed.Before(oldest) {
+				oldestKey, oldest = key, usage.LastUsed
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.useScores, oldestKey)
+	}
+}
+
+// selectProbeCandidates follows the useful part of Surge's periodic testing
+// policy: refresh a small set of frequently used endpoints and fill the rest
+// with the stalest entries. It is only used when a group is budgeted; a full
+// explicit URLTest still covers the complete catalog.
+func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int) []adapter.Outbound {
+	if s == nil || budget <= 0 || len(candidates) <= budget {
+		return candidates
+	}
+	type probeCandidate struct {
+		candidate adapter.Outbound
+		usage     float64
+		lastProbe time.Time
+	}
+	items := make([]probeCandidate, 0, len(candidates))
+	seenProfiles := make(map[string]struct{}, len(candidates))
+	now := time.Now()
+	s.access.RLock()
+	for _, candidate := range candidates {
+		metadata := s.candidateMetadataByTag[candidate.Tag()]
+		profileID := metadata.profileID
+		if profileID == "" {
+			profileID = candidate.Tag()
+		}
+		// Provider refreshes can expose one physical endpoint under several
+		// generated aliases.  The shared registry will single-flight those
+		// aliases, but spending this cycle's budget on duplicates would starve
+		// distinct endpoints from the stale/used rotation.
+		if _, exists := seenProfiles[profileID]; exists {
+			continue
+		}
+		seenProfiles[profileID] = struct{}{}
+		usage := decayedSmartUseScore(s.useScores[profileID], now)
+		items = append(items, probeCandidate{candidate: candidate, usage: usage, lastProbe: s.probeLastAt[profileID]})
+	}
+	s.access.RUnlock()
+	used := make([]probeCandidate, 0, len(items))
+	for _, item := range items {
+		if item.usage > 0 {
+			used = append(used, item)
+		}
+	}
+	sort.SliceStable(used, func(i, j int) bool {
+		if used[i].usage != used[j].usage {
+			return used[i].usage > used[j].usage
+		}
+		return used[i].candidate.Tag() < used[j].candidate.Tag()
+	})
+	sort.SliceStable(items, func(i, j int) bool {
+		if !items[i].lastProbe.Equal(items[j].lastProbe) {
+			if items[i].lastProbe.IsZero() {
+				return true
+			}
+			if items[j].lastProbe.IsZero() {
+				return false
+			}
+			return items[i].lastProbe.Before(items[j].lastProbe)
+		}
+		return items[i].candidate.Tag() < items[j].candidate.Tag()
+	})
+	selected := make([]adapter.Outbound, 0, budget)
+	seen := make(map[string]struct{}, budget)
+	usedBudget := min(len(used), max(1, budget/2))
+	for _, item := range used[:usedBudget] {
+		selected = append(selected, item.candidate)
+		seen[item.candidate.Tag()] = struct{}{}
+	}
+	for _, item := range items {
+		if len(selected) >= budget {
+			break
+		}
+		if _, exists := seen[item.candidate.Tag()]; exists {
+			continue
+		}
+		selected = append(selected, item.candidate)
+		seen[item.candidate.Tag()] = struct{}{}
+	}
+	return selected
+}
+
 func (s *Smart) run(ctx context.Context) {
 	defer s.worker.Done()
 	if s.probeStartupDelay > 0 {
@@ -1113,7 +1314,7 @@ func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound 
 	pinned, temporary, _, _ := s.controlSnapshot(now)
 	contextSelected := ""
 	if metadata != nil {
-		transport := N.NetworkName(metadata.Network)
+		transport := smartTransportKey(metadata.Network, metadata.Destination)
 		_, siteKey := resolveSmartSiteIdentity(s.families, metadata, metadata.Destination)
 		if transport != "" && siteKey != "" {
 			contextKey := smartSelectionKey(s.networkFingerprint(), siteKey, transport)
@@ -1305,7 +1506,7 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.noteTrafficActivity()
-	transport := N.NetworkName(network)
+	transport := smartTransportKey(network, destination)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
@@ -1332,16 +1533,26 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	}
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
+		observedTransport := result.observedTransport
+		if observedTransport == "" {
+			observedTransport = transport
+		}
 		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		observedStartedAt := time.Now().Add(-result.elapsed)
 		return newSmartObservedConnWithRetransmit(conn, observedStartedAt, func(firstByte time.Duration) {
-			s.store.observeFirstByte(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, firstByte)
+			s.observeMetricForTransport(networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, observedTransport, func(metricTransport string) {
+				s.store.observeFirstByte(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), metricTransport, firstByte)
+			})
 		}, func(bytes int64, duration time.Duration) {
-			s.store.observeThroughput(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, bytes, duration)
+			s.observeMetricForTransport(networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, observedTransport, func(metricTransport string) {
+				s.store.observeThroughput(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), metricTransport, bytes, duration)
+			})
 		}, func(ratio float64) {
-			s.store.observeRetransmit(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, ratio)
+			s.observeMetricForTransport(networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, observedTransport, func(metricTransport string) {
+				s.store.observeRetransmit(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), metricTransport, ratio)
+			})
 		}, func() {
 			// A stream can become unusable after DialContext succeeds (for
 			// example a stale multiplex session, a reset upstream socket, or
@@ -1349,7 +1560,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			// network/site/transport profile and wake the shared probe. The
 			// callback is coalesced once per connection by smartObservedConn.
 			s.streamFailureWakes.Add(1)
-			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, time.Since(observedStartedAt))
+			s.observeDialForTransport(time.Now(), networkKey, siteKey, candidate.Tag(), transport, observedTransport, false, time.Since(observedStartedAt))
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		}, s.establishedStallTimeout), nil
@@ -1402,6 +1613,7 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 	if s == nil || ctx.Err() != nil || s.closing.Load() || len(candidates) == 0 {
 		return false
 	}
+	baseTransport := smartTransportBase(transport)
 	now := time.Now()
 	next := s.recoveryProbeUntilUnixNano.Load()
 	if next > now.UnixNano() || !s.recoveryProbeUntilUnixNano.CompareAndSwap(next, now.Add(defaultSmartRecoveryProbeCooldown).UnixNano()) {
@@ -1409,7 +1621,7 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 	}
 	eligible := make([]adapter.Outbound, 0, len(candidates))
 	for _, candidate := range candidates {
-		if common.Contains(candidate.Network(), transport) {
+		if common.Contains(candidate.Network(), baseTransport) {
 			eligible = append(eligible, candidate)
 		}
 	}
@@ -1460,32 +1672,45 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 						identity = candidate.Tag()
 					}
 					key := metadata.probeKey
-					if transport == N.NetworkUDP {
-						key = smartProbeKey(identity, "udp://dns-health", probeTimeout)
+					if baseTransport == N.NetworkUDP {
+						probeIdentity := "udp://dns-health"
+						if family := smartTransportFamily(transport); family != "" {
+							probeIdentity += "/" + family
+						}
+						key = smartProbeKey(identity, probeIdentity, probeTimeout)
+					} else if probeFamily := smartTransportFamily(transport); probeFamily != "" {
+						key = smartProbeKey(identity, s.probeURL+"/"+transport, probeTimeout)
 					} else if key == "" {
 						key = smartProbeKey(identity, s.probeURL, probeTimeout)
 					}
 					var delay uint16
 					delay, err = s.probeRegistry.runRecoveryForEndpoint(probeCtx, identity, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
 						performed = true
-						if transport == N.NetworkUDP {
-							return 0, runSmartUDPHealthProbe(probeContext, candidate)
+						if baseTransport == N.NetworkUDP {
+							return 0, runSmartUDPHealthProbeForTransport(probeContext, candidate, transport)
+						}
+						if probeFamily := smartTransportFamily(transport); probeFamily != "" {
+							return urltest.URLTestWithNetwork(probeContext, s.probeURL, candidate, smartProbeNetwork(probeFamily))
 						}
 						return s.probeRegistry.probe(probeContext, s.probeURL, candidate)
 					})
-					if transport == N.NetworkUDP {
+					if baseTransport == N.NetworkUDP {
 						measured = time.Since(startedAt)
 					} else if err == nil {
 						measured = time.Duration(delay) * time.Millisecond
 					}
-				} else if transport == N.NetworkUDP {
+				} else if baseTransport == N.NetworkUDP {
 					performed = true
-					err = runSmartUDPHealthProbe(probeCtx, candidate)
+					err = runSmartUDPHealthProbeForTransport(probeCtx, candidate, transport)
 					measured = time.Since(startedAt)
 				} else {
 					performed = true
 					var delay uint16
-					delay, err = urltest.URLTest(probeCtx, s.probeURL, candidate)
+					if probeFamily := smartTransportFamily(transport); probeFamily != "" {
+						delay, err = urltest.URLTestWithNetwork(probeCtx, s.probeURL, candidate, smartProbeNetwork(probeFamily))
+					} else {
+						delay, err = urltest.URLTest(probeCtx, s.probeURL, candidate)
+					}
 					if err == nil {
 						measured = time.Duration(delay) * time.Millisecond
 					}
@@ -1565,7 +1790,11 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				conn.Close()
 				return
 			}
-			results <- smartDialResult{attempt: attempt, conn: conn, err: err, elapsed: elapsed}
+			result := smartDialResult{attempt: attempt, conn: conn, err: err, elapsed: elapsed}
+			if err == nil {
+				result.observedTransport = smartTransportKeyFromConn(network, destination, conn)
+			}
+			results <- result
 		}()
 	}
 
@@ -1656,6 +1885,9 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				continue
 			}
 			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+			if result.observedTransport != "" && result.observedTransport != transport {
+				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
+			}
 			result.hadPriorFailure = len(attemptErrors) > 0
 			cancelAll()
 			return result.conn, result, attemptErrors, true
@@ -1690,7 +1922,7 @@ func (s *Smart) smartHedgeDelay() time.Duration {
 
 func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.noteTrafficActivity()
-	transport := N.NetworkUDP
+	transport := smartTransportKey(N.NetworkUDP, destination)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
@@ -1745,7 +1977,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		adapter.NoteRealOutbound(ctx, candidate)
 		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex, attemptIndex > 0)
-		observed := newSmartObservedPacketConnWithWatchdog(conn, startedAt, smartUDPExpectsResponse(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
+		observed := newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, smartUDPExpectsResponse(destination), smartUDPRequiredResponsePackets(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
 			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
@@ -1765,6 +1997,19 @@ func smartUDPExpectsResponse(destination M.Socksaddr) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func smartUDPRequiredResponsePackets(destination M.Socksaddr) uint64 {
+	// DNS is a one-datagram transaction and must remain observable after one
+	// query. QUIC/STUN can legitimately spend their first packets on path
+	// validation or retransmission; requiring three datagrams before declaring a
+	// blackhole avoids turning a single lost packet into a node failover.
+	switch destination.Port {
+	case 443, 3478:
+		return 3
+	default:
+		return 1
 	}
 }
 
@@ -1822,22 +2067,29 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	if len(candidates) == 0 || s.closing.Load() {
 		return result, nil
 	}
-	if len(candidates) > 1 {
-		advance := 1
-		if budget > 0 && budget < len(candidates) {
-			advance = budget
+	if budget > 0 && len(candidates) > budget {
+		s.access.RLock()
+		useScoresAvailable := len(s.useScores) > 0
+		s.access.RUnlock()
+		if useScoresAvailable {
+			candidates = s.selectProbeCandidates(candidates, budget)
+		} else {
+			advance := budget
+			start := int(s.probeCursor.Add(uint64(advance))-uint64(advance)) % len(candidates)
+			candidates = append(candidates[start:], candidates[:start]...)
+			candidates = candidates[:budget]
 		}
+	} else if len(candidates) > 1 {
+		advance := 1
 		start := int(s.probeCursor.Add(uint64(advance))-uint64(advance)) % len(candidates)
 		candidates = append(candidates[start:], candidates[:start]...)
-	}
-	if budget > 0 && len(candidates) > budget {
-		candidates = candidates[:budget]
 	}
 	type probeResult struct {
 		candidate adapter.Outbound
 		delay     uint16
 		err       error
 		penalize  bool
+		families  []smartTCPProbeFamilyResult
 		// performed is false for a registry cache hit.  Cached answers are
 		// usable for the caller, but must not be counted as fresh evidence.
 		performed bool
@@ -1887,8 +2139,9 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 					cancel()
 					performed = true
 				}
+				families := s.probeTCPFamilies(ctx, candidate, metadata)
 				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
-				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize, performed: performed}
+				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize, performed: performed, families: families}
 			}
 		}()
 	}
@@ -1907,8 +2160,34 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 			if probe.performed {
 				summary.performed++
 			}
-			if probe.err != nil {
+			familySuccess := uint16(0)
+			familyPerformed := false
+			for _, family := range probe.families {
+				if family.performed {
+					familyPerformed = true
+				}
+				if family.err == nil && family.performed {
+					if familySuccess == 0 || family.delay < familySuccess {
+						familySuccess = family.delay
+					}
+					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
+					elapsed := family.elapsed
+					if family.delay > 0 {
+						elapsed = time.Duration(family.delay) * time.Millisecond
+					}
+					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, true, elapsed)
+				} else if family.err != nil && family.performed {
+					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
+					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, false, family.elapsed)
+				}
+			}
+			if probe.err != nil && familySuccess == 0 {
 				continue
+			}
+			if probe.err != nil && familySuccess > 0 {
+				probe.delay = familySuccess
+				probe.err = nil
+				probe.performed = familyPerformed
 			}
 			result[probe.candidate.Tag()] = probe.delay
 			if !probe.performed {
@@ -1918,6 +2197,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 			if s.closing.Load() {
 				continue
 			}
+			s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
 			s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
 			if !published {
 				// The first successful basic probe makes a cold group usable while
@@ -1969,6 +2249,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 				metadata = s.buildCandidateMetadata(probe.candidate.Tag(), "")
 			}
 			if s.probeRegistry == nil || s.probeRegistry.dead(metadata.probeKey) {
+				s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
 				s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
 			}
 		}
@@ -1993,16 +2274,83 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	return result, ctx.Err()
 }
 
-type smartUDPProbeResult struct {
-	candidate adapter.Outbound
+type smartUDPProbeFamilyResult struct {
+	transport string
 	elapsed   time.Duration
 	err       error
 	performed bool
 }
 
-var smartUDPProbeTargets = [...]M.Socksaddr{
-	M.ParseSocksaddr("1.1.1.1:53"),
-	M.ParseSocksaddr("8.8.8.8:53"),
+type smartTCPProbeFamilyResult struct {
+	transport string
+	delay     uint16
+	elapsed   time.Duration
+	err       error
+	performed bool
+}
+
+func (s *Smart) probeTCPFamilies(ctx context.Context, candidate adapter.Outbound, metadata smartCandidateMetadata) []smartTCPProbeFamilyResult {
+	if s == nil || !s.familyProbeEnabled || ctx.Err() != nil || s.closing.Load() {
+		return nil
+	}
+	identity := metadata.identity
+	if identity == "" {
+		identity = candidate.Tag()
+	}
+	probeTimeout := s.probeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = defaultSmartProbeTimeout
+	}
+	results := make([]smartTCPProbeFamilyResult, 0, 2)
+	for _, family := range []struct {
+		transport string
+	}{
+		{transport: "tcp/ipv4"},
+		{transport: "tcp/ipv6"},
+	} {
+		key := smartProbeKey(identity, s.probeURL+"/"+family.transport, probeTimeout)
+		startedAt := time.Now()
+		var (
+			delay     uint16
+			err       error
+			performed bool
+		)
+		if s.probeRegistry != nil {
+			delay, err, performed = s.probeRegistry.runProbeMode(ctx, identity, key, probeTimeout, s.probeInterval, false, func(probeContext context.Context) (uint16, error) {
+				performed = true
+				return urltest.URLTestWithNetwork(probeContext, s.probeURL, candidate, smartProbeNetwork(smartTransportFamily(family.transport)))
+			})
+		} else {
+			performed = true
+			testCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			delay, err = urltest.URLTestWithNetwork(testCtx, s.probeURL, candidate, smartProbeNetwork(smartTransportFamily(family.transport)))
+			cancel()
+		}
+		if err == nil && delay == 0 {
+			delay = uint16(time.Since(startedAt) / time.Millisecond)
+		}
+		results = append(results, smartTCPProbeFamilyResult{transport: family.transport, delay: delay, elapsed: time.Since(startedAt), err: err, performed: performed})
+	}
+	return results
+}
+
+type smartUDPProbeResult struct {
+	candidate    adapter.Outbound
+	elapsed      time.Duration
+	err          error
+	performed    bool
+	freshSuccess bool
+	families     []smartUDPProbeFamilyResult
+}
+
+type smartUDPProbeTarget struct {
+	transport   string
+	destination M.Socksaddr
+}
+
+var smartUDPProbeTargets = [...]smartUDPProbeTarget{
+	{transport: "udp/ipv4", destination: M.ParseSocksaddr("1.1.1.1:53")},
+	{transport: "udp/ipv6", destination: M.ParseSocksaddr("[2606:4700:4700::1111]:53")},
 }
 
 func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Outbound, budget int) {
@@ -2039,29 +2387,62 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 			startedAt := time.Now()
 			performed := false
 			var err error
-			if s.probeRegistry != nil {
-				s.access.RLock()
-				metadata := s.candidateMetadataByTag[candidate.Tag()]
-				s.access.RUnlock()
-				identity := metadata.identity
-				if identity == "" {
-					identity = candidate.Tag()
+			freshSuccess := false
+			aggregateElapsed := time.Duration(0)
+			aggregateSuccess := false
+			families := make([]smartUDPProbeFamilyResult, 0, len(smartUDPProbeTargets))
+			s.access.RLock()
+			metadata := s.candidateMetadataByTag[candidate.Tag()]
+			s.access.RUnlock()
+			identity := metadata.identity
+			if identity == "" {
+				identity = candidate.Tag()
+			}
+			probeTimeout := s.probeTimeout
+			if probeTimeout <= 0 {
+				probeTimeout = defaultSmartUDPProbeTimeout
+			}
+			for _, target := range smartUDPProbeTargets {
+				familyStarted := time.Now()
+				familyPerformed := false
+				var familyErr error
+				key := smartProbeKey(identity, "udp://dns-health/"+target.transport, probeTimeout)
+				if s.probeRegistry != nil {
+					_, familyErr, familyPerformed = s.probeRegistry.runProbeMode(probeCtx, identity, key, probeTimeout, s.probeInterval, false, func(probeContext context.Context) (uint16, error) {
+						familyPerformed = true
+						return 0, runSmartUDPHealthProbeTarget(probeContext, candidate, target.destination)
+					})
+				} else {
+					familyPerformed = true
+					familyErr = runSmartUDPHealthProbeTarget(probeCtx, candidate, target.destination)
 				}
-				probeTimeout := s.probeTimeout
-				if probeTimeout <= 0 {
-					probeTimeout = defaultSmartUDPProbeTimeout
-				}
-				key := smartProbeKey(identity, "udp://dns-health", probeTimeout)
-				_, err = s.probeRegistry.runProbeForEndpoint(probeCtx, identity, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
+				familyElapsed := time.Since(familyStarted)
+				families = append(families, smartUDPProbeFamilyResult{transport: target.transport, elapsed: familyElapsed, err: familyErr, performed: familyPerformed})
+				if familyPerformed {
 					performed = true
-					return 0, runSmartUDPHealthProbe(probeContext, candidate)
-				})
-			} else {
-				performed = true
-				err = runSmartUDPHealthProbe(probeCtx, candidate)
+				}
+				if familyErr == nil {
+					aggregateSuccess = true
+					if aggregateElapsed == 0 || familyElapsed < aggregateElapsed {
+						aggregateElapsed = familyElapsed
+					}
+					if familyPerformed {
+						freshSuccess = true
+					}
+				} else if err == nil {
+					err = familyErr
+				}
+			}
+			if aggregateSuccess {
+				err = nil
+			} else if !performed && err == nil {
+				err = errSharedSmartProbeDeferred
 			}
 			cancel()
-			results <- smartUDPProbeResult{candidate: candidate, elapsed: time.Since(startedAt), err: err, performed: performed}
+			if aggregateElapsed == 0 {
+				aggregateElapsed = time.Since(startedAt)
+			}
+			results <- smartUDPProbeResult{candidate: candidate, elapsed: aggregateElapsed, err: err, performed: performed, freshSuccess: freshSuccess, families: families}
 		}
 	}()
 dispatch:
@@ -2077,65 +2458,74 @@ dispatch:
 	close(results)
 
 	networkKey := s.networkFingerprint()
-	completed := make([]smartUDPProbeResult, 0, len(udpCandidates))
 	for result := range results {
 		if s.closing.Load() || ctx.Err() != nil {
 			return
 		}
-		completed = append(completed, result)
-		if result.err == nil {
-			// A shared successful probe is valid evidence for every Smart group
-			// waiting on the same canonical endpoint.  Record it locally even when
-			// this caller was not the registry owner; only failures are owner-only
-			// so a single outage does not multiply breaker penalties.
-			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+		for _, family := range result.families {
+			if family.err == nil && family.performed {
+				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, true, family.elapsed)
+			} else if family.err != nil && family.performed {
+				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, false, family.elapsed)
+			}
 		}
-	}
-	for _, result := range completed {
-		if result.err != nil && result.performed {
-			// Probe failures are advisory evidence. They are recorded in a
-			// dedicated low-weight site so a filtered public DNS target cannot
-			// hard-open the endpoint, while repeated real UDP failures still use
-			// the normal transport breaker.
-			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, false, result.elapsed)
+		if result.err == nil && result.freshSuccess {
+			// Keep an aggregate UDP ledger for domain destinations that have not
+			// selected a concrete address family yet.
+			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
 		}
 	}
 }
 
 func runSmartUDPHealthProbe(ctx context.Context, candidate adapter.Outbound) error {
-	query, id, question, err := buildSmartDNSHealthQuery()
-	if err != nil {
-		return err
-	}
 	for _, target := range smartUDPProbeTargets {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		packetConn, err := candidate.ListenPacket(ctx, target)
-		if err != nil {
-			continue
-		}
-		deadline := time.Now().Add(defaultSmartUDPProbeTimeout)
-		if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
-			deadline = contextDeadline
-		}
-		if err = packetConn.SetDeadline(deadline); err == nil {
-			_, err = packetConn.WriteTo(query, target.UDPAddr())
-		}
-		if err == nil {
-			response := make([]byte, 2048)
-			var count int
-			count, _, err = packetConn.ReadFrom(response)
-			if err == nil {
-				err = validateSmartDNSHealthResponse(response[:count], id, question)
-			}
-		}
-		_ = packetConn.Close()
-		if err == nil {
+		if err := runSmartUDPHealthProbeTarget(ctx, candidate, target.destination); err == nil {
 			return nil
 		}
 	}
 	return errors.New("smart UDP DNS health probe failed")
+}
+
+func runSmartUDPHealthProbeForTransport(ctx context.Context, candidate adapter.Outbound, transport string) error {
+	if family := smartTransportFamily(transport); family != "" {
+		for _, target := range smartUDPProbeTargets {
+			if target.transport == transport {
+				return runSmartUDPHealthProbeTarget(ctx, candidate, target.destination)
+			}
+		}
+	}
+	return runSmartUDPHealthProbe(ctx, candidate)
+}
+
+func runSmartUDPHealthProbeTarget(ctx context.Context, candidate adapter.Outbound, target M.Socksaddr) error {
+	query, id, question, err := buildSmartDNSHealthQuery()
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	packetConn, err := candidate.ListenPacket(ctx, target)
+	if err != nil {
+		return err
+	}
+	defer packetConn.Close()
+	deadline := time.Now().Add(defaultSmartUDPProbeTimeout)
+	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err = packetConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err = packetConn.WriteTo(query, target.UDPAddr()); err != nil {
+		return err
+	}
+	response := make([]byte, 2048)
+	count, _, err := packetConn.ReadFrom(response)
+	if err != nil {
+		return err
+	}
+	return validateSmartDNSHealthResponse(response[:count], id, question)
 }
 
 func buildSmartDNSHealthQuery() ([]byte, uint16, dnsmessage.Question, error) {
@@ -2202,6 +2592,20 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	}
 }
 
+func (s *Smart) observeDialForTransport(now time.Time, network, site, candidate, aggregateTransport, observedTransport string, success bool, elapsed time.Duration) {
+	s.observeDial(now, network, site, candidate, aggregateTransport, success, elapsed)
+	if observedTransport != "" && observedTransport != aggregateTransport {
+		s.observeDial(now, network, site, candidate, observedTransport, success, elapsed)
+	}
+}
+
+func (s *Smart) observeMetricForTransport(network, site, candidate, aggregateTransport, observedTransport string, observe func(string)) {
+	observe(aggregateTransport)
+	if observedTransport != "" && observedTransport != aggregateTransport {
+		observe(observedTransport)
+	}
+}
+
 // candidateProfileID maps provider display tags to the canonical endpoint
 // identity. Subscription copies such as "JP 1" and "JP 2" therefore share
 // one health portrait in the Go store as well as in the Zig policy backend.
@@ -2222,6 +2626,7 @@ func (s *Smart) candidateProfileID(candidate string) string {
 
 func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.Socksaddr) (*smartRanking, string, string, string) {
 	now := time.Now()
+	baseTransport := smartTransportBase(transport)
 	pinned, temporary, _, _ := s.controlSnapshot(now)
 	networkKey := s.networkFingerprint()
 	siteDisplay, siteKey := s.resolveSmartSiteIdentity(adapter.ContextFrom(ctx), destination)
@@ -2246,11 +2651,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		policyIDs = make(map[uint64]struct{}, len(ranking.candidates))
 	}
 	profile := smartProfileInteractive
-	if transport == N.NetworkUDP {
+	if baseTransport == N.NetworkUDP {
 		profile = smartProfileUDP
 	}
 	for _, candidate := range ranking.candidates {
-		if !common.Contains(candidate.Network(), transport) {
+		if !common.Contains(candidate.Network(), baseTransport) {
 			continue
 		}
 		metadata, ok := metadataByTag[candidate.Tag()]
@@ -2259,7 +2664,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 		estimate := s.store.estimate(now, networkKey, siteKey, metadata.profileID, transport, s.minSamples)
 		scoreEstimate := estimate
-		if transport == N.NetworkTCP && estimate.HasRetransmit {
+		if baseTransport == N.NetworkTCP && estimate.HasRetransmit {
 			// Surge models TCP loss as an additive latency penalty. Keep the raw
 			// ratio visible in status, but feed the same bounded penalty to both
 			// host and Zig scoring paths so the policy backend cannot ignore it.
@@ -2271,7 +2676,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 		sharedProbeDead := false
 		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
-			sharedProbeDead = s.probeRegistry.dead(metadata.probeKey)
+			probeKey := metadata.probeKey
+			if family := smartTransportFamily(transport); family != "" {
+				probeKey = smartProbeKey(metadata.identity, s.probeURL+"/"+family, s.probeTimeout)
+			}
+			sharedProbeDead = s.probeRegistry.dead(probeKey)
 		}
 		if sharedProbeDead {
 			estimate.State = "open"
@@ -2601,6 +3010,12 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 		}
 	}
 	s.access.Unlock()
+	// Surge's use score describes TCP policy usage.  A UDP success is a
+	// separate health ledger and must not make a candidate look more popular
+	// for TCP background testing.
+	if smartTransportBase(transport) == N.NetworkTCP {
+		s.noteCandidateUse(candidate.Tag(), now)
+	}
 	if len(ranks) > 0 && ready >= min(2, len(ranks)) {
 		s.setPhase(smartPhaseSteady)
 	} else if ready > 0 {
@@ -2850,6 +3265,104 @@ func (s *Smart) confirmSwitchChallenge(key, candidate string, now time.Time) boo
 
 func smartSelectionKey(networkKey, siteKey, transport string) string {
 	return networkKey + "\x00" + siteKey + "\x00" + transport
+}
+
+// smartTransportKey preserves the address family when the caller already
+// knows it. sing's NetworkName intentionally normalizes tcp4/tcp6 and udp4/
+// udp6 for protocol dispatch, but Smart must not merge those observations into
+// one health ledger. Domain destinations without an explicit family retain
+// the legacy aggregate key until a concrete family is available.
+func smartTransportKey(network string, destination M.Socksaddr) string {
+	base := N.NetworkName(network)
+	if family := smartNetworkFamily(network, destination); family != "" {
+		return base + "/" + family
+	}
+	return base
+}
+
+func smartNetworkFamily(network string, destination M.Socksaddr) string {
+	switch network {
+	case N.NetworkTCP + "4", N.NetworkUDP + "4":
+		return "ipv4"
+	case N.NetworkTCP + "6", N.NetworkUDP + "6":
+		return "ipv6"
+	}
+	switch {
+	case destination.IsIPv4():
+		return "ipv4"
+	case destination.IsIPv6():
+		return "ipv6"
+	default:
+		return ""
+	}
+}
+
+func smartTransportBase(transport string) string {
+	switch {
+	case strings.HasSuffix(transport, "/ipv4"), strings.HasSuffix(transport, "/ipv6"):
+		return transport[:strings.LastIndexByte(transport, '/')]
+	default:
+		return N.NetworkName(transport)
+	}
+}
+
+func smartTransportKeyFromConn(network string, destination M.Socksaddr, conn net.Conn) string {
+	key := smartTransportKey(network, destination)
+	if smartTransportFamily(key) != "" || conn == nil {
+		return key
+	}
+	remote := conn.RemoteAddr()
+	family := smartRemoteAddrFamily(remote)
+	if family == "" {
+		return key
+	}
+	return N.NetworkName(network) + "/" + family
+}
+
+func smartTransportFamily(transport string) string {
+	switch {
+	case strings.HasSuffix(transport, "/ipv4"):
+		return "ipv4"
+	case strings.HasSuffix(transport, "/ipv6"):
+		return "ipv6"
+	default:
+		return ""
+	}
+}
+
+func smartProbeNetwork(family string) string {
+	switch family {
+	case "ipv4":
+		return N.NetworkTCP + "4"
+	case "ipv6":
+		return N.NetworkTCP + "6"
+	default:
+		return N.NetworkTCP
+	}
+}
+
+func smartRemoteAddrFamily(address net.Addr) string {
+	switch value := address.(type) {
+	case *net.TCPAddr:
+		if value.IP != nil {
+			if value.IP.To4() != nil {
+				return "ipv4"
+			}
+			if value.IP.To16() != nil {
+				return "ipv6"
+			}
+		}
+	case *net.UDPAddr:
+		if value.IP != nil {
+			if value.IP.To4() != nil {
+				return "ipv4"
+			}
+			if value.IP.To16() != nil {
+				return "ipv6"
+			}
+		}
+	}
+	return ""
 }
 
 func smartConnectionKey(networkKey, siteKey, transport, candidate string) string {
@@ -3676,13 +4189,15 @@ func isSmartStreamFailure(err error) bool {
 // smartObservedPacketConn turns real transactional UDP blackholes into Smart
 // node evidence. It deliberately ignores one-way UDP and idle timeouts after
 // any response, so telemetry and long-lived QUIC sessions are not penalized.
-// A response watchdog is armed by the first successful write for protocols
-// that require a reply (DNS, QUIC and STUN). This closes the old gap where a
-// half-open UDP/QUIC flow was only reported when its owner happened to close.
+// A response watchdog is armed after the protocol-specific write threshold
+// (one DNS query, three QUIC/STUN datagrams). This closes the old gap where a
+// half-open UDP/QUIC flow was only reported when its owner happened to close,
+// without treating one lost handshake packet as a dead node.
 type smartObservedPacketConn struct {
 	net.PacketConn
 	startedAt          time.Time
 	expectResponse     bool
+	requiredPackets    uint64
 	watchdogTimeout    time.Duration
 	writePackets       atomic.Uint64
 	readPackets        atomic.Uint64
@@ -3701,10 +4216,18 @@ func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expect
 }
 
 func newSmartObservedPacketConnWithWatchdog(conn net.PacketConn, startedAt time.Time, expectResponse bool, watchdogTimeout time.Duration, onNoResponse func(time.Duration)) net.PacketConn {
+	return newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, expectResponse, 1, watchdogTimeout, onNoResponse)
+}
+
+func newSmartObservedPacketConnWithWatchdogThreshold(conn net.PacketConn, startedAt time.Time, expectResponse bool, requiredPackets uint64, watchdogTimeout time.Duration, onNoResponse func(time.Duration)) net.PacketConn {
+	if requiredPackets == 0 {
+		requiredPackets = 1
+	}
 	base := &smartObservedPacketConn{
 		PacketConn:      conn,
 		startedAt:       startedAt,
 		expectResponse:  expectResponse,
+		requiredPackets: requiredPackets,
 		watchdogTimeout: watchdogTimeout,
 		onNoResponse:    onNoResponse,
 	}
@@ -3731,8 +4254,10 @@ func (c *smartObservedPacketConn) observeRead(count int) {
 
 func (c *smartObservedPacketConn) observeWrite(count int) {
 	if count > 0 {
-		c.writePackets.Add(1)
-		c.armWatchdog()
+		packets := c.writePackets.Add(1)
+		if packets >= c.requiredPackets {
+			c.armWatchdog()
+		}
 	}
 }
 
@@ -3758,7 +4283,7 @@ func (c *smartObservedPacketConn) Close() error {
 		c.closed.Store(true)
 		c.stopWatchdog()
 		elapsed := time.Since(c.startedAt)
-		if c.expectResponse && c.writePackets.Load() > 0 && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
+		if c.expectResponse && c.writePackets.Load() >= c.requiredPackets && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
 			c.notifyNoResponse(elapsed)
 		}
 	})
@@ -3766,7 +4291,7 @@ func (c *smartObservedPacketConn) Close() error {
 }
 
 func (c *smartObservedPacketConn) armWatchdog() {
-	if !c.expectResponse || c.watchdogTimeout <= 0 || c.closed.Load() {
+	if !c.expectResponse || c.watchdogTimeout <= 0 || c.closed.Load() || c.writePackets.Load() < c.requiredPackets {
 		return
 	}
 	c.watchdogAccess.Lock()

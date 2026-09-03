@@ -133,8 +133,9 @@ fn healthTier(state: u8) u8 {
     return switch (state) {
         1 => 0, // healthy
         2, 0 => 1, // warming/unknown
-        3 => 2, // suspect/half-open
-        4 => 3, // defensive: open is filtered above
+        3 => 2, // suspect
+        5 => 3, // half-open: usable only for a bounded recovery trial
+        4 => 4, // defensive: open is filtered above
         else => 2,
     };
 }

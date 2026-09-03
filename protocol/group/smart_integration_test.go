@@ -654,6 +654,33 @@ func TestSmartTransactionalUDPWatchdogReportsInFlightBlackhole(t *testing.T) {
 	}
 }
 
+func TestSmartQUICWatchdogWaitsForHandshakeDatagrams(t *testing.T) {
+	var failures atomic.Int64
+	conn := newSmartObservedPacketConnWithWatchdogThreshold(&smartObservedTestPacketConn{}, time.Now(), true, 3, 20*time.Millisecond, func(time.Duration) {
+		failures.Add(1)
+	})
+	for range 2 {
+		if _, err := conn.WriteTo([]byte("quic"), &net.UDPAddr{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if failures.Load() != 0 {
+		t.Fatalf("QUIC watchdog fired before the handshake packet threshold: %d", failures.Load())
+	}
+	if _, err := conn.WriteTo([]byte("quic"), &net.UDPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for failures.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("QUIC watchdog count=%d, want one after three datagrams", failures.Load())
+	}
+	_ = conn.Close()
+}
+
 func TestSmartUDPResponseAndOneWayTrafficDoNotFail(t *testing.T) {
 	for _, test := range []struct {
 		name           string

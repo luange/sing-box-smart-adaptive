@@ -79,17 +79,28 @@ func (s *HistoryStorage) Close() error {
 }
 
 func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	return URLTestWithNetwork(ctx, link, detour, N.NetworkTCP)
+}
+
+// URLTestWithNetwork is the family-aware variant used by Smart's bounded
+// profile worker. The default URLTest contract remains unchanged; tcp4/tcp6
+// are passed through to the dialer so the probe measures the selected address
+// family instead of copying a dual-stack result into both ledgers.
+func URLTestWithNetwork(ctx context.Context, link string, detour N.Dialer, network string) (uint16, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		network = N.NetworkTCP
+	}
 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
-		_, err := urlTest(ctx, link, detour)
+		_, err := urlTest(ctx, link, detour, network)
 		if err != nil {
 			return 0, err
 		}
 	}
-	return urlTest(ctx, link, detour)
+	return urlTest(ctx, link, detour, network)
 }
 
-func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+func urlTest(ctx context.Context, link string, detour N.Dialer, network string) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -109,7 +120,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	instance, err := detour.DialContext(ctx, network, M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
 		return
 	}

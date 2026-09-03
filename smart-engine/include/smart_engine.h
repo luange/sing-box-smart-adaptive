@@ -23,7 +23,7 @@ typedef struct {
     double throughput_bps;
     double samples;
     double weight;
-    uint8_t state; /* 0 unknown, 1 healthy, 2 warming, 3 suspect, 4 open */
+    uint8_t state; /* 0 unknown, 1 healthy, 2 warming, 3 suspect, 4 open, 5 half-open */
     uint8_t eligible; /* non-zero means the host permits selection */
 } smart_candidate;
 
