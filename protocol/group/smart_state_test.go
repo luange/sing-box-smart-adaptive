@@ -423,18 +423,46 @@ func TestSmartRetransmitEvidenceIsScopedAndDecayed(t *testing.T) {
 	}
 }
 
-func TestSmartCoarseAffinityOnlyHashesNearTies(t *testing.T) {
-	smart := &Smart{switchMargin: 0.15}
-	ranks := make([]smartRank, 20)
-	for index := range ranks {
-		ranks[index].eligible = true
-		ranks[index].status.Score = 0.40
+func TestSmartSelectionModeDefaultsAndAliases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  smartSelectionMode
+	}{
+		{input: "", want: smartSelectionPrimaryBackup},
+		{input: "primary_backup", want: smartSelectionPrimaryBackup},
+		{input: "primary-backup", want: smartSelectionPrimaryBackup},
+		{input: "balanced", want: smartSelectionBalanced},
+		{input: "random", want: smartSelectionBalanced},
 	}
-	ranks[19].status.Score = 0.90
-	first := smart.coarseAffinityIndex(ranks, "network\x00example.com\x00tcp")
-	second := smart.coarseAffinityIndex(ranks, "network\x00example.com\x00tcp")
-	if first < 0 || first != second || first == 19 {
-		t.Fatalf("coarse affinity was not stable and near-tie bounded: first=%d second=%d", first, second)
+	for _, test := range tests {
+		got, err := normalizeSmartSelectionMode(test.input)
+		if err != nil || got != test.want {
+			t.Fatalf("normalizeSmartSelectionMode(%q) = %v, %v; want %v, nil", test.input, got, err, test.want)
+		}
+	}
+	if _, err := normalizeSmartSelectionMode("latency_race"); err == nil {
+		t.Fatal("invalid selection mode was accepted")
+	}
+}
+
+func TestSmartBalancedAffinityIsStableAndHealthBounded(t *testing.T) {
+	smart := &Smart{switchMargin: 0.15}
+	ranks := []smartRank{
+		{identity: "endpoint-a", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.40}},
+		{identity: "endpoint-b", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.42}},
+		{identity: "endpoint-c", eligible: true, status: adapter.SmartCandidateStatus{State: "suspect", Score: 0.10}},
+	}
+	first := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
+	second := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
+	if first < 0 || first != second || first == 2 {
+		t.Fatalf("balanced affinity was not stable and health bounded: first=%d second=%d", first, second)
+	}
+	if got := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got != 1 {
+		t.Fatalf("healthy incumbent was not retained in balanced pool: got=%d", got)
+	}
+	ranks[1].eligible = false
+	if got := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got == 1 || got < 0 {
+		t.Fatalf("failed incumbent was retained by balanced affinity: got=%d", got)
 	}
 }
 

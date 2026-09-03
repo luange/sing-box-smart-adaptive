@@ -166,3 +166,16 @@ registry keys and the same endpoint lock. No synthetic data-UDP/QUIC payload is
 introduced; arbitrary proxy protocols do not share a portable application-level
 health request, so real response/write failures remain the authoritative data
 evidence.
+
+### Surge-compatible selection modes (2026-09-03)
+
+The public Smart option `selection_mode` now exposes the deliberate policy
+choice that was previously implicit. `primary_backup` (the default) preserves
+health-tier ordering, confirmation, cooldown and hard-failure failover.
+`balanced` uses stable rendezvous hashing over each network/site/transport
+context, restricted to the best health tier and configured score margin. This
+provides Surge-like same-tier dispersion without per-connection randomness or
+keep-alive churn; an incumbent remains selected while it stays inside the
+pool. The `random` value is accepted only as a backwards-readable alias for
+`balanced`. Balanced mode is host-side and skips the optional Zig decision
+engine, keeping the policy portable and avoiding a new ABI revision.

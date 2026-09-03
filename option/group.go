@@ -50,7 +50,11 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL               string             `json:"url,omitempty"`
+	URL string `json:"url,omitempty"`
+	// SelectionMode controls how Smart chooses among similarly healthy lines.
+	// primary_backup is the conservative default; balanced uses a stable
+	// context hash to spread different services without per-connection churn.
+	SelectionMode     string             `json:"selection_mode,omitempty"`
 	ProbeInterval     badoption.Duration `json:"probe_interval,omitempty"`
 	ProbeCycleTimeout badoption.Duration `json:"probe_cycle_timeout,omitempty"`
 	ProbeTimeout      badoption.Duration `json:"probe_timeout,omitempty"`

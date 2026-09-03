@@ -56,6 +56,12 @@ route/conn.go         dial 后 learn/splice 钩子（自有增量）
 | 观测 | dial/字节 | epoch + 业务观测 |
 | 网关透明 | 适合 | 完整 L4，不抢 PreMatch |
 
+Smart 选路模式只有一个显式开关：`selection_mode`。省略或设为
+`primary_backup` 时按健康档、确认窗口和冷却保持主节点，故障才提升备节点；
+设为 `balanced`（`random` 仅是兼容别名）时，在同一健康档和正常分数窗口内按
+network/site/transport 做稳定分散。它不是每条连接真随机，因此不会破坏长连接；
+健康恶化仍立即触发备节点接管。
+
 ## 构建 tags
 
 生产网关示例见根目录 `README.md`。缺少 `with_ebpf` 则无 TC/maps；缺少 `with_connection_history` 则无 `/history`。

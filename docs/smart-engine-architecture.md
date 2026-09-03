@@ -48,7 +48,7 @@ next new connection; the normal bounded candidate list then provides the
 failover opportunity. Service-local throughput takes precedence over global
 history, so a slow YouTube path cannot be hidden by unrelated traffic.
 
-## Phased startup and coarse stability
+## Phased startup and stable selection
 
 Smart does not block the first user connection on a full candidate test. The
 worker moves through `cold` → `baseline` → `profiling` → `steady`: the first
@@ -60,20 +60,38 @@ delay is shortened to 250 ms so a bad first guess is abandoned quickly without
 starting a full parallel probe storm; a well-sampled steady path keeps the
 longer delay to protect keep-alive traffic.
 
-Large provider groups automatically use a stable hash only among candidates
-inside the normal quality margin. This gives coarse consistent-hashing behavior
-for users who do not need per-service affinity, while never selecting a
-materially slower candidate merely for stickiness. Small groups retain the
-service/site affinity path. Selection timestamps expire with site stickiness,
-so an idle path cannot remain pinned forever.
+Operators that need an explicit policy choice can set `selection_mode` on a
+Smart outbound. The default `primary_backup` keeps the health-tiered Zig/Go
+confirmation and cooldown state: the first eligible line is primary and the
+remaining lines are ordered backups. `balanced` moves the final choice to a
+host-neutral rendezvous hash over the network/site/transport context, limited
+to the best health tier and normal score margin. It therefore spreads
+independent services across near-tied lines like Surge's intra-tier shuffle,
+while retaining the incumbent for that context and failing over immediately
+when it becomes unhealthy. The accepted `random` spelling is only an alias;
+the implementation is deliberately stable per context, not random per dial.
+Balanced mode does not allocate a Zig policy engine, so the same adapter can
+be reused by future sing-box or mihomo hosts without adding an ABI field.
+
+Example:
+
+```json
+{
+  "type": "smart",
+  "tag": "media-smart",
+  "outbounds": ["hk-1", "jp-1", "sg-1"],
+  "selection_mode": "balanced"
+}
+```
 
 The normal configuration does not require any of these policy details: a Smart
 group with only `outbounds`/`providers` uses the built-in probe budget, phase
 transitions, margins, confirmation and cooldown defaults. Advanced fields remain
-compatibility overrides for operators who already use them; the coarse hash and
-staged startup are intentionally internal so a new deployment does not need to
-guess a “correct” tuning value. When the Zig policy backend is enabled it keeps
-ownership of the decision state, and the host hash never short-circuits it.
+compatibility overrides for operators who already use them; the staged startup
+is intentionally internal so a new deployment does not need to guess a
+“correct” tuning value. When `primary_backup` is selected, the Zig policy
+backend owns the confirmation state; `balanced` keeps that policy in the host
+adapter so it remains portable.
 
 On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
 bounded retransmitted-byte ratio. It contributes an additive latency penalty

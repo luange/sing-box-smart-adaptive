@@ -110,10 +110,39 @@ const (
 	// not for overriding health ranking. Keep the decay implicit and bounded so
 	// it cannot become another long-lived per-site state table.
 	smartUseScoreDecayWindow = 2 * time.Hour
-	// Large provider groups use a coarse near-tie hash automatically. This is
-	// deliberately internal: most users should not need to tune stickiness.
-	smartCoarseAffinityThreshold = 16
 )
+
+// smartSelectionMode is intentionally a small public policy switch. The
+// balanced mode is pseudo-random only at the context level (network + site +
+// transport); it never chooses a different line for every connection. That
+// gives Surge-like dispersion while preserving keep-alive and failure
+// semantics.
+type smartSelectionMode uint8
+
+const (
+	smartSelectionPrimaryBackup smartSelectionMode = iota
+	smartSelectionBalanced
+)
+
+func normalizeSmartSelectionMode(value string) (smartSelectionMode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "primary_backup", "primary-backup":
+		return smartSelectionPrimaryBackup, nil
+	case "balanced", "random":
+		// "random" is accepted as a readable alias, but the implementation is
+		// deliberately stable per selection context rather than per dial.
+		return smartSelectionBalanced, nil
+	default:
+		return smartSelectionPrimaryBackup, E.New("invalid smart selection_mode: ", value, " (want primary_backup or balanced)")
+	}
+}
+
+func (m smartSelectionMode) String() string {
+	if m == smartSelectionBalanced {
+		return "balanced"
+	}
+	return "primary_backup"
+}
 
 // smartPhase makes cold-start behavior explicit.  A group is usable from the
 // first successful dial/basic probe; only the later profiling and steady
@@ -373,6 +402,7 @@ type Smart struct {
 	maxAttempts                int
 	attemptTimeout             time.Duration
 	establishedStallTimeout    time.Duration
+	selectionMode              smartSelectionMode
 	siteStickiness             time.Duration
 	switchConfirm              time.Duration
 	switchConfirmSamples       int
@@ -448,6 +478,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	probeURL := normalizeSmartProbeURL(options.URL)
 	if probeURL != options.URL && logger != nil {
 		logger.Warn("smart probe URL uses a recursive DNS hostname; using bootstrap-safe probe endpoint")
+	}
+	selectionMode, err := normalizeSmartSelectionMode(options.SelectionMode)
+	if err != nil {
+		return nil, err
 	}
 	probeInterval := time.Duration(options.ProbeInterval)
 	if probeInterval <= 0 {
@@ -597,15 +631,23 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
-	policyBackend := newSmartPolicyBackend(smartPolicyBackendConfig{
-		Exploration: exploration, SwitchMargin: switchMargin,
-		SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
-		SwitchCooldown: switchCooldown.Milliseconds(),
-	})
-	if policyBackend == nil && logger != nil {
-		logger.Warn("smart policy backend unavailable; using reference Go policy")
-	} else if policyBackend != nil && logger != nil {
-		logger.Info("smart policy backend: zig")
+	var policyBackend smartPolicyBackend
+	if selectionMode == smartSelectionPrimaryBackup {
+		policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
+			Exploration: exploration, SwitchMargin: switchMargin,
+			SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
+			SwitchCooldown: switchCooldown.Milliseconds(),
+		})
+		if policyBackend == nil && logger != nil {
+			logger.Warn("smart policy backend unavailable; using reference Go policy")
+		} else if policyBackend != nil && logger != nil {
+			logger.Info("smart policy backend: zig")
+		}
+	} else if logger != nil {
+		// Balanced selection is owned by the host adapter so it can remain
+		// portable across sing-box and future mihomo adapters. Avoid allocating
+		// one Zig engine per context when the backend is intentionally bypassed.
+		logger.Info("smart selection mode: ", selectionMode.String())
 	}
 	probeRegistry, releaseProbeRegistry := acquireSmartProbeRegistry(ctx)
 	smart := &Smart{
@@ -651,6 +693,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		maxAttempts:               maxAttempts,
 		attemptTimeout:            attemptTimeout,
 		establishedStallTimeout:   establishedStallTimeout,
+		selectionMode:             selectionMode,
 		siteStickiness:            siteStickiness,
 		switchConfirm:             switchConfirm,
 		switchConfirmSamples:      switchConfirmSamples,
@@ -945,20 +988,27 @@ func (s *Smart) performanceSwitchAllowed() bool {
 	return s.currentPhase() >= smartPhaseProfiling
 }
 
-// coarseAffinityIndex provides a coarse mihomo-style stickiness automatically
-// for large provider groups without adding another user-facing knob. Only
-// candidates within the configured relative margin of the best eligible score
-// participate; a stable hash then picks one of that near-tied set. Small groups
-// continue to use the more precise service/site affinity path.
-func (s *Smart) coarseAffinityIndex(ranks []smartRank, key string) int {
-	if s == nil || len(ranks) < smartCoarseAffinityThreshold || key == "" {
+// balancedAffinityIndex implements the optional Surge-like dispersion mode.
+// It first applies the same hard health tier and near-tie score boundary as
+// primary/backup ranking, then uses rendezvous hashing over canonical endpoint
+// identities. The result is pseudo-random across independent contexts but
+// stable for one context, so keep-alive traffic does not bounce between lines.
+// A configured node weight influences the rendezvous metric without allowing a
+// low-health or materially slower candidate into the pool.
+func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag string) int {
+	if s == nil || len(ranks) == 0 || key == "" {
 		return -1
 	}
 	best := -1
+	bestTier := int(^uint(0) >> 1)
 	for index := range ranks {
-		if ranks[index].eligible {
+		if !ranks[index].eligible {
+			continue
+		}
+		tier := smartHealthTier(ranks[index].status.State)
+		if tier < bestTier {
 			best = index
-			break
+			bestTier = tier
 		}
 	}
 	if best < 0 {
@@ -969,18 +1019,63 @@ func (s *Smart) coarseAffinityIndex(ranks []smartRank, key string) int {
 	if bestScore == 0 {
 		threshold = 0.05
 	}
-	pool := make([]int, 0, len(ranks))
-	for index := range ranks {
-		if ranks[index].eligible && ranks[index].status.Score <= threshold {
-			pool = append(pool, index)
+	isInPool := func(index int) bool {
+		return ranks[index].eligible && smartHealthTier(ranks[index].status.State) == bestTier && ranks[index].status.Score <= threshold
+	}
+	// Preserve the incumbent when it is still inside the balanced pool. This
+	// makes score refreshes and provider alias changes non-disruptive; a failed
+	// or materially degraded incumbent is deliberately rehashed to a backup.
+	if preferredTag != "" {
+		for index := range ranks {
+			matches := ranks[index].identity == preferredTag
+			if !matches && ranks[index].outbound != nil {
+				matches = ranks[index].outbound.Tag() == preferredTag
+			}
+			if matches && isInPool(index) {
+				return index
+			}
 		}
 	}
-	if len(pool) == 0 {
-		return best
+
+	seen := make(map[string]struct{}, len(ranks))
+	selected := -1
+	var selectedMetric float64
+	for index := range ranks {
+		if !isInPool(index) {
+			continue
+		}
+		identity := ranks[index].identity
+		if identity == "" && ranks[index].policyID != 0 {
+			identity = strconv.FormatUint(ranks[index].policyID, 16)
+		}
+		if identity == "" && ranks[index].outbound != nil {
+			identity = ranks[index].outbound.Tag()
+		}
+		if identity == "" {
+			continue
+		}
+		if _, exists := seen[identity]; exists {
+			continue
+		}
+		seen[identity] = struct{}{}
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(identity))
+		weight := ranks[index].weight.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		metric := float64(hash.Sum64()) / weight
+		if selected < 0 || metric < selectedMetric {
+			selected = index
+			selectedMetric = metric
+		}
 	}
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(key))
-	return pool[hash.Sum64()%uint64(len(pool))]
+	if selected >= 0 {
+		return selected
+	}
+	return best
 }
 
 func (s *Smart) noteCandidateUse(candidate string, now time.Time) {
@@ -2825,14 +2920,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	// The portable Zig backend owns confirmation/cooldown state when enabled.
-	// Do not bypass it with the host-side coarse hash; the hash is only the
-	// default fallback for the reference Go policy path.
-	if !usePolicyBackend && lastSelected == "" && (affinity.Candidate == "" || !affinity.ExpiresAt.After(now)) {
-		if index := s.coarseAffinityIndex(ranks, networkKey+"\x00"+siteDisplay+"\x00"+transport); index >= 0 {
-			ranks[index].status.Reason = "coarse affinity hash retained near-tied candidate"
+	if s.selectionMode == smartSelectionBalanced {
+		if index := s.balancedAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
+			ranks[index].status.Reason = "balanced stable affinity"
 			moveSmartRankFirst(ranks, index)
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "coarse affinity hash")
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, "balanced stable affinity")
 			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
