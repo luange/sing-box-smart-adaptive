@@ -21,9 +21,15 @@ Smart/传输回归测试，以及 amd64 glibc 的配置检查。eBPF 对象必�
 
 ## 运行边界与部署记录
 
-正式版产物已在 Linux CI 完成四架构构建并核对校验码。2026-09-03 已原子替换
-VM107/VM115：两台运行 `sing-box 1.14.0`，Revision 为
-`f9b92115773f779720fd02353ee6b5b8b17db70b`，部署二进制 SHA-256 为
-`9550a73d428be2d37a62218f6ac12417c66114fb82cd2ec488d39fdd3b99e766`。
-VM115 使用 eBPF v3 `socket_assign`，VM107 保留现有 tproxy 入站；两台均通过配置
-校验、服务状态、API 可达性与最近错误日志门禁。
+正式版产物已在 Linux CI 完成四架构构建并核对校验码。2026-09-03 的初始正式版
+部署曾同时验证 VM107/VM115；随后按生产变更范围，VM107 保持原二进制不动，VM115
+单独接受深审修复后的原子替换。
+
+- VM107：继续运行 Revision `f9b92115773f779720fd02353ee6b5b8b17db70b`，SHA-256
+  `9550a73d428be2d37a62218f6ac12417c66114fb82cd2ec488d39fdd3b99e766`，tproxy 入站。
+- VM115：运行 Revision `80756e692b186b09bbf4f9c869cd0885a7991d45`，SHA-256
+  `d88fa5fcfdf40d2b68b940c5265182185f70b233aa6b0a48bdb597c9e6a49a67`，eBPF v3
+  `socket_assign`。
+
+VM115 替换前通过资产校验与配置检查，替换后通过服务启动、9091 API、监听端口和
+错误日志门禁；VM107 本轮未执行写操作。
