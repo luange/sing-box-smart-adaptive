@@ -51,11 +51,15 @@ var sharedNetworkV3Object []byte
 // V3Backend is the engine=v3 TC dataplane and the sole kernel policy sink.
 // All static/flow/DNS verdicts that affect TC must be written here.
 type V3Backend struct {
-	access   sync.RWMutex
-	runtime  *C.struct_sb_ebpf_v3_runtime
-	control  v3Control
-	hostIPv4 []netip.Prefix
-	hostIPv6 []netip.Prefix
+	access sync.RWMutex
+	// mapAccess protects userspace map mutations and preserves atomicity of
+	// paired forward/reverse flow entries and one-shot redirect consumption.
+	// access remains the lifecycle lock, so close cannot race a syscall.
+	mapAccess sync.RWMutex
+	runtime   *C.struct_sb_ebpf_v3_runtime
+	control   v3Control
+	hostIPv4  []netip.Prefix
+	hostIPv6  []netip.Prefix
 	// statsPossibleCPUs is the kernel's possible-CPU count, not the current
 	// online count. PERCPU map values are laid out for every possible CPU.
 	statsPossibleCPUs int
@@ -352,6 +356,8 @@ func (b *V3Backend) RegisterListenerSocket(key uint32, fd int) error {
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -401,6 +407,8 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil || !b.flowEnabled {
 		return osErrClosed
 	}
@@ -437,6 +445,8 @@ func (b *V3Backend) DeleteDirectFlow(protocol uint8, source, destination netip.A
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -655,6 +665,13 @@ func (b *V3Backend) lookupOriginal(protocol uint8, client, redirect netip.AddrPo
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	if del {
+		b.mapAccess.Lock()
+		defer b.mapAccess.Unlock()
+	} else {
+		b.mapAccess.RLock()
+		defer b.mapAccess.RUnlock()
+	}
 	if b.runtime == nil {
 		return OriginalDestination{}, osErrClosed
 	}
@@ -664,7 +681,9 @@ func (b *V3Backend) lookupOriginal(protocol uint8, client, redirect netip.AddrPo
 		return OriginalDestination{}, E.Cause(err, "lookup v3 original destination")
 	}
 	if del {
-		_ = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key))
+		if err = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
+			return OriginalDestination{}, E.Cause(err, "delete consumed v3 original destination")
+		}
 	}
 	addr, err := addrFromFamily(value.Family, value.DestAddr)
 	if err != nil {
@@ -715,6 +734,8 @@ func (b *V3Backend) DeleteRedirect(protocol uint8, client, redirect netip.AddrPo
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
 	if b.runtime == nil {
 		return osErrClosed
 	}
