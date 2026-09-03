@@ -4,9 +4,9 @@
 
 - 上游正式标签：`v1.14.0`
 - 上游提交：`0b8995879f29a9b98ee027bc17b75e101445b238`
-- 集成提交：`7a516fea`（保留本项目 Smart、Smart Zig、eBPF v3、provider、
+- 集成提交：`f9b92115773f779720fd02353ee6b5b8b17db70b`（保留本项目 Smart、Smart Zig、eBPF v3、provider、
   connection-history、Clash/Zashboard API 与 PBR 适配）
-- 发布分支：`adaptive/official-rc5-smart-ebpf-audit`
+- 发布分支：`adaptive/official-v1.14.0-smart-ebpf`
 
 ## 构建配置
 
