@@ -446,21 +446,6 @@ func (s *HealthStore) mostRestrictiveTransportRecordLocked(handle NodeHandle, tr
 		selected    *healthRecord
 		selectedKey healthKey
 	)
-	rank := func(st HealthStatus) int {
-		switch st.Breaker {
-		case BreakerHalfOpen:
-			return 4
-		case BreakerOpen:
-			return 3
-		case BreakerCooldown:
-			return 2
-		default:
-			if st.Health == HealthUnreachable {
-				return 1
-			}
-			return 0
-		}
-	}
 	for entryKey, candidate := range s.entries {
 		if entryKey.nodeID != handle.NodeID || entryKey.nodeSlot != handle.Slot || entryKey.nodeVersion != handle.Version || entryKey.domain != DomainTransport {
 			continue
@@ -468,16 +453,35 @@ func (s *HealthStore) mostRestrictiveTransportRecordLocked(handle NodeHandle, tr
 		if !strings.HasPrefix(entryKey.transport, prefix) {
 			continue
 		}
-		if selected == nil || rank(candidate.status) > rank(selected.status) ||
-			(rank(candidate.status) == rank(selected.status) && candidate.status.LastUpdated.After(selected.status.LastUpdated)) {
+		if selected == nil || healthTransportStatusRank(candidate.status) > healthTransportStatusRank(selected.status) ||
+			(healthTransportStatusRank(candidate.status) == healthTransportStatusRank(selected.status) && candidate.status.LastUpdated.After(selected.status.LastUpdated)) {
 			selected = candidate
 			selectedKey = entryKey
 		}
 	}
-	if selected == nil || rank(selected.status) == 0 {
+	if selected == nil || healthTransportStatusRank(selected.status) == 0 {
 		return nil, healthKey{}, false
 	}
 	return selected, selectedKey, true
+}
+
+// healthTransportStatusRank is shared by aggregate transport eligibility and
+// status rendering.  BreakerState is a string for API compatibility, so its
+// lexical order must never be used as a health severity ordering.
+func healthTransportStatusRank(status HealthStatus) int {
+	switch status.Breaker {
+	case BreakerHalfOpen:
+		return 4
+	case BreakerOpen:
+		return 3
+	case BreakerCooldown:
+		return 2
+	default:
+		if status.Health == HealthUnreachable {
+			return 1
+		}
+		return 0
+	}
 }
 
 // TryAcquireAttemptPermit atomically acquires all required domains. The order
@@ -945,7 +949,8 @@ func (s *HealthStore) StatusHandle(handle NodeHandle, domain FailureDomain, tran
 			if entryKey.nodeID != handle.NodeID || entryKey.nodeSlot != handle.Slot || entryKey.nodeVersion != handle.Version || entryKey.domain != domain || entryKey.service != service || !strings.HasPrefix(entryKey.transport, transport+"/") {
 				continue
 			}
-			if selected == nil || candidate.status.Breaker > selected.status.Breaker || candidate.status.LastUpdated.After(selected.status.LastUpdated) {
+			if selected == nil || healthTransportStatusRank(candidate.status) > healthTransportStatusRank(selected.status) ||
+				(healthTransportStatusRank(candidate.status) == healthTransportStatusRank(selected.status) && candidate.status.LastUpdated.After(selected.status.LastUpdated)) {
 				selected = candidate
 			}
 		}

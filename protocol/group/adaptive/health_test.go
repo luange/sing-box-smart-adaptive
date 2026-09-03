@@ -267,6 +267,32 @@ func TestHealthStoreBoundsTenThousandObservations(t *testing.T) {
 	}
 }
 
+func TestAggregateTransportStatusUsesBreakerSeverity(t *testing.T) {
+	store, clock := newBreakerTestStore()
+	handle := NodeHandle{NodeID: NodeID{92}, Slot: 1, Version: 1}
+	for _, family := range []string{"tcp/ipv4", "tcp/ipv6"} {
+		for range 3 {
+			store.Observe(Observation{
+				NodeID: handle.NodeID, NodeSlot: handle.Slot, NodeVersion: handle.Version,
+				Scope: DomainTransport, Transport: family, Outcome: OutcomeFailure, At: clock.Now(),
+			})
+		}
+	}
+	// Move only IPv6 into half-open. The aggregate "tcp" status must report
+	// half-open because it is the most restrictive state, not whichever breaker
+	// string happens to sort later lexically ("open" > "half_open").
+	clock.Advance(11 * time.Second)
+	permit, allowed := store.TryAcquireDomainPermitHandle(handle, DomainTransport, "tcp/ipv6", "", clock.Now())
+	if !allowed {
+		t.Fatal("IPv6 half-open recovery permit was not admitted")
+	}
+	defer permit.ReleaseDeferred()
+	status := store.StatusHandle(handle, DomainTransport, "tcp", "")
+	if status.Breaker != BreakerHalfOpen {
+		t.Fatalf("aggregate transport status lost half-open severity: %+v", status)
+	}
+}
+
 func TestHealthStoreNodeVersionDoesNotInheritRetiredBreaker(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(400, 0)}
 	store := NewHealthStoreWithClock(time.Hour, 32, clock, BreakerConfig{FailureThreshold: 1, BaseCooldown: time.Second, MaxCooldown: time.Minute})
