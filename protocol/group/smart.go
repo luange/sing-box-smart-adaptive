@@ -2448,17 +2448,41 @@ func smartSameEndpoint(metadataByTag map[string]smartCandidateMetadata, left, ri
 	leftMetadata, leftFound := metadataByTag[left]
 	rightMetadata, rightFound := metadataByTag[right]
 	if leftFound && rightFound {
-		if leftMetadata.policyID != 0 && leftMetadata.policyID == rightMetadata.policyID {
-			return true
-		}
-		if leftMetadata.profileID != "" && leftMetadata.profileID == rightMetadata.profileID {
-			return true
-		}
-		if leftMetadata.identity != "" && leftMetadata.identity == rightMetadata.identity {
+		if smartMetadataSameEndpoint(leftMetadata, rightMetadata) {
 			return true
 		}
 	}
 	return smartEquivalentLine(left, right)
+}
+
+func smartRemapCandidateAlias(tag string, oldMetadataByTag, newMetadataByTag map[string]smartCandidateMetadata, candidates []adapter.Outbound) string {
+	if tag == "" {
+		return ""
+	}
+	if _, found := newMetadataByTag[tag]; found {
+		return tag
+	}
+	oldMetadata, found := oldMetadataByTag[tag]
+	if !found {
+		return tag
+	}
+	for _, candidate := range candidates {
+		newMetadata, found := newMetadataByTag[candidate.Tag()]
+		if found && smartMetadataSameEndpoint(oldMetadata, newMetadata) {
+			return candidate.Tag()
+		}
+	}
+	return tag
+}
+
+func smartMetadataSameEndpoint(left, right smartCandidateMetadata) bool {
+	if left.policyID != 0 && left.policyID == right.policyID {
+		return true
+	}
+	if left.profileID != "" && left.profileID == right.profileID {
+		return true
+	}
+	return left.identity != "" && left.identity == right.identity
 }
 
 func smartRelativeImprovement(bestScore, currentScore, margin float64) bool {
@@ -2917,6 +2941,14 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 		candidateMetadataByTag[tag] = s.buildCandidateMetadata(tag, identity)
 	}
 	s.access.Lock()
+	oldMetadataByTag := s.candidateMetadataByTag
+	for key, selected := range s.lastSelected {
+		s.lastSelected[key] = smartRemapCandidateAlias(selected, oldMetadataByTag, candidateMetadataByTag, candidates)
+	}
+	for key, affinity := range s.affinity {
+		affinity.Candidate = smartRemapCandidateAlias(affinity.Candidate, oldMetadataByTag, candidateMetadataByTag, candidates)
+		s.affinity[key] = affinity
+	}
 	s.candidates = candidates
 	s.candidateByTag = candidateByTag
 	s.candidateMetadataByTag = candidateMetadataByTag

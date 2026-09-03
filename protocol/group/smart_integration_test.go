@@ -810,6 +810,22 @@ func TestSmartRankIndexForPolicyPrefersCurrentAlias(t *testing.T) {
 	}
 }
 
+func TestSmartRemapRemovedAliasKeepsEndpointAffinity(t *testing.T) {
+	oldTag := "airport/HK #old"
+	newTag := "airport/HK #new"
+	oldMetadata := smartCandidateMetadata{identity: "trojan://edge.example:443", profileID: "endpoint:trojan://edge.example:443", policyID: smartPolicyID("trojan://edge.example:443")}
+	newMetadata := smartCandidateMetadata{identity: oldMetadata.identity, profileID: oldMetadata.profileID, policyID: oldMetadata.policyID}
+	newCandidate := newSmartFakeOutbound(newTag, nil)
+	got := smartRemapCandidateAlias(oldTag,
+		map[string]smartCandidateMetadata{oldTag: oldMetadata},
+		map[string]smartCandidateMetadata{newTag: newMetadata},
+		[]adapter.Outbound{newCandidate},
+	)
+	if got != newTag {
+		t.Fatalf("removed alias was not remapped to the same endpoint: %q", got)
+	}
+}
+
 func TestSmartLineFamilyOnlyStripsGeneratedDuplicateSuffixes(t *testing.T) {
 	base := "airport/香港-广东专线 NeaRoute"
 	for _, duplicate := range []string{base + " #deadbeef", base + " (2)"} {
