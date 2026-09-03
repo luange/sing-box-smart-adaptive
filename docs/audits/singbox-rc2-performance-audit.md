@@ -177,8 +177,8 @@ context, restricted to the best health tier and configured score margin. This
 provides Surge-like same-tier dispersion without per-connection randomness or
 keep-alive churn; an incumbent remains selected while it stays inside the
 pool. The `random` value is accepted only as a backwards-readable alias for
-`balanced`. Balanced mode is host-side and skips the optional Zig decision
-engine, keeping the policy portable and avoiding a new ABI revision.
+`balanced`. Balanced mode remains host-side only in builds without `smart_zig`;
+a Zig production build rejects it instead of creating a second decision path.
 
 ### Portrait freshness correction (2026-09-03)
 
