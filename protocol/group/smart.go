@@ -272,10 +272,14 @@ func smartEndpointID(identity string, policyID uint64) string {
 }
 
 func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetadata {
+	probeIdentity := identity
+	if probeIdentity == "" {
+		probeIdentity = tag
+	}
 	metadata := smartCandidateMetadata{
 		identity:  identity,
 		profileID: tag,
-		probeKey:  smartProbeKey(identity, s.probeURL, s.probeTimeout),
+		probeKey:  smartProbeKey(probeIdentity, s.probeURL, s.probeTimeout),
 		weight:    s.nodeWeights.Explain(tag),
 	}
 	if identity != "" && identity != tag {

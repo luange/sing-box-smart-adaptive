@@ -44,4 +44,8 @@ func TestSmartMetadataAlwaysHasPolicyIdentity(t *testing.T) {
 	if metadata.policyID != smartPolicyID("static-node") {
 		t.Fatalf("static policy identity = %d, want hash of stable tag", metadata.policyID)
 	}
+	other := smart.buildCandidateMetadata("other-static-node", "")
+	if metadata.probeKey == other.probeKey {
+		t.Fatal("static candidates must not share one probe key")
+	}
 }
