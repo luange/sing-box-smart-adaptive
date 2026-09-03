@@ -2739,6 +2739,12 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	s.access.RLock()
 	metadata := s.candidateMetadataByTag[candidate]
 	s.access.RUnlock()
+	if metadata.policyID == 0 {
+		// Embedded callers can construct a Smart snapshot without running the
+		// provider refresh path. Keep those observations on the same stable tag
+		// identity used by rankPooled instead of silently dropping them.
+		metadata = s.buildCandidateMetadata(candidate, "")
+	}
 	if metadata.policyID != 0 {
 		s.observePolicyBackend(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
 	}
