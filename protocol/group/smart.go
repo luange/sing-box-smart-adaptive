@@ -1882,7 +1882,9 @@ dispatch:
 	close(results)
 	networkKey := s.networkFingerprint()
 	successes := 0
+	observedProfiles := make(map[string]struct{}, len(eligible))
 	for result := range results {
+		profileID := s.candidateProfileID(result.candidate.Tag())
 		if !result.performed {
 			// A waiter still needs one local success observation to recover its
 			// own store, but must not duplicate a shared failure penalty.
@@ -1890,6 +1892,10 @@ dispatch:
 				continue
 			}
 		}
+		if _, exists := observedProfiles[profileID]; exists {
+			continue
+		}
+		observedProfiles[profileID] = struct{}{}
 		if result.err == nil {
 			successes++
 			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), transport, true, result.measured)
@@ -2216,6 +2222,12 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	if len(candidates) == 0 || s.closing.Load() {
 		return result, nil
 	}
+	profileIDFor := func(tag string) string {
+		if metadata, ok := metadataByTag[tag]; ok && metadata.profileID != "" {
+			return metadata.profileID
+		}
+		return tag
+	}
 	if budget > 0 && len(candidates) > budget {
 		s.access.RLock()
 		useScoresAvailable := len(s.useScores) > 0
@@ -2304,29 +2316,44 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	go func() {
 		summary := probeSummary{collected: make([]probeResult, 0, len(candidates))}
 		published := false
+		observed := make(map[string]struct{}, len(candidates)*2)
+		noted := make(map[string]struct{}, len(candidates))
+		performedProfiles := make(map[string]struct{}, len(candidates))
+		successfulProfiles := make(map[string]struct{}, len(candidates))
 		for probe := range results {
 			summary.collected = append(summary.collected, probe)
+			profileID := profileIDFor(probe.candidate.Tag())
 			if probe.performed {
-				summary.performed++
+				if _, exists := performedProfiles[profileID]; !exists {
+					performedProfiles[profileID] = struct{}{}
+					summary.performed++
+				}
 			}
 			familySuccess := uint16(0)
 			familyPerformed := false
 			for _, family := range probe.families {
 				if family.performed {
 					familyPerformed = true
+					if _, exists := noted[profileID]; !exists {
+						noted[profileID] = struct{}{}
+						s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
+					}
 				}
+				observationKey := profileID + "\x00" + family.transport
+				if _, exists := observed[observationKey]; exists {
+					continue
+				}
+				observed[observationKey] = struct{}{}
 				if family.err == nil && family.performed {
 					if familySuccess == 0 || family.delay < familySuccess {
 						familySuccess = family.delay
 					}
-					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
 					elapsed := family.elapsed
 					if family.delay > 0 {
 						elapsed = time.Duration(family.delay) * time.Millisecond
 					}
 					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, true, elapsed)
 				} else if family.err != nil && family.performed {
-					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
 					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, false, family.elapsed)
 				}
 			}
@@ -2342,12 +2369,23 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 			if !probe.performed {
 				continue
 			}
+			if _, exists := successfulProfiles[profileID]; exists {
+				continue
+			}
+			successfulProfiles[profileID] = struct{}{}
 			summary.successes++
 			if s.closing.Load() {
 				continue
 			}
-			s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
-			s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
+			if _, exists := noted[profileID]; !exists {
+				noted[profileID] = struct{}{}
+				s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
+			}
+			observationKey := profileID + "\x00" + N.NetworkTCP
+			if _, exists := observed[observationKey]; !exists {
+				observed[observationKey] = struct{}{}
+				s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
+			}
 			if !published {
 				// The first successful basic probe makes a cold group usable while
 				// the remaining candidates continue to build profiles in parallel.
@@ -2391,13 +2429,19 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		return result, ctx.Err()
 	}
 	commonFailure := summary.performed > 1 && summary.successes == 0
+	penalizedProfiles := make(map[string]struct{}, len(summary.collected))
 	for _, probe := range summary.collected {
 		if probe.err != nil && probe.penalize && probe.performed && !commonFailure {
+			profileID := profileIDFor(probe.candidate.Tag())
+			if _, exists := penalizedProfiles[profileID]; exists {
+				continue
+			}
 			metadata, ok := metadataByTag[probe.candidate.Tag()]
 			if !ok {
 				metadata = s.buildCandidateMetadata(probe.candidate.Tag(), "")
 			}
 			if s.probeRegistry == nil || s.probeRegistry.dead(metadata.probeKey) {
+				penalizedProfiles[profileID] = struct{}{}
 				s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
 				s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
 			}
@@ -2507,8 +2551,14 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 		return
 	}
 	udpCandidates := make([]adapter.Outbound, 0, len(candidates))
+	seenUDPProfiles := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
 		if common.Contains(candidate.Network(), N.NetworkUDP) {
+			profileID := s.candidateProfileID(candidate.Tag())
+			if _, exists := seenUDPProfiles[profileID]; exists {
+				continue
+			}
+			seenUDPProfiles[profileID] = struct{}{}
 			udpCandidates = append(udpCandidates, candidate)
 		}
 	}
@@ -2607,11 +2657,18 @@ dispatch:
 	close(results)
 
 	networkKey := s.networkFingerprint()
+	observedUDP := make(map[string]struct{}, len(udpCandidates)*3)
 	for result := range results {
 		if s.closing.Load() || ctx.Err() != nil {
 			return
 		}
+		profileID := s.candidateProfileID(result.candidate.Tag())
 		for _, family := range result.families {
+			observationKey := profileID + "\x00" + family.transport
+			if _, exists := observedUDP[observationKey]; exists {
+				continue
+			}
+			observedUDP[observationKey] = struct{}{}
 			if family.err == nil && family.performed {
 				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, true, family.elapsed)
 			} else if family.err != nil && family.performed {
@@ -2621,7 +2678,11 @@ dispatch:
 		if result.err == nil && result.freshSuccess {
 			// Keep an aggregate UDP ledger for domain destinations that have not
 			// selected a concrete address family yet.
-			s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+			observationKey := profileID + "\x00" + N.NetworkUDP
+			if _, exists := observedUDP[observationKey]; !exists {
+				observedUDP[observationKey] = struct{}{}
+				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+			}
 		}
 	}
 }

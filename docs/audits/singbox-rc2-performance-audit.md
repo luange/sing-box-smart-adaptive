@@ -229,3 +229,10 @@ TCP/UDP probes and connection lifetimes, while Zig receives bounded evidence
 and returns the policy decision. `selection_mode=balanced` is rejected in the
 Zig-only release until its affinity policy is implemented in the ABI; silently
 using the Go host selector would violate the single-kernel invariant.
+
+The same audit also found that two provider aliases could join one shared
+probe but both increment the local portrait as if they were fresh network
+samples. TCP/UDP probe-cycle accounting now coalesces observations, success
+counters and failure penalties by EndpointProfile, so aliases cannot inflate
+confidence or accelerate phase transitions. UDP probe candidates are
+deduplicated before the bounded budget is applied.
