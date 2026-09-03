@@ -45,6 +45,10 @@ type DirectOffload interface {
 // SmartCandidateStatus is a snapshot of one smart leaf candidate.
 type SmartCandidateStatus struct {
 	Tag string `json:"tag"`
+	// EndpointID is a stable, opaque identity shared by subscription aliases
+	// that resolve to the same endpoint. It is intentionally not a URL so
+	// credentials and provider-specific options never reach the API surface.
+	EndpointID string `json:"endpoint_id,omitempty"`
 	// Role is the decision role for the current context. The first eligible
 	// healthy candidate is primary; other eligible candidates are backups.
 	// It is diagnostic only and never overrides a manual pin.
@@ -74,6 +78,7 @@ type SmartContextStatus struct {
 	Transport                 string                 `json:"transport,omitempty"`
 	Phase                     string                 `json:"phase,omitempty"`
 	Selected                  string                 `json:"selected,omitempty"`
+	SelectedEndpointID        string                 `json:"selected_endpoint_id,omitempty"`
 	Reason                    string                 `json:"reason,omitempty"`
 	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
 	CandidateCount            int                    `json:"candidate_count"`
@@ -86,6 +91,7 @@ type SmartContextStatus struct {
 // SmartGroupStatus is exported for clash/API status surfaces.
 type SmartGroupStatus struct {
 	Selected                  string                 `json:"selected,omitempty"`
+	SelectedEndpointID        string                 `json:"selected_endpoint_id,omitempty"`
 	Pinned                    string                 `json:"pinned,omitempty"`
 	Network                   string                 `json:"network,omitempty"`
 	Site                      string                 `json:"site,omitempty"`
@@ -115,18 +121,20 @@ type SmartGroupStatus struct {
 }
 
 type SmartSwitchAudit struct {
-	Network       string    `json:"network,omitempty"`
-	Site          string    `json:"site,omitempty"`
-	Transport     string    `json:"transport,omitempty"`
-	Previous      string    `json:"previous,omitempty"`
-	Current       string    `json:"current"`
-	Category      string    `json:"category"`
-	Reason        string    `json:"reason"`
-	PreviousState string    `json:"previous_state,omitempty"`
-	CurrentState  string    `json:"current_state,omitempty"`
-	PreviousScore float64   `json:"previous_score,omitempty"`
-	CurrentScore  float64   `json:"current_score,omitempty"`
-	OccurredAt    time.Time `json:"occurred_at"`
+	Network            string    `json:"network,omitempty"`
+	Site               string    `json:"site,omitempty"`
+	Transport          string    `json:"transport,omitempty"`
+	Previous           string    `json:"previous,omitempty"`
+	PreviousEndpointID string    `json:"previous_endpoint_id,omitempty"`
+	Current            string    `json:"current"`
+	CurrentEndpointID  string    `json:"current_endpoint_id,omitempty"`
+	Category           string    `json:"category"`
+	Reason             string    `json:"reason"`
+	PreviousState      string    `json:"previous_state,omitempty"`
+	CurrentState       string    `json:"current_state,omitempty"`
+	PreviousScore      float64   `json:"previous_score,omitempty"`
+	CurrentScore       float64   `json:"current_score,omitempty"`
+	OccurredAt         time.Time `json:"occurred_at"`
 }
 
 // LoadBalanceGroup is implemented by protocol/group loadbalance outbound.

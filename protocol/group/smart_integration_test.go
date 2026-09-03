@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -824,6 +825,51 @@ func TestSmartCanonicalEndpointAliasDoesNotCountAsSwitch(t *testing.T) {
 	}
 }
 
+func TestSmartEndpointIDIsStableAndOpaque(t *testing.T) {
+	if got := smartEndpointID("endpoint:"+strings.Repeat("a", 64), 0); got != "endpoint:"+strings.Repeat("a", 64) {
+		t.Fatalf("structured endpoint ID changed: %q", got)
+	}
+	identity := "trojan://edge.example:443"
+	policyID := smartPolicyID(identity)
+	got := smartEndpointID(identity, policyID)
+	want := "policy:" + strconv.FormatUint(policyID, 16)
+	if got != want {
+		t.Fatalf("legacy endpoint ID = %q, want %q", got, want)
+	}
+	if strings.Contains(got, identity) || strings.Contains(got, "edge.example") {
+		t.Fatalf("endpoint ID leaked provider identity: %q", got)
+	}
+}
+
+func TestSmartSwitchAuditIncludesEndpointIDs(t *testing.T) {
+	first := newSmartFakeOutbound("airport/HK #1", nil)
+	second := newSmartFakeOutbound("airport/HK #2", nil)
+	smart := newTestSmart(first, second)
+	setSmartCandidateIdentities(smart, map[string]string{
+		first.Tag():  "trojan://edge-a.example:443",
+		second.Tag(): "trojan://edge-b.example:443",
+	})
+	networkKey := smart.networkFingerprint()
+	siteDisplay, siteKey := smartSiteIdentity(nil, M.ParseSocksaddr("search.example:443"))
+	ranks := []smartRank{
+		{outbound: first, identity: "trojan://edge-a.example:443", policyID: smartPolicyID("trojan://edge-a.example:443"), status: adapter.SmartCandidateStatus{Tag: first.Tag(), State: "open", Score: 2}},
+		{outbound: second, identity: "trojan://edge-b.example:443", policyID: smartPolicyID("trojan://edge-b.example:443"), status: adapter.SmartCandidateStatus{Tag: second.Tag(), State: "healthy", Score: 1}},
+	}
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, ranks, 0, false)
+	smart.markSelected(second, networkKey, siteKey, siteDisplay, N.NetworkTCP, ranks, 1, true)
+	status := smart.SmartStatus()
+	if len(status.RecentSwitches) != 1 {
+		t.Fatalf("expected one switch audit, got %d", len(status.RecentSwitches))
+	}
+	audit := status.RecentSwitches[0]
+	if audit.PreviousEndpointID != smartEndpointID(ranks[0].identity, ranks[0].policyID) || audit.CurrentEndpointID != smartEndpointID(ranks[1].identity, ranks[1].policyID) {
+		t.Fatalf("audit endpoint IDs = %q -> %q", audit.PreviousEndpointID, audit.CurrentEndpointID)
+	}
+	if strings.Contains(audit.PreviousEndpointID, "edge-a.example") || strings.Contains(audit.CurrentEndpointID, "edge-b.example") {
+		t.Fatal("switch audit leaked provider endpoint details")
+	}
+}
+
 func TestSmartRankIndexForPolicyPrefersCurrentAlias(t *testing.T) {
 	primary := newSmartFakeOutbound("airport/HK #1", nil)
 	duplicate := newSmartFakeOutbound("airport/HK #2", nil)
@@ -1338,6 +1384,56 @@ func TestSmartStatusTracksIndependentContexts(t *testing.T) {
 	}
 	if status.Contexts[0].Transport != N.NetworkTCP || status.Contexts[1].Transport != N.NetworkUDP {
 		t.Fatalf("unexpected context transports: %#v", status.Contexts)
+	}
+}
+
+func TestSmartStatusKeepsPerBusinessEndpointSelection(t *testing.T) {
+	// Both candidates belong to this one Smart group. Business contexts may
+	// choose different leaves inside the group, but never draw from another
+	// Smart group's catalog.
+	first := newSmartFakeOutbound("group-a/node-1", nil)
+	second := newSmartFakeOutbound("group-a/node-2", nil)
+	smart := newTestSmart(first, second)
+	setSmartCandidateIdentities(smart, map[string]string{
+		first.Tag():  "trojan://node-1.example:443",
+		second.Tag(): "trojan://node-2.example:443",
+	})
+	ranks := []smartRank{
+		{outbound: first, identity: "trojan://node-1.example:443", policyID: smartPolicyID("trojan://node-1.example:443"), eligible: true, status: adapter.SmartCandidateStatus{Tag: first.Tag(), State: "healthy"}, profile: smartProfileInteractive},
+		{outbound: second, identity: "trojan://node-2.example:443", policyID: smartPolicyID("trojan://node-2.example:443"), eligible: true, status: adapter.SmartCandidateStatus{Tag: second.Tag(), State: "healthy"}, profile: smartProfileInteractive},
+	}
+	smart.updateStatusSelected("network", "service:search", N.NetworkTCP, ranks, first.Tag(), "node 1 path")
+	smart.updateStatusSelected("network", "service:chat", N.NetworkTCP, ranks, second.Tag(), "node 2 path")
+	status := smart.SmartStatus()
+	if len(status.Contexts) != 2 {
+		t.Fatalf("expected two business contexts, got %d", len(status.Contexts))
+	}
+	seen := make(map[string]string, len(status.Contexts))
+	for _, contextStatus := range status.Contexts {
+		seen[contextStatus.Site] = contextStatus.SelectedEndpointID
+	}
+	if seen["service:search"] != smartEndpointID(ranks[0].identity, ranks[0].policyID) || seen["service:chat"] != smartEndpointID(ranks[1].identity, ranks[1].policyID) {
+		t.Fatalf("business selections were not kept independently: %#v", seen)
+	}
+	if status.Selected != second.Tag() || status.SelectedEndpointID != smartEndpointID(ranks[1].identity, ranks[1].policyID) {
+		t.Fatalf("latest group snapshot did not reflect last context: %q / %q", status.Selected, status.SelectedEndpointID)
+	}
+}
+
+func TestSmartPreMatchUsesBusinessContextSelection(t *testing.T) {
+	first := newSmartFakeOutbound("group-a/node-1", nil)
+	second := newSmartFakeOutbound("group-a/node-2", nil)
+	smart := newTestSmart(first, second)
+	destination := M.ParseSocksaddr("search.example:443")
+	metadata := &adapter.InboundContext{Network: N.NetworkTCP, Destination: destination}
+	_, siteKey := resolveSmartSiteIdentity(nil, metadata, destination)
+	contextKey := smartSelectionKey(smart.networkFingerprint(), siteKey, N.NetworkTCP)
+	smart.access.Lock()
+	smart.lastSelected[contextKey] = second.Tag()
+	smart.latest.Store(first)
+	smart.access.Unlock()
+	if got := smart.preMatchLeaf(metadata); got == nil || got.Tag() != second.Tag() {
+		t.Fatalf("pre-match ignored business context selection: %v", got)
 	}
 }
 

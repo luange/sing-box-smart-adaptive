@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,6 +186,20 @@ type smartCandidateMetadata struct {
 	probeKey  string
 	policyID  uint64
 	weight    nodeweight.Match
+}
+
+// smartEndpointID returns the safe, stable identity exposed by Smart status
+// and switch audit records. Structured provider identities are already
+// content-addressed (endpoint:<sha256>); legacy/static candidates use the
+// policy hash so a raw tag, URL, or credential can never leak through the API.
+func smartEndpointID(identity string, policyID uint64) string {
+	if strings.HasPrefix(identity, "endpoint:") {
+		return identity
+	}
+	if policyID != 0 {
+		return "policy:" + strconv.FormatUint(policyID, 16)
+	}
+	return ""
 }
 
 func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetadata {
@@ -1096,6 +1111,17 @@ func (s *Smart) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectO
 func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound {
 	now := time.Now()
 	pinned, temporary, _, _ := s.controlSnapshot(now)
+	contextSelected := ""
+	if metadata != nil {
+		transport := N.NetworkName(metadata.Network)
+		_, siteKey := resolveSmartSiteIdentity(s.families, metadata, metadata.Destination)
+		if transport != "" && siteKey != "" {
+			contextKey := smartSelectionKey(s.networkFingerprint(), siteKey, transport)
+			s.access.RLock()
+			contextSelected = s.lastSelected[contextKey]
+			s.access.RUnlock()
+		}
+	}
 	s.access.RLock()
 	defer s.access.RUnlock()
 	pick := func(tag string) adapter.Outbound {
@@ -1109,6 +1135,9 @@ func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound 
 	}
 	if detour := pick(pinned); detour != nil {
 		return detour
+	}
+	if selected := pick(contextSelected); selected != nil {
+		return selected
 	}
 	if selected := s.latest.Load(); selected != nil {
 		if _, ok := s.candidateByTag[selected.Tag()]; ok {
@@ -2257,6 +2286,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			eligible: estimate.State != "open",
 			status: adapter.SmartCandidateStatus{
 				Tag:             candidate.Tag(),
+				EndpointID:      smartEndpointID(metadata.identity, metadata.policyID),
 				State:           estimate.State,
 				Reliability:     estimate.Reliability,
 				ConnectMS:       estimate.ConnectMS,
@@ -2516,6 +2546,10 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	// failover and must not interrupt healthy connections.
 	sameEndpoint := smartSameEndpoint(s.candidateMetadataByTag, previous, candidate.Tag())
 	logicalSwitch := previous != "" && previous != candidate.Tag() && !sameEndpoint
+	previousMetadata := s.candidateMetadataByTag[previous]
+	currentMetadata := s.candidateMetadataByTag[candidate.Tag()]
+	previousEndpointID := smartEndpointID(previousMetadata.identity, previousMetadata.policyID)
+	currentEndpointID := smartEndpointID(currentMetadata.identity, currentMetadata.policyID)
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
@@ -2582,11 +2616,20 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 			s.performanceSwitches.Add(1)
 		}
 		s.appendSwitchAudit(adapter.SmartSwitchAudit{
-			Network: networkKey, Site: siteDisplay, Transport: transport,
-			Previous: previous, Current: candidate.Tag(), Category: category, Reason: reason,
-			PreviousState: previousRank.status.State, CurrentState: currentRank.status.State,
-			PreviousScore: previousRank.status.Score, CurrentScore: currentRank.status.Score,
-			OccurredAt: now,
+			Network:            networkKey,
+			Site:               siteDisplay,
+			Transport:          transport,
+			Previous:           previous,
+			PreviousEndpointID: previousEndpointID,
+			Current:            candidate.Tag(),
+			CurrentEndpointID:  currentEndpointID,
+			Category:           category,
+			Reason:             reason,
+			PreviousState:      previousRank.status.State,
+			CurrentState:       currentRank.status.State,
+			PreviousScore:      previousRank.status.Score,
+			CurrentScore:       currentRank.status.Score,
+			OccurredAt:         now,
 		})
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, candidate.Tag(), reason)
@@ -2860,6 +2903,13 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	now := time.Now()
 	phase := s.currentPhase().String()
 	contextKey := smartSelectionKey(networkKey, siteDisplay, transport)
+	selectedEndpointID := ""
+	if selectedRank, found := smartRankByTag(ranks, selected); found {
+		selectedEndpointID = selectedRank.status.EndpointID
+		if selectedEndpointID == "" {
+			selectedEndpointID = smartEndpointID(selectedRank.identity, selectedRank.policyID)
+		}
+	}
 	pinned, _, _, _ := s.controlSnapshot(now)
 	statusCount := min(len(ranks), smartStatusCandidateLimit)
 	s.statusAccess.Lock()
@@ -2923,6 +2973,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	}
 	s.status = adapter.SmartGroupStatus{
 		Selected:                  selected,
+		SelectedEndpointID:        selectedEndpointID,
 		Pinned:                    pinned,
 		Network:                   networkKey,
 		Site:                      siteDisplay,
@@ -2952,6 +3003,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		Transport:                 transport,
 		Phase:                     s.currentPhase().String(),
 		Selected:                  selected,
+		SelectedEndpointID:        selectedEndpointID,
 		Reason:                    transport + "/" + profile.String() + ": " + reason,
 		UpdatedAt:                 s.status.UpdatedAt,
 		CandidateCount:            len(ranks),
@@ -3177,13 +3229,17 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {
 	statusCount := min(len(candidates), smartStatusCandidateLimit)
 	statuses := make([]adapter.SmartCandidateStatus, statusCount)
+	s.access.RLock()
 	for index := range statusCount {
+		metadata := s.candidateMetadataByTag[candidates[index].Tag()]
 		statuses[index] = adapter.SmartCandidateStatus{
-			Tag:    candidates[index].Tag(),
-			State:  "warming",
-			Reason: "awaiting observations",
+			Tag:        candidates[index].Tag(),
+			EndpointID: smartEndpointID(metadata.identity, metadata.policyID),
+			State:      "warming",
+			Reason:     "awaiting observations",
 		}
 	}
+	s.access.RUnlock()
 	s.statusAccess.Lock()
 	s.statusLastAt = time.Time{}
 	s.statusLastContext = ""
