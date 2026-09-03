@@ -268,6 +268,8 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 			staticRules = true
 			flowLearn = true
 		}
+		dnsHint := po.Enabled && (po.DNSIPHint == "safe" || po.DNSIPHint == "strong")
+		fakeIP := po.Enabled && po.FakeIP
 		backend, err = ECommon.PrepareSharedNetworkV3(
 			s.parent.enableTCP,
 			s.parent.enableUDP,
@@ -276,10 +278,10 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 			s.parent.dnsMode == dnsModeHijack,
 			s.dropUDP443,
 			s.routingMark,
-			staticRules || po.Enabled,
+			staticRules,
 			flowLearn,
-			po.DNSIPHint == "safe" || po.DNSIPHint == "strong" || po.Enabled,
-			po.FakeIP || po.Enabled,
+			dnsHint,
+			fakeIP,
 			0,
 		)
 		if err != nil {
@@ -615,11 +617,18 @@ func (s *sharedNetwork) observeV3DNS(addr netip.Addr, direct bool, evidence uint
 		return
 	}
 	if s.v3 != nil {
-		s.v3.ObserveDNS(addr, direct, evidence, ttl, time.Now())
+		if err := s.v3.ObserveDNS(addr, direct, evidence, ttl, time.Now()); err != nil && s.parent != nil && s.parent.logger != nil {
+			// DNS hints are advisory: a sink failure must not reject the DNS
+			// response, but it must remain visible for diagnosing a degraded
+			// kernel fast path.  Previously this error was silently discarded.
+			s.parent.logger.Debug("eBPF v3 DNS hint publish skipped: ", err)
+		}
 		return
 	}
 	if s.backend != nil {
-		_ = s.backend.PublishDNSHint(addr, direct, evidence, 0, ttl)
+		if err := s.backend.PublishDNSHint(addr, direct, evidence, 0, ttl); err != nil && s.parent != nil && s.parent.logger != nil {
+			s.parent.logger.Debug("eBPF DNS hint publish skipped: ", err)
+		}
 	}
 }
 

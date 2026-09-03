@@ -300,8 +300,11 @@ func (d *database) enforceLimitLocked() error {
 }
 
 func (d *database) readBlocks(kind string, reverse bool, callback func(segmentBlock) bool) error {
-	d.access.Lock()
-	defer d.access.Unlock()
+	// Queries only read immutable segment files.  Keep the read lock while the
+	// frame is decoded so rotation/pruning cannot unlink a file underneath us,
+	// while allowing concurrent dashboard queries without serializing zstd work.
+	d.access.RLock()
+	defer d.access.RUnlock()
 	files, err := d.segmentFilesLocked()
 	if err != nil {
 		return err

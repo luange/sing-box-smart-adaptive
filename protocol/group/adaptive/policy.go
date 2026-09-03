@@ -88,6 +88,11 @@ type PolicyEngine struct {
 	switchCooldown time.Duration
 	// affinityMode: ""/"service" = per-product sticky; "disabled" = no sticky.
 	affinityMode string
+	// kernelAccess serializes the portable kernel boundary.  The Zig kernel has
+	// its own internal lock, while the pure-Go implementation does not; keeping
+	// the lifecycle and decision calls behind one lock also prevents Close from
+	// racing a Plan/Remember call and observing a nil or freed kernel.
+	kernelAccess sync.Mutex
 	stickyAccess sync.Mutex
 	sticky       map[string]stickyPreference
 }
@@ -157,9 +162,11 @@ func (e *PolicyEngine) BindSwitchStability(margin float64, cooldown time.Duratio
 	}
 	e.switchMargin = margin
 	e.switchCooldown = cooldown
+	e.kernelAccess.Lock()
 	if e.kernel != nil {
 		e.kernel.Configure(margin, cooldown, e.manualFailure)
 	}
+	e.kernelAccess.Unlock()
 	return e
 }
 
@@ -190,16 +197,23 @@ func (e *PolicyEngine) Clear() {
 	e.stickyAccess.Lock()
 	e.sticky = make(map[string]stickyPreference)
 	e.stickyAccess.Unlock()
+	e.kernelAccess.Lock()
 	if e.kernel != nil {
 		e.kernel.Reset()
 	}
+	e.kernelAccess.Unlock()
 }
 
 // Close releases the portable kernel contexts when the pool is permanently
 // retired. Clear already drops them on an epoch retirement; this method makes
 // the final lifecycle boundary explicit for hosts that own PolicyEngine.
 func (e *PolicyEngine) Close() {
-	if e == nil || e.kernel == nil {
+	if e == nil {
+		return
+	}
+	e.kernelAccess.Lock()
+	defer e.kernelAccess.Unlock()
+	if e.kernel == nil {
 		return
 	}
 	e.kernel.Close()
@@ -233,9 +247,11 @@ func (e *PolicyEngine) RememberSelection(key string, handle NodeHandle, now time
 		e.pruneStickyLocked(now)
 	}
 	e.stickyAccess.Unlock()
+	e.kernelAccess.Lock()
 	if e.kernel != nil {
 		e.kernel.Remember(key, handle.NodeID, now, e.switchCooldown)
 	}
+	e.kernelAccess.Unlock()
 }
 
 // ForgetSelectionAfterEarlyFailure removes a newly selected incumbent when a
@@ -257,9 +273,11 @@ func (e *PolicyEngine) ForgetSelectionAfterEarlyFailure(service ServiceContext, 
 	}
 	delete(e.sticky, key)
 	e.stickyAccess.Unlock()
+	e.kernelAccess.Lock()
 	if e.kernel != nil {
 		e.kernel.Forget(key)
 	}
+	e.kernelAccess.Unlock()
 	return true
 }
 
@@ -369,7 +387,7 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 		for index, candidate := range eligible {
 			if candidate.ID == lease.NodeID && candidate.Handle.Slot == lease.NodeSlot && candidate.Handle.Version == lease.NodeVersion {
 				moveCandidateFirst(eligible, index)
-				return e.plan(snapshot, service.Mode, ReasonLease, service, limitCandidates(eligible, e.maxAttempts)), nil
+				return e.plan(snapshot, mode, ReasonLease, service, limitCandidates(eligible, e.maxAttempts)), nil
 			}
 		}
 	}
@@ -379,6 +397,7 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 	if mode == ModeBulk {
 		bulkSequence = e.bulkSequence.Add(1)
 	}
+	e.kernelAccess.Lock()
 	if e.kernel != nil {
 		if mode == ModeBulk {
 			e.kernel.SetBulkSequence(e.stickyKey(service), bulkSequence)
@@ -412,6 +431,7 @@ func (e *PolicyEngine) Plan(snapshot *ExecutionSnapshot, service ServiceContext,
 			}
 		}
 	}
+	e.kernelAccess.Unlock()
 	sortStart := 0
 	if kernelUsed {
 		sortStart = 1

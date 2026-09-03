@@ -112,7 +112,7 @@ func TestGateReloadHeapBounded(t *testing.T) {
 			pool.health.Observe(Observation{
 				NodeID: candidate.ID, NodeSlot: candidate.Handle.Slot, NodeVersion: candidate.Handle.Version,
 				Scope: DomainEndpoint, Outcome: OutcomeSuccess,
-				Delay: time.Duration(20+int(candidate.Handle.Slot))*time.Millisecond, At: now,
+				Delay: time.Duration(20+int(candidate.Handle.Slot)) * time.Millisecond, At: now,
 			})
 			if candidate.Handle.Slot%4 == 0 {
 				pool.health.Observe(Observation{

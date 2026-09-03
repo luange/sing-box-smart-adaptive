@@ -119,18 +119,23 @@ type AdaptivePool struct {
 	statePersistenceAccess     sync.Mutex
 	statePersistenceFailures   atomic.Uint64
 	stateWriter                *adaptiveStateWriter
-	control                    *ControlState
-	switchAudit                *SwitchAuditStore
-	selectionMemoryAccess      sync.Mutex
-	selectionMemory            map[selectionMemoryKey]selectionMemoryEntry
-	catalogAccess              sync.Mutex
-	preparedIdentity           *PreparedIdentity
-	preparedExecution          *PreparedExecution
-	runtimeIdentity            RuntimeIdentity
-	appliedRevision            atomic.Uint64
-	sourcePublication          *SourcePublication
-	deltaAppliedTotal          atomic.Uint64
-	deltaFallbackTotal         atomic.Uint64
+	// runtimeAccess protects the epoch-scoped pointers below.  A source refresh
+	// may publish a new health/lease/policy set while late dials from the old
+	// epoch are still settling; readers take a short snapshot and the policy
+	// kernel has its own close-safe lock.
+	runtimeAccess         sync.RWMutex
+	control               *ControlState
+	switchAudit           *SwitchAuditStore
+	selectionMemoryAccess sync.Mutex
+	selectionMemory       map[selectionMemoryKey]selectionMemoryEntry
+	catalogAccess         sync.Mutex
+	preparedIdentity      *PreparedIdentity
+	preparedExecution     *PreparedExecution
+	runtimeIdentity       RuntimeIdentity
+	appliedRevision       atomic.Uint64
+	sourcePublication     *SourcePublication
+	deltaAppliedTotal     atomic.Uint64
+	deltaFallbackTotal    atomic.Uint64
 
 	lifecycleAccess         sync.Mutex
 	published               bool
@@ -155,6 +160,21 @@ type AdaptivePool struct {
 	aiIPv6Blocked           atomic.Uint64
 	capabilityInitFailures  atomic.Uint64
 	closing                 atomic.Bool
+}
+
+func (p *AdaptivePool) runtimeSnapshot() (*HealthStore, *SessionLeaseManager, *ControlState, *PolicyEngine) {
+	if p == nil {
+		return nil, nil, nil, nil
+	}
+	p.runtimeAccess.RLock()
+	health, leases, control, policy := p.health, p.leases, p.control, p.policy
+	p.runtimeAccess.RUnlock()
+	return health, leases, control, policy
+}
+
+func (p *AdaptivePool) policySnapshot() *PolicyEngine {
+	_, _, _, policy := p.runtimeSnapshot()
+	return policy
 }
 
 func New(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.AdaptivePoolOutboundOptions) (adapter.Outbound, error) {
@@ -467,32 +487,87 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 	preparedIdentity := p.preparedIdentity
 	preparedExecution := p.preparedExecution
 	if preparedIdentity == nil || preparedExecution == nil {
+		p.lifecycleAccess.Lock()
+		if p.publishPhase == publishPhasePublishing {
+			p.publishPhase = publishPhasePrepared
+		}
+		p.lifecycleAccess.Unlock()
 		p.catalogAccess.Unlock()
 		return errors.New("adaptive runtime epoch was not prepared")
 	}
 	shared, identity, err := preparedIdentity.Commit()
 	if err != nil {
+		// A stale/consumed preparation can never be committed again. Drop it
+		// while holding the catalog lock so the next source rebuild creates a
+		// fresh optimistic transaction instead of leaving the pool stuck in the
+		// prepared phase.
+		p.preparedIdentity = nil
+		p.preparedExecution = nil
+		p.lifecycleAccess.Lock()
+		if p.publishPhase == publishPhasePublishing {
+			p.publishPhase = publishPhasePrepared
+		}
+		p.lifecycleAccess.Unlock()
 		p.catalogAccess.Unlock()
 		return err
 	}
 	p.runtimeIdentity = identity
+	var oldHealth *HealthStore
+	var oldLeases *SessionLeaseManager
+	var oldControl *ControlState
+	var oldPolicy *PolicyEngine
+	publishedState := false
 	p.lifecycleAccess.Lock()
 	if p.publishPhase == publishPhasePublishing {
-		p.health = shared.health
-		p.leases = shared.leases
-		p.control = shared.control
-		p.policy = NewPolicyEngine(p.health, p.policyMaxAttempts, p.manualFailure).
+		newPolicy := NewPolicyEngine(shared.health, p.policyMaxAttempts, p.manualFailure).
 			BindNodeWeights(p.nodeWeights).
 			BindSwitchStability(p.switchMargin, p.switchCooldown).
 			BindAffinityMode(p.affinityMode).
-			BindBulkSequence(&p.control.bulkSequence)
+			BindBulkSequence(&shared.control.bulkSequence)
+		p.runtimeAccess.Lock()
+		oldHealth, oldLeases, oldControl = p.health, p.leases, p.control
+		oldPolicy = p.policy
+		p.health = shared.health
+		p.leases = shared.leases
+		p.control = shared.control
+		p.policy = newPolicy
+		p.runtimeAccess.Unlock()
+		publishedState = true
 	}
 	p.lifecycleAccess.Unlock()
+	if !publishedState {
+		_ = preparedIdentity.Rollback()
+		p.runtimeIdentity = RuntimeIdentity{}
+		p.preparedIdentity = nil
+		p.preparedExecution = nil
+		p.catalogAccess.Unlock()
+		return errors.New("adaptive runtime epoch publish was superseded")
+	}
 	if err = p.persistStateDurable(); err != nil {
 		_ = preparedIdentity.Rollback()
 		p.runtimeIdentity = RuntimeIdentity{}
+		p.preparedIdentity = nil
+		p.preparedExecution = nil
+		p.runtimeAccess.Lock()
+		currentPolicy := p.policy
+		p.health = oldHealth
+		p.leases = oldLeases
+		p.control = oldControl
+		p.policy = oldPolicy
+		p.runtimeAccess.Unlock()
+		if currentPolicy != nil && currentPolicy != oldPolicy {
+			currentPolicy.Close()
+		}
+		p.lifecycleAccess.Lock()
+		if p.publishPhase == publishPhasePublishing {
+			p.publishPhase = publishPhasePrepared
+		}
+		p.lifecycleAccess.Unlock()
 		p.catalogAccess.Unlock()
 		return errors.New("adaptive identity state is not durable")
+	}
+	if oldPolicy != nil {
+		oldPolicy.Close()
 	}
 	p.catalog.CommitPrepared(preparedExecution)
 	p.catalogAccess.Unlock()
@@ -502,6 +577,8 @@ func (p *AdaptivePool) OnRuntimeEpochPublish() error {
 func (p *AdaptivePool) OnRuntimeEpochPublishCommit() {
 	p.catalogAccess.Lock()
 	identity := cloneRuntimeIdentity(p.runtimeIdentity)
+	p.preparedIdentity = nil
+	p.preparedExecution = nil
 	p.catalogAccess.Unlock()
 	p.applyCommittedTransitions(identity)
 	p.lifecycleAccess.Lock()
@@ -569,8 +646,8 @@ func (p *AdaptivePool) OnRuntimeEpochRetire() {
 	}
 	// Drop bounded selection/audit views on retire. Observation transactions
 	// remain alive until epoch leases drain so late real failures are not lost.
-	if p.policy != nil {
-		p.policy.Clear()
+	if _, _, _, policy := p.runtimeSnapshot(); policy != nil {
+		policy.Clear()
 	}
 	if p.switchAudit != nil {
 		p.switchAudit.Clear()
@@ -583,8 +660,12 @@ func (p *AdaptivePool) Close() error {
 		return nil
 	}
 	p.OnRuntimeEpochRetire()
-	if p.policy != nil {
-		p.policy.Close()
+	p.runtimeAccess.Lock()
+	policy := p.policy
+	p.policy = nil
+	p.runtimeAccess.Unlock()
+	if policy != nil {
+		policy.Close()
 	}
 	if p.source != nil {
 		_ = p.source.Close()
@@ -599,15 +680,16 @@ func (p *AdaptivePool) Close() error {
 func (p *AdaptivePool) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 
 func (p *AdaptivePool) Now() string {
-	if p.control == nil {
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
 		return ""
 	}
-	p.control.access.RLock()
-	defer p.control.access.RUnlock()
+	control.access.RLock()
+	defer control.access.RUnlock()
 	if p.shadow {
 		return "shadow"
 	}
-	return p.control.latestTag
+	return control.latestTag
 }
 
 func (p *AdaptivePool) All() []string {
@@ -639,19 +721,29 @@ func (p *AdaptivePool) selectAdaptiveOutbound(tag string, expected *uint64) bool
 	if !loaded {
 		return false
 	}
-	if p.control == nil {
-		p.control = new(ControlState)
+	_, leases, control, _ := p.runtimeSnapshot()
+	if control == nil {
+		control = new(ControlState)
+		p.runtimeAccess.Lock()
+		if p.control == nil {
+			p.control = control
+		} else {
+			control = p.control
+		}
+		p.runtimeAccess.Unlock()
 	}
-	p.control.access.Lock()
-	if expected != nil && p.control.revision.Load() != *expected {
-		p.control.access.Unlock()
+	control.access.Lock()
+	if expected != nil && control.revision.Load() != *expected {
+		control.access.Unlock()
 		return false
 	}
-	p.control.pinned = nodeID
-	p.control.pinnedTag = tag
-	p.control.revision.Add(1)
-	p.control.access.Unlock()
-	p.leases.Clear()
+	control.pinned = nodeID
+	control.pinnedTag = tag
+	control.revision.Add(1)
+	control.access.Unlock()
+	if leases != nil {
+		leases.Clear()
+	}
 	p.persistState()
 	return true
 }
@@ -665,64 +757,77 @@ func (p *AdaptivePool) ClearAdaptiveSelectionAt(expected uint64) bool {
 }
 
 func (p *AdaptivePool) clearAdaptiveSelection(expected *uint64) bool {
-	if p.control == nil {
-		p.control = new(ControlState)
+	_, leases, control, _ := p.runtimeSnapshot()
+	if control == nil {
+		control = new(ControlState)
+		p.runtimeAccess.Lock()
+		if p.control == nil {
+			p.control = control
+		} else {
+			control = p.control
+		}
+		p.runtimeAccess.Unlock()
 	}
-	p.control.access.Lock()
-	if expected != nil && p.control.revision.Load() != *expected {
-		p.control.access.Unlock()
+	control.access.Lock()
+	if expected != nil && control.revision.Load() != *expected {
+		control.access.Unlock()
 		return false
 	}
-	p.control.pinned = NodeID{}
-	p.control.pinnedTag = ""
-	p.control.revision.Add(1)
-	p.control.access.Unlock()
-	p.leases.Clear()
+	control.pinned = NodeID{}
+	control.pinnedTag = ""
+	control.revision.Add(1)
+	control.access.Unlock()
+	if leases != nil {
+		leases.Clear()
+	}
 	p.persistState()
 	return true
 }
 
 func (p *AdaptivePool) AdaptiveSelectionRevision() uint64 {
-	if p.control == nil {
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
 		return 0
 	}
-	return p.control.revision.Load()
+	return control.revision.Load()
 }
 
 func (p *AdaptivePool) SetAdaptiveServiceOverride(serviceID, mode string, ttl time.Duration, expectedRevision uint64) error {
-	if p.control == nil {
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
 		return errors.New("adaptive control revision conflict")
 	}
-	p.control.access.Lock()
-	if p.control.revision.Load() != expectedRevision {
-		p.control.access.Unlock()
+	control.access.Lock()
+	if control.revision.Load() != expectedRevision {
+		control.access.Unlock()
 		return errors.New("adaptive control revision conflict")
 	}
 	if err := p.resolver.SetOverride(serviceID, PolicyMode(mode), ttl, time.Now()); err != nil {
-		p.control.access.Unlock()
+		control.access.Unlock()
 		return err
 	}
-	p.control.revision.Add(1)
-	p.control.access.Unlock()
+	control.revision.Add(1)
+	control.access.Unlock()
 	p.persistState()
 	return nil
 }
 
 func (p *AdaptivePool) ClearAdaptiveServiceOverride(serviceID string, expectedRevision uint64) error {
-	if p.control == nil {
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
 		return errors.New("adaptive control revision conflict")
 	}
-	p.control.access.Lock()
-	if p.control.revision.Load() != expectedRevision {
-		p.control.access.Unlock()
+	control.access.Lock()
+	if control.revision.Load() != expectedRevision {
+		control.access.Unlock()
 		return errors.New("adaptive control revision conflict")
 	}
 	if !p.resolver.ClearOverride(serviceID) {
-		p.control.access.Unlock()
+		control.access.Unlock()
 		return errors.New("adaptive service override not found")
 	}
-	p.control.revision.Add(1)
-	p.control.access.Unlock()
+	control.revision.Add(1)
+	control.access.Unlock()
 	p.persistState()
 	return nil
 }
@@ -745,6 +850,10 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	if err := p.waitUntilPublished(ctx); err != nil {
 		return nil, err
 	}
+	_, leases, _, policy := p.runtimeSnapshot()
+	if leases == nil || policy == nil {
+		return nil, errors.New("adaptive pool runtime state is unavailable")
+	}
 	metadata := adapter.ContextFrom(ctx)
 	serviceContext := p.resolver.Resolve(metadata, destination, N.NetworkName(network))
 	if p.applyAIIPv6Policy(serviceContext, destination, metadata) {
@@ -755,7 +864,7 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 	var reservation *LeaseReservation
 	var err error
 	if modeUsesLease(serviceContext.Mode) {
-		lease, reservation, err = p.leases.Reserve(ctx, serviceContext.Session, time.Now())
+		lease, reservation, err = leases.Reserve(ctx, serviceContext.Session, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -765,7 +874,7 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		leasePointer = &lease
 	}
 	pinned := p.pinnedNodeID()
-	plan, err := p.policy.Plan(snapshot, serviceContext, leasePointer, pinned)
+	plan, err := policy.Plan(snapshot, serviceContext, leasePointer, pinned)
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()
@@ -786,9 +895,9 @@ func (p *AdaptivePool) DialContext(ctx context.Context, network string, destinat
 		if reservation != nil {
 			reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 		} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
-			p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
+			leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 		} else {
-			p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
+			leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 		}
 		p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 	}
@@ -919,7 +1028,13 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 	evidence.Source = SourceDial
 	evidence.Confidence = ConfidenceHigh
 	evidence.Delay = delay
-	evidence.At = p.health.Now()
+	if attempt.reducer != nil && attempt.reducer.Store != nil {
+		evidence.At = attempt.reducer.Store.Now()
+	} else if health, _, _, _ := p.runtimeSnapshot(); health != nil {
+		evidence.At = health.Now()
+	} else {
+		evidence.At = time.Now()
+	}
 	evidence.Reason = errorReason(attemptErr)
 	switch {
 	case deferred || errors.Is(attemptErr, context.Canceled):
@@ -948,12 +1063,16 @@ func (p *AdaptivePool) completeTransportAttempt(attempt *observationAttempt, ser
 				p.recordFailureMemory(candidate, evidence.Failure, service.ID, path)
 			}
 		}
-		status := p.health.StatusHandle(evidence.Handle, DomainTransport, path, "")
-		earlyFailure := p.policy != nil && p.policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
+		health := attempt.reducer.Store
+		status := health.StatusHandle(evidence.Handle, DomainTransport, path, "")
+		policy := p.policySnapshot()
+		earlyFailure := policy != nil && policy.ForgetSelectionAfterEarlyFailure(service, evidence.Handle, evidence.At)
 		// Invalidate lease on breaker open OR quality-escalated unreachable (timeout blackhole).
 		pathDead := status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable
 		if modeUsesLease(service.Mode) && (earlyFailure || pathDead) {
-			p.leases.Invalidate(service.Session, evidence.Handle.NodeID)
+			if _, leases, _, _ := p.runtimeSnapshot(); leases != nil {
+				leases.Invalidate(service.Session, evidence.Handle.NodeID)
+			}
 			p.persistState()
 		}
 		p.scheduleFailureProbe(evidence.Handle)
@@ -973,6 +1092,10 @@ type observationAttempt struct {
 }
 
 func (p *AdaptivePool) beginObservationAttempt(snapshot *ExecutionSnapshot, candidate Candidate, permit *AttemptPermit, transport string, networkPath ...string) (*observationAttempt, error) {
+	health, _, _, _ := p.runtimeSnapshot()
+	if health == nil {
+		return nil, errors.New("adaptive health store is unavailable")
+	}
 	lease, err := p.runtimeManager.AcquireEpoch(p.groupID, snapshot.RuntimeEpochID)
 	if err != nil {
 		return nil, err
@@ -982,7 +1105,7 @@ func (p *AdaptivePool) beginObservationAttempt(snapshot *ExecutionSnapshot, cand
 		evidence.NetworkPath = networkPath[0]
 	}
 	guard := RuntimeEpochObservationGuard{Lease: lease}
-	reducer := &HealthObservationReducer{Store: p.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: p.observationReducerHook}
+	reducer := &HealthObservationReducer{Store: health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: p.observationReducerHook}
 	return &observationAttempt{lease: lease, evidence: evidence, guard: guard, reducer: reducer}, nil
 }
 
@@ -1003,6 +1126,10 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	if err := p.waitUntilPublished(ctx); err != nil {
 		return nil, err
 	}
+	_, leases, _, policy := p.runtimeSnapshot()
+	if leases == nil || policy == nil {
+		return nil, errors.New("adaptive pool runtime state is unavailable")
+	}
 	metadata := adapter.ContextFrom(ctx)
 	serviceContext := p.resolver.Resolve(metadata, destination, N.NetworkUDP)
 	if p.applyAIIPv6Policy(serviceContext, destination, metadata) {
@@ -1013,7 +1140,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	var reservation *LeaseReservation
 	var err error
 	if modeUsesLease(serviceContext.Mode) {
-		lease, reservation, err = p.leases.Reserve(ctx, serviceContext.Session, time.Now())
+		lease, reservation, err = leases.Reserve(ctx, serviceContext.Session, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -1022,7 +1149,7 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 	if modeUsesLease(serviceContext.Mode) && reservation == nil {
 		leasePointer = &lease
 	}
-	plan, err := p.policy.Plan(snapshot, serviceContext, leasePointer, p.pinnedNodeID())
+	plan, err := policy.Plan(snapshot, serviceContext, leasePointer, p.pinnedNodeID())
 	if err != nil {
 		if reservation != nil {
 			reservation.Abort()
@@ -1096,9 +1223,9 @@ func (p *AdaptivePool) ListenPacket(ctx context.Context, destination M.Socksaddr
 			if reservation != nil {
 				reservation.CommitHandle(candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 			} else if lease.NodeID != candidate.ID || lease.NodeSlot != candidate.Handle.Slot || lease.NodeVersion != candidate.Handle.Version {
-				p.leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
+				leases.ReplaceHandle(serviceContext.Session, NodeHandle{NodeID: lease.NodeID, Slot: lease.NodeSlot, Version: lease.NodeVersion}, candidate.Handle, serviceContext.ID, serviceContext.Mode, ttl, time.Now())
 			} else {
-				p.leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
+				leases.RenewHandle(serviceContext.Session, candidate.Handle, ttl, time.Now())
 			}
 			p.switchAudit.RecordSelection(serviceContext.Session, serviceContext.ID, previous, candidate, plan.Reason, time.Now())
 		}
@@ -1304,7 +1431,8 @@ func (p *AdaptivePool) rebuild() error {
 	published := p.published
 	p.lifecycleAccess.Unlock()
 	if !published {
-		preparedIdentity, prepareErr := p.runtimeManager.PrepareEpoch(p.groupID, p.health, p.leases, p.control, identitySource)
+		health, leases, control, _ := p.runtimeSnapshot()
+		preparedIdentity, prepareErr := p.runtimeManager.PrepareEpoch(p.groupID, health, leases, control, identitySource)
 		if prepareErr != nil {
 			return prepareErr
 		}
@@ -1405,7 +1533,12 @@ func (p *AdaptivePool) startCapabilityControllerLocked(snapshot *ExecutionSnapsh
 	if runner == nil {
 		runner = NewCapabilityProbeRunner(nil)
 	}
-	sessions, err := NewRuntimeCapabilityObservationFactory(p.runtimeManager, p.groupID, p.sharedObservationIngestor(), p.health, p.observationReducerHook)
+	health, _, _, _ := p.runtimeSnapshot()
+	if health == nil {
+		p.capabilityInitFailures.Add(1)
+		return
+	}
+	sessions, err := NewRuntimeCapabilityObservationFactory(p.runtimeManager, p.groupID, p.sharedObservationIngestor(), health, p.observationReducerHook)
 	if err != nil {
 		p.capabilityInitFailures.Add(1)
 		return
@@ -1495,9 +1628,14 @@ func (p *AdaptivePool) applyCommittedTransitions(identity RuntimeIdentity) {
 			break
 		}
 	}
+	health, leases, _, _ := p.runtimeSnapshot()
 	for _, handle := range identity.RetiredHandles {
-		p.health.RetireNodeHandle(handle)
-		p.leases.RetireNodeHandle(handle)
+		if health != nil {
+			health.RetireNodeHandle(handle)
+		}
+		if leases != nil {
+			leases.RetireNodeHandle(handle)
+		}
 		p.lifecycleAccess.Lock()
 		scheduler := p.scheduler
 		p.lifecycleAccess.Unlock()
@@ -1508,12 +1646,13 @@ func (p *AdaptivePool) applyCommittedTransitions(identity RuntimeIdentity) {
 }
 
 func (p *AdaptivePool) pinnedNodeID() *NodeID {
-	if p.control == nil {
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
 		return nil
 	}
-	p.control.access.RLock()
-	pinned := p.control.pinned
-	p.control.access.RUnlock()
+	control.access.RLock()
+	pinned := control.pinned
+	control.access.RUnlock()
 	if pinned == (NodeID{}) {
 		return nil
 	}
@@ -1521,12 +1660,20 @@ func (p *AdaptivePool) pinnedNodeID() *NodeID {
 }
 
 func (p *AdaptivePool) setLatest(tag string) {
-	if p.control == nil {
-		p.control = new(ControlState)
+	_, _, control, _ := p.runtimeSnapshot()
+	if control == nil {
+		control = new(ControlState)
+		p.runtimeAccess.Lock()
+		if p.control == nil {
+			p.control = control
+		} else {
+			control = p.control
+		}
+		p.runtimeAccess.Unlock()
 	}
-	p.control.access.Lock()
-	p.control.latestTag = tag
-	p.control.access.Unlock()
+	control.access.Lock()
+	control.latestTag = tag
+	control.access.Unlock()
 }
 
 func (p *AdaptivePool) leaseTTL(mode PolicyMode) time.Duration {

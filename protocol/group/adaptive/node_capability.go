@@ -26,14 +26,14 @@ type NodeCapabilityProfile struct {
 // Path capability states exposed to operators. These are intentionally finer
 // than a bare available bool so "never probed" is not shown as verified OK.
 const (
-	PathStateUnknown        = "unknown"
-	PathStateHealthy        = "healthy"
-	PathStateDegraded       = "degraded"
-	PathStateUnreachable    = "unreachable"
-	PathStateOpen           = "open"
-	PathStateCooldown       = "cooldown"
-	PathStateCooldownReady  = "cooldown_ready"
-	PathStateHalfOpen       = "half_open"
+	PathStateUnknown         = "unknown"
+	PathStateHealthy         = "healthy"
+	PathStateDegraded        = "degraded"
+	PathStateUnreachable     = "unreachable"
+	PathStateOpen            = "open"
+	PathStateCooldown        = "cooldown"
+	PathStateCooldownReady   = "cooldown_ready"
+	PathStateHalfOpen        = "half_open"
 	PathStateRecoveryPending = "recovery_pending"
 )
 

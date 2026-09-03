@@ -41,7 +41,7 @@ type smartProbeRegistry struct {
 	entries         map[string]*smartProbeEntry
 	probe           func(context.Context, string, adapter.Outbound) (uint16, error)
 	slots           chan struct{}
-	groups          atomic.Uint32
+	activeGroups    atomic.Uint32
 	completedProbes atomic.Uint64
 }
 
@@ -49,7 +49,7 @@ func (r *smartProbeRegistry) startupDelay() time.Duration {
 	if r == nil {
 		return 0
 	}
-	order := r.groups.Add(1) - 1
+	order := r.activeGroups.Add(1) - 1
 	return time.Duration(min(order, uint32(4))) * 15 * time.Second
 }
 
@@ -84,6 +84,7 @@ func acquireSmartProbeRegistry(ctx context.Context) (*smartProbeRegistry, func()
 	var once sync.Once
 	return registry, func() {
 		once.Do(func() {
+			registry.activeGroups.Add(^uint32(0))
 			smartProbeRegistries.Lock()
 			current := smartProbeRegistries.byProcess[processKey]
 			if current == reference {
@@ -134,7 +135,14 @@ func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
 	r.access.Lock()
 	defer r.access.Unlock()
 	entry := r.entries[key]
-	return entry != nil && !entry.inflight && !entry.result.success && !entry.result.nextProbeAt.IsZero() && time.Now().Before(entry.result.nextProbeAt)
+	if entry == nil || entry.inflight || entry.result.success || entry.result.nextProbeAt.IsZero() {
+		return false
+	}
+	now := time.Now()
+	if ttl > 0 && now.Sub(entry.result.completedAt) > ttl {
+		return false
+	}
+	return now.Before(entry.result.nextProbeAt)
 }
 
 func (r *smartProbeRegistry) dead(key string) bool {
@@ -144,7 +152,12 @@ func (r *smartProbeRegistry) dead(key string) bool {
 	r.access.Lock()
 	defer r.access.Unlock()
 	entry := r.entries[key]
-	return entry != nil && !entry.inflight && !entry.result.success && entry.result.failures >= 3
+	if entry == nil || entry.inflight || entry.result.success || entry.result.failures < 3 {
+		return false
+	}
+	// Dead is a temporary breaker state. Once the cadence deadline is reached,
+	// the next caller is allowed to run a half-open recovery probe.
+	return !entry.result.nextProbeAt.IsZero() && time.Now().Before(entry.result.nextProbeAt)
 }
 
 func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
@@ -169,6 +182,32 @@ func smartProbeCadence(success bool, successes, failures uint8) time.Duration {
 }
 
 func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, timeout, ttl time.Duration, candidate adapter.Outbound) (uint16, error) {
+	if r == nil {
+		return 0, errSharedSmartProbeFailed
+	}
+	return r.runProbeMode(ctx, key, timeout, ttl, false, func(probeCtx context.Context) (uint16, error) {
+		return r.probe(probeCtx, probeURL, candidate)
+	})
+}
+
+// runRecovery performs one bounded half-open trial when every candidate in a
+// Smart context is currently open. It bypasses the normal cadence cache, but
+// still shares the per-endpoint single-flight lock and admission slots.
+func (r *smartProbeRegistry) runRecovery(ctx context.Context, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
+	return r.runProbeMode(ctx, key, timeout, ttl, true, probe)
+}
+
+// runProbe is the shared single-flight admission path for every probe kind.
+// URLTest and UDP reachability use the same endpoint key, so aliases and
+// multiple Smart groups cannot open duplicate probes for one endpoint.
+func (r *smartProbeRegistry) runProbe(ctx context.Context, key string, timeout, ttl time.Duration, probe func(context.Context) (uint16, error)) (uint16, error) {
+	return r.runProbeMode(ctx, key, timeout, ttl, false, probe)
+}
+
+func (r *smartProbeRegistry) runProbeMode(ctx context.Context, key string, timeout, ttl time.Duration, force bool, probe func(context.Context) (uint16, error)) (uint16, error) {
+	if r == nil || probe == nil {
+		return 0, errSharedSmartProbeFailed
+	}
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -181,17 +220,6 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	now := time.Now()
 	r.access.Lock()
 	entry := r.entries[key]
-	if entry != nil && !entry.inflight && now.Before(entry.result.nextProbeAt) {
-		result := entry.result
-		r.access.Unlock()
-		if result.success {
-			return result.delay, nil
-		}
-		if result.deferred {
-			return 0, errSharedSmartProbeDeferred
-		}
-		return 0, errSharedSmartProbeFailed
-	}
 	if entry != nil && entry.inflight {
 		done := entry.done
 		r.access.Unlock()
@@ -203,6 +231,32 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 		case <-done:
 		}
 		r.access.Lock()
+		result := entry.result
+		r.access.Unlock()
+		if result.success {
+			return result.delay, nil
+		}
+		if !force && result.deferred {
+			return 0, errSharedSmartProbeDeferred
+		}
+		if !force {
+			return 0, errSharedSmartProbeFailed
+		}
+		// A forced recovery caller is allowed to become the next owner after
+		// the previous single-flight attempt completes. Re-check the entry
+		// under the lock so concurrent recoveries still serialize.
+		r.access.Lock()
+		if current := r.entries[key]; current == entry && !current.inflight {
+			entry = current
+			entry.inflight = true
+			entry.done = make(chan struct{})
+			r.access.Unlock()
+			goto admitted
+		}
+		r.access.Unlock()
+		return 0, errSharedSmartProbeFailed
+	}
+	if entry != nil && !force && now.Before(entry.result.nextProbeAt) {
 		result := entry.result
 		r.access.Unlock()
 		if result.success {
@@ -223,7 +277,7 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 				cancel()
 				return 0, probeCtx.Err()
 			}
-			delay, err := r.probe(probeCtx, probeURL, candidate)
+			delay, err := probe(probeCtx)
 			cancel()
 			if err != nil {
 				return 0, errSharedSmartProbeFailed
@@ -235,6 +289,7 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	r.entries[key] = entry
 	r.access.Unlock()
 
+admitted:
 	select {
 	case r.slots <- struct{}{}:
 	case <-ctx.Done():
@@ -256,7 +311,7 @@ func (r *smartProbeRegistry) run(ctx context.Context, key, probeURL string, time
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	delay, err := r.probe(probeCtx, probeURL, candidate)
+	delay, err := probe(probeCtx)
 	cancel()
 	// Release the admission slot immediately — never block peers behind GC.
 	<-r.slots

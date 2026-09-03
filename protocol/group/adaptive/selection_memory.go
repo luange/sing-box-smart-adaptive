@@ -30,12 +30,13 @@ func (p *AdaptivePool) rememberPolicySelectionWithReason(service ServiceContext,
 		return
 	}
 	key := ""
-	if p.policy != nil {
-		key = p.policy.stickyKey(service)
+	policy := p.policySnapshot()
+	if policy != nil {
+		key = policy.stickyKey(service)
 	}
 	now := time.Now()
-	if p.policy != nil {
-		p.policy.RememberSelection(key, candidate.Handle, now)
+	if policy != nil {
+		policy.RememberSelection(key, candidate.Handle, now)
 	}
 	p.recordSelectionMemory(candidate.Handle, string(reason), "", service.ID, serviceHealthTransport(service), now)
 }
@@ -225,4 +226,3 @@ func durationMillis32(value time.Duration) uint32 {
 	}
 	return uint32(milliseconds)
 }
-

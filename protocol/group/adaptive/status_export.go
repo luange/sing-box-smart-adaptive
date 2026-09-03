@@ -12,6 +12,7 @@ import (
 
 func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	snapshot := p.catalog.load()
+	health, leases, control, policy := p.runtimeSnapshot()
 	status := adapter.AdaptivePoolStatus{Shadow: p.shadow, UpdatedAt: time.Now()}
 	status.MissedObservations = p.missedObservations.Load()
 	status.ObservationStaleTotal = p.observationStale.Load()
@@ -28,22 +29,24 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	status.RecentSwitches, status.SelectionSwitchesTotal = p.switchAudit.Snapshot()
 	status.DeltaAppliedTotal = p.deltaAppliedTotal.Load()
 	status.DeltaFallbackTotal = p.deltaFallbackTotal.Load()
-	if p.control == nil {
-		p.control = new(ControlState)
+	if control == nil {
+		control = new(ControlState)
 	}
-	p.control.access.RLock()
-	status.Pinned = p.control.pinnedTag
+	control.access.RLock()
+	status.Pinned = control.pinnedTag
 	if p.shadow {
 		status.Mode = "shadow"
-	} else if p.control.pinned != (NodeID{}) {
+	} else if control.pinned != (NodeID{}) {
 		status.Mode = string(ModeManual)
 	} else {
 		status.Mode = string(p.defaultMode)
 	}
-	p.control.access.RUnlock()
-	status.ActiveLeases, status.LeaseEvictions = p.leases.Stats()
-	status.BulkSequence = p.control.bulkSequence.Load()
-	status.ControlRevision = p.control.revision.Load()
+	control.access.RUnlock()
+	if leases != nil {
+		status.ActiveLeases, status.LeaseEvictions = leases.Stats()
+	}
+	status.BulkSequence = control.bulkSequence.Load()
+	status.ControlRevision = control.revision.Load()
 	if p.resolver != nil {
 		status.ServiceOverrideCount = len(p.resolver.Overrides(time.Now()))
 	}
@@ -55,7 +58,10 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	if snapshot == nil {
 		return status
 	}
-	leaseSnapshot := p.leases.PersistenceSnapshot(time.Now())
+	var leaseSnapshot []SessionLease
+	if leases != nil {
+		leaseSnapshot = leases.PersistenceSnapshot(time.Now())
+	}
 	slices.SortFunc(leaseSnapshot, func(left, right SessionLease) int {
 		if left.ServiceID != right.ServiceID {
 			return bytes.Compare([]byte(left.ServiceID), []byte(right.ServiceID))
@@ -86,15 +92,19 @@ func (p *AdaptivePool) AdaptiveStatus() adapter.AdaptivePoolStatus {
 	}
 	// Live health under RLock-friendly snapshot. Bind the same switch stability
 	// knobs as the dial path so status scores are not a parallel fictional policy.
-	healthView := p.health.ReadOnlySnapshot()
+	if health == nil {
+		return status
+	}
+	healthView := health.ReadOnlySnapshot()
 	policyView := NewPolicyEngine(healthView, p.policyMaxAttempts, p.manualFailure).
 		BindNodeWeights(p.nodeWeights).
 		BindSwitchStability(p.switchMargin, p.switchCooldown).
 		BindAffinityMode(p.affinityMode)
 	// Copy sticky prefs from the live engine so margin/cooldown explain matches dial.
-	if p.policy != nil {
-		policyView.importStickyFrom(p.policy)
+	if policy != nil {
+		policyView.importStickyFrom(policy)
 	}
+	defer policyView.Close()
 	throughput := healthView.ThroughputByHandle()
 	for _, candidate := range snapshot.Candidates {
 		status.AliasCount += len(candidate.Aliases)

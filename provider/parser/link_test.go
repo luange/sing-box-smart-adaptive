@@ -139,5 +139,7 @@ func TestParseHysteria2LinkOptions(t *testing.T) {
 	options := outbound.Options.(*option.Hysteria2OutboundOptions)
 	require.Equal(t, []string{"40000:50000"}, []string(options.ServerPorts))
 	require.Equal(t, "example.com", options.TLS.ServerName)
-	require.Equal(t, "AA:BB", options.TLS.CertificatePinSHA256)
+	// pinSHA256 is not part of pure SagerNet TLS options; compatibility parsing
+	// intentionally leaves the unsupported field unset.
+	require.Empty(t, options.TLS.CertificatePublicKeySHA256)
 }

@@ -556,6 +556,7 @@ func (s *HealthStore) TryAcquireConnectionFallbackPermitHandle(handle NodeHandle
 	if at.IsZero() {
 		at = s.clock.Now()
 	}
+	transport = transportLedgerKey(transport)
 	keys := []healthKey{{nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainEndpoint}, {nodeID: handle.NodeID, nodeSlot: handle.Slot, nodeVersion: handle.Version, domain: DomainTransport, transport: transport}}
 	s.access.Lock()
 	defer s.access.Unlock()

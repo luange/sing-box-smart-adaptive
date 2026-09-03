@@ -241,17 +241,25 @@ func (s *smartStore) observeCrossSiteFailureLocked(now time.Time, key smartCandi
 	metric.LastUpdated = now
 }
 
-func (s *smartStore) candidateDead(candidate string, now time.Time) bool {
+func (s *smartStore) candidateDead(network, site, candidate, transport string, now time.Time) bool {
 	if s == nil || candidate == "" {
 		return false
 	}
 	s.access.RLock()
 	defer s.access.RUnlock()
 	for key, metric := range s.metrics {
-		if key.Candidate != candidate || key.Site != "" || now.Sub(metric.LastUpdated) > 30*time.Second {
+		if key.Candidate != candidate || key.Network != network || key.Transport != transport {
 			continue
 		}
-		if metric.ConsecutiveFailures >= 3 {
+		// A site-specific view may use either its local ledger or the global
+		// endpoint ledger. Never borrow evidence from an unrelated site.
+		if site != "" && key.Site != "" && key.Site != site {
+			continue
+		}
+		if now.Sub(metric.LastUpdated) > 30*time.Second || !metric.CircuitUntil.After(now) {
+			continue
+		}
+		if metric.ConsecutiveFailures >= s.breakerFailures {
 			return true
 		}
 	}
@@ -680,6 +688,27 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 		score -= exploration * math.Sqrt(math.Log(totalSamples+2)/(estimate.Samples+1))
 	}
 	return math.Max(0, score)
+}
+
+// smartHealthTier enforces primary/backup semantics before latency ranking.
+// A lower latency suspect line must not displace a healthy primary merely
+// because its current sample is faster; hard failures still move the next
+// eligible backup to the front immediately.
+func smartHealthTier(state string) int {
+	switch state {
+	case "healthy":
+		return 0
+	case "warming", "unknown":
+		return 1
+	case "suspect":
+		return 2
+	case "half_open":
+		return 3
+	case "open":
+		return 4
+	default:
+		return 2
+	}
 }
 
 // passiveThroughputBelowFloor is intentionally separate from probing. It is

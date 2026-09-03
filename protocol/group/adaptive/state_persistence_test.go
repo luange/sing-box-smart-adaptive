@@ -376,6 +376,12 @@ func TestRuntimePublishRequiresDurableIdentityBeforeCatalogCommit(t *testing.T) 
 	if pool.statePersistenceFailures.Load() == 0 {
 		t.Fatal("durable publish failure was not observable")
 	}
+	pool.catalogAccess.Lock()
+	preparedIdentity, preparedExecution := pool.preparedIdentity, pool.preparedExecution
+	pool.catalogAccess.Unlock()
+	if preparedIdentity != nil || preparedExecution != nil {
+		t.Fatal("failed durable publish retained a consumed preparation")
+	}
 }
 
 func TestAdaptiveStateMigratesV1WithSafeThroughputAndCursorDefaults(t *testing.T) {

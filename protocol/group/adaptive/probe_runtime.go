@@ -48,8 +48,12 @@ func (p *AdaptivePool) scheduleFailureProbe(handle NodeHandle) {
 	// Accelerate DNS recovery only for ipv4. Production showed automatic ipv6 DNS
 	// probes mostly emit protocol noise (address family 0 / framing) and pile the
 	// queue without improving TCP business selection. IPv6 DNS stays passive-only.
+	health, _, _, _ := p.runtimeSnapshot()
+	if health == nil {
+		return
+	}
 	path := "udp_dns/ipv4"
-	status := p.health.StatusHandle(handle, DomainTransport, path, "")
+	status := health.StatusHandle(handle, DomainTransport, path, "")
 	if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown || status.Health == HealthUnreachable {
 		_ = scheduler.Submit(p.dnsHealthProbeTask(snapshot, candidate, "ipv4", time.Now(), 0))
 	}
@@ -148,6 +152,10 @@ func isProviderReplicaTag(tag string) bool {
 }
 
 func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate) (ProbeResult, uint16) {
+	health, _, _, _ := p.runtimeSnapshot()
+	if health == nil {
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: "adaptive health store unavailable"}, 0
+	}
 	current := p.catalog.load()
 	if current == nil || snapshot == nil || current.RuntimeEpochID != snapshot.RuntimeEpochID || current.CatalogRevision != snapshot.CatalogRevision || current.Generation != snapshot.Generation {
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}, 0
@@ -156,7 +164,7 @@ func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionS
 	if !loaded || currentCandidate.Handle.Slot != candidate.Handle.Slot || currentCandidate.Handle.Version != candidate.Handle.Version {
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "candidate handle retired"}, 0
 	}
-	permit, allowed := p.health.TryAcquireDomainPermitHandle(candidate.Handle, DomainEndpoint, "", "", p.health.Now())
+	permit, allowed := health.TryAcquireDomainPermitHandle(candidate.Handle, DomainEndpoint, "", "", health.Now())
 	if !allowed {
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "endpoint breaker deferred"}, 0
 	}
@@ -200,6 +208,10 @@ func (p *AdaptivePool) runGenericProbe(ctx context.Context, snapshot *ExecutionS
 }
 
 func (p *AdaptivePool) runDNSHealthProbe(ctx context.Context, snapshot *ExecutionSnapshot, candidate Candidate, family string) ProbeResult {
+	health, _, _, _ := p.runtimeSnapshot()
+	if health == nil {
+		return ProbeResult{Outcome: OutcomeDeferred, Reason: "adaptive health store unavailable"}
+	}
 	current := p.catalog.load()
 	if current == nil || snapshot == nil || current.RuntimeEpochID != snapshot.RuntimeEpochID || current.CatalogRevision != snapshot.CatalogRevision || current.Generation != snapshot.Generation {
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "catalog revision unavailable"}
@@ -209,7 +221,7 @@ func (p *AdaptivePool) runDNSHealthProbe(ctx context.Context, snapshot *Executio
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "candidate handle retired"}
 	}
 	path := "udp_dns/" + family
-	permit, allowed := p.health.TryAcquireDomainPermitHandle(candidate.Handle, DomainTransport, path, "", p.health.Now())
+	permit, allowed := health.TryAcquireDomainPermitHandle(candidate.Handle, DomainTransport, path, "", health.Now())
 	if !allowed {
 		return ProbeResult{Outcome: OutcomeDeferred, Reason: "DNS path breaker deferred"}
 	}
@@ -251,10 +263,10 @@ func (p *AdaptivePool) completeDNSHealthProbe(attempt *observationAttempt, probe
 	evidence.Stage = StageDNSHealth
 	evidence.Confidence = ConfidenceHigh
 	evidence.Delay = delay
-	if p.health != nil {
-		evidence.At = p.health.Now()
+	if attempt.reducer != nil && attempt.reducer.Store != nil {
+		evidence.At = attempt.reducer.Store.Now()
 	} else {
-		evidence.At = p.health.Now()
+		evidence.At = time.Now()
 	}
 	evidence.Reason = errorReason(probeErr)
 	switch {
@@ -298,7 +310,11 @@ func (p *AdaptivePool) completeGenericProbe(attempt *observationAttempt, probeEr
 	// distinguish a node failure from common-mode target failure or blocking.
 	evidence.Confidence = ConfidenceMedium
 	evidence.Delay = delay
-	evidence.At = p.health.Now()
+	if attempt.reducer != nil && attempt.reducer.Store != nil {
+		evidence.At = attempt.reducer.Store.Now()
+	} else {
+		evidence.At = time.Now()
+	}
 	evidence.Reason = errorReason(probeErr)
 	switch {
 	case deferred:

@@ -174,9 +174,10 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	if !ok {
 		return fmt.Errorf("compile already in progress")
 	}
-	// Clear inactive bank then fill — never touch active.
-	b.Policy4[inactive] = make(map[LPM4Key]PolicyValue)
-	b.Policy6[inactive] = make(map[LPM6Key]PolicyValue)
+	// Build off to the side, then install the complete bank in one assignment;
+	// a malformed prefix must not leave a partially refreshed inactive snapshot.
+	policy4 := make(map[LPM4Key]PolicyValue)
+	policy6 := make(map[LPM6Key]PolicyValue)
 	// generation for entries is commit generation (current+1)
 	nextGen := b.Publisher.Generation() + 1
 	if nextGen == 0 {
@@ -191,7 +192,7 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 				b.Publisher.AbortCompile()
 				return err
 			}
-			b.Policy4[inactive][key] = p.Value
+			policy4[key] = p.Value
 			continue
 		}
 		key, err := PrefixToLPM6(p.Prefix)
@@ -199,8 +200,10 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 			b.Publisher.AbortCompile()
 			return err
 		}
-		b.Policy6[inactive][key] = p.Value
+		policy6[key] = p.Value
 	}
+	b.Policy4[inactive] = policy4
+	b.Policy6[inactive] = policy6
 	gen, bank := b.Publisher.Commit()
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen

@@ -87,3 +87,31 @@ failure. The timeout reuses `established_stall_timeout` (default 10s, bounded
 5s–2m), so this is passive data-plane evidence rather than an extra business
 probe. Regression coverage includes an in-flight blackhole and exactly-once
 notification check.
+
+### Smart primary/backup semantics (2026-09-03)
+
+Smart combines URLTest evidence with a bounded primary/backup selector; it is
+not a latency-only race and it does not continuously round-robin healthy
+nodes. URLTest and passive data-plane observations update one endpoint profile
+shared by all Smart groups. Ranking first applies the health tier
+(`healthy` → `warming`/`unknown` → `suspect` → `half_open` → `open`), then a
+confidence-adjusted score using reliability, connect/first-byte tails,
+throughput, jitter and retransmit evidence. The first eligible candidate is
+the primary and subsequent eligible candidates are ordered backups; open
+candidates remain standby until recovery confirmation.
+
+Normal operation retains the primary through the switch margin, confirmation
+window and cooldown. A hard dial or established-flow failure bypasses those
+performance guards and promotes the next backup for that request; a bounded
+hedge is only used during cold/uncertain startup or after the primary has
+exceeded its response budget. A successful hedge is recorded as a raced
+request, not as a node failure. The status API exposes `role=primary`,
+`role=backup`, or `role=standby` so a displayed ranking change cannot be
+mistaken for an actual failover. If every candidate is circuit-open, Smart
+rotates a capped two-second half-open sample (single-flight per endpoint) using
+the connectivity URLTest path for TCP and the independent DNS reachability
+probe for UDP. Any success is immediately fed back into the profile and the
+normal ranking; failures keep the recovery ladder (30s, 1m, 5m) and the
+10-second per-group recovery gate. Suspect but still usable candidates are not
+preemptively probed or replaced: the real dial/first-byte result is the
+authoritative trigger for fast failover.

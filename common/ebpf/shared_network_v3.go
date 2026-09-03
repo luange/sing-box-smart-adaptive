@@ -64,9 +64,10 @@ type V3Backend struct {
 	// lifecycle lock, so sharing the buffer without a second lock would race.
 	statsAccess  sync.Mutex
 	statsScratch []v3StatsValue
-	// lastStatic tracks the last full snapshot so inactive-bank rewrite can
-	// delete removed keys (LPM_TRIE has no clear-all).
-	lastStatic      []netip.Prefix
+	// lastStatic is kept per bank.  A single snapshot is insufficient because
+	// banks alternate: A→B→C would otherwise try to delete B from bank A and
+	// leave A's stale prefixes live when bank A becomes active again.
+	lastStatic      [2][]netip.Prefix
 	originalDstLost atomic.Uint64
 	flowEnabled     bool
 }
@@ -328,6 +329,7 @@ func (b *V3Backend) WriteControlV3(enabled bool, flags uint32, activeBank, gener
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	previous := b.control
 	if generation == 0 {
 		generation = 1
 	}
@@ -337,7 +339,11 @@ func (b *V3Backend) WriteControlV3(enabled bool, flags uint32, activeBank, gener
 	if routingMark != 0 {
 		b.control.RoutingMark = routingMark
 	}
-	return b.writeControl(enabled)
+	if err := b.writeControl(enabled); err != nil {
+		b.control = previous
+		return err
+	}
+	return nil
 }
 
 func (b *V3Backend) RegisterListenerSocket(key uint32, fd int) error {
@@ -362,13 +368,20 @@ func (b *V3Backend) SetFlowDirect(enabled bool) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	b.flowEnabled = enabled
+	previousEnabled := b.flowEnabled
+	previousFlags := b.control.Flags
 	if enabled {
 		b.control.Flags |= v3FlagExactFlow
 	} else {
 		b.control.Flags &^= v3FlagExactFlow
 	}
-	return b.writeControl(b.control.Enabled != 0)
+	if err := b.writeControl(b.control.Enabled != 0); err != nil {
+		b.flowEnabled = previousEnabled
+		b.control.Flags = previousFlags
+		return err
+	}
+	b.flowEnabled = enabled
+	return nil
 }
 
 func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
@@ -403,6 +416,12 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 		return E.Cause(err, "update v3 flow forward")
 	}
 	if err = updateMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev), unsafe.Pointer(&value)); err != nil {
+		// Never leave a one-sided pair.  A reverse miss would make return
+		// traffic take a different path until the TTL expires.
+		cleanupErr := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd))
+		if cleanupErr != nil && !errors.Is(cleanupErr, unix.ENOENT) {
+			return errors.Join(E.Cause(err, "update v3 flow reverse"), E.Cause(cleanupErr, "rollback v3 flow forward"))
+		}
 		return E.Cause(err, "update v3 flow reverse")
 	}
 	return nil
@@ -421,9 +440,18 @@ func (b *V3Backend) DeleteDirectFlow(protocol uint8, source, destination netip.A
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	_ = deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd))
-	_ = deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev))
-	return nil
+	var firstErr error
+	if err := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd)); err != nil && !errors.Is(err, unix.ENOENT) {
+		firstErr = E.Cause(err, "delete v3 flow forward")
+	}
+	if err := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&rev)); err != nil && !errors.Is(err, unix.ENOENT) {
+		if firstErr == nil {
+			firstErr = E.Cause(err, "delete v3 flow reverse")
+		} else {
+			firstErr = errors.Join(firstErr, E.Cause(err, "delete v3 flow reverse"))
+		}
+	}
+	return firstErr
 }
 
 // makeV3FlowPair builds forward + reverse keys both with direction=0.
@@ -754,22 +782,49 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 	for _, p := range next {
 		nextSet[p] = struct{}{}
 	}
-	// Drop keys present in last snapshot but not in the new one.
-	for _, old := range b.lastStatic {
+	// Keep a copy so a control-map commit failure can restore the in-process
+	// transaction state. The inactive bank may contain the new entries, but it
+	// is still unreachable until writeControl succeeds and can safely be retried.
+	previousControl := b.control
+	previousStatic := append([]netip.Prefix(nil), b.lastStatic[inactive]...)
+	// Drop keys present in this bank's previous snapshot but not in the new one.
+	for _, old := range b.lastStatic[inactive] {
 		if _, keep := nextSet[old]; keep {
 			continue
 		}
-		_ = deleteV3PolicyPrefix(fd4, fd6, old)
-	}
-	for _, prefix := range next {
-		if err := writeV3PolicyPrefix(fd4, fd6, prefix, generation); err != nil {
-			return err
+		if err := deleteV3PolicyPrefix(fd4, fd6, old); err != nil {
+			return E.Cause(err, "remove stale v3 static prefix")
 		}
 	}
-	b.lastStatic = next
+	written := make([]netip.Prefix, 0, len(next))
+	for _, prefix := range next {
+		if err := writeV3PolicyPrefix(fd4, fd6, prefix, generation); err != nil {
+			// A failed update may have written an earlier prefix.  Remove only
+			// entries from this attempt so the inactive bank remains the previous
+			// committed snapshot and can be retried safely.
+			var cleanupErr error
+			for _, partial := range written {
+				if removeErr := deleteV3PolicyPrefix(fd4, fd6, partial); removeErr != nil {
+					cleanupErr = errors.Join(cleanupErr, removeErr)
+				}
+			}
+			b.lastStatic[inactive] = previousStatic
+			if cleanupErr != nil {
+				return errors.Join(err, E.Cause(cleanupErr, "rollback v3 static prefix"))
+			}
+			return err
+		}
+		written = append(written, prefix)
+	}
+	b.lastStatic[inactive] = next
 	b.control.ActiveBank = inactive
 	b.control.PolicyGeneration = generation
-	return b.writeControl(b.control.Enabled != 0)
+	if err := b.writeControl(b.control.Enabled != 0); err != nil {
+		b.control = previousControl
+		b.lastStatic[inactive] = previousStatic
+		return E.Cause(err, "commit v3 static policy")
+	}
+	return nil
 }
 
 // MergeStaticDirect installs one DIRECT prefix into the *active* bank using the
@@ -798,16 +853,17 @@ func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
 	if err := writeV3PolicyPrefix(fd4, fd6, prefix, b.control.PolicyGeneration); err != nil {
 		return err
 	}
-	// Keep lastStatic coherent for the next full publish delete pass.
+	// Keep the active bank snapshot coherent for the next full publish delete pass.
+	last := b.lastStatic[active]
 	found := false
-	for _, p := range b.lastStatic {
+	for _, p := range last {
 		if p == prefix {
 			found = true
 			break
 		}
 	}
 	if !found {
-		b.lastStatic = append(b.lastStatic, prefix)
+		b.lastStatic[active] = append(last, prefix)
 	}
 	return nil
 }
@@ -916,7 +972,9 @@ func (b *V3Backend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8,
 		}
 	}
 	var cur v3DNSValue
-	_ = lookupMap(int(b.runtime.dns_hint_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&cur))
+	if err := lookupMap(int(b.runtime.dns_hint_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&cur)); err != nil && !errors.Is(err, unix.ENOENT) {
+		return E.Cause(err, "lookup v3 dns hint")
+	}
 	// Expired hints must start a fresh evidence epoch.  Carrying an old
 	// proxy/direct ref across TTL turns transient CDN address reuse into a
 	// permanent conflict and prevents the direct fast path from recovering.

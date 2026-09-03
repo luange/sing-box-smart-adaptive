@@ -170,7 +170,8 @@ func (w *adaptiveStateWriter) run() {
 }
 
 func (p *AdaptivePool) persistStateDurable() error {
-	if p == nil || p.statePath == "" || p.health == nil || p.leases == nil {
+	health, leases, _, _ := p.runtimeSnapshot()
+	if p == nil || p.statePath == "" || health == nil || leases == nil {
 		return nil
 	}
 	if p.stateWriter != nil {
@@ -196,12 +197,13 @@ func (p *AdaptivePool) persistenceSnapshot(now time.Time) persistedAdaptiveState
 	if p.runtimeManager != nil && p.groupID != "" {
 		state.Identity = p.runtimeManager.PersistenceSnapshot(p.groupID)
 	}
-	if p.control != nil {
-		p.control.access.RLock()
-		state.Pinned, state.PinnedTag = p.control.pinned, safePersistentTag(p.control.pinnedTag)
-		p.control.access.RUnlock()
-		state.BulkSequence = p.control.bulkSequence.Load()
-		state.ControlRevision = p.control.revision.Load()
+	_, _, control, _ := p.runtimeSnapshot()
+	if control != nil {
+		control.access.RLock()
+		state.Pinned, state.PinnedTag = control.pinned, safePersistentTag(control.pinnedTag)
+		control.access.RUnlock()
+		state.BulkSequence = control.bulkSequence.Load()
+		state.ControlRevision = control.revision.Load()
 	}
 	return state
 }
@@ -215,7 +217,8 @@ func safePersistentTag(value string) string {
 }
 
 func (p *AdaptivePool) persistState() {
-	if p == nil || p.statePath == "" || p.health == nil || p.leases == nil {
+	health, leases, _, _ := p.runtimeSnapshot()
+	if p == nil || p.statePath == "" || health == nil || leases == nil {
 		return
 	}
 	if p.stateWriter != nil {
@@ -230,7 +233,8 @@ func (p *AdaptivePool) persistState() {
 }
 
 func (p *AdaptivePool) loadPersistentState() {
-	if p == nil || p.statePath == "" || p.health == nil || p.leases == nil {
+	health, leases, control, _ := p.runtimeSnapshot()
+	if p == nil || p.statePath == "" || health == nil || leases == nil {
 		return
 	}
 	state, err := readAdaptiveState(p.persistentStatePath())
@@ -242,18 +246,18 @@ func (p *AdaptivePool) loadPersistentState() {
 		return
 	}
 	if state.Identity != nil && p.runtimeManager != nil && p.groupID != "" {
-		if err = p.runtimeManager.RestorePersistence(p.groupID, p.health, p.leases, p.control, state.Identity); err != nil {
+		if err = p.runtimeManager.RestorePersistence(p.groupID, health, leases, control, state.Identity); err != nil {
 			p.statePersistenceFailures.Add(1)
 			return
 		}
 	}
-	if p.control != nil {
-		p.control.access.Lock()
-		p.control.pinned, p.control.pinnedTag = state.Pinned, state.PinnedTag
-		p.control.latestTag = ""
-		p.control.access.Unlock()
-		p.control.bulkSequence.Store(state.BulkSequence)
-		p.control.revision.Store(state.ControlRevision)
+	if control != nil {
+		control.access.Lock()
+		control.pinned, control.pinnedTag = state.Pinned, state.PinnedTag
+		control.latestTag = ""
+		control.access.Unlock()
+		control.bulkSequence.Store(state.BulkSequence)
+		control.revision.Store(state.ControlRevision)
 	}
 }
 

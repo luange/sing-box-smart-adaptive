@@ -145,9 +145,10 @@ func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableU
 	l.backend.Control.Enabled = 1
 }
 
-// PublishStaticRules compiles and double-buffers static DIRECT/PROXY/BLOCK sinks.
-// When a kernel sink is bound, only DIRECT destination prefixes are pushed today
-// (PROXY/BLOCK static sinks land in a later compiler expansion).
+// PublishStaticRules compiles and double-buffers static DIRECT rules.  The v3
+// dataplane intentionally has one direct fast-path sink; proxy/block/group
+// rules remain userspace decisions and are reported as rejected instead of
+// being counted as accepted while silently disappearing at the kernel boundary.
 func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted int, rejected int, err error) {
 	if l == nil || l.backend == nil {
 		return 0, 0, fmt.Errorf("nil lifecycle")
@@ -161,21 +162,27 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := l.backend.PublishStatic(compiled); err != nil {
-		return 0, 0, err
+	direct := make([]ebpfv3.CompiledPolicy, 0, len(compiled))
+	for _, policy := range compiled {
+		if policy.Value.Verdict == uint8(ebpfv3.VerdictDirect) {
+			direct = append(direct, policy)
+		} else {
+			rej = append(rej, ebpfv3.CompileInput{Destination: policy.Prefix, Verdict: ebpfv3.Verdict(policy.Value.Verdict), Kind: ebpfv3.RuleKindNeedsControl, PolicyID: policy.Value.PolicyID})
+		}
+	}
+	directPrefixes := make([]netip.Prefix, 0, len(direct))
+	for _, c := range direct {
+		directPrefixes = append(directPrefixes, c.Prefix)
 	}
 	if l.sink != nil {
-		direct := make([]netip.Prefix, 0, len(compiled))
-		for _, c := range compiled {
-			if c.Value.Verdict == uint8(ebpfv3.VerdictDirect) {
-				direct = append(direct, c.Prefix)
-			}
-		}
-		if err := l.sink.PublishStaticDirect(direct, 0, 0); err != nil {
-			return len(compiled), len(rej), err
+		if err := l.sink.PublishStaticDirect(directPrefixes, 0, 0); err != nil {
+			return len(direct), len(rej), err
 		}
 	}
-	return len(compiled), len(rej), nil
+	if err := l.backend.PublishStatic(direct); err != nil {
+		return 0, 0, err
+	}
+	return len(direct), len(rej), nil
 }
 
 // LearnFlow publishes exact-flow verdict after userspace bare-direct route.
@@ -191,18 +198,21 @@ func (l *Lifecycle) LearnFlow(client, dest netip.AddrPort, protocol uint8, bareD
 	if !bareDirect {
 		return nil
 	}
-	if err := l.backend.PublishFlow(ebpfv3.FlowPublishRequest{
+	request := ebpfv3.FlowPublishRequest{
 		Client:           client,
 		Destination:      dest,
 		Protocol:         protocol,
 		Verdict:          ebpfv3.VerdictDirect,
 		LeafIsBareDirect: true,
 		TTL:              l.flowTTL,
-	}, uint64(now.UnixNano())); err != nil {
-		return err
 	}
 	if l.sink != nil {
-		return l.sink.PutDirectFlow(protocol, client, dest, l.flowTTL)
+		if err := l.sink.PutDirectFlow(protocol, client, dest, l.flowTTL); err != nil {
+			return err
+		}
+	}
+	if err := l.backend.PublishFlow(request, uint64(now.UnixNano())); err != nil {
+		return err
 	}
 	return nil
 }
@@ -214,7 +224,9 @@ func (l *Lifecycle) RevokeFlow(client, dest netip.AddrPort, protocol uint8) erro
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_ = l.backend.RevokeFlow(client, dest, protocol)
+	if err := l.backend.RevokeFlow(client, dest, protocol); err != nil {
+		return err
+	}
 	if l.sink != nil {
 		return l.sink.DeleteDirectFlow(protocol, client, dest)
 	}
@@ -223,12 +235,12 @@ func (l *Lifecycle) RevokeFlow(client, dest netip.AddrPort, protocol uint8) erro
 
 // ObserveDNS records DNS/FakeIP evidence with conflict isolation and mirrors
 // into the kernel DNS hint map when a sink is bound.
-func (l *Lifecycle) ObserveDNS(addr netip.Addr, direct bool, evidence uint8, ttl time.Duration, now time.Time) {
+func (l *Lifecycle) ObserveDNS(addr netip.Addr, direct bool, evidence uint8, ttl time.Duration, now time.Time) error {
 	if l == nil || l.backend == nil || l.backend.DNS == nil {
-		return
+		return nil
 	}
 	if !l.options.PolicyOffload.Enabled {
-		return
+		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -242,17 +254,23 @@ func (l *Lifecycle) ObserveDNS(addr netip.Addr, direct bool, evidence uint8, ttl
 		family = ebpfv3.AFInet6
 		raw = a.As16()
 	} else {
-		return
+		return nil
 	}
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
+	if now.IsZero() {
+		now = time.Now()
+	}
 	key := ebpfv3.DNSIPKey{Family: family, Addr: raw}
 	expire := uint64(now.Add(ttl).UnixNano())
-	l.backend.DNS.Observe(key, direct, evidence, 0, l.backend.Control.PolicyGeneration, expire, uint64(now.UnixNano()))
 	if l.sink != nil {
-		_ = l.sink.PublishDNSHint(addr, direct, evidence, 0, ttl)
+		if err := l.sink.PublishDNSHint(addr, direct, evidence, 0, ttl); err != nil {
+			return err
+		}
 	}
+	l.backend.DNS.Observe(key, direct, evidence, 0, l.backend.Control.PolicyGeneration, expire, uint64(now.UnixNano()))
+	return nil
 }
 
 // InvalidateGeneration bumps policy generation on memory + kernel sinks so

@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing-box/service/powerreport"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
@@ -89,6 +90,12 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
 		Debug:       sDebug,
 		OOMReporter: reporter,
 	})
+	if sPowerReportEnabled {
+		err := powerManager.Start(PowerReportOptions(server.StartedService))
+		if err != nil {
+			log.StdLogger().Error(E.Cause(err, "start power report recorder"))
+		}
+	}
 	return server, nil
 }
 
@@ -199,6 +206,9 @@ type OverrideOptions struct {
 
 func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
 	saveConfigSnapshot(configContent)
+	if s.powerManager.Recorder() != nil {
+		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
+	}
 	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
 		AutoRedirect:   options.AutoRedirect,
 		IncludePackage: iteratorToArray(options.IncludePackage),

@@ -428,11 +428,14 @@ func (p *PreparedIdentity) Rollback() error {
 func (p *PreparedIdentity) Identity() RuntimeIdentity { return cloneRuntimeIdentity(p.identity) }
 
 func (p *PreparedIdentity) Commit() (*sharedGroupState, RuntimeIdentity, error) {
-	if p == nil || p.manager == nil || !p.committed.CompareAndSwap(false, true) {
+	if p == nil || p.manager == nil {
 		return nil, RuntimeIdentity{}, errors.New("adaptive identity preparation is no longer committable")
 	}
 	p.manager.access.Lock()
 	defer p.manager.access.Unlock()
+	if p.committed.Load() || p.rolledBack.Load() {
+		return nil, RuntimeIdentity{}, errors.New("adaptive identity preparation is no longer committable")
+	}
 	state := p.manager.groups[p.groupID]
 	if p.baseState == nil {
 		if state != nil {
@@ -449,6 +452,10 @@ func (p *PreparedIdentity) Commit() (*sharedGroupState, RuntimeIdentity, error) 
 			return nil, RuntimeIdentity{}, ErrPreparedIdentityStale
 		}
 	}
+	// Mark committed only after all stale/base checks succeed.  A failed
+	// optimistic publish remains retryable instead of consuming the prepared
+	// object and leaving the pool stuck in publishing phase.
+	p.committed.Store(true)
 	state.identity = p.nextState
 	if p.newEpoch {
 		state.epochs[p.identity.EpochID] = &stableEpoch{lifecycle: EpochActive, revision: p.identity.Revision, lastSourceGeneration: p.identity.SourceGeneration, handles: cloneHandles(p.identity.Handles)}

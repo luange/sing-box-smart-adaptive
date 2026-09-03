@@ -44,7 +44,11 @@ type DirectOffload interface {
 
 // SmartCandidateStatus is a snapshot of one smart leaf candidate.
 type SmartCandidateStatus struct {
-	Tag             string  `json:"tag"`
+	Tag string `json:"tag"`
+	// Role is the decision role for the current context. The first eligible
+	// healthy candidate is primary; other eligible candidates are backups.
+	// It is diagnostic only and never overrides a manual pin.
+	Role            string  `json:"role,omitempty"`
 	State           string  `json:"state"`
 	Score           float64 `json:"score"`
 	Weight          float64 `json:"weight,omitempty"`

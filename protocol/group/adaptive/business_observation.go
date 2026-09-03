@@ -22,6 +22,9 @@ var ErrObservationIdentityIncomplete = errors.New("adaptive business observation
 // connection. It never consults the active catalog to relabel old traffic.
 type businessObservation struct {
 	pool           *AdaptivePool
+	health         *HealthStore
+	leases         *SessionLeaseManager
+	policy         *PolicyEngine
 	lease          *RuntimeEpochIdentityLease
 	guard          ObservationIdentityGuard
 	evidence       ObservationEvidence
@@ -45,9 +48,9 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 		evidence.Outcome = OutcomeFailure
 		evidence.Failure = failure
 		evidence.Delay = delay
-		evidence.At = o.pool.health.Now()
+		evidence.At = o.health.Now()
 		evidence.Reason = reason
-		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.pool.health.Now())
+		permit, allowed := o.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.health.Now())
 		var reducer *HealthObservationReducer
 		if !allowed {
 			// Half-open owner busy: still record quality (non-breaker) so concurrent
@@ -56,19 +59,19 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 			if confidence > ConfidenceLow {
 				evidence.Confidence = ConfidenceLow
 			}
-			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, BeforeReduce: o.pool.observationReducerHook}
 		} else {
-			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
 		}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
 		if publishErr == nil && disposition == IngestAccepted && confidence >= ConfidenceHigh && allowed {
 			o.pool.businessTLSFailures.Add(1)
-			earlyFailure := o.pool.policy != nil && o.pool.policy.ForgetSelectionAfterEarlyFailure(o.service, o.evidence.Handle, evidence.At)
+			earlyFailure := o.policy != nil && o.policy.ForgetSelectionAfterEarlyFailure(o.service, o.evidence.Handle, evidence.At)
 			if earlyFailure {
-				o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+				o.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
 			}
-			status := o.pool.health.StatusHandle(o.evidence.Handle, DomainService, "", o.service.ID)
+			status := o.health.StatusHandle(o.evidence.Handle, DomainService, "", o.service.ID)
 			if !earlyFailure && status.Breaker != BreakerOpen && status.Breaker != BreakerCooldown {
 				return
 			}
@@ -78,7 +81,7 @@ func (o *businessObservation) observeTLSFailure(delay time.Duration, failure Fai
 					o.pool.recordFailureMemory(candidate, FailureTLS, o.service.ID, serviceHealthTransport(o.service))
 				}
 			}
-			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+			o.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
 			o.pool.scheduleFailureProbe(o.evidence.Handle)
 			o.pool.persistState()
 		}
@@ -117,18 +120,18 @@ func (o *businessObservation) observeUDPFailureConfidence(err error, delay time.
 		evidence.Outcome = OutcomeFailure
 		evidence.Failure = failure
 		evidence.Delay = delay
-		evidence.At = o.pool.health.Now()
+		evidence.At = o.health.Now()
 		evidence.Reason = errorReason(err)
-		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		reducer := &HealthObservationReducer{Store: o.health, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
 		if publishErr != nil || disposition != IngestAccepted || confidence != ConfidenceHigh {
 			return
 		}
 		o.pool.transportFailures.Add(1)
-		status := o.pool.health.StatusHandle(o.evidence.Handle, DomainTransport, evidence.NetworkPath, "")
+		status := o.health.StatusHandle(o.evidence.Handle, DomainTransport, evidence.NetworkPath, "")
 		if status.Breaker == BreakerOpen || status.Breaker == BreakerCooldown {
-			o.pool.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
+			o.leases.Invalidate(o.service.Session, o.evidence.Handle.NodeID)
 			o.pool.scheduleFailureProbe(o.evidence.Handle)
 			o.pool.persistState()
 		}
@@ -136,7 +139,8 @@ func (o *businessObservation) observeUDPFailureConfidence(err error, delay time.
 }
 
 func (p *AdaptivePool) beginBusinessObservation(snapshot *ExecutionSnapshot, candidate Candidate, service ServiceContext) (*businessObservation, error) {
-	if snapshot == nil || snapshot.RuntimeEpochID == 0 || snapshot.CatalogRevision == 0 || p.runtimeManager == nil || p.health == nil {
+	health, leases, _, policy := p.runtimeSnapshot()
+	if snapshot == nil || snapshot.RuntimeEpochID == 0 || snapshot.CatalogRevision == 0 || p.runtimeManager == nil || health == nil {
 		return nil, ErrObservationIdentityIncomplete
 	}
 	lease, err := p.runtimeManager.AcquireEpoch(p.groupID, snapshot.RuntimeEpochID)
@@ -147,7 +151,7 @@ func (p *AdaptivePool) beginBusinessObservation(snapshot *ExecutionSnapshot, can
 		RuntimeEpochID: snapshot.RuntimeEpochID, CatalogRevision: snapshot.CatalogRevision, SourceGeneration: snapshot.Generation,
 		Handle: candidate.Handle, AttemptID: AttemptID(p.attemptSequence.Add(1)), ServiceID: service.ID, Transport: service.Transport,
 	}
-	return &businessObservation{pool: p, lease: lease, guard: RuntimeEpochObservationGuard{Lease: lease}, evidence: evidence, service: service}, nil
+	return &businessObservation{pool: p, health: health, leases: leases, policy: policy, lease: lease, guard: RuntimeEpochObservationGuard{Lease: lease}, evidence: evidence, service: service}, nil
 }
 
 func (o *businessObservation) observePayload(source ObservationSource, delay time.Duration) {
@@ -162,7 +166,7 @@ func (o *businessObservation) observePayload(source ObservationSource, delay tim
 	o.payloadOnce.Do(func() {
 		// Half-open owner busy: still quality-learn at low confidence so concurrent
 		// successes are not silently dropped (parity with observeTLSFailure).
-		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.pool.health.Now())
+		permit, allowed := o.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainService, "", o.service.ID, o.health.Now())
 		evidence := o.evidence
 		evidence.Source = source
 		evidence.Stage = StageServiceApplication
@@ -170,14 +174,14 @@ func (o *businessObservation) observePayload(source ObservationSource, delay tim
 		evidence.Outcome = OutcomeSuccess
 		evidence.Failure = FailureNone
 		evidence.Delay = delay
-		evidence.At = o.pool.health.Now()
+		evidence.At = o.health.Now()
 		var reducer *HealthObservationReducer
 		if !allowed {
 			o.pool.observationPermitBusy.Add(1)
 			evidence.Confidence = ConfidenceLow
-			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, BeforeReduce: o.pool.observationReducerHook}
 		} else {
-			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
 		}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
@@ -204,7 +208,7 @@ func (o *businessObservation) observeUDPSuccess(payload []byte, delay time.Durat
 // observeUDPPathSuccess reports whether the payload is admissible path evidence.
 // False means the payload must not count for transport or service success.
 func (o *businessObservation) observeUDPPathSuccess(payload []byte, delay time.Duration) bool {
-	if o == nil || len(payload) == 0 || o.pool == nil || o.pool.health == nil {
+	if o == nil || len(payload) == 0 || o.pool == nil || o.health == nil {
 		return false
 	}
 	path := normalizeHealthTransportPath(serviceHealthTransport(o.service))
@@ -237,16 +241,16 @@ func (o *businessObservation) observeUDPPathSuccess(payload []byte, delay time.D
 		evidence.Outcome = OutcomeSuccess
 		evidence.Failure = FailureNone
 		evidence.Delay = delay
-		evidence.At = o.pool.health.Now()
+		evidence.At = o.health.Now()
 		evidence.Reason = ""
-		permit, allowed := o.pool.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainTransport, path, "", o.pool.health.Now())
+		permit, allowed := o.health.TryAcquireDomainPermitHandle(o.evidence.Handle, DomainTransport, path, "", o.health.Now())
 		var reducer *HealthObservationReducer
 		if !allowed {
 			o.pool.observationPermitBusy.Add(1)
 			evidence.Confidence = ConfidenceLow
-			reducer = &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, BeforeReduce: o.pool.observationReducerHook}
 		} else {
-			reducer = &HealthObservationReducer{Store: o.pool.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
+			reducer = &HealthObservationReducer{Store: o.health, Settlement: AttemptPermitSettlement{Permit: permit}, BeforeReduce: o.pool.observationReducerHook}
 		}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
@@ -280,8 +284,8 @@ func (o *businessObservation) observeThroughput(bytes int64, elapsed time.Durati
 		evidence.Outcome = OutcomeSuccess
 		evidence.Failure = FailureNone
 		evidence.ThroughputBPS = bps
-		evidence.At = o.pool.health.Now()
-		reducer := &HealthObservationReducer{Store: o.pool.health, BeforeReduce: o.pool.observationReducerHook}
+		evidence.At = o.health.Now()
+		reducer := &HealthObservationReducer{Store: o.health, BeforeReduce: o.pool.observationReducerHook}
 		disposition, publishErr := PublishSettledObservationGuarded(o.pool.sharedObservationIngestor(), o.guard, evidence, reducer)
 		o.pool.recordObservationResult(disposition, publishErr)
 	})

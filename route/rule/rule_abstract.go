@@ -200,6 +200,23 @@ type abstractLogicalRule struct {
 	action adapter.RuleAction
 }
 
+// legacyPreMatcher preserves deferred destination-IP semantics when a logical
+// DNS rule is nested inside another logical rule. Calling Match directly on a
+// LogicalDNSRule intentionally evaluates it as a final boolean and drops the
+// deferred group marker; pre-match must use its LegacyPreMatch path instead.
+type legacyPreMatcher interface {
+	LegacyPreMatch(*adapter.InboundContext) bool
+}
+
+func matchLogicalChild(rule adapter.HeadlessRule, metadata *adapter.InboundContext) bool {
+	if metadata.IgnoreDestinationIPCIDRMatch {
+		if preMatcher, ok := rule.(legacyPreMatcher); ok {
+			return preMatcher.LegacyPreMatch(metadata)
+		}
+	}
+	return rule.Match(metadata)
+}
+
 func (r *abstractLogicalRule) Type() string {
 	return C.RuleTypeLogical
 }
@@ -248,42 +265,47 @@ func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 		for _, rule := range r.rules {
 			nestedMetadata := *metadata
 			nestedMetadata.ResetRuleCache()
-			if !rule.Match(&nestedMetadata) {
-				matched = false
-				deferredGroups = 0
-				break
-			}
-			// AND: union classes from every satisfied sub-rule.
+			subMatched := matchLogicalChild(rule, &nestedMetadata)
+			// A nested branch may be unable to decide while destination IP
+			// matching is deliberately deferred. Preserve that evidence even when
+			// the branch currently returns false; an outer OR/invert must re-enter
+			// address-limit evaluation instead of treating the provisional result
+			// as a final boolean.
 			collected |= nestedMetadata.MatchInputs
 			deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
+			if !subMatched {
+				matched = false
+				if deferredGroups == 0 {
+					break
+				}
+			}
 		}
 	} else {
 		for _, rule := range r.rules {
 			nestedMetadata := *metadata
 			nestedMetadata.ResetRuleCache()
-			if rule.Match(&nestedMetadata) {
+			subMatched := matchLogicalChild(rule, &nestedMetadata)
+			deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
+			if subMatched {
 				matched = true
 				// OR: prefer the first fully-resolved match. If the match is
 				// deferred, retain its classes while allowing a later rule to
 				// resolve the same destination group.
 				collected = nestedMetadata.MatchInputs
 				if nestedMetadata.DeferredIPCIDRMatchGroups == 0 {
-					deferredGroups = 0
 					break
 				}
-				deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
 			}
 		}
 	}
-	if matched {
-		metadata.DeferredIPCIDRMatchGroups |= deferredGroups
-	}
 	if r.invert {
-		if !matched {
-			deferredGroups = 0
+		// A deferred address group is an unknown, not a false, result. Keep the
+		// rule eligible for the post-DNS address check; otherwise nested logical
+		// invert rules incorrectly skip routing during pre-match.
+		if deferredGroups != 0 {
 			matched = true
 		} else {
-			matched = deferredGroups != 0
+			matched = !matched
 		}
 	}
 	if matched {

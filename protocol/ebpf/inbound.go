@@ -1211,19 +1211,22 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool 
 	if len(i.promotedBypass) >= promotedBypassMaxEntries {
 		if !existed {
 			now := time.Now()
-			dropped := false
+			// Evict the entry closest to expiry first.  Map iteration order is
+			// random; arbitrary eviction made hot destinations disappear while
+			// long-lived entries occupied the bounded table.
+			var evict netip.Addr
+			var evictAt time.Time
 			for a, exp := range i.promotedBypass {
 				if now.After(exp) {
 					delete(i.promotedBypass, a)
-					dropped = true
-					break
+					continue
+				}
+				if evict == (netip.Addr{}) || exp.Before(evictAt) {
+					evict, evictAt = a, exp
 				}
 			}
-			if !dropped {
-				for a := range i.promotedBypass {
-					delete(i.promotedBypass, a)
-					break
-				}
+			if evict.IsValid() {
+				delete(i.promotedBypass, evict)
 			}
 		}
 	}
@@ -1325,6 +1328,14 @@ func (i *Inbound) logBypassCIDRUpdate() {
 }
 
 func (i *Inbound) InterfaceUpdated(_ context.Context) {
+	if i == nil {
+		return
+	}
+	i.closeAccess.Lock()
+	defer i.closeAccess.Unlock()
+	if i.udpNat == nil || i.dnsMux == nil {
+		return
+	}
 	i.udpNat.Purge()
 	i.dnsMux.Purge()
 	i.bypassRuleSetAccess.Lock()

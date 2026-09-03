@@ -53,6 +53,8 @@ const (
 	defaultSmartProbeConcurrency        = 2
 	defaultSmartUDPProbeTimeout         = 2 * time.Second
 	defaultSmartUDPProbeTargetCount     = 2
+	defaultSmartRecoveryProbeTimeout    = 2 * time.Second
+	defaultSmartRecoveryProbeCooldown   = 10 * time.Second
 	defaultSmartAttemptTimeout          = 4 * time.Second
 	defaultSmartEstablishedStallTimeout = 10 * time.Second
 	minSmartEstablishedStallTimeout     = 5 * time.Second
@@ -332,67 +334,68 @@ type Smart struct {
 	statusLastReason   string
 	statusLastPhase    string
 
-	store                     *smartStore
-	policyBackend             smartPolicyBackend
-	policyBackendAccess       sync.RWMutex
-	probeURL                  string
-	probeInterval             time.Duration
-	probeCycleTimeout         time.Duration
-	probeTimeout              time.Duration
-	probeConcurrency          int
-	maxAttempts               int
-	attemptTimeout            time.Duration
-	establishedStallTimeout   time.Duration
-	siteStickiness            time.Duration
-	switchConfirm             time.Duration
-	switchConfirmSamples      int
-	switchCooldown            time.Duration
-	switchMargin              float64
-	switchMinImprovement      time.Duration
-	exploration               float64
-	minSamples                int
-	passiveThroughputFloorBPS uint64
-	passiveThroughputSamples  int
-	halfLife                  time.Duration
-	breakerFailures           int
-	breakerCooldown           time.Duration
-	historyRetention          time.Duration
-	maxHistoryEntries         int
-	interruptGroup            *interrupt.Group
-	interruptExternal         bool
-	interruptMode             string
-	interruptIdle             time.Duration
-	interruptLongAge          time.Duration
-	interruptGrace            time.Duration
-	switchesTotal             atomic.Uint64
-	performanceSwitches       atomic.Uint64
-	failureFailovers          atomic.Uint64
-	coldStarts                atomic.Uint64
-	switchAuditAccess         sync.Mutex
-	switchAudit               []adapter.SmartSwitchAudit
-	switchesForceAll          atomic.Uint64
-	switchesSelective         atomic.Uint64
-	connectionsInterrupted    atomic.Uint64
-	connectionsKept           atomic.Uint64
-	streamFailureWakes        atomic.Uint64
-	probing                   atomic.Bool
-	probeCursor               atomic.Uint64
-	phase                     atomic.Uint32
-	phaseInitialized          atomic.Bool
-	successfulProbeCycles     atomic.Uint32
-	lastActivityUnixNano      atomic.Int64
-	closing                   atomic.Bool
-	cancel                    context.CancelFunc
-	worker                    sync.WaitGroup
-	lifecycleAccess           sync.Mutex
-	postStarted               bool
-	retired                   bool
-	workerStarted             bool
-	probeRegistry             *smartProbeRegistry
-	releaseProbeRegistry      func()
-	probeStartupDelay         time.Duration
-	probeNow                  chan struct{}
-	families                  *trafficfamily.Resolver
+	store                      *smartStore
+	policyBackend              smartPolicyBackend
+	policyBackendAccess        sync.RWMutex
+	probeURL                   string
+	probeInterval              time.Duration
+	probeCycleTimeout          time.Duration
+	probeTimeout               time.Duration
+	probeConcurrency           int
+	maxAttempts                int
+	attemptTimeout             time.Duration
+	establishedStallTimeout    time.Duration
+	siteStickiness             time.Duration
+	switchConfirm              time.Duration
+	switchConfirmSamples       int
+	switchCooldown             time.Duration
+	switchMargin               float64
+	switchMinImprovement       time.Duration
+	exploration                float64
+	minSamples                 int
+	passiveThroughputFloorBPS  uint64
+	passiveThroughputSamples   int
+	halfLife                   time.Duration
+	breakerFailures            int
+	breakerCooldown            time.Duration
+	historyRetention           time.Duration
+	maxHistoryEntries          int
+	interruptGroup             *interrupt.Group
+	interruptExternal          bool
+	interruptMode              string
+	interruptIdle              time.Duration
+	interruptLongAge           time.Duration
+	interruptGrace             time.Duration
+	switchesTotal              atomic.Uint64
+	performanceSwitches        atomic.Uint64
+	failureFailovers           atomic.Uint64
+	coldStarts                 atomic.Uint64
+	switchAuditAccess          sync.Mutex
+	switchAudit                []adapter.SmartSwitchAudit
+	switchesForceAll           atomic.Uint64
+	switchesSelective          atomic.Uint64
+	connectionsInterrupted     atomic.Uint64
+	connectionsKept            atomic.Uint64
+	streamFailureWakes         atomic.Uint64
+	recoveryProbeUntilUnixNano atomic.Int64
+	probing                    atomic.Bool
+	probeCursor                atomic.Uint64
+	phase                      atomic.Uint32
+	phaseInitialized           atomic.Bool
+	successfulProbeCycles      atomic.Uint32
+	lastActivityUnixNano       atomic.Int64
+	closing                    atomic.Bool
+	cancel                     context.CancelFunc
+	worker                     sync.WaitGroup
+	lifecycleAccess            sync.Mutex
+	postStarted                bool
+	retired                    bool
+	workerStarted              bool
+	probeRegistry              *smartProbeRegistry
+	releaseProbeRegistry       func()
+	probeStartupDelay          time.Duration
+	probeNow                   chan struct{}
+	families                   *trafficfamily.Resolver
 }
 
 type smartSwitchChallenge struct {
@@ -1275,13 +1278,23 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.noteTrafficActivity()
 	transport := N.NetworkName(network)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
-	defer ranking.Release()
+	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no service-reachable candidate")
+		// All circuits being open is an outage state, not a reason to strand the
+		// group indefinitely. Run a small, single-flight half-open URLTest-style
+		// recovery sample, then rank again if any endpoint proves reachable.
+		if s.recoverOpenCandidates(ctx, ranking.candidates, transport) {
+			ranking.Release()
+			ranking, networkKey, siteKey, siteDisplay = s.rankPooled(ctx, transport, destination)
+			ranks = ranking.ranks
+		}
+		if !hasEligibleSmartRank(ranks) {
+			return nil, E.New("smart group has no service-reachable candidate")
+		}
 	}
 	attempts := s.collectDialAttempts(ranks, networkKey, siteKey, transport)
 	if len(attempts) == 0 {
@@ -1348,6 +1361,147 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 		})
 	}
 	return attempts
+}
+
+// recoverOpenCandidates is the outage escape hatch for the staged selector.
+// Once every candidate is circuit-open, waiting for the ordinary probe cadence
+// would strand new connections. A short, rotating half-open sample instead
+// revalidates a bounded subset; one success immediately closes that endpoint's
+// circuit and lets the normal health-tier ranking choose it as primary. The
+// registry keeps the sample single-flight across Smart groups.
+func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.Outbound, transport string) bool {
+	if s == nil || ctx.Err() != nil || s.closing.Load() || len(candidates) == 0 {
+		return false
+	}
+	now := time.Now()
+	next := s.recoveryProbeUntilUnixNano.Load()
+	if next > now.UnixNano() || !s.recoveryProbeUntilUnixNano.CompareAndSwap(next, now.Add(defaultSmartRecoveryProbeCooldown).UnixNano()) {
+		return false
+	}
+	eligible := make([]adapter.Outbound, 0, len(candidates))
+	for _, candidate := range candidates {
+		if common.Contains(candidate.Network(), transport) {
+			eligible = append(eligible, candidate)
+		}
+	}
+	if len(eligible) == 0 {
+		return false
+	}
+	budget := max(defaultSmartColdProbeBudget, max(s.maxAttempts, 1))
+	if budget > 8 {
+		budget = 8
+	}
+	if len(eligible) > budget {
+		start := int(s.probeCursor.Add(uint64(budget))-uint64(budget)) % len(eligible)
+		eligible = append(eligible[start:], eligible[:start]...)
+		eligible = eligible[:budget]
+	}
+	probeTimeout := defaultSmartRecoveryProbeTimeout
+	if s.probeTimeout > 0 && s.probeTimeout < probeTimeout {
+		probeTimeout = s.probeTimeout
+	}
+	type recoveryResult struct {
+		candidate adapter.Outbound
+		measured  time.Duration
+		err       error
+		performed bool
+	}
+	results := make(chan recoveryResult, len(eligible))
+	jobs := make(chan adapter.Outbound)
+	workerCount := min(max(s.probeConcurrency, 1), len(eligible))
+	var workers sync.WaitGroup
+	for range workerCount {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for candidate := range jobs {
+				probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+				startedAt := time.Now()
+				var (
+					err       error
+					measured  time.Duration
+					performed bool
+				)
+				if s.probeRegistry != nil {
+					s.access.RLock()
+					metadata := s.candidateMetadataByTag[candidate.Tag()]
+					s.access.RUnlock()
+					identity := metadata.identity
+					if identity == "" {
+						identity = candidate.Tag()
+					}
+					key := metadata.probeKey
+					if transport == N.NetworkUDP {
+						key = smartProbeKey(identity, "udp://dns-health", probeTimeout)
+					} else if key == "" {
+						key = smartProbeKey(identity, s.probeURL, probeTimeout)
+					}
+					var delay uint16
+					delay, err = s.probeRegistry.runRecovery(probeCtx, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
+						performed = true
+						if transport == N.NetworkUDP {
+							return 0, runSmartUDPHealthProbe(probeContext, candidate)
+						}
+						return s.probeRegistry.probe(probeContext, s.probeURL, candidate)
+					})
+					if transport == N.NetworkUDP {
+						measured = time.Since(startedAt)
+					} else if err == nil {
+						measured = time.Duration(delay) * time.Millisecond
+					}
+				} else if transport == N.NetworkUDP {
+					performed = true
+					err = runSmartUDPHealthProbe(probeCtx, candidate)
+					measured = time.Since(startedAt)
+				} else {
+					performed = true
+					var delay uint16
+					delay, err = urltest.URLTest(probeCtx, s.probeURL, candidate)
+					if err == nil {
+						measured = time.Duration(delay) * time.Millisecond
+					}
+				}
+				cancel()
+				if measured <= 0 {
+					measured = time.Since(startedAt)
+				}
+				results <- recoveryResult{candidate: candidate, measured: measured, err: err, performed: performed}
+			}
+		}()
+	}
+dispatch:
+	for _, candidate := range eligible {
+		select {
+		case jobs <- candidate:
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	close(results)
+	networkKey := s.networkFingerprint()
+	successes := 0
+	for result := range results {
+		if !result.performed {
+			// A waiter still needs one local success observation to recover its
+			// own store, but must not duplicate a shared failure penalty.
+			if result.err != nil {
+				continue
+			}
+		}
+		if result.err == nil {
+			successes++
+			s.observeDial(time.Now(), networkKey, "", s.candidateProfileID(result.candidate.Tag()), transport, true, result.measured)
+		} else if result.performed {
+			s.observeDial(time.Now(), networkKey, "", s.candidateProfileID(result.candidate.Tag()), transport, false, result.measured)
+		}
+	}
+	if successes > 0 {
+		s.noteProbeCycle(successes)
+		return true
+	}
+	return false
 }
 
 func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destination M.Socksaddr, attempts []smartDialAttempt, networkKey, siteKey, transport string) (net.Conn, smartDialResult, []error, bool) {
@@ -1509,13 +1663,20 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	s.noteTrafficActivity()
 	transport := N.NetworkUDP
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
-	defer ranking.Release()
+	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		return nil, E.New("smart group has no service-reachable UDP candidate")
+		if s.recoverOpenCandidates(ctx, ranking.candidates, transport) {
+			ranking.Release()
+			ranking, networkKey, siteKey, siteDisplay = s.rankPooled(ctx, transport, destination)
+			ranks = ranking.ranks
+		}
+		if !hasEligibleSmartRank(ranks) {
+			return nil, E.New("smart group has no service-reachable UDP candidate")
+		}
 	}
 	var attemptErrors []error
 	attemptCount := 0
@@ -1795,6 +1956,7 @@ type smartUDPProbeResult struct {
 	candidate adapter.Outbound
 	elapsed   time.Duration
 	err       error
+	performed bool
 }
 
 var smartUDPProbeTargets = [...]M.Socksaddr{
@@ -1834,9 +1996,31 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 		for candidate := range jobs {
 			probeCtx, cancel := context.WithTimeout(ctx, defaultSmartUDPProbeTimeout)
 			startedAt := time.Now()
-			err := runSmartUDPHealthProbe(probeCtx, candidate)
+			performed := false
+			var err error
+			if s.probeRegistry != nil {
+				s.access.RLock()
+				metadata := s.candidateMetadataByTag[candidate.Tag()]
+				s.access.RUnlock()
+				identity := metadata.identity
+				if identity == "" {
+					identity = candidate.Tag()
+				}
+				probeTimeout := s.probeTimeout
+				if probeTimeout <= 0 {
+					probeTimeout = defaultSmartUDPProbeTimeout
+				}
+				key := smartProbeKey(identity, "udp://dns-health", probeTimeout)
+				_, err = s.probeRegistry.runProbe(probeCtx, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
+					performed = true
+					return 0, runSmartUDPHealthProbe(probeContext, candidate)
+				})
+			} else {
+				performed = true
+				err = runSmartUDPHealthProbe(probeCtx, candidate)
+			}
 			cancel()
-			results <- smartUDPProbeResult{candidate: candidate, elapsed: time.Since(startedAt), err: err}
+			results <- smartUDPProbeResult{candidate: candidate, elapsed: time.Since(startedAt), err: err, performed: performed}
 		}
 	}()
 dispatch:
@@ -1853,26 +2037,26 @@ dispatch:
 
 	networkKey := s.networkFingerprint()
 	completed := make([]smartUDPProbeResult, 0, len(udpCandidates))
-	successes := 0
 	for result := range results {
 		if s.closing.Load() || ctx.Err() != nil {
 			return
 		}
 		completed = append(completed, result)
 		if result.err == nil {
-			successes++
-			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+			// A shared successful probe is valid evidence for every Smart group
+			// waiting on the same canonical endpoint.  Record it locally even when
+			// this caller was not the registry owner; only failures are owner-only
+			// so a single outage does not multiply breaker penalties.
+			s.observeDial(time.Now(), networkKey, "__udp_probe__", s.candidateProfileID(result.candidate.Tag()), N.NetworkUDP, true, result.elapsed)
 		}
 	}
-	if successes == 0 {
-		// If every sampled candidate fails, the destination itself may be
-		// filtered. Keep the evidence out of the breaker in that case; the
-		// normal per-flow watchdog remains authoritative for real traffic.
-		return
-	}
 	for _, result := range completed {
-		if result.err != nil {
-			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), N.NetworkUDP, false, result.elapsed)
+		if result.err != nil && result.performed {
+			// Probe failures are advisory evidence. They are recorded in a
+			// dedicated low-weight site so a filtered public DNS target cannot
+			// hard-open the endpoint, while repeated real UDP failures still use
+			// the normal transport breaker.
+			s.observeDial(time.Now(), networkKey, "__udp_probe__", s.candidateProfileID(result.candidate.Tag()), N.NetworkUDP, false, result.elapsed)
 		}
 	}
 }
@@ -2139,6 +2323,11 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	sort.SliceStable(ranking.ranks, func(i, j int) bool {
 		if ranking.ranks[i].eligible != ranking.ranks[j].eligible {
 			return ranking.ranks[i].eligible
+		}
+		leftTier := smartHealthTier(ranking.ranks[i].status.State)
+		rightTier := smartHealthTier(ranking.ranks[j].status.State)
+		if leftTier != rightTier {
+			return leftTier < rightTier
 		}
 		return ranking.ranks[i].status.Score < ranking.ranks[j].status.Score
 	})
@@ -2624,7 +2813,7 @@ func (s *Smart) interruptPreviousCandidate(networkKey, siteKey, transport, previ
 		forceAll = s.probeRegistry.dead(metadata.probeKey)
 	}
 	if !forceAll {
-		forceAll = s.store.candidateDead(s.candidateProfileID(previous), time.Now())
+		forceAll = s.store.candidateDead(networkKey, siteKey, s.candidateProfileID(previous), transport, time.Now())
 	}
 	// A performance-driven switch must be invisible to established flows. New
 	// connections use the better candidate while existing healthy connections
@@ -2687,6 +2876,26 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	if cap(statuses) < statusCount {
 		statuses = make([]adapter.SmartCandidateStatus, 0, statusCount)
 	}
+	primaryAssigned := false
+	appendStatus := func(rank smartRank) {
+		if len(statuses) >= statusCount {
+			return
+		}
+		status := rank.status
+		switch {
+		case selected != "" && rank.outbound.Tag() == selected:
+			status.Role = "primary"
+			primaryAssigned = true
+		case !rank.eligible || rank.status.State == "open":
+			status.Role = "standby"
+		case !primaryAssigned:
+			status.Role = "primary"
+			primaryAssigned = true
+		default:
+			status.Role = "backup"
+		}
+		statuses = append(statuses, status)
+	}
 	stateCounts := s.status.StateCounts
 	if stateCounts == nil {
 		stateCounts = make(map[string]int, 6)
@@ -2697,7 +2906,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		stateCounts[rank.status.State]++
 	}
 	if selectedIndex := smartRankIndex(ranks, selected); selectedIndex >= 0 && len(statuses) < statusCount {
-		statuses = append(statuses, ranks[selectedIndex].status)
+		appendStatus(ranks[selectedIndex])
 	}
 	for index := range ranks {
 		if len(statuses) >= statusCount {
@@ -2706,7 +2915,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		if ranks[index].outbound.Tag() == selected {
 			continue
 		}
-		statuses = append(statuses, ranks[index].status)
+		appendStatus(ranks[index])
 	}
 	profile := smartProfileInteractive
 	if len(ranks) > 0 {

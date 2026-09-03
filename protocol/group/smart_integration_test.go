@@ -498,6 +498,37 @@ func TestSmartBasicProbeRequiresConfirmedFailure(t *testing.T) {
 	}
 }
 
+func TestSmartAllOpenRecoveryUsesHalfOpenBasicProbe(t *testing.T) {
+	first := newSmartFakeOutbound("recovery-first", nil)
+	second := newSmartFakeOutbound("recovery-second", nil)
+	smart := newTestSmart(first, second)
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	registry.probe = func(_ context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
+		if candidate.Tag() == first.Tag() {
+			return 25, nil
+		}
+		return 40, nil
+	}
+	smart.probeRegistry = registry
+	setSmartCandidateIdentities(smart, map[string]string{first.Tag(): first.Tag(), second.Tag(): second.Tag()})
+	now := time.Now()
+	for _, candidate := range []adapter.Outbound{first, second} {
+		smart.store.observeDial(now, smart.networkFingerprint(), "", candidate.Tag(), N.NetworkTCP, false, time.Second)
+	}
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(ranks) != 2 || hasEligibleSmartRank(ranks) {
+		t.Fatalf("expected all candidates to start open: %+v", ranks)
+	}
+	if !smart.recoverOpenCandidates(context.Background(), []adapter.Outbound{first, second}, N.NetworkTCP) {
+		t.Fatal("half-open recovery did not find a reachable candidate")
+	}
+	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if !hasEligibleSmartRank(ranks) || ranks[0].status.State == "open" {
+		t.Fatalf("recovered candidate remained unavailable: %+v", ranks)
+	}
+}
+
 func TestSmartProbePublishesFirstSuccessBeforeCycleCompletes(t *testing.T) {
 	fast := newSmartFakeOutbound("stream-fast", nil)
 	slow := newSmartFakeOutbound("stream-slow", nil)
@@ -1307,6 +1338,26 @@ func TestSmartStatusTracksIndependentContexts(t *testing.T) {
 	}
 	if status.Contexts[0].Transport != N.NetworkTCP || status.Contexts[1].Transport != N.NetworkUDP {
 		t.Fatalf("unexpected context transports: %#v", status.Contexts)
+	}
+}
+
+func TestSmartStatusExposesPrimaryBackupAndStandbyRoles(t *testing.T) {
+	primary := newSmartFakeOutbound("primary", nil)
+	backup := newSmartFakeOutbound("backup", nil)
+	standby := newSmartFakeOutbound("standby", nil)
+	smart := newTestSmart(primary, backup, standby)
+	ranks := []smartRank{
+		{outbound: primary, eligible: true, status: adapter.SmartCandidateStatus{Tag: primary.Tag(), State: "healthy"}, profile: smartProfileInteractive},
+		{outbound: backup, eligible: true, status: adapter.SmartCandidateStatus{Tag: backup.Tag(), State: "suspect"}, profile: smartProfileInteractive},
+		{outbound: standby, eligible: false, status: adapter.SmartCandidateStatus{Tag: standby.Tag(), State: "open"}, profile: smartProfileInteractive},
+	}
+	smart.updateStatusSelected("network", "site", N.NetworkTCP, ranks, primary.Tag(), "ranked")
+	status := smart.SmartStatus()
+	if len(status.Candidates) != 3 {
+		t.Fatalf("unexpected status candidates: %+v", status.Candidates)
+	}
+	if status.Candidates[0].Role != "primary" || status.Candidates[1].Role != "backup" || status.Candidates[2].Role != "standby" {
+		t.Fatalf("unexpected primary/backup roles: %+v", status.Candidates)
 	}
 }
 

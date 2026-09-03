@@ -206,7 +206,11 @@ func overrideDialerOption(options option.DialerOptions, overrideDialerOptions *o
 	if overrideDialerOptions.UDPFragment != nil {
 		options.UDPFragment = overrideDialerOptions.UDPFragment
 	}
-	options.DomainResolver = overrideDialerOptions.DomainResolver
+	// A partial provider override must not erase the outbound's existing
+	// resolver. Only replace it when the field is explicitly present.
+	if overrideDialerOptions.DomainResolver != nil {
+		options.DomainResolver = overrideDialerOptions.DomainResolver
+	}
 	if overrideDialerOptions.NetworkStrategy != nil {
 		options.NetworkStrategy = overrideDialerOptions.NetworkStrategy
 	}

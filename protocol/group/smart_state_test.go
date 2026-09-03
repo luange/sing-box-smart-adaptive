@@ -434,21 +434,21 @@ func TestSmartCandidateDeadRequiresRecentGlobalConsecutiveFailures(t *testing.T)
 	for range 2 {
 		store.observeDial(now, "ethernet", "", "node-a", "tcp", false, time.Second)
 	}
-	if store.candidateDead("node-a", now) {
+	if store.candidateDead("ethernet", "", "node-a", "tcp", now) {
 		t.Fatal("two failures must not mark candidate dead")
 	}
 	store.observeDial(now, "ethernet", "", "node-a", "tcp", false, time.Second)
-	if !store.candidateDead("node-a", now) {
+	if !store.candidateDead("ethernet", "", "node-a", "tcp", now) {
 		t.Fatal("three recent failures must mark candidate dead")
 	}
 	store.observeDial(now, "ethernet", "", "node-a", "tcp", true, time.Millisecond)
-	if store.candidateDead("node-a", now) {
+	if store.candidateDead("ethernet", "", "node-a", "tcp", now) {
 		t.Fatal("success must clear candidate death")
 	}
 	for range 3 {
 		store.observeDial(now.Add(-time.Minute), "ethernet", "", "node-a", "tcp", false, time.Second)
 	}
-	if store.candidateDead("node-a", now) {
+	if store.candidateDead("ethernet", "", "node-a", "tcp", now) {
 		t.Fatal("stale failures must not mark candidate dead")
 	}
 }
@@ -755,5 +755,14 @@ func TestSmartHealthIsPerInstance(t *testing.T) {
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSmartHealthTierPrecedesLatency(t *testing.T) {
+	if smartHealthTier("healthy") >= smartHealthTier("suspect") {
+		t.Fatal("healthy candidates must outrank suspect candidates regardless of latency")
+	}
+	if smartHealthTier("suspect") >= smartHealthTier("open") {
+		t.Fatal("suspect candidates must remain a recoverable backup ahead of open candidates")
 	}
 }
