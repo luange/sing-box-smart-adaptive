@@ -277,7 +277,7 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 		probeIdentity = tag
 	}
 	metadata := smartCandidateMetadata{
-		identity:  identity,
+		identity:  probeIdentity,
 		profileID: tag,
 		probeKey:  smartProbeKey(probeIdentity, s.probeURL, s.probeTimeout),
 		weight:    s.nodeWeights.Explain(tag),
@@ -289,10 +289,7 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 	// candidates use their credential-free EndpointProfile identity so aliases
 	// share one Zig state; static/test candidates use their stable tag and must not be
 	// silently omitted from the Zig-only release path.
-	policyIdentity := identity
-	if policyIdentity == "" {
-		policyIdentity = metadata.identity
-	}
+	policyIdentity := metadata.identity
 	if policyIdentity == "" {
 		policyIdentity = tag
 	}
