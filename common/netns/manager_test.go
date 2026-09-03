@@ -43,7 +43,7 @@ func TestUnshareNamespace(t *testing.T) {
 	}
 	err = manager.Start(adapter.StartStateInitialize)
 	if err != nil {
-		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		if (errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)) && strings.Contains(err.Error(), "start holder process") {
 			t.Skipf("network namespace creation is not permitted by this test environment: %v", err)
 		}
 		t.Fatal(err)
