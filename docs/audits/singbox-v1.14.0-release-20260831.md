@@ -19,7 +19,11 @@ connection-history、Tailscale、eBPF v3 与 Smart Zig；musl 产物为静态链
 Smart/传输回归测试，以及 amd64 glibc 的配置检查。eBPF 对象必须先通过 provenance
 检查后才允许进入打包步骤，防止源码与 `go:embed` 对象漂移。
 
-## 运行边界
+## 运行边界与部署记录
 
-本次仅更新正式版源码与发布产物；未自动替换 VM107/VM115 的生产核心。生产部署仍
-沿用上一版可回滚包，待四架构产物和校验码核对完成后再单独授权切换。
+正式版产物已在 Linux CI 完成四架构构建并核对校验码。2026-09-03 已原子替换
+VM107/VM115：两台运行 `sing-box 1.14.0`，Revision 为
+`f9b92115773f779720fd02353ee6b5b8b17db70b`，部署二进制 SHA-256 为
+`9550a73d428be2d37a62218f6ac12417c66114fb82cd2ec488d39fdd3b99e766`。
+VM115 使用 eBPF v3 `socket_assign`，VM107 保留现有 tproxy 入站；两台均通过配置
+校验、服务状态、API 可达性与最近错误日志门禁。
