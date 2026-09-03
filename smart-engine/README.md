@@ -44,8 +44,11 @@ Release builds intentionally use the portable `baseline` CPU profile.  Use
 ```
 
 Linux release builds select Zig with `smart_zig` and link the matching static
-library. ABI mismatch or allocation failure safely falls back to the reference
-Go policy and emits a warning; manual pins, EndpointProfile, failure wakeups,
-and switch auditing remain host-owned in either mode. Adaptive ABI changes are
-versioned (`ADAPTIVE_ENGINE_ABI_VERSION`) and old libraries are rejected before
-use.
+library. The release adapter rejects an ABI mismatch or engine allocation
+failure instead of falling back to the duplicate Go policy state machine; this
+keeps one production decision owner. Manual pins, EndpointProfile, failure
+wakeups, and switch auditing remain host-owned. Builds without the
+`smart_zig` tag may use the Go adapter for upstream-compatible development or
+cgo-less platforms; a `smart_zig` build without cgo fails closed. Adaptive ABI
+changes are versioned (`ADAPTIVE_ENGINE_ABI_VERSION`) and old libraries are
+rejected before use.

@@ -281,17 +281,29 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 	if identity != "" && identity != tag {
 		metadata.profileID = "endpoint:" + identity
 	}
-	if identity != "" {
-		metadata.policyID = smartPolicyID(identity)
+	// Every candidate must have a stable policy identity. Provider-backed
+	// candidates use their credential-free EndpointProfile identity so aliases
+	// share one Zig state; static/test candidates use their stable tag and must not be
+	// silently omitted from the Zig-only release path.
+	policyIdentity := identity
+	if policyIdentity == "" {
+		policyIdentity = metadata.identity
+	}
+	if policyIdentity == "" {
+		policyIdentity = tag
+	}
+	if policyIdentity != "" {
+		metadata.policyID = smartPolicyID(policyIdentity)
 	}
 	return metadata
 }
 
 type smartRanking struct {
-	ranks           []smartRank
-	candidates      []adapter.Outbound
-	rankBuffer      *[]smartRank
-	candidateBuffer *[]adapter.Outbound
+	ranks             []smartRank
+	candidates        []adapter.Outbound
+	policyUnavailable bool
+	rankBuffer        *[]smartRank
+	candidateBuffer   *[]adapter.Outbound
 }
 
 type smartDialAttempt struct {
@@ -333,10 +345,11 @@ func acquireSmartRanking(candidateCount int) *smartRanking {
 		candidates = make([]adapter.Outbound, 0, candidateCount)
 	}
 	return &smartRanking{
-		ranks:           ranks[:0],
-		candidates:      candidates[:0],
-		rankBuffer:      rankBuffer,
-		candidateBuffer: candidateBuffer,
+		ranks:             ranks[:0],
+		candidates:        candidates[:0],
+		policyUnavailable: false,
+		rankBuffer:        rankBuffer,
+		candidateBuffer:   candidateBuffer,
 	}
 }
 
@@ -346,6 +359,7 @@ func (r *smartRanking) Release() {
 	}
 	clear(r.ranks)
 	clear(r.candidates)
+	r.policyUnavailable = false
 	if cap(r.ranks) <= 4096 {
 		*r.rankBuffer = r.ranks[:0]
 		smartRankPool.Put(r.rankBuffer)
@@ -662,6 +676,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
+	if selectionMode == smartSelectionBalanced && smartPolicyBackendRequired() {
+		return nil, E.New("smart selection_mode balanced is not available in Zig-only release builds")
+	}
 	var policyBackend smartPolicyBackend
 	if selectionMode == smartSelectionPrimaryBackup {
 		policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
@@ -669,6 +686,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 			SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
 			SwitchCooldown: switchCooldown.Milliseconds(),
 		})
+		if policyBackend == nil && smartPolicyBackendRequired() {
+			return nil, E.New("smart Zig policy backend unavailable; refusing Go policy fallback")
+		}
 		if policyBackend == nil && logger != nil {
 			logger.Warn("smart policy backend unavailable; using reference Go policy")
 		} else if policyBackend != nil && logger != nil {
@@ -1632,6 +1652,9 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
+	if ranking.policyUnavailable {
+		return nil, E.New("smart Zig policy backend unavailable")
+	}
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
@@ -2048,6 +2071,9 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
+	if ranking.policyUnavailable {
+		return nil, E.New("smart Zig policy backend unavailable")
+	}
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
@@ -2709,7 +2735,7 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	s.access.RLock()
 	metadata := s.candidateMetadataByTag[candidate]
 	s.access.RUnlock()
-	if metadata.identity != "" {
+	if metadata.policyID != 0 {
 		s.observePolicyBackend(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
 	}
 }
@@ -2840,7 +2866,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				Samples:         estimate.Samples,
 			},
 		})
-		if usePolicyBackend && metadata.identity != "" {
+		if usePolicyBackend && metadata.policyID != 0 {
 			// Several provider lines can describe one endpoint.  Let the policy
 			// kernel see one candidate so suffix-renamed duplicates cannot create
 			// contradictory state; the host still keeps all lines for fallback.
@@ -2919,6 +2945,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if len(ranks) == 0 {
 		return ranking, networkKey, siteKey, siteDisplay
 	}
+	if smartPolicyBackendRequired() && s.selectionMode == smartSelectionPrimaryBackup && !usePolicyBackend {
+		for index := range ranks {
+			ranks[index].eligible = false
+			ranks[index].status.State = "open"
+			ranks[index].status.Reason = "zig policy unavailable"
+		}
+		ranking.policyUnavailable = true
+		s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+		return ranking, networkKey, siteKey, siteDisplay
+	}
 	if ranks[0].status.State == "open" {
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, "no eligible candidates; circuits open")
 		return ranking, networkKey, siteKey, siteDisplay
@@ -2960,9 +2996,19 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if usePolicyBackend {
 		decision, backendAvailable := s.choosePolicyBackend(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
 		if !backendAvailable {
-			// Close can retire the optional backend while a ranking snapshot is
-			// still being assembled. Fall through to the reference Go policy
-			// instead of dereferencing a retired engine.
+			// Close can retire the backend while a ranking snapshot is still being
+			// assembled. In a Zig-only release this is a closed state, never an
+			// invitation to re-enter the duplicate Go policy state machine.
+			if smartPolicyBackendRequired() {
+				for index := range ranks {
+					ranks[index].eligible = false
+					ranks[index].status.State = "open"
+					ranks[index].status.Reason = "zig policy unavailable"
+				}
+				ranking.policyUnavailable = true
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+				return ranking, networkKey, siteKey, siteDisplay
+			}
 			usePolicyBackend = false
 		} else {
 			if decision.SelectedID != 0 {
@@ -2974,7 +3020,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				selectedIndex := smartRankIndexForPolicy(ranks, decision.SelectedID, lastSelected)
 				if selectedIndex >= 0 {
 					currentIndex := smartRankIndex(ranks, lastSelected)
-					if currentIndex >= 0 && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
+					if currentIndex >= 0 && !smartPolicyBackendRequired() && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
 						ranks[currentIndex].status.Reason = "baseline retained current candidate"
 						moveSmartRankFirst(ranks, currentIndex)
 						s.updateStatus(networkKey, siteDisplay, transport, ranks, "baseline retained current candidate")
@@ -2991,7 +3037,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 						s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy awaiting sustained confirmation")
 						return ranking, networkKey, siteKey, siteDisplay
 					}
-					if currentIndex >= 0 && currentIndex != selectedIndex &&
+					if currentIndex >= 0 && !smartPolicyBackendRequired() && currentIndex != selectedIndex &&
 						!smartAbsoluteImprovement(ranks[selectedIndex], ranks[currentIndex], s.switchMinImprovement) {
 						// The Zig kernel already applies relative margin, confirmation,
 						// and cooldown. This additional absolute floor prevents a tiny
@@ -3016,6 +3062,18 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 			// A corrupt/unsupported backend decision must fail safe to the best
 			// host-ranked candidate, without re-entering the Go confirmation FSM.
+			// Zig-only release builds instead fail closed: accepting a Go decision
+			// here would reintroduce a second policy owner after an ABI/runtime
+			// failure and make production behavior non-deterministic.
+			if smartPolicyBackendRequired() {
+				for index := range ranks {
+					ranks[index].eligible = false
+					ranks[index].status.State = "open"
+					ranks[index].status.Reason = "zig policy unavailable"
+				}
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+				return ranking, networkKey, siteKey, siteDisplay
+			}
 			s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy fallback to host ranking")
 			return ranking, networkKey, siteKey, siteDisplay
 		}
@@ -3076,6 +3134,13 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
 	usePolicyBackend := s.policyBackendEnabled() && s.selectionMode == smartSelectionPrimaryBackup
+	// A concurrent Close may retire the Zig engine after rankPooled returned a
+	// candidate but before its dial completed. Do not let this late completion
+	// update host-owned Go switch/cooldown state in a Zig-only release; the
+	// ranking is already invalid and the next request will fail closed.
+	if smartPolicyBackendRequired() && s.selectionMode == smartSelectionPrimaryBackup && !usePolicyBackend {
+		return
+	}
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]

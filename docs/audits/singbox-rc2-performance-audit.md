@@ -214,3 +214,18 @@ are needed for API diagnostics, EWMA maintenance, or freshness gates; they are
 not silently treated as extra score dimensions. The Go exploration denominator
 now includes only eligible candidates in the best health tier, matching the
 Zig kernel instead of letting open/lower-tier history influence ranking.
+
+### Zig-only production policy (2026-09-03)
+
+The release profile now treats `smart_zig` as the sole Smart decision kernel.
+If the Zig library or ABI is missing/incompatible, Smart construction fails
+instead of silently re-entering the Go policy path. A runtime engine allocation
+failure also fails closed for that ranking rather than selecting through a
+second policy owner. The untagged Go path remains available only for
+upstream-compatible development and cgo-less platforms.
+
+This does not move socket I/O into Zig: sing-box still owns protocol dialing,
+TCP/UDP probes and connection lifetimes, while Zig receives bounded evidence
+and returns the policy decision. `selection_mode=balanced` is rejected in the
+Zig-only release until its affinity policy is implemented in the ABI; silently
+using the Go host selector would violate the single-kernel invariant.

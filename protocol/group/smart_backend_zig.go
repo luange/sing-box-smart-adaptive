@@ -58,6 +58,11 @@ func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 	return backend
 }
 
+// Release builds that carry the Zig backend must not silently fall back to the
+// duplicate Go policy state machine. A missing/incompatible library is a build
+// or packaging error and is rejected during Smart construction.
+func smartPolicyBackendRequired() bool { return true }
+
 func maxInt64(value int64) int64 {
 	if value < 0 {
 		return 0

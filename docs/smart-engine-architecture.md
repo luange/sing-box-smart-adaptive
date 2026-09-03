@@ -28,10 +28,20 @@ hosts; unknown profile values fall back to interactive scoring.
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
 - `lib.zig`: thin lifecycle and C ABI facade.
 
-The Go implementation remains the zero-dependency reference backend. Linux
-release builds select the in-process Zig adapter with the `smart_zig` build
-tag after the same conformance gate; provider, routing, and API code are
-unchanged.
+The Go implementation remains a zero-dependency development/reference path.
+Linux release builds select the in-process Zig adapter with the `smart_zig`
+build tag after the same conformance gate; provider, routing, and API code are
+unchanged. In a `smart_zig` release, Smart construction fails if the Zig ABI
+is missing or incompatible instead of silently falling back to the Go policy.
+This makes Zig the only production decision kernel.
+
+Zig deliberately does not open sockets or duplicate sing-box protocol code.
+The Go host remains the network-I/O adapter that performs the actual TCP/UDP
+probe and reports observations over the small ABI. “Zig-only” therefore means
+one policy/selection owner, not a second DNS/TLS/proxy stack. The optional
+`balanced` host-affinity mode is rejected in Zig-only releases until that
+affinity policy is implemented inside the ABI; it must never silently run a Go
+selector in a Zig release.
 
 The Go adapter sends candidates through the existing batch ABI entry point and
 reuses one conversion buffer per lock shard (16 shards, four bounded contexts
@@ -61,17 +71,21 @@ starting a full parallel probe storm; a well-sampled steady path keeps the
 longer delay to protect keep-alive traffic.
 
 Operators that need an explicit policy choice can set `selection_mode` on a
-Smart outbound. The default `primary_backup` keeps the health-tiered Zig/Go
-confirmation and cooldown state: the first eligible line is primary and the
-remaining lines are ordered backups. `balanced` moves the final choice to a
+Smart outbound. The default `primary_backup` keeps the health-tiered Zig
+confirmation and cooldown state in a `smart_zig` release (builds without that
+tag use the Go reference adapter): the first eligible line is
+primary and the remaining lines are ordered backups. `balanced` moves the
+final choice to a
 host-neutral rendezvous hash over the network/site/transport context, limited
 to the best health tier and normal score margin. It therefore spreads
 independent services across near-tied lines like Surge's intra-tier shuffle,
 while retaining the incumbent for that context and failing over immediately
 when it becomes unhealthy. The accepted `random` spelling is only an alias;
 the implementation is deliberately stable per context, not random per dial.
-Balanced mode does not allocate a Zig policy engine, so the same adapter can
-be reused by future sing-box or mihomo hosts without adding an ABI field.
+Balanced mode is retained for builds without the `smart_zig` tag. It is
+rejected by `smart_zig` production builds until the affinity seed/mode is part
+of the versioned ABI; silently executing the Go selector would violate the
+single-kernel invariant.
 
 Example:
 
@@ -90,8 +104,8 @@ transitions, margins, confirmation and cooldown defaults. Advanced fields remain
 compatibility overrides for operators who already use them; the staged startup
 is intentionally internal so a new deployment does not need to guess a
 “correct” tuning value. When `primary_backup` is selected, the Zig policy
-backend owns the confirmation state; `balanced` keeps that policy in the host
-adapter so it remains portable.
+backend owns the confirmation state. A production release does not silently
+switch to the host adapter.
 
 On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
 bounded retransmitted-byte ratio. It contributes an additive latency penalty
@@ -156,5 +170,6 @@ integration must add deterministic parity tests before production enablement.
    decision/reason transition, including empty and over-limit inputs.
 3. A canary host enables the release binary's `smart_zig` backend and records
    switch audits, RSS and latency for at least 72 hours.
-4. ABI mismatch or allocation failure falls back to Go with an explicit log;
-   provider refresh, DNS and routing behavior remain unchanged.
+4. ABI mismatch or allocation failure fails Smart construction/ranking closed
+   with an explicit error; provider refresh, DNS and routing behavior remain
+   unchanged.

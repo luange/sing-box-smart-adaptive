@@ -34,3 +34,14 @@ func TestSmartProbeIdentitySharesCredentialVariants(t *testing.T) {
 		t.Fatalf("different endpoints must not share identity: %q", gotA)
 	}
 }
+
+func TestSmartMetadataAlwaysHasPolicyIdentity(t *testing.T) {
+	smart := &Smart{}
+	metadata := smart.buildCandidateMetadata("static-node", "")
+	if metadata.policyID == 0 {
+		t.Fatal("static candidates must be represented in the Zig policy snapshot")
+	}
+	if metadata.policyID != smartPolicyID("static-node") {
+		t.Fatalf("static policy identity = %d, want hash of stable tag", metadata.policyID)
+	}
+}
