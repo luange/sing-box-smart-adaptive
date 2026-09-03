@@ -41,7 +41,8 @@ jobs:
           #include <stddef.h>
           int main(void) {
             if (smart_engine_abi_version() != SMART_ENGINE_ABI_VERSION) return 1;
-            smart_engine_config cfg = {0, 0, 2, 0, 0};
+            smart_engine_config cfg = {0};
+            cfg.switch_confirm_samples = 2;
             smart_engine *engine = smart_engine_create(cfg);
             if (!engine) return 2;
             smart_candidate incumbent = {1, .9, 20, 20, 1, 0, 4, 1, 1, 1};
