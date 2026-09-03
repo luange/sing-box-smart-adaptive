@@ -83,6 +83,19 @@ export fn smart_engine_choose_profile(engine: ?*Engine, candidates: ?[*]const Ca
     return .{ .selected_id = 0, .score = 100.0, .switched = 0, .reason = 3 };
 }
 
+// The host owns the actual dial result. Synchronize that incumbent into the
+// policy FSM after a successful selection so a cold policy engine does not
+// mistake the first ranking snapshot for a confirmed performance switch.
+export fn smart_engine_set_selected(engine: ?*Engine, id: u64) void {
+    if (engine) |value| {
+        if (id == 0) return;
+        value.state.selected_id = id;
+        value.state.challenge_id = 0;
+        value.state.challenge_count = 0;
+        value.state.challenge_since = 0;
+    }
+}
+
 export fn smart_engine_reset(engine: ?*Engine) void {
     if (engine) |value| value.reset();
 }

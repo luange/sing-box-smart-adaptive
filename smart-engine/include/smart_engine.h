@@ -49,6 +49,8 @@ void smart_engine_observe(smart_engine *engine, uint64_t id, uint8_t success, do
 smart_decision smart_engine_choose(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms);
 /* profile: 0 interactive, 1 bulk, 2 UDP; unknown values use interactive. */
 smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms, uint8_t profile);
+/* Synchronize the host's incumbent after a real selection without recording a policy switch. */
+void smart_engine_set_selected(smart_engine *engine, uint64_t id);
 void smart_engine_reset(smart_engine *engine);
 
 /* Host-neutral AdaptivePool decision kernel.  The host still owns health

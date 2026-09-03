@@ -16,6 +16,12 @@ type smartPolicyBackend interface {
 	Close()
 }
 
+// smartPolicyIncumbent is optional so non-Zig/reference backends and small
+// test doubles do not need an extra state-synchronization primitive.
+type smartPolicyIncumbent interface {
+	SetSelected(key string, id uint64, now time.Time)
+}
+
 type smartPolicyCandidate struct {
 	ID          uint64
 	Reliability float64

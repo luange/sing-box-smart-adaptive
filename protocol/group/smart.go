@@ -290,6 +290,12 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 	// share one Zig state; static/test candidates use their stable tag and must not be
 	// silently omitted from the Zig-only release path.
 	policyIdentity := metadata.identity
+	if identity == "" {
+		// Provider duplicate resolvers append " #deadbeef" or " (2)" to a
+		// display tag. Treat those generated aliases as one policy candidate so
+		// equal lines do not create a false performance challenge.
+		policyIdentity = smartLineFamily(tag)
+	}
 	if policyIdentity == "" {
 		policyIdentity = tag
 	}
@@ -958,6 +964,17 @@ func (s *Smart) choosePolicyBackend(key string, candidates []smartPolicyCandidat
 	decision := s.policyBackend.Choose(key, candidates, profile, now)
 	s.policyBackendAccess.RUnlock()
 	return decision, true
+}
+
+func (s *Smart) setPolicyBackendSelected(key string, id uint64, now time.Time) {
+	if s == nil || key == "" || id == 0 {
+		return
+	}
+	s.policyBackendAccess.RLock()
+	if incumbent, ok := s.policyBackend.(smartPolicyIncumbent); ok {
+		incumbent.SetSelected(key, id, now)
+	}
+	s.policyBackendAccess.RUnlock()
 }
 
 // waitWorkerStop waits for the probe worker up to timeout after cancel.
@@ -3089,8 +3106,17 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				// suffixes; selecting the first alias on every rank would make
 				// the visible tag (and the dial target) oscillate on refresh.
 				selectedIndex := smartRankIndexForPolicy(ranks, decision.SelectedID, lastSelected)
+				equivalentRetained := false
 				if selectedIndex >= 0 {
 					currentIndex := smartRankIndex(ranks, lastSelected)
+					if currentIndex >= 0 && currentIndex == selectedIndex {
+						for index := range ranks {
+							if index != currentIndex && smartEquivalentLine(ranks[currentIndex].outbound.Tag(), ranks[index].outbound.Tag()) {
+								equivalentRetained = true
+								break
+							}
+						}
+					}
 					if currentIndex >= 0 && !smartPolicyBackendRequired() && !s.performanceSwitchAllowed() && currentIndex != selectedIndex {
 						ranks[currentIndex].status.Reason = "baseline retained current candidate"
 						moveSmartRankFirst(ranks, currentIndex)
@@ -3124,6 +3150,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 					reason := "zig policy retained candidate"
 					if decision.Switched {
 						reason = "zig policy confirmed candidate"
+					} else if equivalentRetained {
+						reason = "equivalent subscription line retained"
 					}
 					ranks[selectedIndex].status.Reason = reason
 					moveSmartRankFirst(ranks, selectedIndex)
@@ -3231,6 +3259,15 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
+	if usePolicyBackend && previous != "" && logicalSwitch && attemptIndex > 0 && !hadPriorFailure {
+		// A hedge is a transport race, not evidence that the backup should
+		// replace a healthy incumbent. Keep the host and Zig policy state on the
+		// incumbent so a slow primary is not permanently displaced by one fast
+		// request.
+		s.access.Unlock()
+		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "hedged connection won; incumbent retained")
+		return
+	}
 	// Several requests can rank concurrently and finish in a different order.
 	// Do not let a late healthy completion undo a just-committed selection.
 	if !usePolicyBackend && logicalSwitch && !failureSwitch {
@@ -3267,6 +3304,13 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 		}
 	}
 	s.access.Unlock()
+	if usePolicyBackend {
+		policyID := currentMetadata.policyID
+		if policyID == 0 {
+			policyID = smartPolicyID(smartLineFamily(candidate.Tag()))
+		}
+		s.setPolicyBackendSelected(key, policyID, now)
+	}
 	// Surge's use score describes TCP policy usage.  A UDP success is a
 	// separate health ledger and must not make a candidate look more popular
 	// for TCP background testing.
