@@ -960,6 +960,17 @@ func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testin
 	smart.switchConfirm = 20 * time.Millisecond
 	smart.switchConfirmSamples = 3
 	smart.switchMargin = 0
+	// The production backend receives these values at construction time. Rebuild
+	// the fixture after overriding them so the test models the same immutable
+	// configuration boundary instead of accidentally retaining the defaults.
+	smart.closePolicyBackend()
+	smart.policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
+		Exploration:         smart.exploration,
+		SwitchMargin:        smart.switchMargin,
+		SwitchConfirm:       smart.switchConfirmSamples,
+		SwitchConfirmWindow: smart.switchConfirm.Milliseconds(),
+		SwitchCooldown:      smart.switchCooldown.Milliseconds(),
+	})
 	now := time.Now()
 	networkKey := smart.networkFingerprint()
 	destination := M.ParseSocksaddr("search.example:443")
