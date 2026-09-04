@@ -25,6 +25,14 @@ is called only after a real dial succeeds, so stickiness never hides a failed
 initial connection. Probe scheduling, provider filters, breakers, and
 connection interruption remain host-owned by design.
 
+After a hard failure, the displaced ID is retained as a deferred backup. A
+recovered endpoint cannot preempt the replacement primary; it is eligible
+again only when the current primary becomes unusable. This rule applies to
+both `primary_backup` and balanced rendezvous mode, so dispersion is per
+business context, not per connection. `smart_engine_adopt_selected` restores
+the host-confirmed primary when a bounded context is recreated without
+overwriting an in-flight policy challenge.
+
 The optional `conformance/` package is built by Linux CI with the `smart_zig`
 tag. It links the produced library through the C ABI and compares the
 transition sequence with a Go reference. Production release jobs compile the
