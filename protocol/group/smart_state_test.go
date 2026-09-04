@@ -444,11 +444,13 @@ func TestSmartSelectionModeDefaultsAndAliases(t *testing.T) {
 		input string
 		want  smartSelectionMode
 	}{
-		{input: "", want: smartSelectionPrimaryBackup},
-		{input: "primary_backup", want: smartSelectionPrimaryBackup},
-		{input: "primary-backup", want: smartSelectionPrimaryBackup},
-		{input: "balanced", want: smartSelectionBalanced},
-		{input: "random", want: smartSelectionBalanced},
+		{input: "", want: smartSelectionUnified},
+		{input: "adaptive", want: smartSelectionUnified},
+		{input: "unified", want: smartSelectionUnified},
+		{input: "primary_backup", want: smartSelectionUnified},
+		{input: "primary-backup", want: smartSelectionUnified},
+		{input: "balanced", want: smartSelectionUnified},
+		{input: "random", want: smartSelectionUnified},
 	}
 	for _, test := range tests {
 		got, err := normalizeSmartSelectionMode(test.input)
@@ -458,6 +460,9 @@ func TestSmartSelectionModeDefaultsAndAliases(t *testing.T) {
 	}
 	if _, err := normalizeSmartSelectionMode("latency_race"); err == nil {
 		t.Fatal("invalid selection mode was accepted")
+	}
+	if got := smartSelectionUnified.String(); got != "adaptive" {
+		t.Fatalf("unified selection mode string = %q, want adaptive", got)
 	}
 }
 
@@ -484,12 +489,12 @@ func TestSmartMetricDecayDropsStaleEvidenceClasses(t *testing.T) {
 	}
 }
 
-func TestSmartBalancedAffinityIsStableAndHealthBounded(t *testing.T) {
+func TestSmartUnifiedAffinityIsStableAndHealthBounded(t *testing.T) {
 	smart := &Smart{switchMargin: 0.15}
 	ranks := []smartRank{
-		{identity: "endpoint-a", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.40}},
-		{identity: "endpoint-b", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.42}},
-		{identity: "endpoint-c", eligible: true, status: adapter.SmartCandidateStatus{State: "suspect", Score: 0.10}},
+		{identity: "endpoint-a", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.40, Samples: 3}},
+		{identity: "endpoint-b", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.42, Samples: 3}},
+		{identity: "endpoint-c", eligible: true, status: adapter.SmartCandidateStatus{State: "suspect", Score: 0.10, Samples: 3}},
 	}
 	first := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
 	second := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")

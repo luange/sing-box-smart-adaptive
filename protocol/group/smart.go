@@ -113,36 +113,37 @@ const (
 	smartUseScoreDecayWindow = 2 * time.Hour
 )
 
-// smartSelectionMode is intentionally a small public policy switch. The
-// balanced mode is pseudo-random only at the context level (network + site +
-// transport); it never chooses a different line for every connection. That
-// gives Surge-like dispersion while preserving keep-alive and failure
-// semantics.
+// smartSelectionMode is retained as a wire/configuration compatibility field.
+// The old primary_backup and balanced policies are now one policy: health
+// tiers, confirmation/cooldown and hard-failure failover define the primary
+// and backups, while a stable context hash disperses near-tied healthy lines.
+// It never chooses a different line for every connection, so keep-alive
+// traffic remains sticky and both old spellings have identical behavior.
 type smartSelectionMode uint8
 
 const (
-	smartSelectionPrimaryBackup smartSelectionMode = iota
-	smartSelectionBalanced
+	// ABI value 1 was previously balanced. It is now the canonical unified
+	// policy value. The aliases below keep old in-tree references compiling and
+	// make the compatibility mapping explicit without adding an ABI version.
+	smartSelectionUnified       smartSelectionMode = 1
+	smartSelectionPrimaryBackup                    = smartSelectionUnified
+	smartSelectionBalanced                         = smartSelectionUnified
 )
 
 func normalizeSmartSelectionMode(value string) (smartSelectionMode, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "primary_backup", "primary-backup":
-		return smartSelectionPrimaryBackup, nil
-	case "balanced", "random":
-		// "random" is accepted as a readable alias, but the implementation is
-		// deliberately stable per selection context rather than per dial.
-		return smartSelectionBalanced, nil
+	case "", "adaptive", "unified", "primary_backup", "primary-backup", "balanced", "random":
+		// All historical spellings intentionally select the same policy. The
+		// stable context hash is only used among similarly healthy candidates;
+		// hard failures still promote the next backup immediately.
+		return smartSelectionUnified, nil
 	default:
-		return smartSelectionPrimaryBackup, E.New("invalid smart selection_mode: ", value, " (want primary_backup or balanced)")
+		return smartSelectionUnified, E.New("invalid smart selection_mode: ", value, " (want adaptive)")
 	}
 }
 
 func (m smartSelectionMode) String() string {
-	if m == smartSelectionBalanced {
-		return "balanced"
-	}
-	return "primary_backup"
+	return "adaptive"
 }
 
 // smartPhase makes cold-start behavior explicit.  A group is usable from the
@@ -1070,11 +1071,12 @@ func (s *Smart) performanceSwitchAllowed() bool {
 	return s.currentPhase() >= smartPhaseProfiling
 }
 
-// balancedAffinityIndex implements the optional Surge-like dispersion mode.
-// It first applies the same hard health tier and near-tie score boundary as
-// primary/backup ranking, then uses rendezvous hashing over canonical endpoint
-// identities. The result is pseudo-random across independent contexts but
-// stable for one context, so keep-alive traffic does not bounce between lines.
+// balancedAffinityIndex implements the unified primary/backup policy's stable
+// context dispersion. It first applies the same hard health tier and near-tie
+// score boundary as ranking, then uses rendezvous hashing over canonical
+// endpoint identities. The result is pseudo-random across independent
+// contexts but stable for one context, so keep-alive traffic does not bounce
+// between lines. The historical name is kept for API/test compatibility.
 // Node weights have already been applied to the confidence-adjusted score;
 // applying them again here would double-count a priority rule.
 func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag string) int {
@@ -1095,6 +1097,21 @@ func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag strin
 	}
 	if best < 0 {
 		return -1
+	}
+	// Do not hash a cold catalog before the first usable portraits exist. The
+	// initial ranked line is the primary/backup bootstrap path; once every
+	// candidate in the best health tier has the normal minimum evidence, the
+	// same stable affinity policy can safely disperse near-tied lines. This
+	// keeps cold-start failover deterministic and avoids picking an unobserved
+	// candidate merely because its hash happens to be higher.
+	minimumSamples := float64(max(1, s.minSamples))
+	for index := range ranks {
+		if !ranks[index].eligible || smartHealthTier(ranks[index].status.State) != bestTier {
+			continue
+		}
+		if ranks[index].status.Samples < minimumSamples {
+			return -1
+		}
 	}
 	bestScore := ranks[best].status.Score
 	threshold := bestScore * (1 + s.switchMargin)
@@ -3100,9 +3117,12 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		s.updateStatus(networkKey, siteDisplay, transport, ranks, statusReason("no service-reachable candidates"))
 		return ranking, networkKey, siteKey, siteDisplay
 	}
-	if s.selectionMode == smartSelectionBalanced && !usePolicyBackend {
+	// The former primary_backup and balanced branches are deliberately unified.
+	// Keep the host fallback on the same stable context affinity as Zig so a
+	// development build cannot silently choose a different policy.
+	if !usePolicyBackend {
 		if index := s.balancedAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
-			ranks[index].status.Reason = "balanced stable affinity"
+			ranks[index].status.Reason = "unified stable affinity"
 			moveSmartRankFirst(ranks, index)
 		}
 	}

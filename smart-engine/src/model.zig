@@ -18,6 +18,8 @@ pub const Config = extern struct {
     switch_confirm_ms: u64,
     switch_cooldown_ms: u64,
     affinity_seed: u64 = 0,
+    // Kept in the ABI for older hosts. Values 0 and 1 intentionally have the
+    // same unified primary/backup + stable-affinity behavior.
     selection_mode: u8 = 0,
     site_stickiness_ms: u64 = 0,
     switch_min_improvement_ms: u64 = 0,

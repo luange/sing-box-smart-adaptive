@@ -38,9 +38,9 @@ This makes Zig the only production decision kernel.
 Zig deliberately does not open sockets or duplicate sing-box protocol code.
 The Go host remains the network-I/O adapter that performs the actual TCP/UDP
 probe and reports observations over the small ABI. “Zig-only” therefore means
-one policy/selection owner, not a second DNS/TLS/proxy stack. Both
-`primary_backup` and the optional `balanced` host-affinity mode are implemented
-inside the versioned ABI; a Zig release never silently runs a Go selector.
+one policy/selection owner, not a second DNS/TLS/proxy stack. The unified
+stable primary/backup affinity policy is implemented inside the versioned ABI;
+a Zig release never silently runs a Go selector.
 
 The Go adapter sends candidates through the existing batch ABI entry point and
 reuses one conversion buffer per lock shard (16 shards, four bounded contexts
@@ -87,21 +87,14 @@ delay is shortened to 250 ms so a bad first guess is abandoned quickly without
 starting a full parallel probe storm; a well-sampled steady path keeps the
 longer delay to protect keep-alive traffic.
 
-Operators that need an explicit policy choice can set `selection_mode` on a
-Smart outbound. The default `primary_backup` keeps the health-tiered Zig
-confirmation and cooldown state in a `smart_zig` release (builds without that
-tag use the Go reference adapter): the first eligible line is
-primary and the remaining lines are ordered backups. `balanced` moves the
-final choice to a
-host-neutral rendezvous hash over the network/site/transport context, limited
-to the best health tier and normal score margin. It therefore spreads
-independent services across near-tied lines like Surge's intra-tier shuffle,
-while retaining the incumbent for that context and failing over immediately
-when it becomes unhealthy. The accepted `random` spelling is only an alias;
-the implementation is deliberately stable per context, not random per dial.
-Both `primary_backup` and `balanced` are implemented by the versioned Zig
-policy ABI in production builds; the host does not fall back to a second Go
-selector when balanced is selected.
+`selection_mode` is retained only for configuration compatibility. Empty,
+`adaptive`, `unified`, `primary_backup`, `balanced` and `random` all select the
+same policy: the first eligible line is the primary and the remaining lines
+are ordered backups; within the best health tier and normal score margin, a
+host-neutral rendezvous hash over network/site/transport provides stable
+same-tier dispersion. The incumbent is retained for that context and fails
+over immediately when unhealthy. The host never selects a second policy based
+on the legacy spelling.
 
 Example:
 
@@ -110,7 +103,7 @@ Example:
   "type": "smart",
   "tag": "media-smart",
   "outbounds": ["hk-1", "jp-1", "sg-1"],
-  "selection_mode": "balanced"
+  "selection_mode": "adaptive"
 }
 ```
 
@@ -119,9 +112,9 @@ group with only `outbounds`/`providers` uses the built-in probe budget, phase
 transitions, margins, confirmation and cooldown defaults. Advanced fields remain
 compatibility overrides for operators who already use them; the staged startup
 is intentionally internal so a new deployment does not need to guess a
-”correct” tuning value. The Zig policy backend owns the confirmation state for
-both selection modes. A production release does not silently switch to the
-host adapter.
+ ”correct” tuning value. The Zig policy backend owns the confirmation state for
+the unified policy. A production release does not silently switch to the host
+adapter.
 
 On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
 bounded retransmitted-byte ratio. It contributes an additive latency penalty

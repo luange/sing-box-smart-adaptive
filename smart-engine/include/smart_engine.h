@@ -33,8 +33,9 @@ typedef struct {
     uint32_t switch_confirm_samples; /* zero is normalized to one */
     uint64_t switch_confirm_ms; /* monotonic milliseconds */
     uint64_t switch_cooldown_ms; /* monotonic milliseconds */
-    uint64_t affinity_seed; /* stable context seed for balanced selection */
-    uint8_t selection_mode; /* 0 primary/backup, 1 balanced dispersion */
+    uint64_t affinity_seed; /* stable context seed for unified affinity */
+    /* Compatibility field: 0/1 both select unified primary/backup affinity. */
+    uint8_t selection_mode;
     uint64_t site_stickiness_ms; /* healthy incumbent hold window */
     uint64_t switch_min_improvement_ms; /* minimum p95 latency gain */
 } smart_engine_config;

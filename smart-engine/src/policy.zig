@@ -96,12 +96,12 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     }
     var selected = best orelse return decision;
     var selected_score = best_score;
-    // Balanced mode is deliberately implemented in the policy kernel rather
-    // than in the sing-box host.  The host may be replaced by mihomo or
-    // another core, while the health tier, score margin and confirmation FSM
-    // remain identical.  A context seed is supplied when the engine is
-    // created, so rendezvous selection is stable without retaining a string
-    // key in the Zig state.
+    // Stable context affinity is part of the single primary/backup policy,
+    // not a second selection algorithm.  The old ABI values 0 (primary/
+    // backup) and 1 (balanced) are both accepted and deliberately take this
+    // path, so older hosts and new hosts make the same decision.  A context
+    // seed is supplied when the engine is created; no unbounded string key is
+    // retained in the Zig state.
     var incumbent: ?model.Candidate = null;
     if (state.selected_id != 0) {
         for (candidates) |raw_candidate| {
@@ -112,7 +112,21 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             }
         }
     }
-    if (config.selection_mode == 1) {
+    // Keep the cold-start primary/backup order until every candidate in the
+    // best health tier has the normal confidence floor. Hashing an unobserved
+    // catalog would make the first request depend on an arbitrary seed and
+    // could select a line that has no evidence yet. Once portraits are ready,
+    // values 0 and 1 use the same stable affinity policy.
+    var affinity_ready = true;
+    for (candidates) |raw_candidate| {
+        const candidate = observations.enrich(raw_candidate);
+        if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
+        if (!(candidate.samples >= 3.0) or !scoring.isFinite(candidate.samples)) {
+            affinity_ready = false;
+            break;
+        }
+    }
+    if (config.selection_mode <= 1 and affinity_ready) {
         const threshold = if (best_score > 0) best_score * (1.0 + switch_margin) else 0.05;
         var retained_incumbent = false;
         if (incumbent) |current| {

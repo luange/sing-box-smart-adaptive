@@ -345,7 +345,7 @@ test "healthy tier wins over faster suspect candidate" {
     try std.testing.expectEqual(@as(u64, 1), decision.selected_id);
 }
 
-test "balanced selection is stable and health bounded" {
+test "unified selection is stable and health bounded" {
     var engine = Engine.init(.{
         .exploration = 0,
         .switch_margin = 0.20,
@@ -379,6 +379,32 @@ test "balanced selection is stable and health bounded" {
     };
     const bounded = policy.chooseProfile(&health_engine.state, health_engine.config, &health_engine.observations, health_bounded[0..], 0, .interactive);
     try std.testing.expectEqual(@as(u64, 11), bounded.selected_id);
+}
+
+test "legacy primary backup and balanced values are identical" {
+    const candidates = [_]Candidate{
+        .{ .id = 21, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 22, .reliability = 0.98, .connect_ms = 21, .first_byte_ms = 21, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    var primary_backup = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0.20,
+        .switch_confirm_samples = 1,
+        .affinity_seed = 0x99,
+        .selection_mode = 0,
+    });
+    var balanced = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0.20,
+        .switch_confirm_samples = 1,
+        .affinity_seed = 0x99,
+        .selection_mode = 1,
+    });
+    const old_value = policy.choose(&primary_backup.state, primary_backup.config, &primary_backup.observations, candidates[0..], 0);
+    const new_value = policy.choose(&balanced.state, balanced.config, &balanced.observations, candidates[0..], 0);
+    try std.testing.expectEqual(old_value.selected_id, new_value.selected_id);
+    try std.testing.expectEqual(old_value.score, new_value.score);
+    try std.testing.expectEqual(old_value.reason, new_value.reason);
 }
 
 test "site stickiness retains a healthy incumbent until expiry" {

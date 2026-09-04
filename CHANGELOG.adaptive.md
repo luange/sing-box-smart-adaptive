@@ -10,6 +10,15 @@
 - Preserve existing history queue-drop counters; no sensitive payload or URL is
   recorded.
 
+## Unreleased — unified Smart selection policy
+
+- Merge the former `primary_backup` and `balanced` branches into one stable
+  primary/backup policy with same-tier context affinity.
+- Keep all historical `selection_mode` spellings as compatibility aliases; they
+  now produce identical Go and Zig decisions.
+- Apply the same affinity rule in the development fallback so build tags cannot
+  change selection semantics.
+
 ## Unreleased — Zig Smart production backend
 
 ### Balanced dispersion in Zig ABI
