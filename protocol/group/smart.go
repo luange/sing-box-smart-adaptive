@@ -306,11 +306,14 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 }
 
 type smartRanking struct {
-	ranks             []smartRank
-	candidates        []adapter.Outbound
-	policyUnavailable bool
-	rankBuffer        *[]smartRank
-	candidateBuffer   *[]adapter.Outbound
+	ranks              []smartRank
+	candidates         []adapter.Outbound
+	policyUnavailable  bool
+	snapshotSelected   string
+	snapshotSelectedAt time.Time
+	snapshotValid      bool
+	rankBuffer         *[]smartRank
+	candidateBuffer    *[]adapter.Outbound
 }
 
 type smartDialAttempt struct {
@@ -352,11 +355,14 @@ func acquireSmartRanking(candidateCount int) *smartRanking {
 		candidates = make([]adapter.Outbound, 0, candidateCount)
 	}
 	return &smartRanking{
-		ranks:             ranks[:0],
-		candidates:        candidates[:0],
-		policyUnavailable: false,
-		rankBuffer:        rankBuffer,
-		candidateBuffer:   candidateBuffer,
+		ranks:              ranks[:0],
+		candidates:         candidates[:0],
+		policyUnavailable:  false,
+		snapshotSelected:   "",
+		snapshotSelectedAt: time.Time{},
+		snapshotValid:      false,
+		rankBuffer:         rankBuffer,
+		candidateBuffer:    candidateBuffer,
 	}
 }
 
@@ -367,6 +373,9 @@ func (r *smartRanking) Release() {
 	clear(r.ranks)
 	clear(r.candidates)
 	r.policyUnavailable = false
+	r.snapshotSelected = ""
+	r.snapshotSelectedAt = time.Time{}
+	r.snapshotValid = false
 	if cap(r.ranks) <= 4096 {
 		*r.rankBuffer = r.ranks[:0]
 		smartRankPool.Put(r.rankBuffer)
@@ -686,7 +695,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	policyBackend := newSmartPolicyBackend(smartPolicyBackendConfig{
 		Exploration: exploration, SwitchMargin: switchMargin,
 		SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
-		SwitchCooldown: switchCooldown.Milliseconds(), SelectionMode: uint8(selectionMode),
+		SwitchCooldown: switchCooldown.Milliseconds(), SiteStickiness: siteStickiness.Milliseconds(),
+		SwitchMinImprovement: switchMinImprovement.Milliseconds(),
+		SelectionMode:        uint8(selectionMode),
 	})
 	if policyBackend == nil && smartPolicyBackendRequired() {
 		return nil, E.New("smart Zig policy backend unavailable; refusing Go policy fallback")
@@ -1695,7 +1706,9 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			observedTransport = transport
 		}
 		adapter.NoteRealOutbound(ctx, candidate)
-		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex, result.hadPriorFailure)
+		s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
+			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
+			ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		observedStartedAt := time.Now().Add(-result.elapsed)
 		return newSmartObservedConnWithRetransmit(conn, observedStartedAt, func(firstByte time.Duration) {
@@ -2142,7 +2155,9 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		adapter.NoteRealOutbound(ctx, candidate)
-		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex, attemptIndex > 0)
+		s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
+			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
+			ranks, attemptIndex, attemptIndex > 0)
 		observed := newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, smartUDPExpectsResponse(destination), smartUDPRequiredResponsePackets(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
 			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
@@ -2862,10 +2877,18 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	ranking.candidates = append(ranking.candidates, s.candidates...)
 	metadataByTag := s.candidateMetadataByTag
 	selectionKey := smartSelectionKey(networkKey, siteKey, transport)
+	snapshotSelectedAt := s.lastSelectedAt[selectionKey]
 	lastSelected := s.lastSelected[selectionKey]
-	if selectedAt := s.lastSelectedAt[selectionKey]; lastSelected != "" && !selectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(selectedAt) > s.siteStickiness {
+	if lastSelected != "" && !snapshotSelectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(snapshotSelectedAt) > s.siteStickiness {
 		lastSelected = ""
+		snapshotSelectedAt = time.Time{}
 	}
+	// Keep the exact incumbent generation used for this ranking. Dial attempts
+	// may complete out of order; markSelected uses this snapshot to reject a
+	// late healthy result that would otherwise overwrite a newer choice.
+	ranking.snapshotSelected = lastSelected
+	ranking.snapshotSelectedAt = snapshotSelectedAt
+	ranking.snapshotValid = true
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
 	s.access.RUnlock()
 
@@ -3221,6 +3244,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 }
 
 func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
+	s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport, "", time.Time{}, false, ranks, attemptIndex, hadPriorFailure)
+}
+
+func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, snapshotSelected string, snapshotSelectedAt time.Time, snapshotValid bool, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
 	usePolicyBackend := s.policyBackendEnabled()
@@ -3234,8 +3261,10 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
 	previous := s.lastSelected[key]
-	if selectedAt := s.lastSelectedAt[key]; previous != "" && !selectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(selectedAt) > s.siteStickiness {
+	currentSelectedAt := s.lastSelectedAt[key]
+	if previous != "" && !currentSelectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(currentSelectedAt) > s.siteStickiness {
 		previous = ""
+		currentSelectedAt = time.Time{}
 	}
 	// Compare canonical endpoint identity before accounting for a switch. A
 	// provider refresh can replace one display alias with another while the
@@ -3250,6 +3279,17 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
+	// A ranking is a point-in-time view. If another request committed a newer
+	// incumbent while this dial was in flight, a healthy late result must not
+	// roll the decision back. Failure-driven failover remains allowed because
+	// preserving a broken incumbent would strand the request.
+	staleSnapshot := snapshotValid &&
+		(previous != snapshotSelected || !currentSelectedAt.Equal(snapshotSelectedAt))
+	if staleSnapshot && logicalSwitch && !failureSwitch {
+		s.access.Unlock()
+		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "stale healthy result retained current candidate")
+		return
+	}
 	if usePolicyBackend && previous != "" && logicalSwitch && attemptIndex > 0 && !hadPriorFailure {
 		// A hedge is a transport race, not evidence that the backup should
 		// replace a healthy incumbent. Keep the host and Zig policy state on the

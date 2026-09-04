@@ -47,6 +47,24 @@ reuses one conversion buffer per lock shard (16 shards, four bounded contexts
 each). Different service contexts can rank concurrently without retaining a
 large candidate buffer per context.
 
+### Parameter ownership and parity
+
+The Zig ABI receives every parameter that changes a selection decision:
+`exploration`, `switch_margin`, `switch_confirm_samples`, `switch_confirm`,
+`switch_cooldown`, `switch_min_improvement`, `site_stickiness`, and
+`selection_mode`. Candidate `weight`, health state, reliability, p95 connect /
+first-byte latency, jitter, throughput, sample count, and eligibility are sent
+in each bounded snapshot. ABI version 4 is required when this layout changes.
+
+The remaining Smart options are intentionally host-owned and are not missing
+ABI fields: URL/probe interval, probe concurrency and timeout, dial attempts,
+stall observation, breaker and half-life storage, passive throughput gating,
+provider/catalog filters, manual pins, connection interruption, and history/API
+limits. They perform I/O, lifecycle, or evidence preparation before the Zig
+kernel is called. Keeping them out of Zig avoids a second scheduler or a second
+health store. The host and Zig scoring paths use the same p95 latency order,
+half-open penalty, confidence prior, and exploration formula.
+
 ## Passive bulk throughput gate
 
 Bulk candidates can be bypassed after the configured number of real-traffic

@@ -863,6 +863,30 @@ func TestSmartCanonicalEndpointAliasDoesNotCountAsSwitch(t *testing.T) {
 	}
 }
 
+func TestSmartLateHealthyResultCannotOverwriteNewerSelection(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("search.example:443")
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	// A newer request has already committed second. The late result below was
+	// ranked while first was still the incumbent and must not roll it back.
+	smart.markSelected(second, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	selectedAt := smart.lastSelectedAt[smartSelectionKey(networkKey, siteKey, N.NetworkTCP)]
+	ranks := []smartRank{
+		{outbound: first, eligible: true, status: adapter.SmartCandidateStatus{Tag: first.Tag(), State: "healthy", Score: 0.1}},
+		{outbound: second, eligible: true, status: adapter.SmartCandidateStatus{Tag: second.Tag(), State: "healthy", Score: 0.2}},
+	}
+	smart.markSelectedWithSnapshot(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, "first", selectedAt.Add(-time.Second), true, ranks, 0, false)
+	if got := smart.Now(); got != second.Tag() {
+		t.Fatalf("late healthy result replaced newer selection: %s", got)
+	}
+	if got := smart.switchesTotal.Load(); got != 0 {
+		t.Fatalf("stale healthy result counted as a switch: %d", got)
+	}
+}
+
 func TestSmartEndpointIDIsStableAndOpaque(t *testing.T) {
 	if got := smartEndpointID("endpoint:"+strings.Repeat("a", 64), 0); got != "endpoint:"+strings.Repeat("a", 64) {
 		t.Fatalf("structured endpoint ID changed: %q", got)

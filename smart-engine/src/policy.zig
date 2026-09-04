@@ -8,6 +8,7 @@ pub const State = struct {
     challenge_count: u32 = 0,
     challenge_since: u64 = 0,
     cooldown_until: u64 = 0,
+    sticky_until: u64 = 0,
 
     pub fn reset(self: *State) void {
         self.* = .{};
@@ -98,6 +99,22 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             }
         }
     }
+    // The host calls set_selected only after a real dial succeeds. Hold a
+    // healthy incumbent for the configured window so score noise cannot cause
+    // rapid oscillation; a hard-open incumbent still fails over below.
+    if (incumbent) |current| {
+        if (config.site_stickiness_ms > 0 and now_ms < state.sticky_until and
+            current.state != 4 and current.eligible != 0 and healthTier(current.state) == best_tier)
+        {
+            const current_score = scoring.score(config, current, total_samples, profile);
+            if (scoring.isFinite(current_score)) {
+                decision.selected_id = current.id;
+                decision.score = current_score;
+                decision.reason = @intFromEnum(model.DecisionReason.retained);
+                return decision;
+            }
+        }
+    }
     decision.selected_id = selected.id;
     decision.score = selected_score;
     if (state.selected_id == 0 or state.selected_id == selected.id) {
@@ -121,7 +138,10 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         }
         const current_score = scoring.score(config, current, total_samples, profile);
         const improvement = if (current_score > 0) (current_score - selected_score) / current_score else 0;
-        if (improvement < switch_margin or now_ms < state.cooldown_until) {
+        if (improvement < switch_margin or
+            !absoluteImprovement(selected, current, config.switch_min_improvement_ms) or
+            now_ms < state.cooldown_until)
+        {
             decision.selected_id = current.id;
             decision.score = current_score;
             decision.reason = @intFromEnum(model.DecisionReason.retained);
@@ -166,6 +186,21 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     decision.switched = 1;
     decision.reason = @intFromEnum(model.DecisionReason.confirmed);
     return decision;
+}
+
+fn absoluteImprovement(best: model.Candidate, current: model.Candidate, minimum_ms: u64) bool {
+    if (minimum_ms == 0) return true;
+    const best_latency = candidateLatencyMS(best);
+    const current_latency = candidateLatencyMS(current);
+    if (!(best_latency > 0) or !scoring.isFinite(best_latency) or
+        !(current_latency > 0) or !scoring.isFinite(current_latency)) return false;
+    return current_latency - best_latency >= @as(f64, @floatFromInt(minimum_ms));
+}
+
+fn candidateLatencyMS(candidate: model.Candidate) f64 {
+    if (candidate.first_byte_ms > 0 and scoring.isFinite(candidate.first_byte_ms)) return candidate.first_byte_ms;
+    if (candidate.connect_ms > 0 and scoring.isFinite(candidate.connect_ms)) return candidate.connect_ms;
+    return 0;
 }
 
 // splitmix64 gives a stable, cheap rendezvous metric for the pair

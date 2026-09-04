@@ -10,7 +10,7 @@ extern "C" {
 typedef struct smart_engine smart_engine;
 
 /* Increment only when field order or enum semantics change. */
-#define SMART_ENGINE_ABI_VERSION 2u
+#define SMART_ENGINE_ABI_VERSION 4u
 #define SMART_ENGINE_MAX_CANDIDATES 8192u
 #define ADAPTIVE_ENGINE_ABI_VERSION 2u
 
@@ -35,6 +35,8 @@ typedef struct {
     uint64_t switch_cooldown_ms; /* monotonic milliseconds */
     uint64_t affinity_seed; /* stable context seed for balanced selection */
     uint8_t selection_mode; /* 0 primary/backup, 1 balanced dispersion */
+    uint64_t site_stickiness_ms; /* healthy incumbent hold window */
+    uint64_t switch_min_improvement_ms; /* minimum p95 latency gain */
 } smart_engine_config;
 
 typedef struct {
@@ -52,7 +54,7 @@ smart_decision smart_engine_choose(smart_engine *engine, const smart_candidate *
 /* profile: 0 interactive, 1 bulk, 2 UDP; unknown values use interactive. */
 smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms, uint8_t profile);
 /* Synchronize the host's incumbent after a real selection without recording a policy switch. */
-void smart_engine_set_selected(smart_engine *engine, uint64_t id);
+void smart_engine_set_selected(smart_engine *engine, uint64_t id, uint64_t now_ms);
 void smart_engine_reset(smart_engine *engine);
 
 /* Host-neutral AdaptivePool decision kernel.  The host still owns health

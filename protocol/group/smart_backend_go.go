@@ -13,10 +13,12 @@ func newSmartPolicyBackend(_ smartPolicyBackendConfig) smartPolicyBackend { retu
 func smartPolicyBackendRequired() bool { return false }
 
 type smartPolicyBackendConfig struct {
-	Exploration         float64
-	SwitchMargin        float64
-	SwitchConfirm       int
-	SwitchConfirmWindow int64
-	SwitchCooldown      int64
-	SelectionMode       uint8
+	Exploration          float64
+	SwitchMargin         float64
+	SwitchConfirm        int
+	SwitchConfirmWindow  int64
+	SwitchCooldown       int64
+	SiteStickiness       int64
+	SwitchMinImprovement int64
+	SelectionMode        uint8
 }

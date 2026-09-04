@@ -18,6 +18,13 @@ cannot retain a large hash-map backing allocation.
 `smart_engine_choose_profile` exposes interactive, bulk and UDP weighting; the
 original choose function remains an interactive-compatible entry point.
 
+The versioned ABI carries the complete policy set: exploration, relative and
+absolute latency thresholds, confirmation/cooldown, healthy-incumbent site
+stickiness, and primary/backup or balanced selection. `smart_engine_set_selected`
+is called only after a real dial succeeds, so stickiness never hides a failed
+initial connection. Probe scheduling, provider filters, breakers, and
+connection interruption remain host-owned by design.
+
 The optional `conformance/` package is built by Linux CI with the `smart_zig`
 tag. It links the produced library through the C ABI and compares the
 transition sequence with a Go reference. Production release jobs compile the

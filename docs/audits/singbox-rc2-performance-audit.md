@@ -258,3 +258,22 @@ comparisons finite and transitive. Regression tests cover invalid latency,
 sample counts, delay and configuration values. Local validation for this pass
 was limited to `gofmt` and `git diff --check`; Linux Zig/Go/eBPF builds remain
 CI-only because eBPF cannot be validated by a macOS toolchain.
+
+### Zig parameter parity and concurrent-result hardening (2026-09-04)
+
+The strict option-to-ABI review found two real omissions. `site_stickiness`
+was accepted by Smart but never reached the Zig policy state, and
+`switch_min_improvement` was enforced only by the non-Zig reference path. ABI
+version 4 now appends both millisecond fields; `smart_engine_set_selected`
+receives the completion timestamp and starts stickiness only after a real dial
+succeeds. Zig also matches the host's p95 latency order, half-open penalty,
+jitter presence rule, and exploration denominator. Hard-open and provider
+removal failover still bypass the performance floor.
+
+The same review found that concurrent dial completions could let an older
+healthy result overwrite a newer incumbent in the Zig path. Each pooled ranking
+now records the selected tag and timestamp generation; `markSelected` rejects
+only stale healthy results while allowing failure-driven failover. The snapshot
+fields are cleared on pool release to avoid retaining provider strings. Zig
+unit, C ABI smoke, and Smart integration tests cover stickiness, absolute
+latency gating, and stale-result rejection; Linux CI remains the build gate.

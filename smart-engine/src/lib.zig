@@ -47,7 +47,7 @@ export fn smart_engine_create(config: Config) ?*Engine {
 }
 
 export fn smart_engine_abi_version() u32 {
-    return 2;
+    return 4;
 }
 
 export fn smart_engine_destroy(engine: ?*Engine) void {
@@ -87,13 +87,17 @@ export fn smart_engine_choose_profile(engine: ?*Engine, candidates: ?[*]const Ca
 // The host owns the actual dial result. Synchronize that incumbent into the
 // policy FSM after a successful selection so a cold policy engine does not
 // mistake the first ranking snapshot for a confirmed performance switch.
-export fn smart_engine_set_selected(engine: ?*Engine, id: u64) void {
+export fn smart_engine_set_selected(engine: ?*Engine, id: u64, now_ms: u64) void {
     if (engine) |value| {
         if (id == 0) return;
         value.state.selected_id = id;
         value.state.challenge_id = 0;
         value.state.challenge_count = 0;
         value.state.challenge_since = 0;
+        value.state.sticky_until = if (value.config.site_stickiness_ms > 0)
+            now_ms +| value.config.site_stickiness_ms
+        else
+            0;
     }
 }
 
@@ -255,6 +259,53 @@ test "balanced selection is stable and health bounded" {
     };
     const bounded = policy.chooseProfile(&health_engine.state, health_engine.config, &health_engine.observations, health_bounded[0..], 0, .interactive);
     try std.testing.expectEqual(@as(u64, 11), bounded.selected_id);
+}
+
+test "site stickiness retains a healthy incumbent until expiry" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .site_stickiness_ms = 60000,
+    });
+    const incumbent = Candidate{ .id = 1, .reliability = 0.90, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 };
+    const better = Candidate{ .id = 2, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 };
+    const initial = [_]Candidate{incumbent};
+    _ = policy.choose(&engine.state, engine.config, &engine.observations, initial[0..], 1);
+    // This mirrors the host callback after the first real dial succeeds.
+    engine.state.selected_id = 1;
+    engine.state.sticky_until = 60001;
+    const candidates = [_]Candidate{ incumbent, better };
+    const retained = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 60000);
+    try std.testing.expectEqual(@as(u64, 1), retained.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), retained.switched);
+    const pending = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 60001);
+    try std.testing.expectEqual(@as(u64, 1), pending.selected_id);
+    const switched = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 60002);
+    try std.testing.expectEqual(@as(u64, 2), switched.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), switched.switched);
+}
+
+test "minimum latency improvement is enforced before switching" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .switch_min_improvement_ms = 100,
+    });
+    const incumbent = Candidate{ .id = 1, .reliability = 0.99, .connect_ms = 200, .first_byte_ms = 200, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 };
+    const small_gain = Candidate{ .id = 2, .reliability = 0.99, .connect_ms = 150, .first_byte_ms = 150, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 };
+    const initial = [_]Candidate{incumbent};
+    _ = policy.choose(&engine.state, engine.config, &engine.observations, initial[0..], 1);
+    engine.state.selected_id = 1;
+    const candidates = [_]Candidate{ incumbent, small_gain };
+    const decision = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 2);
+    try std.testing.expectEqual(@as(u64, 1), decision.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), decision.switched);
 }
 
 test "suspect remains ahead of half-open during recovery" {

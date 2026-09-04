@@ -15,12 +15,14 @@ import (
 )
 
 type smartPolicyBackendConfig struct {
-	Exploration         float64
-	SwitchMargin        float64
-	SwitchConfirm       int
-	SwitchConfirmWindow int64
-	SwitchCooldown      int64
-	SelectionMode       uint8
+	Exploration          float64
+	SwitchMargin         float64
+	SwitchConfirm        int
+	SwitchConfirmWindow  int64
+	SwitchCooldown       int64
+	SiteStickiness       int64
+	SwitchMinImprovement int64
+	SelectionMode        uint8
 }
 
 type zigSmartPolicyBackend struct {
@@ -43,14 +45,16 @@ type zigSmartPolicyEngine struct {
 
 func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 	cfg := C.smart_engine_config{
-		exploration:            C.double(config.Exploration),
-		switch_margin:          C.double(config.SwitchMargin),
-		switch_confirm_samples: C.uint32_t(config.SwitchConfirm),
-		switch_confirm_ms:      C.uint64_t(maxInt64(config.SwitchConfirmWindow)),
-		switch_cooldown_ms:     C.uint64_t(maxInt64(config.SwitchCooldown)),
-		selection_mode:         C.uint8_t(config.SelectionMode),
+		exploration:               C.double(config.Exploration),
+		switch_margin:             C.double(config.SwitchMargin),
+		switch_confirm_samples:    C.uint32_t(config.SwitchConfirm),
+		switch_confirm_ms:         C.uint64_t(maxInt64(config.SwitchConfirmWindow)),
+		switch_cooldown_ms:        C.uint64_t(maxInt64(config.SwitchCooldown)),
+		selection_mode:            C.uint8_t(config.SelectionMode),
+		site_stickiness_ms:        C.uint64_t(maxInt64(config.SiteStickiness)),
+		switch_min_improvement_ms: C.uint64_t(maxInt64(config.SwitchMinImprovement)),
 	}
-	if C.smart_engine_abi_version() != 2 {
+	if C.smart_engine_abi_version() != 4 {
 		return nil
 	}
 	backend := &zigSmartPolicyBackend{config: cfg}
@@ -195,7 +199,7 @@ func (b *zigSmartPolicyBackend) SetSelected(key string, id uint64, now time.Time
 	defer shard.access.Unlock()
 	engine := b.engineForLocked(shard, key, now)
 	if engine != nil {
-		C.smart_engine_set_selected(engine.engine, C.uint64_t(id))
+		C.smart_engine_set_selected(engine.engine, C.uint64_t(id), C.uint64_t(smartMillis(now)))
 	}
 }
 

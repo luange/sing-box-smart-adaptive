@@ -19,6 +19,8 @@ pub const Config = extern struct {
     switch_cooldown_ms: u64,
     affinity_seed: u64 = 0,
     selection_mode: u8 = 0,
+    site_stickiness_ms: u64 = 0,
+    switch_min_improvement_ms: u64 = 0,
 };
 
 pub const Decision = extern struct {

@@ -35,7 +35,8 @@ pub fn score(config: model.Config, candidate: model.Candidate, total_samples: f6
     // only have an EWMA still get the same bounded fallback behavior.
     const connect_cost = normalizedCost(candidate.connect_ms, 5000.0);
     const first_byte_cost = normalizedCost(candidate.first_byte_ms, 10000.0);
-    const jitter_cost = if (candidate.jitter_ms > 0 and isFinite(candidate.jitter_ms))
+    const jitter_cost = if (candidate.connect_ms > 0 and isFinite(candidate.connect_ms) and
+        candidate.jitter_ms >= 0 and isFinite(candidate.jitter_ms))
         std.math.clamp(candidate.jitter_ms / 1000.0, 0.0, 1.0)
     else
         0.5;
@@ -45,7 +46,7 @@ pub fn score(config: model.Config, candidate: model.Candidate, total_samples: f6
     else
         0.60;
     const exploration = if (sample_count > 0 and total_samples > 0 and isFinite(total_samples))
-        exploration_budget * @sqrt(@log(total_samples + 1.0) / sample_count)
+        exploration_budget * @sqrt(@log(total_samples + 2.0) / (sample_count + 1.0))
     else
         exploration_budget;
     const weight = if (candidate.weight > 0 and isFinite(candidate.weight)) candidate.weight else 1.0;
@@ -73,7 +74,11 @@ pub fn score(config: model.Config, candidate: model.Candidate, total_samples: f6
         .interactive => {},
     }
     const confidence_cost = if (sample_count < 3.0) 1.0 - sample_count / 3.0 else 0.0;
-    const base = reliability_weight * (1.0 - reliability) + connect_weight * connect_cost + first_byte_weight * first_byte_cost + throughput_weight * throughput_cost + jitter_weight * jitter_cost + confidence_weight * confidence_cost;
+    var base = reliability_weight * (1.0 - reliability) + connect_weight * connect_cost + first_byte_weight * first_byte_cost + throughput_weight * throughput_cost + jitter_weight * jitter_cost + confidence_weight * confidence_cost;
+    // Match the host's recovery semantics: half-open candidates are usable
+    // only as bounded trials and must not outrank a healthy incumbent merely
+    // because their first retry was fast.
+    if (candidate.state == 5) base += 0.20;
     return @max(0.0, base - exploration) / weight;
 }
 
