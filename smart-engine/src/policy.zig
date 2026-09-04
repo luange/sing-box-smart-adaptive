@@ -49,18 +49,36 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         for (candidates) |raw_candidate| {
             const candidate = observations.enrich(raw_candidate);
             if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4) continue;
-            if (candidate.id == state.selected_id and healthTier(candidate.state) == best_tier) {
+            // A suspect/warming incumbent is still the active primary until
+            // it is open.  Recovery of the deferred endpoint must not
+            // preempt a usable replacement merely because its tier is lower.
+            if (candidate.id == state.selected_id) {
                 selected_usable = true;
             }
-            if (candidate.id != state.deferred_id and healthTier(candidate.state) == best_tier) {
+            if (candidate.id != state.deferred_id) {
                 alternative_exists = true;
             }
         }
         defer_recovered = selected_usable and alternative_exists;
     }
+    if (defer_recovered) {
+        // Recompute the best tier without the deferred endpoint. Otherwise a
+        // recovered healthy A could leave no candidate in the selected tier
+        // after filtering, or force a lower-tier B through a null result.
+        var non_deferred_tier: u8 = 255;
+        for (candidates) |raw_candidate| {
+            const candidate = observations.enrich(raw_candidate);
+            if (candidate.id == 0 or candidate.id == state.deferred_id or candidate.eligible == 0 or candidate.state == 4) continue;
+            const tier = healthTier(candidate.state);
+            if (tier < non_deferred_tier) non_deferred_tier = tier;
+        }
+        if (non_deferred_tier != 255) best_tier = non_deferred_tier;
+    }
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
-        if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4 and healthTier(candidate.state) == best_tier) {
+        if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4 and
+            (!defer_recovered or candidate.id != state.deferred_id) and healthTier(candidate.state) == best_tier)
+        {
             if (candidate.samples > 0 and scoring.isFinite(candidate.samples)) {
                 total_samples += candidate.samples;
             }

@@ -309,6 +309,16 @@ test "failed primary stays deferred after recovery until replacement fails" {
     try std.testing.expectEqual(@as(u64, 2), retained.selected_id);
     try std.testing.expectEqual(@as(u8, 0), retained.switched);
 
+    // Even a still-usable suspect replacement remains the primary. The
+    // deferred endpoint is not allowed to reclaim it until it reaches open.
+    const suspect_replacement = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.85, .connect_ms = 80, .first_byte_ms = 80, .jitter_ms = 2, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 3, .eligible = 1 },
+    };
+    const suspect_retained = policy.choose(&engine.state, engine.config, &engine.observations, suspect_replacement[0..], 3);
+    try std.testing.expectEqual(@as(u64, 2), suspect_retained.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), suspect_retained.switched);
+
     // Only when B fails may the recovered A take over. The failed B becomes
     // the new deferred backup marker, so a later recovery of B cannot reclaim
     // the primary slot without another hard failure.
@@ -316,7 +326,7 @@ test "failed primary stays deferred after recovery until replacement fails" {
         .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
         .{ .id = 2, .reliability = 0.85, .connect_ms = 80, .first_byte_ms = 80, .jitter_ms = 2, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 4, .eligible = 1 },
     };
-    const promoted = policy.choose(&engine.state, engine.config, &engine.observations, replacement_failed[0..], 3);
+    const promoted = policy.choose(&engine.state, engine.config, &engine.observations, replacement_failed[0..], 4);
     try std.testing.expectEqual(@as(u64, 1), promoted.selected_id);
     try std.testing.expectEqual(@as(u8, 1), promoted.switched);
     try std.testing.expectEqual(@as(u64, 2), engine.state.deferred_id);
