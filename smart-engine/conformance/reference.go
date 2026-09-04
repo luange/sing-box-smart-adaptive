@@ -11,6 +11,7 @@ type Config struct {
 	Exploration, SwitchMargin         float64
 	SwitchConfirmSamples              uint32
 	SwitchConfirmMS, SwitchCooldownMS uint64
+	MinSamples                        uint32
 }
 
 type Decision struct {
@@ -44,8 +45,12 @@ func score(c Config, candidate Candidate, total float64) float64 {
 		exploration *= math.Sqrt(math.Log(total+1) / candidate.Samples)
 	}
 	confidence := 0.0
-	if candidate.Samples < 3 {
-		confidence = math.Max(0, 1-candidate.Samples/3)
+	minSamples := float64(c.MinSamples)
+	if minSamples <= 0 {
+		minSamples = 3
+	}
+	if candidate.Samples < minSamples {
+		confidence = math.Max(0, 1-candidate.Samples/minSamples)
 	}
 	return math.Max(0, .30*(1-candidate.Reliability)+.25*connect+.30*first+.10*jitter+.05*confidence-exploration) / math.Max(candidate.Weight, 1)
 }

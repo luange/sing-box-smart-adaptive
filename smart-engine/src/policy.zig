@@ -117,11 +117,15 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     // catalog would make the first request depend on an arbitrary seed and
     // could select a line that has no evidence yet. Once portraits are ready,
     // values 0 and 1 use the same stable affinity policy.
+    const affinity_min_samples: f64 = if (config.min_samples > 0)
+        @floatFromInt(config.min_samples)
+    else
+        3.0;
     var affinity_ready = true;
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
         if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
-        if (!(candidate.samples >= 3.0) or !scoring.isFinite(candidate.samples)) {
+        if (!(candidate.samples >= affinity_min_samples) or !scoring.isFinite(candidate.samples)) {
             affinity_ready = false;
             break;
         }

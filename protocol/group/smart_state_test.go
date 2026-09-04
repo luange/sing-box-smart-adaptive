@@ -497,17 +497,34 @@ func TestSmartUnifiedAffinityIsStableAndHealthBounded(t *testing.T) {
 		{identity: "endpoint-b", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy", Score: 0.42, Samples: 3}},
 		{identity: "endpoint-c", eligible: true, status: adapter.SmartCandidateStatus{State: "suspect", Score: 0.10, Samples: 3}},
 	}
-	first := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
-	second := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
+	first := smart.stableAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
+	second := smart.stableAffinityIndex(ranks, "network\x00example.com\x00tcp", "")
 	if first < 0 || first != second || first == 2 {
 		t.Fatalf("balanced affinity was not stable and health bounded: first=%d second=%d", first, second)
 	}
-	if got := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got != 1 {
+	if got := smart.stableAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got != 1 {
 		t.Fatalf("healthy incumbent was not retained in balanced pool: got=%d", got)
 	}
 	ranks[1].eligible = false
-	if got := smart.balancedAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got == 1 || got < 0 {
+	if got := smart.stableAffinityIndex(ranks, "network\x00example.com\x00tcp", "endpoint-b"); got == 1 || got < 0 {
 		t.Fatalf("failed incumbent was retained by balanced affinity: got=%d", got)
+	}
+}
+
+func TestSmartStoreBoundsPruneOnConfiguration(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Now()
+	store.observeDial(now.Add(-2*time.Hour), "ethernet", "", "old", "tcp", true, time.Millisecond)
+	store.observeDial(now.Add(-time.Minute), "ethernet", "", "new-a", "tcp", true, time.Millisecond)
+	store.observeDial(now, "ethernet", "", "new-b", "tcp", true, time.Millisecond)
+	store.setBounds(time.Hour, 1)
+	store.access.RLock()
+	defer store.access.RUnlock()
+	if len(store.metrics) != 1 {
+		t.Fatalf("store bounds retained %d metrics, want 1", len(store.metrics))
+	}
+	if _, loaded := store.metrics[smartMetricKey{Network: "ethernet", Candidate: "new-b", Transport: "tcp"}]; !loaded {
+		t.Fatal("store bounds did not retain newest metric")
 	}
 }
 
@@ -845,58 +862,6 @@ func TestPassiveThroughputFloorUsesOnlyRealTrafficSamples(t *testing.T) {
 	}
 }
 
-func TestSmartHistorySnapshotRoundTrip(t *testing.T) {
-	store := newSmartStore(time.Hour, 3, time.Minute)
-	now := time.Unix(8000, 0)
-	for range 5 {
-		store.observeDial(now, "ethernet", "video.example", "a", "tcp", true, 45*time.Millisecond)
-	}
-	store.observeFirstByte(now, "ethernet", "video.example", "a", "tcp", 80*time.Millisecond)
-	store.observeThroughput(now, "ethernet", "video.example", "a", "tcp", 32*1024*1024, 2*time.Second)
-	snapshot := store.snapshot(now, 24*time.Hour, 100)
-	if snapshot.Version != smartStateVersion || len(snapshot.Metrics) == 0 {
-		t.Fatal("history snapshot is empty")
-	}
-
-	restored := newSmartStore(time.Hour, 3, time.Minute)
-	restored.restore(snapshot)
-	estimate := restored.estimate(now, "ethernet", "video.example", "a", "tcp", 3)
-	if estimate.State != "healthy" {
-		t.Fatalf("restored state mismatch: %s", estimate.State)
-	}
-	if !estimate.HasFirstByte || !estimate.HasThroughput {
-		t.Fatal("restored observations are incomplete")
-	}
-
-	rejected := newSmartStore(time.Hour, 3, time.Minute)
-	snapshot.Version++
-	rejected.restore(snapshot)
-	if estimate := rejected.estimate(now, "ethernet", "video.example", "a", "tcp", 3); estimate.State != "unknown" {
-		t.Fatalf("unsupported history schema was accepted: %s", estimate.State)
-	}
-}
-
-func TestSmartHistorySnapshotHonorsRetentionAndLimit(t *testing.T) {
-	store := newSmartStore(time.Hour, 3, time.Minute)
-	now := time.Unix(9000, 0)
-	store.observeDial(now.Add(-2*time.Hour), "ethernet", "", "old", "tcp", true, time.Millisecond)
-	store.observeDial(now.Add(-time.Minute), "ethernet", "", "new-a", "tcp", true, time.Millisecond)
-	store.observeDial(now, "ethernet", "", "new-b", "tcp", true, time.Millisecond)
-	snapshot := store.snapshot(now, time.Hour, 1)
-	if len(snapshot.Metrics) != 1 {
-		t.Fatalf("expected one retained metric, got %d", len(snapshot.Metrics))
-	}
-	if snapshot.Metrics[0].Candidate != "new-b" {
-		t.Fatalf("snapshot did not keep the newest metric: %s", snapshot.Metrics[0].Candidate)
-	}
-	store.access.RLock()
-	liveEntries := len(store.metrics)
-	store.access.RUnlock()
-	if liveEntries != 1 {
-		t.Fatalf("live state was not pruned with snapshot: %d", liveEntries)
-	}
-}
-
 func TestSmartWorkerStartsOnPostStart(t *testing.T) {
 	smart := &Smart{
 		ctx:               context.Background(),
@@ -906,7 +871,6 @@ func TestSmartWorkerStartsOnPostStart(t *testing.T) {
 		halfLife:          time.Hour,
 		breakerFailures:   3,
 		breakerCooldown:   time.Minute,
-		historyRetention:  time.Hour,
 		maxHistoryEntries: 100,
 	}
 	if err := smart.PostStart(); err != nil {
@@ -969,7 +933,6 @@ func TestSmartCloseDoesNotBlockIndefinitely(t *testing.T) {
 		halfLife:          time.Hour,
 		breakerFailures:   3,
 		breakerCooldown:   time.Minute,
-		historyRetention:  time.Hour,
 		maxHistoryEntries: 100,
 		probeRegistry:     registry,
 		candidates:        []adapter.Outbound{leaf},
@@ -1003,7 +966,6 @@ func TestSmartHealthIsPerInstance(t *testing.T) {
 			halfLife:          time.Hour,
 			breakerFailures:   3,
 			breakerCooldown:   time.Minute,
-			historyRetention:  time.Hour,
 			maxHistoryEntries: 100,
 		}
 	}

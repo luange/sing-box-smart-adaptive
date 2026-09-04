@@ -23,6 +23,7 @@ type smartPolicyBackendConfig struct {
 	SiteStickiness       int64
 	SwitchMinImprovement int64
 	SelectionMode        uint8
+	MinSamples           int
 }
 
 type zigSmartPolicyBackend struct {
@@ -53,8 +54,9 @@ func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 		selection_mode:            C.uint8_t(config.SelectionMode),
 		site_stickiness_ms:        C.uint64_t(maxInt64(config.SiteStickiness)),
 		switch_min_improvement_ms: C.uint64_t(maxInt64(config.SwitchMinImprovement)),
+		min_samples:               C.uint32_t(smartPolicyMinSamples(config.MinSamples)),
 	}
-	if C.smart_engine_abi_version() != 4 {
+	if C.smart_engine_abi_version() != 5 {
 		return nil
 	}
 	backend := &zigSmartPolicyBackend{config: cfg}
@@ -62,6 +64,16 @@ func newSmartPolicyBackend(config smartPolicyBackendConfig) smartPolicyBackend {
 		backend.shards[index].engines = make(map[string]*zigSmartPolicyEngine)
 	}
 	return backend
+}
+
+func smartPolicyMinSamples(value int) uint32 {
+	if value <= 0 {
+		return 3
+	}
+	if uint64(value) > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(value)
 }
 
 // Release builds that carry the Zig backend must not silently fall back to the

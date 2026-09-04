@@ -470,7 +470,6 @@ type Smart struct {
 	maxAttempts                int
 	attemptTimeout             time.Duration
 	establishedStallTimeout    time.Duration
-	selectionMode              smartSelectionMode
 	siteStickiness             time.Duration
 	switchConfirm              time.Duration
 	switchConfirmSamples       int
@@ -484,10 +483,8 @@ type Smart struct {
 	halfLife                   time.Duration
 	breakerFailures            int
 	breakerCooldown            time.Duration
-	historyRetention           time.Duration
 	maxHistoryEntries          int
 	interruptGroup             *interrupt.Group
-	interruptExternal          bool
 	interruptMode              string
 	interruptIdle              time.Duration
 	interruptLongAge           time.Duration
@@ -693,11 +690,6 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if options.InterruptPolicy.Mode != "" && options.InterruptConnections && logger != nil {
 		logger.Warn("smart interrupt_policy overrides deprecated interrupt_exist_connections")
 	}
-	historyPath := options.HistoryPath
-	if historyPath != "" && logger != nil {
-		// S2: field kept for config compat; no effect since rc44.
-		logger.Warn("smart history_path is deprecated since rc44, no effect (health is process-local and rebuilt after each start)")
-	}
 	store := newSmartStore(halfLife, breakerFailures, breakerCooldown)
 	store.setBounds(historyRetention, maxHistoryEntries)
 	policyBackend := newSmartPolicyBackend(smartPolicyBackendConfig{
@@ -705,6 +697,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		SwitchConfirm: switchConfirmSamples, SwitchConfirmWindow: switchConfirm.Milliseconds(),
 		SwitchCooldown: switchCooldown.Milliseconds(), SiteStickiness: siteStickiness.Milliseconds(),
 		SwitchMinImprovement: switchMinImprovement.Milliseconds(),
+		MinSamples:           minSamples,
 		SelectionMode:        uint8(selectionMode),
 	})
 	if policyBackend == nil && smartPolicyBackendRequired() {
@@ -762,7 +755,6 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		maxAttempts:               maxAttempts,
 		attemptTimeout:            attemptTimeout,
 		establishedStallTimeout:   establishedStallTimeout,
-		selectionMode:             selectionMode,
 		siteStickiness:            siteStickiness,
 		switchConfirm:             switchConfirm,
 		switchConfirmSamples:      switchConfirmSamples,
@@ -776,10 +768,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		halfLife:                  halfLife,
 		breakerFailures:           breakerFailures,
 		breakerCooldown:           breakerCooldown,
-		historyRetention:          historyRetention,
 		maxHistoryEntries:         maxHistoryEntries,
 		interruptGroup:            interrupt.NewGroup(),
-		interruptExternal:         options.InterruptConnections,
 		interruptMode:             interruptMode,
 		interruptIdle:             interruptIdle,
 		interruptLongAge:          interruptLongAge,
@@ -1081,15 +1071,15 @@ func (s *Smart) performanceSwitchAllowed() bool {
 	return s.currentPhase() >= smartPhaseProfiling
 }
 
-// balancedAffinityIndex implements the unified primary/backup policy's stable
+// stableAffinityIndex implements the unified primary/backup policy's stable
 // context dispersion. It first applies the same hard health tier and near-tie
 // score boundary as ranking, then uses rendezvous hashing over canonical
 // endpoint identities. The result is pseudo-random across independent
 // contexts but stable for one context, so keep-alive traffic does not bounce
-// between lines. The historical name is kept for API/test compatibility.
+// between lines.
 // Node weights have already been applied to the confidence-adjusted score;
 // applying them again here would double-count a priority rule.
-func (s *Smart) balancedAffinityIndex(ranks []smartRank, key, preferredTag string) int {
+func (s *Smart) stableAffinityIndex(ranks []smartRank, key, preferredTag string) int {
 	if s == nil || len(ranks) == 0 || key == "" {
 		return -1
 	}
@@ -3302,7 +3292,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	// Keep the host fallback on the same stable context affinity as Zig so a
 	// development build cannot silently choose a different policy.
 	if !usePolicyBackend {
-		if index := s.balancedAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
+		if index := s.stableAffinityIndex(ranks, networkKey+"\x00"+siteKey+"\x00"+transport, lastSelected); index >= 0 {
 			ranks[index].status.Reason = "unified stable affinity"
 			moveSmartRankFirst(ranks, index)
 		}

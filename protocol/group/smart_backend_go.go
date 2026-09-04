@@ -21,4 +21,5 @@ type smartPolicyBackendConfig struct {
 	SiteStickiness       int64
 	SwitchMinImprovement int64
 	SelectionMode        uint8
+	MinSamples           int
 }

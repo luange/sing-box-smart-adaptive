@@ -197,6 +197,7 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		SwitchConfirm:       smart.switchConfirmSamples,
 		SwitchConfirmWindow: smart.switchConfirm.Milliseconds(),
 		SwitchCooldown:      smart.switchCooldown.Milliseconds(),
+		MinSamples:          smart.minSamples,
 	})
 	return smart
 }
@@ -994,6 +995,7 @@ func TestSmartHealthyCandidateRequiresSustainedImprovementBeforeSwitch(t *testin
 		SwitchConfirm:       smart.switchConfirmSamples,
 		SwitchConfirmWindow: smart.switchConfirm.Milliseconds(),
 		SwitchCooldown:      smart.switchCooldown.Milliseconds(),
+		MinSamples:          smart.minSamples,
 	})
 	now := time.Now()
 	networkKey := smart.networkFingerprint()

@@ -15,7 +15,6 @@ type URLTestOutboundOptions struct {
 	Tolerance                 uint16                 `json:"tolerance,omitempty"`
 	IdleTimeout               badoption.Duration     `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool                   `json:"interrupt_exist_connections,omitempty"`
-	Fallback                  URLTestFallbackOptions `json:"fallback,omitempty"`
 }
 
 type GroupCommonOption struct {
@@ -31,11 +30,6 @@ type GroupCommonOption struct {
 type NodeWeightOptions struct {
 	Match  string  `json:"match"`
 	Weight float64 `json:"weight"`
-}
-
-type URLTestFallbackOptions struct {
-	Enabled  bool               `json:"enabled,omitempty"`
-	MaxDelay badoption.Duration `json:"max_delay,omitempty"`
 }
 
 type LoadBalanceOutboundOptions struct {
@@ -85,7 +79,6 @@ type SmartOutboundOptions struct {
 	BreakerFailures           int                         `json:"breaker_failures,omitempty"`
 	BreakerCooldown           badoption.Duration          `json:"breaker_cooldown,omitempty"`
 	HalfLife                  badoption.Duration          `json:"half_life,omitempty"`
-	HistoryPath               string                      `json:"history_path,omitempty"`
 	HistoryRetention          badoption.Duration          `json:"history_retention,omitempty"`
 	MaxHistoryEntries         int                         `json:"max_history_entries,omitempty"`
 	InterruptConnections      bool                        `json:"interrupt_exist_connections,omitempty"`

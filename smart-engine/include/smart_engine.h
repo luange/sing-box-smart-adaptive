@@ -10,7 +10,7 @@ extern "C" {
 typedef struct smart_engine smart_engine;
 
 /* Increment only when field order or enum semantics change. */
-#define SMART_ENGINE_ABI_VERSION 4u
+#define SMART_ENGINE_ABI_VERSION 5u
 #define SMART_ENGINE_MAX_CANDIDATES 8192u
 #define ADAPTIVE_ENGINE_ABI_VERSION 2u
 
@@ -38,6 +38,7 @@ typedef struct {
     uint8_t selection_mode;
     uint64_t site_stickiness_ms; /* healthy incumbent hold window */
     uint64_t switch_min_improvement_ms; /* minimum p95 latency gain */
+    uint32_t min_samples; /* host confidence floor used by affinity */
 } smart_engine_config;
 
 typedef struct {

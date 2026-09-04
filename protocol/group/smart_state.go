@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-const smartStateVersion = 1
-
 type smartMetricKey struct {
 	Network   string
 	Site      string
@@ -49,11 +47,6 @@ type smartMetric struct {
 	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
 	CircuitUntil        time.Time `json:"circuit_until,omitempty"`
 	LastUpdated         time.Time `json:"last_updated"`
-}
-
-type smartStoreSnapshot struct {
-	Version int           `json:"version"`
-	Metrics []smartMetric `json:"metrics"`
 }
 
 type smartEstimate struct {
@@ -398,25 +391,6 @@ func (s *smartStore) metricCopy(key smartMetricKey, now time.Time) (smartMetric,
 	return copyMetric, true
 }
 
-func (s *smartStore) snapshot(now time.Time, retention time.Duration, maxEntries int) smartStoreSnapshot {
-	s.access.Lock()
-	s.pruneLocked(now, retention, maxEntries)
-	metrics := make([]smartMetric, 0, len(s.metrics))
-	for _, metric := range s.metrics {
-		copyMetric := *metric
-		copyMetric.decay(now, s.halfLife)
-		metrics = append(metrics, copyMetric)
-	}
-	s.access.Unlock()
-	sort.Slice(metrics, func(i, j int) bool {
-		return metrics[i].LastUpdated.After(metrics[j].LastUpdated)
-	})
-	if maxEntries > 0 && len(metrics) > maxEntries {
-		metrics = metrics[:maxEntries]
-	}
-	return smartStoreSnapshot{Version: smartStateVersion, Metrics: metrics}
-}
-
 func (s *smartStore) pruneLocked(now time.Time, retention time.Duration, maxEntries int) {
 	if retention > 0 {
 		for key, metric := range s.metrics {
@@ -442,26 +416,6 @@ func (s *smartStore) pruneLocked(now time.Time, retention time.Duration, maxEntr
 	for _, entry := range ages[maxEntries:] {
 		delete(s.metrics, entry.key)
 	}
-}
-
-func (s *smartStore) restore(snapshot smartStoreSnapshot) {
-	if snapshot.Version != smartStateVersion {
-		return
-	}
-	s.access.Lock()
-	defer s.access.Unlock()
-	for index := range snapshot.Metrics {
-		metric := snapshot.Metrics[index]
-		key := smartMetricKey{
-			Network:   metric.Network,
-			Site:      metric.Site,
-			Candidate: metric.Candidate,
-			Transport: metric.Transport,
-		}
-		copyMetric := metric
-		s.metrics[key] = &copyMetric
-	}
-	s.pruneLocked(time.Now(), s.retention, s.maxEntries)
 }
 
 func (m *smartMetric) decay(now time.Time, halfLife time.Duration) {

@@ -23,6 +23,7 @@ pub const Config = extern struct {
     selection_mode: u8 = 0,
     site_stickiness_ms: u64 = 0,
     switch_min_improvement_ms: u64 = 0,
+    min_samples: u32 = 3,
 };
 
 pub const Decision = extern struct {

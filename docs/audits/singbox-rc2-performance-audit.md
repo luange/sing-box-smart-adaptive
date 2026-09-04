@@ -264,7 +264,8 @@ CI-only because eBPF cannot be validated by a macOS toolchain.
 The strict option-to-ABI review found two real omissions. `site_stickiness`
 was accepted by Smart but never reached the Zig policy state, and
 `switch_min_improvement` was enforced only by the non-Zig reference path. ABI
-version 4 now appends both millisecond fields; `smart_engine_set_selected`
+version 4 appended both millisecond fields; the current ABI version 5 also
+carries the host-configured `min_samples` confidence floor. `smart_engine_set_selected`
 receives the completion timestamp and starts stickiness only after a real dial
 succeeds. Zig also matches the host's p95 latency order, half-open penalty,
 jitter presence rule, and exploration denominator. Hard-open and provider

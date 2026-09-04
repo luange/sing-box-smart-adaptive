@@ -52,9 +52,9 @@ large candidate buffer per context.
 The Zig ABI receives every parameter that changes a selection decision:
 `exploration`, `switch_margin`, `switch_confirm_samples`, `switch_confirm`,
 `switch_cooldown`, `switch_min_improvement`, `site_stickiness`, and
-`selection_mode`. Candidate `weight`, health state, reliability, p95 connect /
+`selection_mode`, and the configured `min_samples` confidence floor. Candidate `weight`, health state, reliability, p95 connect /
 first-byte latency, jitter, throughput, sample count, and eligibility are sent
-in each bounded snapshot. ABI version 4 is required when this layout changes.
+in each bounded snapshot. ABI version 5 is required when this layout changes.
 
 The remaining Smart options are intentionally host-owned and are not missing
 ABI fields: URL/probe interval, probe concurrency and timeout, dial attempts,

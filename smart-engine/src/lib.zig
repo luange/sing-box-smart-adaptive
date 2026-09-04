@@ -27,6 +27,7 @@ const Engine = struct {
         if (normalized.switch_margin > 0.95) normalized.switch_margin = 0.95;
         if (normalized.switch_confirm_samples == 0) normalized.switch_confirm_samples = 1;
         if (normalized.selection_mode > 1) normalized.selection_mode = 0;
+        if (normalized.min_samples == 0) normalized.min_samples = 3;
         return .{ .config = normalized };
     }
 
@@ -47,7 +48,7 @@ export fn smart_engine_create(config: Config) ?*Engine {
 }
 
 export fn smart_engine_abi_version() u32 {
-    return 4;
+    return 5;
 }
 
 export fn smart_engine_destroy(engine: ?*Engine) void {
@@ -217,6 +218,10 @@ test "ABI configuration rejects non-finite limits" {
     try std.testing.expectEqual(@as(f64, 0), smart.config.switch_margin);
     try std.testing.expectEqual(@as(u32, 1), smart.config.switch_confirm_samples);
     try std.testing.expectEqual(@as(u8, 0), smart.config.selection_mode);
+    try std.testing.expectEqual(@as(u32, 3), smart.config.min_samples);
+
+    const custom = Engine.init(.{ .min_samples = 7 });
+    try std.testing.expectEqual(@as(u32, 7), custom.config.min_samples);
 
     const adaptive_engine = adaptive_engine_create(.{
         .switch_margin = std.math.inf(f64),
