@@ -1150,6 +1150,35 @@ func TestSmartAccountAndChallengeFamiliesStayStable(t *testing.T) {
 	}
 }
 
+func TestSmartChatGPTWebsocketSharesAffinityAcrossClients(t *testing.T) {
+	// Source IP is part of the lineage resolver for challenge inheritance, not
+	// the Smart selection key. Connections from two clients to the same
+	// WebSocket service therefore share one service affinity; they do not get a
+	// fresh rendezvous choice merely because their local ports differ.
+	variants := []struct {
+		source string
+		host   string
+	}{
+		{source: "192.168.0.2:51001", host: "ws.chatgpt.com"},
+		{source: "192.168.0.30:51002", host: "WS.CHATGPT.COM."},
+	}
+	var expectedDisplay, expectedKey string
+	for _, variant := range variants {
+		metadata := &adapter.InboundContext{
+			Inbound: "JP-in",
+			Source:  M.ParseSocksaddr(variant.source),
+			Domain:  variant.host,
+		}
+		display, key := smartSiteIdentity(metadata, M.ParseSocksaddr("198.18.0.1:443"))
+		if expectedDisplay == "" {
+			expectedDisplay, expectedKey = display, key
+		}
+		if display != "service:chatgpt_web" || display != expectedDisplay || key != expectedKey {
+			t.Fatalf("WebSocket service affinity split for source %s: display=%q key=%q, want %q/%q", variant.source, display, key, expectedDisplay, expectedKey)
+		}
+	}
+}
+
 func TestSmartGoogleProductsKeepIndependentFamilies(t *testing.T) {
 	tests := map[string]string{
 		"www.youtube.com":                   "service:youtube",
