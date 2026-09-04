@@ -234,6 +234,7 @@ test "hard-open incumbent fails over without confirmation" {
     const fallback = Candidate{ .id = 2, .reliability = 0.30, .connect_ms = 500, .first_byte_ms = 500, .jitter_ms = 10, .throughput_bps = 0, .samples = 1, .weight = 1, .state = 1, .eligible = 1 };
     const initial = [_]Candidate{incumbent};
     _ = policy.chooseProfile(&engine.state, engine.config, &engine.observations, initial[0..], 0, .bulk);
+    engine.state.selected_id = 1;
     const opened = [_]Candidate{ .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 10, .weight = 1, .state = 4, .eligible = 1 }, fallback };
     const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, opened[0..], 1, .bulk);
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
@@ -270,7 +271,10 @@ test "confirmed switch remains pending until host commits it" {
         .{ .id = 1, .reliability = 0.80, .connect_ms = 200, .first_byte_ms = 200, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
         .{ .id = 2, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
     };
-    const decision = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 1);
+    const pending = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 1);
+    try std.testing.expectEqual(@as(u64, 1), pending.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), pending.switched);
+    const decision = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 2);
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
     try std.testing.expectEqual(@as(u64, 1), engine.state.selected_id);
@@ -439,6 +443,7 @@ test "removed incumbent is replaced immediately after provider refresh" {
         .eligible = 1,
     }};
     _ = policy.choose(&engine.state, engine.config, &engine.observations, initial[0..], 0);
+    engine.state.selected_id = 11;
 
     // The provider has replaced the old endpoint ID.  The new candidate is
     // deliberately much worse so a performance-based switch would normally
