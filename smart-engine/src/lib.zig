@@ -390,6 +390,8 @@ test "legacy primary backup and balanced values are identical" {
         .exploration = 0,
         .switch_margin = 0.20,
         .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
         .affinity_seed = 0x99,
         .selection_mode = 0,
     });
@@ -397,6 +399,8 @@ test "legacy primary backup and balanced values are identical" {
         .exploration = 0,
         .switch_margin = 0.20,
         .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
         .affinity_seed = 0x99,
         .selection_mode = 1,
     });
