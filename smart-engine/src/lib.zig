@@ -220,7 +220,14 @@ test "ABI configuration rejects non-finite limits" {
     try std.testing.expectEqual(@as(u8, 0), smart.config.selection_mode);
     try std.testing.expectEqual(@as(u32, 3), smart.config.min_samples);
 
-    const custom = Engine.init(.{ .min_samples = 7 });
+    const custom = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .min_samples = 7,
+    });
     try std.testing.expectEqual(@as(u32, 7), custom.config.min_samples);
 
     const adaptive_engine = adaptive_engine_create(.{
