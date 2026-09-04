@@ -23,5 +23,10 @@ func TestZigMatchesReferenceTransitions(t *testing.T) {
 		if got.SelectedID != want.SelectedID || got.Switched != want.Switched || got.Reason != want.Reason {
 			t.Fatalf("at %d: got id=%d switched=%d reason=%d, want id=%d switched=%d reason=%d", now, got.SelectedID, got.Switched, got.Reason, want.SelectedID, want.Switched, want.Reason)
 		}
+		// A policy result is only a proposal. Mirror the host callback after a
+		// real dial succeeds so the next transition compares the same incumbent.
+		if now == 0 || got.Switched != 0 {
+			engine.setSelected(got.SelectedID, now)
+		}
 	}
 }

@@ -44,3 +44,10 @@ func (e *zigEngine) choose(candidates []Candidate, now uint64) Decision {
 	got := C.smart_engine_choose(e.ptr, &candidatesC[0], C.uintptr_t(len(candidatesC)), C.uint64_t(now))
 	return Decision{SelectedID: uint64(got.selected_id), Score: float64(got.score), Switched: uint8(got.switched), Reason: uint8(got.reason)}
 }
+
+func (e *zigEngine) setSelected(id, now uint64) {
+	if e == nil || e.ptr == nil || id == 0 {
+		return
+	}
+	C.smart_engine_set_selected(e.ptr, C.uint64_t(id), C.uint64_t(now))
+}
