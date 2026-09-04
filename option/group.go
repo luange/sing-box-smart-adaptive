@@ -52,7 +52,7 @@ type SmartOutboundOptions struct {
 	GroupCommonOption
 	URL string `json:"url,omitempty"`
 	// SelectionMode is retained for configuration compatibility. Empty,
-	// primary_backup, balanced, random, adaptive and unified all select the
+	// primary_backup, balanced/balance, random, adaptive and unified all select the
 	// same stable primary/backup policy; the hash only disperses near-tied
 	// healthy lines and never changes a line per connection.
 	SelectionMode     string             `json:"selection_mode,omitempty"`

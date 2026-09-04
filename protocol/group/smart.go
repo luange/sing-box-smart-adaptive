@@ -132,7 +132,7 @@ const (
 
 func normalizeSmartSelectionMode(value string) (smartSelectionMode, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "adaptive", "unified", "primary_backup", "primary-backup", "balanced", "random":
+	case "", "adaptive", "unified", "primary_backup", "primary-backup", "balanced", "balance", "random":
 		// All historical spellings intentionally select the same policy. The
 		// stable context hash is only used among similarly healthy candidates;
 		// hard failures still promote the next backup immediately.

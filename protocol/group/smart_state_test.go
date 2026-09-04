@@ -450,6 +450,7 @@ func TestSmartSelectionModeDefaultsAndAliases(t *testing.T) {
 		{input: "primary_backup", want: smartSelectionUnified},
 		{input: "primary-backup", want: smartSelectionUnified},
 		{input: "balanced", want: smartSelectionUnified},
+		{input: "balance", want: smartSelectionUnified},
 		{input: "random", want: smartSelectionUnified},
 	}
 	for _, test := range tests {

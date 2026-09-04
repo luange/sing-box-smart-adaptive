@@ -62,7 +62,7 @@ network/site/transport 做稳定分散。它不是每条连接真随机，因此
 健康恶化仍立即触发备节点接管。
 
 `selection_mode` 仅为旧配置兼容字段。省略、`adaptive`、`unified`、
-`primary_backup`、`balanced` 和 `random` 的行为完全相同，推荐新配置使用
+`primary_backup`、`balanced`/`balance` 和 `random` 的行为完全相同，推荐新配置使用
 `adaptive` 或直接省略该字段。
 
 ## 构建 tags

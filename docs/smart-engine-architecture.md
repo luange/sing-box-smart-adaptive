@@ -88,7 +88,7 @@ starting a full parallel probe storm; a well-sampled steady path keeps the
 longer delay to protect keep-alive traffic.
 
 `selection_mode` is retained only for configuration compatibility. Empty,
-`adaptive`, `unified`, `primary_backup`, `balanced` and `random` all select the
+`adaptive`, `unified`, `primary_backup`, `balanced`/`balance` and `random` all select the
 same policy: the first eligible line is the primary and the remaining lines
 are ordered backups; within the best health tier and normal score margin, a
 host-neutral rendezvous hash over network/site/transport provides stable
