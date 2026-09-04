@@ -49,25 +49,30 @@ const (
 	// The probe must not depend on a hostname whose DNS is routed through the
 	// very Smart group being measured.  A literal Cloudflare address keeps the
 	// first probe bootstrap-safe; urltest supplies the matching TLS SNI.
-	defaultSmartProbeURL                = "https://1.1.1.1/cdn-cgi/trace"
-	defaultSmartProbeCycleTimeout       = 30 * time.Second
-	defaultSmartProbeTimeout            = 5 * time.Second
-	defaultSmartProbeConcurrency        = 2
-	defaultSmartUDPProbeTimeout         = 2 * time.Second
-	defaultSmartUDPProbeTargetCount     = 2
-	defaultSmartRecoveryProbeTimeout    = 2 * time.Second
-	defaultSmartRecoveryProbeCooldown   = 10 * time.Second
-	defaultSmartAttemptTimeout          = 4 * time.Second
-	defaultSmartEstablishedStallTimeout = 10 * time.Second
-	minSmartEstablishedStallTimeout     = 5 * time.Second
-	maxSmartEstablishedStallTimeout     = 2 * time.Minute
-	defaultSmartSiteStickiness          = 30 * time.Minute
-	defaultSmartSwitchConfirm           = 2 * time.Minute
-	defaultSmartSwitchConfirmSamples    = 3
-	defaultSmartSwitchCooldown          = 10 * time.Minute
-	defaultSmartMinSwitchImprovement    = 100 * time.Millisecond
-	defaultSmartHedgeDelay              = 450 * time.Millisecond
-	minSmartHedgeDelay                  = 250 * time.Millisecond
+	defaultSmartProbeURL              = "https://1.1.1.1/cdn-cgi/trace"
+	defaultSmartProbeCycleTimeout     = 30 * time.Second
+	defaultSmartProbeTimeout          = 5 * time.Second
+	defaultSmartProbeConcurrency      = 2
+	defaultSmartUDPProbeTimeout       = 2 * time.Second
+	defaultSmartUDPProbeTargetCount   = 2
+	defaultSmartRecoveryProbeTimeout  = 2 * time.Second
+	defaultSmartRecoveryProbeCooldown = 10 * time.Second
+	defaultSmartAttemptTimeout        = 4 * time.Second
+	// A real data-plane connection failure is stronger evidence than a
+	// background probe result.  Quarantine only the affected site/transport
+	// briefly so the next request fails over immediately without making one
+	// remote service outage poison the endpoint globally.
+	defaultSmartDataPlaneFailureQuarantine = 30 * time.Second
+	defaultSmartEstablishedStallTimeout    = 10 * time.Second
+	minSmartEstablishedStallTimeout        = 5 * time.Second
+	maxSmartEstablishedStallTimeout        = 2 * time.Minute
+	defaultSmartSiteStickiness             = 30 * time.Minute
+	defaultSmartSwitchConfirm              = 2 * time.Minute
+	defaultSmartSwitchConfirmSamples       = 3
+	defaultSmartSwitchCooldown             = 10 * time.Minute
+	defaultSmartMinSwitchImprovement       = 100 * time.Millisecond
+	defaultSmartHedgeDelay                 = 450 * time.Millisecond
+	minSmartHedgeDelay                     = 250 * time.Millisecond
 	// Give a healthy, already-established path a little more time for its
 	// first byte before starting a competing dial.  This reduces Safari/Google
 	// asset bursts that otherwise create needless hedges; hard dial failures
@@ -1887,7 +1892,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			// network/site/transport profile and wake the shared probe. The
 			// callback is coalesced once per connection by smartObservedConn.
 			s.streamFailureWakes.Add(1)
-			s.observeDialForTransport(time.Now(), networkKey, siteKey, candidate.Tag(), transport, observedTransport, false, time.Since(observedStartedAt))
+			s.observeDataPlaneFailureForTransport(time.Now(), networkKey, siteKey, candidate.Tag(), transport, observedTransport, time.Since(observedStartedAt))
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		}, s.establishedStallTimeout), nil
@@ -2200,7 +2205,7 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			active--
 			candidate := result.attempt.candidate
 			if result.err != nil {
-				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, result.elapsed)
+				s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed)
 				s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 				// A real data-plane failure must wake recovery itself.  Dashboard
 				// latency tests may also refresh the shared profile, but production
@@ -2304,7 +2309,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		elapsed := time.Since(startedAt)
 		if err != nil {
-			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, elapsed)
+			s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, elapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 			attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
@@ -2316,7 +2321,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
 			ranks, attemptIndex, attemptIndex > 0)
 		observed := newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, smartUDPExpectsResponse(destination), smartUDPRequiredResponsePackets(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
-			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, flowElapsed)
+			s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, flowElapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		})
@@ -3009,6 +3014,26 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	}
 	if metadata.policyID != 0 {
 		s.observePolicyBackend(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
+	}
+}
+
+// observeDataPlaneFailure records a real connection or established-flow
+// failure and immediately quarantines only the affected site/transport. The
+// ordinary breaker still requires repeated evidence, while this short local
+// quarantine makes the next request fail over instead of retrying the same
+// dead incumbent. Probe failures intentionally do not use this path: if the
+// shared probe endpoint is unavailable, candidates must not all be evicted.
+func (s *Smart) observeDataPlaneFailure(now time.Time, network, site, candidate, transport string, elapsed time.Duration) {
+	s.observeDial(now, network, site, candidate, transport, false, elapsed)
+	if s.store != nil {
+		s.store.quarantineDataPlaneFailure(now, network, site, s.candidateProfileID(candidate), transport, defaultSmartDataPlaneFailureQuarantine)
+	}
+}
+
+func (s *Smart) observeDataPlaneFailureForTransport(now time.Time, network, site, candidate, aggregateTransport, observedTransport string, elapsed time.Duration) {
+	s.observeDataPlaneFailure(now, network, site, candidate, aggregateTransport, elapsed)
+	if observedTransport != "" && observedTransport != aggregateTransport {
+		s.observeDataPlaneFailure(now, network, site, candidate, observedTransport, elapsed)
 	}
 }
 

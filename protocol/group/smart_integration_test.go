@@ -1039,6 +1039,36 @@ func TestSmartDialFailureBypassesLazySwitchConfirmation(t *testing.T) {
 	}
 }
 
+func TestSmartDataPlaneFailureSkipsDeadIncumbentOnNextRequest(t *testing.T) {
+	first := newSmartFakeOutbound("first", errors.New("node unavailable"))
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.maxAttempts = 1
+	// Keep the ordinary breaker at its production threshold. The test must
+	// prove that the short data-plane quarantine, not three repeated failures,
+	// removes the incumbent from the next ranking.
+	smart.store.breakerFailures = 3
+	destination := M.ParseSocksaddr("jp.example:443")
+	networkKey := smart.networkFingerprint()
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, nil, 0, false)
+	if _, err := smart.DialContext(context.Background(), N.NetworkTCP, destination); err == nil {
+		t.Fatal("expected the dead incumbent dial to fail")
+	}
+	if first.dials.Load() != 1 || second.dials.Load() != 0 {
+		t.Fatalf("unexpected first request dials: first=%d second=%d", first.dials.Load(), second.dials.Load())
+	}
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer (<-second.peers).Close()
+	if first.dials.Load() != 1 || second.dials.Load() != 1 {
+		t.Fatalf("quarantined incumbent was retried: first=%d second=%d", first.dials.Load(), second.dials.Load())
+	}
+}
+
 func TestSmartHedgeWinnerDoesNotMasqueradeAsFailureFailover(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	first.dialDelay = 400 * time.Millisecond

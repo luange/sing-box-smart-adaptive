@@ -213,6 +213,30 @@ func (s *smartStore) observeDial(now time.Time, network, site, candidate, transp
 	}
 }
 
+// quarantineDataPlaneFailure adds a short, site-local circuit after a real
+// data-plane failure. It is deliberately separate from observeDial so
+// background probe failures keep their endpoint-wide fail-open behavior. A
+// site-specific failure never opens the global endpoint ledger; requests for
+// another service can continue using the same node.
+func (s *smartStore) quarantineDataPlaneFailure(now time.Time, network, site, candidate, transport string, duration time.Duration) {
+	if s == nil || candidate == "" || duration <= 0 {
+		return
+	}
+	s.access.Lock()
+	defer s.access.Unlock()
+	until := now.Add(duration)
+	key := smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport}
+	metric := s.metric(key, now)
+	metric.decay(now, s.halfLife)
+	if metric.CircuitUntil.Before(until) {
+		metric.CircuitUntil = until
+	}
+	if metric.ConsecutiveFailures < 1 {
+		metric.ConsecutiveFailures = 1
+	}
+	metric.LastUpdated = now
+}
+
 func (s *smartStore) observeCrossSiteFailureLocked(now time.Time, key smartCandidateKey, site string) {
 	window := s.breakerCooldown
 	if window < 30*time.Second {

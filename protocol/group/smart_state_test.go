@@ -641,6 +641,26 @@ func TestSmartSiteFailuresDoNotOpenGlobalCircuit(t *testing.T) {
 	}
 }
 
+func TestSmartDataPlaneFailureQuarantinesOnlyAffectedSite(t *testing.T) {
+	store := newSmartStore(time.Hour, 3, time.Minute)
+	now := time.Unix(4500, 0)
+	store.observeDial(now, "wifi", "", "node-a", N.NetworkTCP, true, 20*time.Millisecond)
+	store.quarantineDataPlaneFailure(now, "wifi", "service:jp", "node-a", N.NetworkTCP, 30*time.Second)
+
+	local := store.estimate(now, "wifi", "service:jp", "node-a", N.NetworkTCP, 3)
+	if local.State != "open" || !local.CircuitUntil.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("data-plane failure did not quarantine local service: %+v", local)
+	}
+	global := store.estimate(now, "wifi", "", "node-a", N.NetworkTCP, 3)
+	if global.State == "open" {
+		t.Fatalf("site-local data-plane failure poisoned global endpoint: %+v", global)
+	}
+	other := store.estimate(now, "wifi", "service:us", "node-a", N.NetworkTCP, 3)
+	if other.State == "open" {
+		t.Fatalf("site-local data-plane failure poisoned another service: %+v", other)
+	}
+}
+
 func TestSmartCrossSiteFailureBurstOpensGlobalCircuit(t *testing.T) {
 	store := newSmartStore(time.Hour, 3, 2*time.Minute)
 	now := time.Unix(5000, 0)
