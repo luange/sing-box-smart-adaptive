@@ -2775,7 +2775,13 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 	if budget > len(udpCandidates) {
 		budget = len(udpCandidates)
 	}
-	udpCandidates = udpCandidates[:budget]
+	// Use the independent rotating UDP scheduler rather than the catalog's
+	// first-N order. Without this handoff, large groups repeatedly probe only
+	// the first two provider lines and leave the rest permanently unknown.
+	udpCandidates = s.selectUDPProbeCandidates(udpCandidates, budget)
+	if len(udpCandidates) == 0 {
+		return
+	}
 	results := make(chan smartUDPProbeResult, len(udpCandidates))
 	jobs := make(chan adapter.Outbound)
 	var waitGroup sync.WaitGroup

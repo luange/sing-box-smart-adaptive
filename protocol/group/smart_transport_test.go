@@ -1,13 +1,74 @@
 package group
 
 import (
+	"context"
+	"errors"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"golang.org/x/net/dns/dnsmessage"
 )
+
+type smartUDPProbeFakeOutbound struct {
+	*smartFakeOutbound
+	probeCalls atomic.Int64
+}
+
+func newSmartUDPProbeFakeOutbound(tag string) *smartUDPProbeFakeOutbound {
+	return &smartUDPProbeFakeOutbound{smartFakeOutbound: newSmartFakeOutboundNetworks(tag, []string{N.NetworkUDP}, nil)}
+}
+
+func (f *smartUDPProbeFakeOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	f.probeCalls.Add(1)
+	return &smartUDPProbePacketConn{}, nil
+}
+
+type smartUDPProbePacketConn struct {
+	response []byte
+}
+
+func (c *smartUDPProbePacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
+	if len(c.response) == 0 {
+		return 0, nil, errors.New("no DNS response")
+	}
+	count := copy(payload, c.response)
+	return count, &net.UDPAddr{}, nil
+}
+
+func (c *smartUDPProbePacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	var parser dnsmessage.Parser
+	header, err := parser.Start(payload)
+	if err != nil {
+		return 0, err
+	}
+	question, err := parser.Question()
+	if err != nil {
+		return 0, err
+	}
+	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: header.ID, Response: true, RCode: dnsmessage.RCodeSuccess})
+	if err = builder.StartQuestions(); err != nil {
+		return 0, err
+	}
+	if err = builder.Question(question); err != nil {
+		return 0, err
+	}
+	c.response, err = builder.Finish()
+	if err != nil {
+		return 0, err
+	}
+	return len(payload), nil
+}
+
+func (*smartUDPProbePacketConn) Close() error                     { return nil }
+func (*smartUDPProbePacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (*smartUDPProbePacketConn) SetDeadline(time.Time) error      { return nil }
+func (*smartUDPProbePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*smartUDPProbePacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestSmartTransportKeyKeepsAddressFamiliesSeparate(t *testing.T) {
 	v4 := M.ParseSocksaddr("192.0.2.10:443")
@@ -190,6 +251,31 @@ func TestSmartUDPProbeBudgetDeduplicatesEndpointAliases(t *testing.T) {
 			t.Fatalf("UDP probe budget selected endpoint alias twice: %q", profileID)
 		}
 		seen[profileID] = struct{}{}
+	}
+}
+
+func TestSmartUDPProbeBudgetIsUsedByProductionPath(t *testing.T) {
+	fakes := make([]*smartUDPProbeFakeOutbound, 6)
+	candidates := make([]adapter.Outbound, len(fakes))
+	identities := make(map[string]string, len(fakes))
+	for index := range fakes {
+		tag := "udp-production-" + itoaSmall(index)
+		fakes[index] = newSmartUDPProbeFakeOutbound(tag)
+		candidates[index] = fakes[index]
+		identities[tag] = tag
+	}
+	smart := newTestSmart(candidates...)
+	setSmartCandidateIdentities(smart, identities)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for range 3 {
+		smart.probeUDPWithBudget(ctx, candidates, 2)
+	}
+	for index, fake := range fakes {
+		if got := fake.probeCalls.Load(); got != 2 {
+			// One catalog visit checks both UDP address families.
+			t.Fatalf("candidate %d was probed %d times, want two family checks", index, got)
+		}
 	}
 }
 

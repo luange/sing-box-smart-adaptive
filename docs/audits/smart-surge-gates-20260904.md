@@ -28,3 +28,8 @@ handles repeated failures and exponential recovery.
 The behavior is covered by
 `TestSmartDataPlaneFailureSkipsDeadIncumbentOnNextRequest` and
 `TestSmartDataPlaneFailureQuarantinesOnlyAffectedSite`.
+
+UDP coverage uses the same bounded scheduler in the production path: each
+cycle rotates never-probed/oldest EndpointProfiles, caps the batch at two, and
+checks IPv4/IPv6 serially. `TestSmartUDPProbeBudgetIsUsedByProductionPath`
+guards the wiring so the scheduler cannot silently degrade to first-N order.
