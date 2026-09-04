@@ -116,6 +116,18 @@ is intentionally internal so a new deployment does not need to guess a
 the unified policy. A production release does not silently switch to the host
 adapter.
 
+TCP and UDP background coverage are independent. TCP uses its used/stale
+candidate budget, while UDP serializes at most two DNS reachability probes per
+cycle and rotates by never-probed or least-recently-probed EndpointProfile.
+Provider aliases share one UDP budget slot, and a failed attempt advances the
+UDP cursor just like a successful one. Registry cache hits are usable evidence
+for the caller but do not advance fresh UDP coverage, so a large group is
+eventually sampled without creating a probe storm or leaving UDP-only lines in
+an `unknown` state forever. Cold starts use a four-candidate batch, active
+periodic cycles use a bounded sixteen-candidate batch, and idle cycles continue
+with a one-candidate maintenance batch; repeated cycles therefore form a full
+catalog sweep without blocking the first request.
+
 On Linux, Smart reads `TCP_INFO` once when a TCP connection closes and records a
 bounded retransmitted-byte ratio. It contributes an additive latency penalty
 (1% ≈ 50 ms, capped) rather than opening a circuit; unsupported platforms and

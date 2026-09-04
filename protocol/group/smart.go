@@ -437,6 +437,7 @@ type Smart struct {
 	performanceCooldown    map[string]time.Time
 	useScores              map[string]smartUseScore
 	probeLastAt            map[string]time.Time
+	udpProbeLastAt         map[string]time.Time
 	halfOpen               map[string]struct{}
 	latest                 common.TypedValue[adapter.Outbound]
 	fingerprint            atomic.Pointer[smartFingerprintCache]
@@ -500,6 +501,7 @@ type Smart struct {
 	recoveryProbeUntilUnixNano atomic.Int64
 	probing                    atomic.Bool
 	probeCursor                atomic.Uint64
+	udpProbeCursor             atomic.Uint64
 	phase                      atomic.Uint32
 	phaseInitialized           atomic.Bool
 	successfulProbeCycles      atomic.Uint32
@@ -741,6 +743,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		performanceCooldown:    make(map[string]time.Time),
 		useScores:              make(map[string]smartUseScore),
 		probeLastAt:            make(map[string]time.Time),
+		udpProbeLastAt:         make(map[string]time.Time),
 		halfOpen:               make(map[string]struct{}),
 		store:                  store,
 		policyBackend:          policyBackend,
@@ -890,6 +893,7 @@ func (s *Smart) Close() error {
 	clear(s.performanceCooldown)
 	clear(s.useScores)
 	clear(s.probeLastAt)
+	clear(s.udpProbeLastAt)
 	clear(s.halfOpen)
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
@@ -901,6 +905,7 @@ func (s *Smart) Close() error {
 	s.performanceCooldown = make(map[string]time.Time)
 	s.useScores = make(map[string]smartUseScore)
 	s.probeLastAt = make(map[string]time.Time)
+	s.udpProbeLastAt = make(map[string]time.Time)
 	s.halfOpen = make(map[string]struct{})
 	s.access.Unlock()
 	s.providerAccess.Lock()
@@ -1226,21 +1231,42 @@ func (s *Smart) noteCandidateProbe(candidate string, now time.Time) {
 	if profileID == "" {
 		profileID = candidate
 	}
-	s.access.Lock()
-	if s.probeLastAt == nil {
-		s.probeLastAt = make(map[string]time.Time)
+	s.noteProbeTimestamp(&s.probeLastAt, profileID, now)
+}
+
+// noteUDPCandidateProbe keeps UDP coverage independent from TCP coverage. A
+// candidate that was recently exercised by the TCP budget must still become
+// eligible for the next UDP rotation, and vice versa.
+func (s *Smart) noteUDPCandidateProbe(candidate string, now time.Time) {
+	if s == nil || candidate == "" {
+		return
 	}
-	s.probeLastAt[profileID] = now
-	if len(s.probeLastAt) > defaultSmartMaxHistoryEntries {
-		for key, lastProbe := range s.probeLastAt {
+	profileID := s.candidateProfileID(candidate)
+	if profileID == "" {
+		profileID = candidate
+	}
+	s.noteProbeTimestamp(&s.udpProbeLastAt, profileID, now)
+}
+
+func (s *Smart) noteProbeTimestamp(store *map[string]time.Time, profileID string, now time.Time) {
+	if s == nil || store == nil || profileID == "" {
+		return
+	}
+	s.access.Lock()
+	if *store == nil {
+		*store = make(map[string]time.Time)
+	}
+	(*store)[profileID] = now
+	if len(*store) > defaultSmartMaxHistoryEntries {
+		for key, lastProbe := range *store {
 			if lastProbe.IsZero() || now.Sub(lastProbe) > 4*smartUseScoreDecayWindow {
-				delete(s.probeLastAt, key)
+				delete(*store, key)
 			}
 		}
-		for len(s.probeLastAt) > defaultSmartMaxHistoryEntries {
+		for len(*store) > defaultSmartMaxHistoryEntries {
 			var oldestKey string
 			var oldest time.Time
-			for key, lastProbe := range s.probeLastAt {
+			for key, lastProbe := range *store {
 				if oldestKey == "" || lastProbe.Before(oldest) {
 					oldestKey, oldest = key, lastProbe
 				}
@@ -1248,7 +1274,7 @@ func (s *Smart) noteCandidateProbe(candidate string, now time.Time) {
 			if oldestKey == "" {
 				break
 			}
-			delete(s.probeLastAt, oldestKey)
+			delete(*store, oldestKey)
 		}
 	}
 	s.access.Unlock()
@@ -1351,6 +1377,109 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int)
 		selected = append(selected, item.candidate)
 		seen[item.candidate.Tag()] = struct{}{}
 	}
+	return selected
+}
+
+// selectUDPProbeCandidates gives UDP health checks their own bounded coverage
+// window. TCP probe timestamps and cursors must not starve UDP-only candidates;
+// aliases of one EndpointProfile consume only one slot, while never-probed and
+// least-recently-probed profiles rotate through the remaining budget.
+func (s *Smart) selectUDPProbeCandidates(candidates []adapter.Outbound, budget int) []adapter.Outbound {
+	if s == nil || len(candidates) == 0 {
+		return nil
+	}
+	if budget <= 0 || budget > defaultSmartUDPProbeTargetCount {
+		budget = defaultSmartUDPProbeTargetCount
+	}
+	type udpProbeCandidate struct {
+		candidate adapter.Outbound
+		profileID string
+		usage     float64
+		lastProbe time.Time
+		rotation  int
+	}
+	items := make([]udpProbeCandidate, 0, len(candidates))
+	seenProfiles := make(map[string]struct{}, len(candidates))
+	now := time.Now()
+	s.access.RLock()
+	for index, candidate := range candidates {
+		if !common.Contains(candidate.Network(), N.NetworkUDP) {
+			continue
+		}
+		metadata := s.candidateMetadataByTag[candidate.Tag()]
+		profileID := metadata.profileID
+		if profileID == "" {
+			profileID = candidate.Tag()
+		}
+		if _, exists := seenProfiles[profileID]; exists {
+			continue
+		}
+		seenProfiles[profileID] = struct{}{}
+		items = append(items, udpProbeCandidate{
+			candidate: candidate,
+			profileID: profileID,
+			usage:     decayedSmartUseScore(s.useScores[profileID], now),
+			lastProbe: s.udpProbeLastAt[profileID],
+			rotation:  index,
+		})
+	}
+	cursor := s.udpProbeCursor.Load()
+	s.access.RUnlock()
+	if len(items) == 0 {
+		return nil
+	}
+	// Equal timestamps (especially the initial zero timestamp) need a stable
+	// rotating tie-breaker; otherwise a large group would probe the same first
+	// two aliases forever.
+	start := int(cursor % uint64(len(items)))
+	for index := range items {
+		items[index].rotation = (index + len(items) - start) % len(items)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if !items[i].lastProbe.Equal(items[j].lastProbe) {
+			if items[i].lastProbe.IsZero() {
+				return true
+			}
+			if items[j].lastProbe.IsZero() {
+				return false
+			}
+			return items[i].lastProbe.Before(items[j].lastProbe)
+		}
+		return items[i].rotation < items[j].rotation
+	})
+	used := make([]udpProbeCandidate, 0, len(items))
+	for _, item := range items {
+		if item.usage > 0 {
+			used = append(used, item)
+		}
+	}
+	sort.SliceStable(used, func(i, j int) bool {
+		if used[i].usage != used[j].usage {
+			return used[i].usage > used[j].usage
+		}
+		return used[i].rotation < used[j].rotation
+	})
+	if budget > len(items) {
+		budget = len(items)
+	}
+	selected := make([]adapter.Outbound, 0, budget)
+	seen := make(map[string]struct{}, budget)
+	usedBudget := min(len(used), max(1, budget/2))
+	for _, item := range used[:usedBudget] {
+		selected = append(selected, item.candidate)
+		seen[item.profileID] = struct{}{}
+	}
+	for _, item := range items {
+		if len(selected) >= budget {
+			break
+		}
+		if _, exists := seen[item.profileID]; exists {
+			continue
+		}
+		selected = append(selected, item.candidate)
+		seen[item.profileID] = struct{}{}
+	}
+	s.udpProbeCursor.Add(uint64(len(selected)))
 	return selected
 }
 
@@ -2270,11 +2399,27 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	}
 	defer s.probing.Store(false)
 	s.access.RLock()
-	candidates := append([]adapter.Outbound(nil), s.candidates...)
+	allCandidates := append([]adapter.Outbound(nil), s.candidates...)
 	metadataByTag := s.candidateMetadataByTag
 	s.access.RUnlock()
-	if len(candidates) == 0 || s.closing.Load() {
+	if len(allCandidates) == 0 || s.closing.Load() {
 		return result, nil
+	}
+	// Keep the TCP budget a true TCP budget. A UDP-only outbound must not
+	// consume one of the bounded TCP slots and make a healthy TCP catalog look
+	// smaller than it is; the complete catalog is still passed to the separate
+	// UDP scheduler below.
+	candidates := make([]adapter.Outbound, 0, len(allCandidates))
+	for _, candidate := range allCandidates {
+		if common.Contains(candidate.Network(), N.NetworkTCP) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		if ctx.Err() == nil && !s.closing.Load() {
+			s.probeUDPWithBudget(ctx, allCandidates, budget)
+		}
+		return result, ctx.Err()
 	}
 	profileIDFor := func(tag string) string {
 		if metadata, ok := metadataByTag[tag]; ok && metadata.profileID != "" {
@@ -2473,7 +2618,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		// Keep this separate from the TCP result map so URLTest callers retain
 		// their historical latency contract while UDP evidence enters its own
 		// profile and cannot poison TCP ranking.
-		s.probeUDPWithBudget(ctx, candidates, budget)
+		s.probeUDPWithBudget(ctx, allCandidates, budget)
 	}
 	if s.closing.Load() {
 		// Shutdown: skip store mutations so Close can clear maps safely.  A
@@ -2717,6 +2862,11 @@ dispatch:
 			return
 		}
 		profileID := s.candidateProfileID(result.candidate.Tag())
+		if result.performed {
+			// Record attempts, not only successes. A failed candidate must leave
+			// the current UDP window so the next cycle can cover another profile.
+			s.noteUDPCandidateProbe(result.candidate.Tag(), time.Now())
+		}
 		for _, family := range result.families {
 			observationKey := profileID + "\x00" + family.transport
 			if _, exists := observedUDP[observationKey]; exists {

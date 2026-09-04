@@ -137,6 +137,62 @@ func TestSmartProbeBudgetDeduplicatesEndpointAliases(t *testing.T) {
 	}
 }
 
+func TestSmartUDPProbeBudgetRotatesWithoutStarvingUnknownCandidates(t *testing.T) {
+	candidates := make([]adapter.Outbound, 6)
+	identities := make(map[string]string, len(candidates))
+	for index := range candidates {
+		tag := "udp-node-" + itoaSmall(index)
+		candidates[index] = newSmartFakeOutboundNetworks(tag, []string{N.NetworkUDP}, nil)
+		identities[tag] = tag
+	}
+	smart := newTestSmart(candidates...)
+	setSmartCandidateIdentities(smart, identities)
+
+	seen := make(map[string]struct{}, len(candidates))
+	for round := 0; round < 3; round++ {
+		selected := smart.selectUDPProbeCandidates(candidates, 2)
+		if len(selected) != 2 {
+			t.Fatalf("round %d selected %d candidates, want 2", round, len(selected))
+		}
+		for _, candidate := range selected {
+			if _, exists := seen[candidate.Tag()]; exists {
+				t.Fatalf("UDP probe rotation repeated %q before covering the catalog", candidate.Tag())
+			}
+			seen[candidate.Tag()] = struct{}{}
+			smart.noteUDPCandidateProbe(candidate.Tag(), time.Now())
+		}
+	}
+	if len(seen) != len(candidates) {
+		t.Fatalf("UDP probe rotation covered %d/%d candidates", len(seen), len(candidates))
+	}
+}
+
+func TestSmartUDPProbeBudgetDeduplicatesEndpointAliases(t *testing.T) {
+	candidates := []adapter.Outbound{
+		newSmartFakeOutboundNetworks("line-a", []string{N.NetworkUDP}, nil),
+		newSmartFakeOutboundNetworks("line-a (2)", []string{N.NetworkUDP}, nil),
+		newSmartFakeOutboundNetworks("line-b", []string{N.NetworkUDP}, nil),
+	}
+	smart := newTestSmart(candidates...)
+	setSmartCandidateIdentities(smart, map[string]string{
+		"line-a":     "endpoint-a",
+		"line-a (2)": "endpoint-a",
+		"line-b":     "endpoint-b",
+	})
+	selected := smart.selectUDPProbeCandidates(candidates, 2)
+	if len(selected) != 2 {
+		t.Fatalf("selected %d candidates, want 2 distinct endpoints", len(selected))
+	}
+	seen := make(map[string]struct{}, len(selected))
+	for _, candidate := range selected {
+		profileID := smart.candidateProfileID(candidate.Tag())
+		if _, exists := seen[profileID]; exists {
+			t.Fatalf("UDP probe budget selected endpoint alias twice: %q", profileID)
+		}
+		seen[profileID] = struct{}{}
+	}
+}
+
 func TestSmartUseScoreTracksTCPButNotUDP(t *testing.T) {
 	candidate := newSmartFakeOutboundNetworks("node", []string{N.NetworkTCP, N.NetworkUDP}, nil)
 	smart := newTestSmart(candidate)
