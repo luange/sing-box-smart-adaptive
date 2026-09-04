@@ -55,6 +55,8 @@ smart_decision smart_engine_choose(smart_engine *engine, const smart_candidate *
 smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_candidate *candidates, uintptr_t count, uint64_t now_ms, uint8_t profile);
 /* Synchronize the host's incumbent after a real selection without recording a policy switch. */
 void smart_engine_set_selected(smart_engine *engine, uint64_t id, uint64_t now_ms);
+/* Restore a host-confirmed incumbent only when the policy context is empty. */
+void smart_engine_adopt_selected(smart_engine *engine, uint64_t id, uint64_t now_ms);
 void smart_engine_reset(smart_engine *engine);
 
 /* Host-neutral AdaptivePool decision kernel.  The host still owns health

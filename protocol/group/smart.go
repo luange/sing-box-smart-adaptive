@@ -979,6 +979,17 @@ func (s *Smart) setPolicyBackendSelected(key string, id uint64, now time.Time) {
 	s.policyBackendAccess.RUnlock()
 }
 
+func (s *Smart) adoptPolicyBackendSelected(key string, id uint64, now time.Time) {
+	if s == nil || key == "" || id == 0 {
+		return
+	}
+	s.policyBackendAccess.RLock()
+	if adopter, ok := s.policyBackend.(smartPolicyAdopter); ok {
+		adopter.AdoptSelected(key, id, now)
+	}
+	s.policyBackendAccess.RUnlock()
+}
+
 // waitWorkerStop waits for the probe worker up to timeout after cancel.
 // Stragglers must honor s.closing / cancelled ctx and not touch cleared maps.
 func (s *Smart) waitWorkerStop(timeout time.Duration) {
@@ -3096,6 +3107,15 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		}
 	}
 	if usePolicyBackend {
+		// A policy context can be evicted and recreated to keep memory bounded.
+		// Seed only an empty Zig context from the host's confirmed incumbent so
+		// that maintenance churn cannot cause an unconfirmed healthy switch.
+		if currentIndex := smartRankIndex(ranks, lastSelected); currentIndex >= 0 {
+			policyID := ranks[currentIndex].policyID
+			if policyID != 0 {
+				s.adoptPolicyBackendSelected(smartSelectionKey(networkKey, siteKey, transport), policyID, now)
+			}
+		}
 		decision, backendAvailable := s.choosePolicyBackend(smartSelectionKey(networkKey, siteKey, transport), policyCandidates, profile, now)
 		if !backendAvailable {
 			// Close can retire the backend while a ranking snapshot is still being

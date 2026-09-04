@@ -203,6 +203,19 @@ func (b *zigSmartPolicyBackend) SetSelected(key string, id uint64, now time.Time
 	}
 }
 
+func (b *zigSmartPolicyBackend) AdoptSelected(key string, id uint64, now time.Time) {
+	if b == nil || key == "" || id == 0 {
+		return
+	}
+	shard := b.shardFor(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	engine := b.engineForLocked(shard, key, now)
+	if engine != nil {
+		C.smart_engine_adopt_selected(engine.engine, C.uint64_t(id), C.uint64_t(smartMillis(now)))
+	}
+}
+
 func (b *zigSmartPolicyBackend) Reset() {
 	if b != nil {
 		for index := range b.shards {

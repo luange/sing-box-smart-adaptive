@@ -117,8 +117,12 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     }
     decision.selected_id = selected.id;
     decision.score = selected_score;
+    // `selected_id` is the last candidate whose dial actually succeeded.  Do
+    // not commit a cold-start guess here: the host may still fail the dial and
+    // report the observation on the next call.  Committing before that
+    // callback would turn an unconnected candidate into the apparent primary
+    // and could keep retrying it during a transient failure.
     if (state.selected_id == 0 or state.selected_id == selected.id) {
-        state.selected_id = selected.id;
         decision.reason = @intFromEnum(model.DecisionReason.best);
         return decision;
     }
@@ -127,7 +131,6 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         // passive throughput floor trips). Do not wait for performance
         // confirmation or cooldown: the next real connection must fail over.
         if (current.state == 4) {
-            state.selected_id = selected.id;
             state.cooldown_until = now_ms +| config.switch_cooldown_ms;
             state.challenge_id = 0;
             state.challenge_count = 0;
@@ -155,7 +158,6 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     // a stale challenge state.  Adopt the best currently eligible candidate
     // immediately and clear all confirmation state.
     if (state.selected_id != 0 and incumbent == null) {
-        state.selected_id = selected.id;
         state.cooldown_until = now_ms +| config.switch_cooldown_ms;
         state.challenge_id = 0;
         state.challenge_count = 0;
@@ -178,7 +180,6 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         decision.reason = @intFromEnum(model.DecisionReason.retained);
         return decision;
     }
-    state.selected_id = selected.id;
     state.cooldown_until = now_ms +| config.switch_cooldown_ms;
     state.challenge_id = 0;
     state.challenge_count = 0;

@@ -22,6 +22,14 @@ type smartPolicyIncumbent interface {
 	SetSelected(key string, id uint64, now time.Time)
 }
 
+// smartPolicyAdopter restores a host-confirmed incumbent after a bounded
+// policy context is recreated. It must be a no-op when the backend already has
+// a selected candidate; otherwise a pending policy challenge could be reset by
+// every host ranking call.
+type smartPolicyAdopter interface {
+	AdoptSelected(key string, id uint64, now time.Time)
+}
+
 type smartPolicyCandidate struct {
 	ID          uint64
 	Reliability float64

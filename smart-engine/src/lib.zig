@@ -101,6 +101,26 @@ export fn smart_engine_set_selected(engine: ?*Engine, id: u64, now_ms: u64) void
     }
 }
 
+// Seed a newly-created context from the host's last confirmed dial without
+// overriding a decision that is already in flight.  Context engines are
+// intentionally bounded and may be evicted under provider churn; restoring
+// only an empty state prevents that maintenance event from looking like a
+// healthy performance switch while keeping the host as the source of truth
+// for successful dials.
+export fn smart_engine_adopt_selected(engine: ?*Engine, id: u64, now_ms: u64) void {
+    if (engine) |value| {
+        if (id == 0 or value.state.selected_id != 0) return;
+        value.state.selected_id = id;
+        value.state.challenge_id = 0;
+        value.state.challenge_count = 0;
+        value.state.challenge_since = 0;
+        value.state.sticky_until = if (value.config.site_stickiness_ms > 0)
+            now_ms +| value.config.site_stickiness_ms
+        else
+            0;
+    }
+}
+
 export fn smart_engine_reset(engine: ?*Engine) void {
     if (engine) |value| value.reset();
 }
@@ -175,6 +195,9 @@ test "retains incumbent until confirmation" {
         .{ .id = 2, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 4, .weight = 1, .state = 1, .eligible = 1 },
     };
     try std.testing.expectEqual(@as(u64, 1), policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..1], 0).selected_id);
+    // The policy result is only a proposal. The host commits the incumbent
+    // after the real dial succeeds.
+    engine.state.selected_id = 1;
     try std.testing.expectEqual(@as(u8, 0), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 1000).switched);
     try std.testing.expectEqual(@as(u8, 1), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 2000).switched);
 }
@@ -213,6 +236,42 @@ test "hard-open incumbent fails over without confirmation" {
     const decision = policy.chooseProfile(&engine.state, engine.config, &engine.observations, opened[0..], 1, .bulk);
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
+}
+
+test "policy proposal is not committed before host dial succeeds" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+    });
+    const candidates = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 4, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 4, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    const proposal = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 0);
+    try std.testing.expectEqual(@as(u64, 2), proposal.selected_id);
+    try std.testing.expectEqual(@as(u64, 0), engine.state.selected_id);
+}
+
+test "confirmed switch remains pending until host commits it" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+    });
+    engine.state.selected_id = 1;
+    const candidates = [_]Candidate{
+        .{ .id = 1, .reliability = 0.80, .connect_ms = 200, .first_byte_ms = 200, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    const decision = policy.choose(&engine.state, engine.config, &engine.observations, candidates[0..], 1);
+    try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), decision.switched);
+    try std.testing.expectEqual(@as(u64, 1), engine.state.selected_id);
 }
 
 test "healthy tier wins over faster suspect candidate" {
