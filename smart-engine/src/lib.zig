@@ -91,6 +91,7 @@ export fn smart_engine_set_selected(engine: ?*Engine, id: u64, now_ms: u64) void
     if (engine) |value| {
         if (id == 0) return;
         value.state.selected_id = id;
+        if (value.state.deferred_id == id) value.state.deferred_id = 0;
         value.state.challenge_id = 0;
         value.state.challenge_count = 0;
         value.state.challenge_since = 0;
@@ -111,6 +112,7 @@ export fn smart_engine_adopt_selected(engine: ?*Engine, id: u64, now_ms: u64) vo
     if (engine) |value| {
         if (id == 0 or value.state.selected_id != 0) return;
         value.state.selected_id = id;
+        if (value.state.deferred_id == id) value.state.deferred_id = 0;
         value.state.challenge_id = 0;
         value.state.challenge_count = 0;
         value.state.challenge_since = 0;
@@ -272,6 +274,51 @@ test "confirmed switch remains pending until host commits it" {
     try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
     try std.testing.expectEqual(@as(u8, 1), decision.switched);
     try std.testing.expectEqual(@as(u64, 1), engine.state.selected_id);
+}
+
+test "failed primary stays deferred after recovery until replacement fails" {
+    var engine = Engine.init(.{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+    });
+    engine.state.selected_id = 1;
+    const failed = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 4, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.85, .connect_ms = 80, .first_byte_ms = 80, .jitter_ms = 2, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    const failover = policy.choose(&engine.state, engine.config, &engine.observations, failed[0..], 1);
+    try std.testing.expectEqual(@as(u64, 2), failover.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), failover.switched);
+    try std.testing.expectEqual(@as(u64, 1), engine.state.deferred_id);
+
+    // The host has now completed the B dial. A is healthy again but must not
+    // preempt B simply because it has a lower latency.
+    engine.state.selected_id = 2;
+    const recovered = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.85, .connect_ms = 80, .first_byte_ms = 80, .jitter_ms = 2, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+    };
+    const retained = policy.choose(&engine.state, engine.config, &engine.observations, recovered[0..], 2);
+    try std.testing.expectEqual(@as(u64, 2), retained.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), retained.switched);
+
+    // Only when B fails may the recovered A take over. The failed B becomes
+    // the new deferred backup marker, so a later recovery of B cannot reclaim
+    // the primary slot without another hard failure.
+    const replacement_failed = [_]Candidate{
+        .{ .id = 1, .reliability = 0.99, .connect_ms = 5, .first_byte_ms = 5, .jitter_ms = 1, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 1, .eligible = 1 },
+        .{ .id = 2, .reliability = 0.85, .connect_ms = 80, .first_byte_ms = 80, .jitter_ms = 2, .throughput_bps = 0, .samples = 8, .weight = 1, .state = 4, .eligible = 1 },
+    };
+    const promoted = policy.choose(&engine.state, engine.config, &engine.observations, replacement_failed[0..], 3);
+    try std.testing.expectEqual(@as(u64, 1), promoted.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), promoted.switched);
+    try std.testing.expectEqual(@as(u64, 2), engine.state.deferred_id);
+    smart_engine_set_selected(&engine, 1, 4);
+    try std.testing.expectEqual(@as(u64, 1), engine.state.selected_id);
+    try std.testing.expectEqual(@as(u64, 2), engine.state.deferred_id);
 }
 
 test "healthy tier wins over faster suspect candidate" {

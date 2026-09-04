@@ -4,6 +4,11 @@ const metrics = @import("metrics.zig");
 
 pub const State = struct {
     selected_id: u64 = 0,
+    // The last primary displaced by a hard failure.  It remains eligible as a
+    // backup, but must not preempt the replacement when it recovers.  This is
+    // intentionally one ID per business context; a later hard failover
+    // replaces it with the primary that just failed.
+    deferred_id: u64 = 0,
     challenge_id: u64 = 0,
     challenge_count: u32 = 0,
     challenge_since: u64 = 0,
@@ -33,6 +38,26 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         if (tier < best_tier) best_tier = tier;
     }
     if (best_tier == 255) return decision;
+    // Once a hard failure has promoted a backup, keep the recovered old
+    // primary out of the active ranking while the replacement remains usable.
+    // If the replacement is gone or no other candidate exists, the deferred
+    // endpoint is allowed back in as the only viable recovery path.
+    var defer_recovered = false;
+    if (state.deferred_id != 0 and state.selected_id != 0) {
+        var selected_usable = false;
+        var alternative_exists = false;
+        for (candidates) |raw_candidate| {
+            const candidate = observations.enrich(raw_candidate);
+            if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4) continue;
+            if (candidate.id == state.selected_id and healthTier(candidate.state) == best_tier) {
+                selected_usable = true;
+            }
+            if (candidate.id != state.deferred_id and healthTier(candidate.state) == best_tier) {
+                alternative_exists = true;
+            }
+        }
+        defer_recovered = selected_usable and alternative_exists;
+    }
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
         if (candidate.id != 0 and candidate.eligible != 0 and candidate.state != 4 and healthTier(candidate.state) == best_tier) {
@@ -44,6 +69,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     for (candidates) |raw_candidate| {
         const candidate = observations.enrich(raw_candidate);
         if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
+        if (defer_recovered and candidate.id == state.deferred_id) continue;
         const value = scoring.score(config, candidate, total_samples, profile);
         if (scoring.isFinite(value) and (best == null or value < best_score)) {
             best = candidate;
@@ -87,6 +113,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             for (candidates) |raw_candidate| {
                 const candidate = observations.enrich(raw_candidate);
                 if (candidate.id == 0 or candidate.eligible == 0 or candidate.state == 4 or healthTier(candidate.state) != best_tier) continue;
+                if (defer_recovered and candidate.id == state.deferred_id) continue;
                 const value = scoring.score(config, candidate, total_samples, profile);
                 if (!scoring.isFinite(value) or value > threshold) continue;
                 const hash = rendezvousHash(config.affinity_seed, candidate.id);
@@ -131,6 +158,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         // passive throughput floor trips). Do not wait for performance
         // confirmation or cooldown: the next real connection must fail over.
         if (current.state == 4) {
+            state.deferred_id = current.id;
             state.cooldown_until = now_ms +| config.switch_cooldown_ms;
             state.challenge_id = 0;
             state.challenge_count = 0;
