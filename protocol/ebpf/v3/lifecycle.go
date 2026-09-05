@@ -136,17 +136,26 @@ func ControlFlags(options option.EBPFSharedNetworkOptions, enableIPv4, enableIPv
 	return flags
 }
 
-// ApplyControlFlags refreshes backend control flag bits without flipping generation.
-func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack bool, routingMark uint32) {
+// ApplyControlFlags refreshes backend control flag bits without flipping
+// generation. When a kernel sink is bound, the same flags are pushed into the
+// live control map (WriteControlV3) so a reconfig cannot leave the kernel
+// running a stale feature mask while the memory model moved on.
+func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack bool, routingMark uint32) error {
 	if l == nil || l.backend == nil {
-		return
+		return fmt.Errorf("nil lifecycle")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.backend.Control.Flags = ControlFlags(l.options, enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack, routingMark)
+	flags := ControlFlags(l.options, enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack, routingMark)
+	l.backend.Control.Flags = flags
 	l.backend.Control.RoutingMark = routingMark
 	l.backend.Control.ABIVersion = ebpfv3.ABIVersion
 	l.backend.Control.Enabled = 1
+	if l.sink != nil {
+		bank, generation := l.backend.Publisher.Snapshot()
+		return l.sink.WriteControlV3(true, flags, bank, generation, routingMark)
+	}
+	return nil
 }
 
 // PublishStaticRules compiles and double-buffers static DIRECT rules.  The v3

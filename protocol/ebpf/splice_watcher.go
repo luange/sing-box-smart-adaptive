@@ -34,7 +34,7 @@ type spliceWatcher struct {
 }
 
 type watchPairState struct {
-	leftFD, rightFD int32
+	leftFD, rightFD  int32
 	lastUp, lastDown uint64
 	stale            int
 }

@@ -92,6 +92,9 @@ type memSink struct {
 	deleted int
 	mac     int
 	gen     uint32
+
+	controlWrites int
+	flags         uint32
 }
 
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
@@ -119,6 +122,11 @@ func (m *memSink) DeleteDirectFlow(protocol uint8, source, destination netip.Add
 }
 func (m *memSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	m.mac += len(entries)
+	return nil
+}
+func (m *memSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
+	m.controlWrites++
+	m.flags = flags
 	return nil
 }
 func (m *memSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {

@@ -74,7 +74,7 @@ func TestIsStableDirectLeafType(t *testing.T) {
 func TestFilterPrefillAddresses(t *testing.T) {
 	in := []netip.Addr{
 		netip.MustParseAddr("1.1.1.1"),
-		netip.MustParseAddr("1.1.1.1"), // dup
+		netip.MustParseAddr("1.1.1.1"),  // dup
 		netip.MustParseAddr("10.0.0.1"), // private
 		netip.MustParseAddr("127.0.0.1"),
 		netip.MustParseAddr("8.8.8.8"),

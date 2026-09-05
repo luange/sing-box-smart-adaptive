@@ -5,32 +5,16 @@ package ebpf
 import (
 	"net/netip"
 	"runtime"
+	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+
+	ebpfv3 "github.com/sagernet/sing-box/common/ebpf/v3"
 )
 
 const SharedNetworkMapCapacity = 16384
 
 type SharedNetworkBackend struct{}
-
-type SharedNetworkRuntimeStats struct {
-	IngressRedirects     uint64
-	IngressBypass        uint64
-	IngressDrops         uint64
-	EgressRestores       uint64
-	EgressReverseMisses  uint64
-	TokenFailures        uint64
-	RewriteFailures      uint64
-	SocketAssignments    uint64
-	SocketAssignFailures uint64
-	FlowUpdateFailures   uint64
-	FallbackOpen         uint64
-	EstablishedBypass    uint64
-	ParseFailures        uint64
-	PolicyBypass         uint64
-	ListenerMisses       uint64
-	OriginalDstLost      uint64
-}
 
 func PrepareSharedNetwork(
 	*Backend,
@@ -77,5 +61,41 @@ func (b *SharedNetworkBackend) DeleteRedirect(uint8, netip.AddrPort, netip.AddrP
 func (b *SharedNetworkBackend) UpdateHostAddresses([]netip.Addr) error {
 	return unsupportedSharedNetworkError()
 }
+func (b *SharedNetworkBackend) SetFlowDirect(bool) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) PutDirectFlow(uint8, netip.AddrPort, netip.AddrPort, time.Duration) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) DeleteDirectFlow(uint8, netip.AddrPort, netip.AddrPort) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) InvalidateFlowDirect() error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) TakeOriginal(uint8, netip.AddrPort, netip.AddrPort) (OriginalDestination, error) {
+	return OriginalDestination{}, unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) PublishStaticDirect([]netip.Prefix, uint32, uint32) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) MergeStaticDirect(netip.Prefix) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) PublishDNSHint(netip.Addr, bool, uint8, uint32, time.Duration) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) PublishMACPolicies([]ebpfv3.MACPolicyEntry) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) WriteControlV3(bool, uint32, uint32, uint32, uint32) error {
+	return unsupportedSharedNetworkError()
+}
+func (b *SharedNetworkBackend) PolicyGeneration() uint32 { return 0 }
+func (b *SharedNetworkBackend) V3Stats() ([]uint64, uint32, uint32) {
+	return nil, 0, 0
+}
 func (b *SharedNetworkBackend) Close() error   { return nil }
 func (b *SharedNetworkBackend) IsClosed() bool { return true }
+
+var _ SharedDataplane = (*SharedNetworkBackend)(nil)

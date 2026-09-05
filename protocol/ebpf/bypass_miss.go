@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"time"
-
 )
 
 // bypassMissSampler watches userspace-admitted flows against the installed

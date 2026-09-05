@@ -6,8 +6,8 @@ import (
 	"net/netip"
 
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	C "github.com/sagernet/sing-box/constant"
 	R "github.com/sagernet/sing-box/route/rule"
 )
 

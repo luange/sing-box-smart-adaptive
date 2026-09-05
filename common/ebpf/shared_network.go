@@ -78,25 +78,6 @@ const (
 	sharedStatCount
 )
 
-type SharedNetworkRuntimeStats struct {
-	IngressRedirects     uint64
-	IngressBypass        uint64
-	IngressDrops         uint64
-	EgressRestores       uint64
-	EgressReverseMisses  uint64
-	TokenFailures        uint64
-	RewriteFailures      uint64
-	SocketAssignments    uint64
-	SocketAssignFailures uint64
-	FlowUpdateFailures   uint64
-	FallbackOpen         uint64
-	EstablishedBypass    uint64
-	ParseFailures        uint64
-	PolicyBypass         uint64
-	ListenerMisses       uint64
-	OriginalDstLost      uint64
-}
-
 //go:embed native/shared_network.bpf.o
 var sharedNetworkV1Object []byte
 

@@ -41,22 +41,16 @@ type VerdictEntry struct {
 // only — not per-UID/flow. One DIRECT learn affects all local UIDs for that dest
 // on the cgroup capture surface. Keep mode=off unless that model fits the deployment.
 type VerdictBackend struct {
-	access       sync.RWMutex
-	verdictMap   int
-	controlMap   int
-	statsMap     int // BPF ARRAY: hits/expired/gen_mismatch (A2)
-	generation   uint32
-	enabled      bool
-	writes       atomic.Uint64
-	skips        atomic.Uint64
-	exportAccess sync.Mutex
-	// Q9/N6: fixed ring from the start — head is next write slot; count ≤ cap.
-	exportRing  []VerdictEntry
-	exportHead  int
-	exportCount int
+	access     sync.RWMutex
+	verdictMap int
+	controlMap int
+	statsMap   int // BPF ARRAY: hits/expired/gen_mismatch (A2)
+	generation uint32
+	enabled    bool
+	writes     atomic.Uint64
+	skips      atomic.Uint64
+	verdictExportRing
 }
-
-const verdictExportCap = 256
 
 // NewVerdictBackend wraps map fds from inbound runtime after Prepare.
 // control map must already exist; seeds generation=1, enabled=1.
@@ -127,28 +121,6 @@ func (v *VerdictBackend) PutDIRECT(protocol uint8, destination netip.AddrPort, t
 	return nil
 }
 
-func (v *VerdictBackend) recordExport(key outVerdictKey, value outVerdictValue, destination netip.AddrPort) {
-	v.exportAccess.Lock()
-	defer v.exportAccess.Unlock()
-	entry := VerdictEntry{
-		Destination: destination,
-		Family:      key.Family,
-		Protocol:    key.Protocol,
-		Verdict:     value.Verdict,
-		Generation:  value.Generation,
-		ExpireNs:    value.ExpireNs,
-	}
-	// Q9/N6: fixed ring, O(1) — no slice shift on learn hot path.
-	if v.exportRing == nil {
-		v.exportRing = make([]VerdictEntry, verdictExportCap)
-	}
-	v.exportRing[v.exportHead] = entry
-	v.exportHead = (v.exportHead + 1) % verdictExportCap
-	if v.exportCount < verdictExportCap {
-		v.exportCount++
-	}
-}
-
 // Skip records a safety-gate skip (never an error path).
 func (v *VerdictBackend) Skip() {
 	if v == nil {
@@ -215,32 +187,6 @@ func lookupVerdictStat(statsFD int, index uint32) uint64 {
 
 // Export returns a snapshot of recent writes (debug / tests). Not a full map dump.
 // Oldest first. When full, head points at the oldest entry (next overwrite slot).
-func (v *VerdictBackend) Export() []VerdictEntry {
-	if v == nil {
-		return nil
-	}
-	v.exportAccess.Lock()
-	defer v.exportAccess.Unlock()
-	if v.exportCount == 0 || v.exportRing == nil {
-		return nil
-	}
-	n := v.exportCount
-	out := make([]VerdictEntry, n)
-	start := 0
-	if n == verdictExportCap {
-		start = v.exportHead // full: head is oldest
-	}
-	// not full: entries occupy [0, head) in order, head == count
-	if n < verdictExportCap {
-		start = 0
-		// head == count when never wrapped
-	}
-	for i := 0; i < n; i++ {
-		out[i] = v.exportRing[(start+i)%verdictExportCap]
-	}
-	return out
-}
-
 // Generation returns the current control generation.
 func (v *VerdictBackend) Generation() uint32 {
 	if v == nil {

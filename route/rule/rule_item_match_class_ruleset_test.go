@@ -27,9 +27,9 @@ func (s *matchClassRuleSet) RegisterCallback(adapter.RuleSetUpdateCallback) *lis
 	return nil
 }
 func (s *matchClassRuleSet) UnregisterCallback(*list.Element[adapter.RuleSetUpdateCallback]) {}
-func (s *matchClassRuleSet) Close() error                                                   { return nil }
-func (s *matchClassRuleSet) Match(*adapter.InboundContext) bool                             { return false }
-func (s *matchClassRuleSet) String() string                                                 { return "match-class-fake" }
+func (s *matchClassRuleSet) Close() error                                                    { return nil }
+func (s *matchClassRuleSet) Match(*adapter.InboundContext) bool                              { return false }
+func (s *matchClassRuleSet) String() string                                                  { return "match-class-fake" }
 
 func TestRuleSetItemMatchClassPureIP(t *testing.T) {
 	item := &RuleSetItem{setList: []adapter.RuleSet{&matchClassRuleSet{

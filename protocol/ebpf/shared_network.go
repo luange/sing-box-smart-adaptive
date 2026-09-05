@@ -203,7 +203,9 @@ func newSharedNetwork(parent *Inbound, options option.EBPFSharedNetworkOptions) 
 			shared.v3 = lc
 			enableTCP := parent.enableTCP
 			enableUDP := parent.enableUDP
-			lc.ApplyControlFlags(true, true, enableTCP, enableUDP, parent.dnsMode == dnsModeHijack, options.RoutingMark)
+			if err := lc.ApplyControlFlags(true, true, enableTCP, enableUDP, parent.dnsMode == dnsModeHijack, options.RoutingMark); err != nil {
+				parent.logger.Warn("eBPF v3 control flags push failed: ", err)
+			}
 			parent.logger.Info("eBPF shared-network engine=v3 control-plane ready (policy_offload=",
 				options.PolicyOffload.Enabled, "); kernel tc.bpf attach uses generate on Linux")
 		}
@@ -529,6 +531,12 @@ func (s v3KernelSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error 
 		return nil
 	}
 	return s.dp.PublishMACPolicies(entries)
+}
+func (s v3KernelSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.WriteControlV3(enabled, flags, activeBank, generation, routingMark)
 }
 func (s v3KernelSink) MergeStaticDirect(prefix netip.Prefix) error {
 	if s.dp == nil {

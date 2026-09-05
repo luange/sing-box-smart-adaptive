@@ -17,6 +17,9 @@ type DataplaneSink interface {
 	DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
 	PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error
+	// WriteControlV3 pushes control flags/mark/generation into the live kernel
+	// control map without touching policy banks (hot reconfig surface).
+	WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error
 	InvalidateFlowDirect() error
 	PolicyGeneration() uint32
 }

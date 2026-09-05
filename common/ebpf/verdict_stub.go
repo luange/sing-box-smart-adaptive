@@ -41,7 +41,6 @@ func (v *VerdictBackend) InvalidateAll() error { return E.New("verdict not avail
 func (v *VerdictBackend) SetEnabled(bool) error {
 	return E.New("verdict not available")
 }
-func (v *VerdictBackend) Stats() VerdictStats    { return VerdictStats{} }
-func (v *VerdictBackend) Export() []VerdictEntry { return nil }
-func (v *VerdictBackend) Generation() uint32     { return 0 }
-func (v *VerdictBackend) Close()                 {}
+func (v *VerdictBackend) Stats() VerdictStats { return VerdictStats{} }
+func (v *VerdictBackend) Generation() uint32  { return 0 }
+func (v *VerdictBackend) Close()              {}

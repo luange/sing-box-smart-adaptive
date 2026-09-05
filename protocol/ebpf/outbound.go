@@ -54,10 +54,10 @@ type outboundCoordinator struct {
 	skipReason   [8]atomic.Uint64
 	learnInvoked atomic.Uint64
 	// splice skip tallies (high-cardinality path → Debug log + periodic Info)
-	spliceSkipBareTCP   uint64
-	spliceSkipType      uint64
-	spliceSkipRecvq     uint64
-	spliceActive        uint64
+	spliceSkipBareTCP uint64
+	spliceSkipType    uint64
+	spliceSkipRecvq   uint64
+	spliceActive      uint64
 	// Q5: backend-level single epoll + idle sweeper (nil → per-pair fallback).
 	spliceWatch *spliceWatcher
 }
