@@ -272,6 +272,10 @@ func (d *Daemon) stopServiceLocked(ownerUserID string) error {
 	if oomReportError != nil {
 		return oomReportError
 	}
+	powerReportError := tagUnownedReports(filepath.Join(directory, powerReportsDirectoryName), ownerUserID)
+	if powerReportError != nil {
+		return powerReportError
+	}
 	options.WasRunning = false
 	return saveStartOptions(ownerUserID, options)
 }

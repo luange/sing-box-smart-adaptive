@@ -186,19 +186,21 @@ func (c *CacheFile) FakeIPLoadDomain(domain string, isIPv6 bool) (netip.Addr, bo
 func (c *CacheFile) FakeIPReset() error {
 	c.flushAccess.Lock()
 	defer c.flushAccess.Unlock()
-	c.pendingAccess.Lock()
-	for _, domain := range c.pending.fakeIPDomain {
-		c.pending.count--
-		c.pending.size -= len(domain)
+	if c.pending != nil {
+		c.pendingAccess.Lock()
+		for _, domain := range c.pending.fakeIPDomain {
+			c.pending.count--
+			c.pending.size -= len(domain)
+		}
+		clear(c.pending.fakeIPDomain)
+		clear(c.pending.fakeIPAddress4)
+		clear(c.pending.fakeIPAddress6)
+		if c.pending.fakeIPMetadata != nil {
+			c.pending.fakeIPMetadata = nil
+			c.pending.count--
+		}
+		c.pendingAccess.Unlock()
 	}
-	clear(c.pending.fakeIPDomain)
-	clear(c.pending.fakeIPAddress4)
-	clear(c.pending.fakeIPAddress6)
-	if c.pending.fakeIPMetadata != nil {
-		c.pending.fakeIPMetadata = nil
-		c.pending.count--
-	}
-	c.pendingAccess.Unlock()
 	return c.batch(func(tx *bbolt.Tx) error {
 		for _, bucket := range [][]byte{bucketFakeIP, bucketFakeIPDomain4, bucketFakeIPDomain6} {
 			err := tx.DeleteBucket(bucket)
