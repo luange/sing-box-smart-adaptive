@@ -2,8 +2,6 @@
 
 package ebpf
 
-import "time"
-
 // SharedDataplane is the TC shared-network backend surface used by protocol/ebpf.
 // v2 and v3 both implement this so engine selection stays outside TC attach code.
 //
