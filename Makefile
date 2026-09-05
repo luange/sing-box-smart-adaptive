@@ -15,11 +15,22 @@ PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
-.PHONY: test release docs build schema
+.PHONY: test release docs build build_smart schema
 
 build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
+
+# Production Smart build. Build the Zig library on the same Linux target first;
+# production_smart makes a missing Zig ABI fail closed instead of using the
+# reference Go policy.
+SMART_TAGS ?= $(TAGS),smart_zig,production_smart
+
+build_smart:
+	@test "$(GOHOSTOS)" = "linux" || { echo "build_smart must run on Linux" >&2; exit 1; }
+	@test -s smart-engine/zig-out/lib/libsmart_engine.a || { echo "missing smart-engine/zig-out/lib/libsmart_engine.a; run zig build first" >&2; exit 1; }
+	export GOTOOLCHAIN=local CGO_ENABLED=1 && \
+	go build $(PARAMS) -tags "$(SMART_TAGS)" $(MAIN)
 
 race:
 	export GOTOOLCHAIN=local && \

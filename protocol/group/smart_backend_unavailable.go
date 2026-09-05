@@ -1,15 +1,15 @@
-//go:build smart_zig && !cgo
+//go:build production_smart && !smart_zig
 
 package group
 
-// A smart_zig build without cgo cannot link the Zig ABI. Keep this variant
-// compileable so tooling can inspect the package, but fail Smart construction
-// rather than silently selecting through the duplicate Go policy backend.
+// A production_smart build without smart_zig must not silently run the
+// duplicate Go policy path. Smart remains buildable for tooling, but
+// constructing a Smart outbound fails closed with a clear production error.
 func newSmartPolicyBackend(_ smartPolicyBackendConfig) smartPolicyBackend { return nil }
 
 func smartPolicyBackendRequired() bool { return true }
 
-func smartPolicyBackendName() string { return "zig-unavailable" }
+func smartPolicyBackendName() string { return "unavailable" }
 
 type smartPolicyBackendConfig struct {
 	Exploration          float64

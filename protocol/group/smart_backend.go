@@ -30,6 +30,13 @@ type smartPolicyAdopter interface {
 	AdoptSelected(key string, id uint64, now time.Time)
 }
 
+// smartPolicyPruner lets a provider refresh remove policy state for endpoints
+// that no longer exist. The catalog is shared by all contexts, so one bounded
+// ID set is enough; the Zig backend applies it to every retained context.
+type smartPolicyPruner interface {
+	Prune(ids []uint64)
+}
+
 type smartPolicyCandidate struct {
 	ID          uint64
 	Reliability float64

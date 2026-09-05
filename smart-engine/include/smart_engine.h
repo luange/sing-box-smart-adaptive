@@ -59,6 +59,7 @@ smart_decision smart_engine_choose_profile(smart_engine *engine, const smart_can
 void smart_engine_set_selected(smart_engine *engine, uint64_t id, uint64_t now_ms);
 /* Restore a host-confirmed incumbent only when the policy context is empty. */
 void smart_engine_adopt_selected(smart_engine *engine, uint64_t id, uint64_t now_ms);
+void smart_engine_prune(smart_engine *engine, const uint64_t *ids, uintptr_t count);
 void smart_engine_reset(smart_engine *engine);
 
 /* Host-neutral AdaptivePool decision kernel.  The host still owns health

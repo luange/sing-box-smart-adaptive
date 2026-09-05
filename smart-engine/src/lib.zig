@@ -124,6 +124,28 @@ export fn smart_engine_adopt_selected(engine: ?*Engine, id: u64, now_ms: u64) vo
     }
 }
 
+export fn smart_engine_prune(engine: ?*Engine, ids: ?[*]const u64, count: usize) void {
+    if (engine) |value| {
+        if (count == 0) {
+            value.observations.prune(&[_]u64{});
+        } else if (ids) |pointer| {
+            value.observations.prune(pointer[0..count]);
+        }
+        if (value.state.selected_id != 0) {
+            var retained = false;
+            if (ids) |pointer| {
+                for (pointer[0..count]) |id| {
+                    if (id == value.state.selected_id) {
+                        retained = true;
+                        break;
+                    }
+                }
+            }
+            if (!retained) value.state.reset();
+        }
+    }
+}
+
 export fn smart_engine_reset(engine: ?*Engine) void {
     if (engine) |value| value.reset();
 }

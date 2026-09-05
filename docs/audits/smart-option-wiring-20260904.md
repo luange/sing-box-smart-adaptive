@@ -9,7 +9,7 @@ configuration fields from becoming decorative API.
 | `url`, probe interval/timeout/cycle/concurrency | shared TCP/UDP/family probe scheduler | Go host |
 | `max_attempts`, `attempt_timeout`, `established_stall_timeout` | bounded dial/hedge and passive stall watchdog | Go host |
 | `site_stickiness`, switch confirmation/cooldown/margin/min improvement | primary/backup FSM and Zig policy ABI | Go + Zig |
-| `selection_mode`, `exploration`, `min_samples` | stable affinity and confidence/exploration scoring | Zig ABI (Go fallback) |
+| `selection_mode`, `exploration`, `min_samples` | stable affinity and confidence/exploration scoring | Zig ABI in packaged builds; Go host policy remains a development fallback |
 | throughput floor/samples | passive bulk eligibility gate | Go host |
 | breaker, half-life, retention, max entries | portrait decay, circuit state and bounded in-memory pruning | Go host |
 | provider/catalog filters and node weights | candidate discovery and score normalization | Go host |
@@ -25,3 +25,8 @@ alias, but all accepted values intentionally use the one unified policy.
 Options that prepare evidence or own I/O stay out of Zig by design. Adding them
 to the policy kernel would duplicate schedulers, sockets, or health stores and
 would make the two implementations less deterministic.
+
+The build contract is fail-closed for production: release jobs must include
+`smart_zig,production_smart`; a production build without Zig reports
+`policy_backend=unavailable` and refuses to construct Smart. Ordinary untagged
+builds retain the host policy for development and conformance.

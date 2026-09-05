@@ -79,6 +79,13 @@ type SmartContextStatus struct {
 	Phase                     string                 `json:"phase,omitempty"`
 	Selected                  string                 `json:"selected,omitempty"`
 	SelectedEndpointID        string                 `json:"selected_endpoint_id,omitempty"`
+	ZigSelectedEndpointID     string                 `json:"zig_selected_endpoint_id,omitempty"`
+	ActualDialEndpointID      string                 `json:"actual_dial_endpoint_id,omitempty"`
+	SelectionGeneration       uint64                 `json:"selection_generation,omitempty"`
+	LastFailureType           string                 `json:"last_failure_type,omitempty"`
+	CircuitState              string                 `json:"circuit_state,omitempty"`
+	SelectionMismatchTotal    uint64                 `json:"selection_mismatch_total,omitempty"`
+	UnobservedConnectionTotal uint64                 `json:"unobserved_connection_total,omitempty"`
 	Reason                    string                 `json:"reason,omitempty"`
 	UpdatedAt                 time.Time              `json:"updated_at,omitempty"`
 	CandidateCount            int                    `json:"candidate_count"`
@@ -90,8 +97,21 @@ type SmartContextStatus struct {
 
 // SmartGroupStatus is exported for clash/API status surfaces.
 type SmartGroupStatus struct {
+	// PolicyBackend identifies the compiled selection kernel. Production
+	// releases must report "zig"; "unavailable" is a fail-closed build and
+	// "go-reference" is reserved for explicit development builds.
+	PolicyBackend             string                 `json:"policy_backend,omitempty"`
+	PolicyBackendRequired     bool                   `json:"policy_backend_required"`
+	PolicyBackendAvailable    bool                   `json:"policy_backend_available"`
 	Selected                  string                 `json:"selected,omitempty"`
 	SelectedEndpointID        string                 `json:"selected_endpoint_id,omitempty"`
+	ZigSelectedEndpointID     string                 `json:"zig_selected_endpoint_id,omitempty"`
+	ActualDialEndpointID      string                 `json:"actual_dial_endpoint_id,omitempty"`
+	SelectionGeneration       uint64                 `json:"selection_generation,omitempty"`
+	LastFailureType           string                 `json:"last_failure_type,omitempty"`
+	CircuitState              string                 `json:"circuit_state,omitempty"`
+	SelectionMismatchTotal    uint64                 `json:"selection_mismatch_total,omitempty"`
+	UnobservedConnectionTotal uint64                 `json:"unobserved_connection_total,omitempty"`
 	Pinned                    string                 `json:"pinned,omitempty"`
 	Network                   string                 `json:"network,omitempty"`
 	Site                      string                 `json:"site,omitempty"`

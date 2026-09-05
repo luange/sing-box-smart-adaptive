@@ -94,6 +94,41 @@ pub const Store = struct {
         return null;
     }
 
+    pub fn prune(self: *Store, keep: []const u64) void {
+        // Provider reloads can remove an endpoint while its policy context is
+        // still retained. Drop those rows before the next Choose so stale
+        // aliases cannot inherit health or selection state.
+        var index: usize = 0;
+        while (index < self.entries.len) : (index += 1) {
+            if (!self.entries[index].used) continue;
+            var retained = false;
+            for (keep) |id| {
+                if (id == self.entries[index].id) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) self.removeIndex(self.entries[index].id);
+        }
+        for (self.entries, 0..) |*entry, entry_index| {
+            if (!entry.used) continue;
+            var retained = false;
+            for (keep) |id| {
+                if (id == entry.id) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) {
+                entry.* = .{};
+                self.free_slots[self.free_count] = @intCast(entry_index);
+                self.free_count += 1;
+                self.count -= 1;
+            }
+        }
+        self.rebuildIndex();
+    }
+
     pub fn enrich(self: *const Store, candidate: anytype) @TypeOf(candidate) {
         const observed = self.get(candidate.id) orelse return candidate;
         var result = candidate;

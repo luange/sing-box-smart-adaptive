@@ -81,6 +81,8 @@ func smartPolicyMinSamples(value int) uint32 {
 // or packaging error and is rejected during Smart construction.
 func smartPolicyBackendRequired() bool { return true }
 
+func smartPolicyBackendName() string { return "zig" }
+
 func maxInt64(value int64) int64 {
 	if value < 0 {
 		return 0
@@ -225,6 +227,31 @@ func (b *zigSmartPolicyBackend) AdoptSelected(key string, id uint64, now time.Ti
 	engine := b.engineForLocked(shard, key, now)
 	if engine != nil {
 		C.smart_engine_adopt_selected(engine.engine, C.uint64_t(id), C.uint64_t(smartMillis(now)))
+	}
+}
+
+func (b *zigSmartPolicyBackend) Prune(ids []uint64) {
+	if b == nil {
+		return
+	}
+	var keep []C.uint64_t
+	if len(ids) > 0 {
+		keep = make([]C.uint64_t, len(ids))
+		for index, id := range ids {
+			keep[index] = C.uint64_t(id)
+		}
+	}
+	for index := range b.shards {
+		shard := &b.shards[index]
+		shard.access.Lock()
+		for _, engine := range shard.engines {
+			if len(keep) == 0 {
+				C.smart_engine_prune(engine.engine, nil, 0)
+			} else {
+				C.smart_engine_prune(engine.engine, &keep[0], C.uintptr_t(len(keep)))
+			}
+		}
+		shard.access.Unlock()
 	}
 }
 

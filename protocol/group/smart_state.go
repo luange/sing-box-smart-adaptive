@@ -206,6 +206,24 @@ func (s *smartStore) observeDial(now time.Time, network, site, candidate, transp
 	}
 }
 
+func (s *smartStore) pruneCandidates(keep map[string]struct{}) {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	for key := range s.metrics {
+		if _, retained := keep[key.Candidate]; !retained {
+			delete(s.metrics, key)
+		}
+	}
+	for key := range s.failureBursts {
+		if _, retained := keep[key.Candidate]; !retained {
+			delete(s.failureBursts, key)
+		}
+	}
+	s.access.Unlock()
+}
+
 // quarantineDataPlaneFailure adds a short, site-local circuit after a real
 // data-plane failure. It is deliberately separate from observeDial so
 // background probe failures keep their endpoint-wide fail-open behavior. A

@@ -47,9 +47,11 @@ strict-affinity, latency, and bulk ordering/rotation are decided by Zig. The
 Go adapter reuses a
 candidate batch buffer per lock shard (16 shards, four bounded contexts each),
 so cgo conversion allocations are amortized without retaining a large buffer
-per context. The default developer build keeps the reference Go policy for
-zero-dependency development; production `smart_zig` builds use the same Zig
-ABI for all legacy selection mode spellings.
+per context. The reference Go policy remains available for zero-dependency
+development. Production builds add `smart_zig,production_smart`; the latter
+makes a missing Zig ABI fail closed instead of silently selecting through the
+Go policy. Production `smart_zig` builds use the same Zig ABI
+for all legacy selection mode spellings.
 
 Build and test with Zig 0.14+:
 
@@ -65,8 +67,6 @@ Linux release builds select Zig with `smart_zig` and link the matching static
 library. The release adapter rejects an ABI mismatch or engine allocation
 failure instead of falling back to the duplicate Go policy state machine; this
 keeps one production decision owner. Manual pins, EndpointProfile, failure
-wakeups, and switch auditing remain host-owned. Builds without the
-`smart_zig` tag may use the Go adapter for upstream-compatible development or
-cgo-less platforms; a `smart_zig` build without cgo fails closed. Adaptive ABI
-changes are versioned (`ADAPTIVE_ENGINE_ABI_VERSION`) and old libraries are
-rejected before use.
+wakeups, and switch auditing remain host-owned. A `smart_zig` build without cgo
+fails closed. Adaptive ABI changes are versioned
+(`ADAPTIVE_ENGINE_ABI_VERSION`) and old libraries are rejected before use.

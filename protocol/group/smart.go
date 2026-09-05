@@ -248,6 +248,7 @@ type smartRank struct {
 	identity             string
 	probeKey             string
 	policyID             uint64
+	selectionGeneration  uint64
 	weight               nodeweight.Match
 	status               adapter.SmartCandidateStatus
 	profile              smartTrafficProfile
@@ -317,14 +318,17 @@ func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetad
 }
 
 type smartRanking struct {
-	ranks              []smartRank
-	candidates         []adapter.Outbound
-	policyUnavailable  bool
-	snapshotSelected   string
-	snapshotSelectedAt time.Time
-	snapshotValid      bool
-	rankBuffer         *[]smartRank
-	candidateBuffer    *[]adapter.Outbound
+	ranks                    []smartRank
+	candidates               []adapter.Outbound
+	policyUnavailable        bool
+	statusKey                string
+	policySelectedEndpointID string
+	snapshotSelected         string
+	snapshotSelectedAt       time.Time
+	snapshotGeneration       uint64
+	snapshotValid            bool
+	rankBuffer               *[]smartRank
+	candidateBuffer          *[]adapter.Outbound
 }
 
 type smartDialAttempt struct {
@@ -371,6 +375,8 @@ func acquireSmartRanking(candidateCount int) *smartRanking {
 		policyUnavailable:  false,
 		snapshotSelected:   "",
 		snapshotSelectedAt: time.Time{},
+		snapshotGeneration: 0,
+		statusKey:          "",
 		snapshotValid:      false,
 		rankBuffer:         rankBuffer,
 		candidateBuffer:    candidateBuffer,
@@ -386,6 +392,9 @@ func (r *smartRanking) Release() {
 	r.policyUnavailable = false
 	r.snapshotSelected = ""
 	r.snapshotSelectedAt = time.Time{}
+	r.snapshotGeneration = 0
+	r.statusKey = ""
+	r.policySelectedEndpointID = ""
 	r.snapshotValid = false
 	if cap(r.ranks) <= 4096 {
 		*r.rankBuffer = r.ranks[:0]
@@ -449,9 +458,16 @@ type Smart struct {
 	probeLastAt            map[string]time.Time
 	udpProbeLastAt         map[string]time.Time
 	halfOpen               map[string]struct{}
-	latest                 common.TypedValue[adapter.Outbound]
-	fingerprint            atomic.Pointer[smartFingerprintCache]
-	fingerprintLock        sync.Mutex
+	// selectionGeneration is keyed by the dashboard context (network/site/
+	// transport). It changes only when the canonical EndpointID changes, so
+	// provider aliases do not look like a data-plane switch.
+	selectionGeneration map[string]uint64
+	zigSelectedEndpoint map[string]string
+	actualDialEndpoint  map[string]string
+	circuitState        map[string]string
+	latest              common.TypedValue[adapter.Outbound]
+	fingerprint         atomic.Pointer[smartFingerprintCache]
+	fingerprintLock     sync.Mutex
 
 	statusAccess       sync.RWMutex
 	status             adapter.SmartGroupStatus
@@ -505,6 +521,9 @@ type Smart struct {
 	connectionsInterrupted     atomic.Uint64
 	connectionsKept            atomic.Uint64
 	streamFailureWakes         atomic.Uint64
+	selectionMismatchTotal     atomic.Uint64
+	unobservedConnectionTotal  atomic.Uint64
+	lastFailureType            atomic.Pointer[string]
 	recoveryProbeUntilUnixNano atomic.Int64
 	probing                    atomic.Bool
 	probeCursor                atomic.Uint64
@@ -749,6 +768,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		probeLastAt:            make(map[string]time.Time),
 		udpProbeLastAt:         make(map[string]time.Time),
 		halfOpen:               make(map[string]struct{}),
+		selectionGeneration:    make(map[string]uint64),
+		zigSelectedEndpoint:    make(map[string]string),
+		actualDialEndpoint:     make(map[string]string),
+		circuitState:           make(map[string]string),
 		store:                  store,
 		policyBackend:          policyBackend,
 
@@ -896,6 +919,10 @@ func (s *Smart) Close() error {
 	clear(s.probeLastAt)
 	clear(s.udpProbeLastAt)
 	clear(s.halfOpen)
+	clear(s.selectionGeneration)
+	clear(s.zigSelectedEndpoint)
+	clear(s.actualDialEndpoint)
+	clear(s.circuitState)
 	s.candidates = nil
 	s.candidateByTag = make(map[string]adapter.Outbound)
 	s.candidateMetadataByTag = nil
@@ -908,6 +935,10 @@ func (s *Smart) Close() error {
 	s.probeLastAt = make(map[string]time.Time)
 	s.udpProbeLastAt = make(map[string]time.Time)
 	s.halfOpen = make(map[string]struct{})
+	s.selectionGeneration = make(map[string]uint64)
+	s.zigSelectedEndpoint = make(map[string]string)
+	s.actualDialEndpoint = make(map[string]string)
+	s.circuitState = make(map[string]string)
 	s.access.Unlock()
 	s.providerAccess.Lock()
 	clear(s.providers)
@@ -986,6 +1017,17 @@ func (s *Smart) setPolicyBackendSelected(key string, id uint64, now time.Time) {
 	s.policyBackendAccess.RUnlock()
 }
 
+func (s *Smart) prunePolicyBackend(ids []uint64) {
+	if s == nil {
+		return
+	}
+	s.policyBackendAccess.RLock()
+	if pruner, ok := s.policyBackend.(smartPolicyPruner); ok {
+		pruner.Prune(ids)
+	}
+	s.policyBackendAccess.RUnlock()
+}
+
 func (s *Smart) adoptPolicyBackendSelected(key string, id uint64, now time.Time) {
 	if s == nil || key == "" || id == 0 {
 		return
@@ -995,6 +1037,86 @@ func (s *Smart) adoptPolicyBackendSelected(key string, id uint64, now time.Time)
 		adopter.AdoptSelected(key, id, now)
 	}
 	s.policyBackendAccess.RUnlock()
+}
+
+func (s *Smart) recordZigSelectedEndpoint(statusKey string, endpointID string) uint64 {
+	if s == nil || statusKey == "" || endpointID == "" {
+		return 0
+	}
+	s.access.Lock()
+	if s.zigSelectedEndpoint == nil {
+		s.zigSelectedEndpoint = make(map[string]string)
+	}
+	if previous := s.zigSelectedEndpoint[statusKey]; previous != endpointID {
+		if s.selectionGeneration == nil {
+			s.selectionGeneration = make(map[string]uint64)
+		}
+		generation := s.selectionGeneration[statusKey]
+		if generation == 0 {
+			generation = 1
+		} else if previous != "" {
+			generation++
+		}
+		s.selectionGeneration[statusKey] = generation
+	}
+	s.zigSelectedEndpoint[statusKey] = endpointID
+	generation := s.selectionGeneration[statusKey]
+	s.access.Unlock()
+	return generation
+}
+
+// recordActualDial is the data-plane half of the Smart proof. It records the
+// canonical endpoint that actually accepted a new connection and compares it
+// with the last endpoint returned by Zig. A mismatch is observable (and
+// counted) instead of being silently hidden by a provider alias or an
+// in-flight selection race.
+func (s *Smart) recordActualDial(statusKey, endpointID string, dialGeneration uint64) {
+	if s == nil || statusKey == "" || endpointID == "" {
+		return
+	}
+	s.access.Lock()
+	if s.actualDialEndpoint == nil {
+		s.actualDialEndpoint = make(map[string]string)
+	}
+	if s.selectionGeneration == nil {
+		s.selectionGeneration = make(map[string]uint64)
+	}
+	currentGeneration := s.selectionGeneration[statusKey]
+	zigEndpoint := s.zigSelectedEndpoint[statusKey]
+	s.actualDialEndpoint[statusKey] = endpointID
+	s.access.Unlock()
+	if (zigEndpoint != "" && zigEndpoint != endpointID) || (dialGeneration != 0 && currentGeneration != 0 && dialGeneration != currentGeneration) {
+		s.selectionMismatchTotal.Add(1)
+		if s.logger != nil {
+			s.logger.Warn("smart control/data selection mismatch: zig_selected_endpoint=", zigEndpoint,
+				" actual_dial_endpoint=", endpointID, " selection_generation=", currentGeneration,
+				" dial_generation=", dialGeneration)
+		}
+	}
+}
+
+func (s *Smart) recordUnobservedConnection(statusKey, endpointID string) {
+	if s == nil {
+		return
+	}
+	s.unobservedConnectionTotal.Add(1)
+	if s.logger != nil {
+		s.logger.Error("smart managed connection bypassed observation wrapper: context=", statusKey, " endpoint=", endpointID)
+	}
+}
+
+func (s *Smart) noteFailureType(statusKey, failureType string) {
+	if s == nil || failureType == "" {
+		return
+	}
+	s.access.Lock()
+	if s.circuitState == nil {
+		s.circuitState = make(map[string]string)
+	}
+	s.circuitState[statusKey] = "open"
+	s.access.Unlock()
+	value := failureType
+	s.lastFailureType.Store(&value)
 }
 
 // waitWorkerStop waits for the probe worker up to timeout after cancel.
@@ -1697,8 +1819,14 @@ func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound 
 func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	pinned, temporary, expiresAt, reason := s.controlSnapshot(time.Now())
 	s.statusAccess.RLock()
-	defer s.statusAccess.RUnlock()
 	status := s.status
+	statusContexts := make(map[string]adapter.SmartContextStatus, len(s.statusContexts))
+	for key, contextStatus := range s.statusContexts {
+		statusContexts[key] = cloneSmartContextStatus(contextStatus)
+	}
+	statusContextOrder := append([]string(nil), s.statusContextOrder...)
+	statusLastContext := s.statusLastContext
+	s.statusAccess.RUnlock()
 	status.Pinned = pinned
 	status.TemporaryOverride = temporary
 	status.OverrideReason = reason
@@ -1717,10 +1845,35 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.ConnectionsInterrupted = s.connectionsInterrupted.Load()
 	status.ConnectionsKept = s.connectionsKept.Load()
 	status.StreamFailureWakes = s.streamFailureWakes.Load()
-	if len(s.statusContexts) > 0 {
-		status.Contexts = make([]adapter.SmartContextStatus, 0, len(s.statusContexts))
-		for _, key := range s.statusContextOrder {
-			if contextStatus, loaded := s.statusContexts[key]; loaded {
+	status.SelectionMismatchTotal = s.selectionMismatchTotal.Load()
+	status.UnobservedConnectionTotal = s.unobservedConnectionTotal.Load()
+	if failureType := s.lastFailureType.Load(); failureType != nil {
+		status.LastFailureType = *failureType
+	}
+	s.access.RLock()
+	if statusLastContext != "" {
+		status.ZigSelectedEndpointID = s.zigSelectedEndpoint[statusLastContext]
+		status.ActualDialEndpointID = s.actualDialEndpoint[statusLastContext]
+		status.SelectionGeneration = s.selectionGeneration[statusLastContext]
+		status.CircuitState = s.circuitState[statusLastContext]
+	}
+	s.access.RUnlock()
+	status.PolicyBackend = smartPolicyBackendName()
+	status.PolicyBackendRequired = smartPolicyBackendRequired()
+	status.PolicyBackendAvailable = s.policyBackendEnabled()
+	if len(statusContexts) > 0 {
+		status.Contexts = make([]adapter.SmartContextStatus, 0, len(statusContexts))
+		for _, key := range statusContextOrder {
+			if contextStatus, loaded := statusContexts[key]; loaded {
+				s.access.RLock()
+				contextStatus.ZigSelectedEndpointID = s.zigSelectedEndpoint[key]
+				contextStatus.ActualDialEndpointID = s.actualDialEndpoint[key]
+				contextStatus.SelectionGeneration = s.selectionGeneration[key]
+				contextStatus.CircuitState = s.circuitState[key]
+				s.access.RUnlock()
+				contextStatus.LastFailureType = status.LastFailureType
+				contextStatus.SelectionMismatchTotal = status.SelectionMismatchTotal
+				contextStatus.UnobservedConnectionTotal = status.UnobservedConnectionTotal
 				status.Contexts = append(status.Contexts, cloneSmartContextStatus(contextStatus))
 			}
 		}
@@ -1881,6 +2034,11 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	}
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
+		endpointID := result.attempt.rank.status.EndpointID
+		if endpointID == "" {
+			endpointID = smartEndpointID(result.attempt.rank.identity, result.attempt.rank.policyID)
+		}
+		s.recordActualDial(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, result.attempt.rank.selectionGeneration)
 		observedTransport := result.observedTransport
 		if observedTransport == "" {
 			observedTransport = transport
@@ -1891,7 +2049,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			ranks, result.attempt.attemptIndex, result.hadPriorFailure)
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		observedStartedAt := time.Now().Add(-result.elapsed)
-		return newSmartObservedConnWithRetransmit(conn, observedStartedAt, func(firstByte time.Duration) {
+		observed := newSmartObservedConnWithRetransmitReason(conn, observedStartedAt, func(firstByte time.Duration) {
 			s.observeMetricForTransport(networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, observedTransport, func(metricTransport string) {
 				s.store.observeFirstByte(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), metricTransport, firstByte)
 			})
@@ -1903,17 +2061,27 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			s.observeMetricForTransport(networkKey, siteKey, s.candidateProfileID(candidate.Tag()), transport, observedTransport, func(metricTransport string) {
 				s.store.observeRetransmit(time.Now(), networkKey, siteKey, s.candidateProfileID(candidate.Tag()), metricTransport, ratio)
 			})
-		}, func() {
+		}, nil, func(failureType string) {
 			// A stream can become unusable after DialContext succeeds (for
 			// example a stale multiplex session, a reset upstream socket, or
 			// a bounded first-response stall). Record the failure against this
 			// network/site/transport profile and wake the shared probe. The
 			// callback is coalesced once per connection by smartObservedConn.
 			s.streamFailureWakes.Add(1)
-			s.observeDataPlaneFailureForTransport(time.Now(), networkKey, siteKey, candidate.Tag(), transport, observedTransport, time.Since(observedStartedAt))
+			if failureType == "" {
+				failureType = "transport"
+			}
+			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, time.Since(observedStartedAt), failureType)
+			if observedTransport != "" && observedTransport != transport {
+				s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), observedTransport, time.Since(observedStartedAt), failureType)
+			}
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
-		}, s.establishedStallTimeout, ctx), nil
+		}, s.establishedStallTimeout, ctx)
+		if _, wrapped := observed.(*smartObservedConn); !wrapped {
+			s.recordUnobservedConnection(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID)
+		}
+		return observed, nil
 	} else {
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
 		if len(attemptErrors) == 0 {
@@ -2232,7 +2400,11 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			}
 			candidate := result.attempt.candidate
 			if result.err != nil {
-				s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed)
+				failureType := "transport"
+				if isSmartProtocolHandshakeFailure(result.err) {
+					failureType = "protocol"
+				}
+				s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed, failureType)
 				s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 				// A real data-plane failure must wake recovery itself.  Dashboard
 				// latency tests may also refresh the shared profile, but production
@@ -2349,7 +2521,11 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			return nil, parentErr
 		}
 		if err != nil {
-			s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, elapsed)
+			failureType := "transport"
+			if isSmartProtocolHandshakeFailure(err) {
+				failureType = "protocol"
+			}
+			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, elapsed, failureType)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 			attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
@@ -2357,14 +2533,22 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
 		adapter.NoteRealOutbound(ctx, candidate)
+		endpointID := rank.status.EndpointID
+		if endpointID == "" {
+			endpointID = smartEndpointID(rank.identity, rank.policyID)
+		}
+		s.recordActualDial(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, rank.selectionGeneration)
 		s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
 			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
 			ranks, attemptIndex, attemptIndex > 0)
 		observed := newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, smartUDPExpectsResponse(destination), smartUDPRequiredResponsePackets(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
-			s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, flowElapsed)
+			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, flowElapsed, "udp_no_response")
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		})
+		if _, wrapped := observed.(*smartObservedPacketConn); !wrapped {
+			s.recordUnobservedConnection(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID)
+		}
 		return s.interruptGroup.NewPacketConnWithKey(observed, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
 	}
 	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible UDP candidates failed")
@@ -3083,10 +3267,15 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 // dead incumbent. Probe failures intentionally do not use this path: if the
 // shared probe endpoint is unavailable, candidates must not all be evicted.
 func (s *Smart) observeDataPlaneFailure(now time.Time, network, site, candidate, transport string, elapsed time.Duration) {
+	s.observeDataPlaneFailureWithType(now, network, site, candidate, transport, elapsed, "transport")
+}
+
+func (s *Smart) observeDataPlaneFailureWithType(now time.Time, network, site, candidate, transport string, elapsed time.Duration, failureType string) {
 	s.observeDial(now, network, site, candidate, transport, false, elapsed)
 	if s.store != nil {
 		s.store.quarantineDataPlaneFailure(now, network, site, s.candidateProfileID(candidate), transport, defaultSmartDataPlaneFailureQuarantine)
 	}
+	s.noteFailureType(smartStatusSelectionKey(network, site, transport), failureType)
 }
 
 func (s *Smart) observeDataPlaneFailureForTransport(now time.Time, network, site, candidate, aggregateTransport, observedTransport string, elapsed time.Duration) {
@@ -3139,6 +3328,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	ranking.candidates = append(ranking.candidates, s.candidates...)
 	metadataByTag := s.candidateMetadataByTag
 	selectionKey := smartSelectionKey(networkKey, siteKey, transport)
+	statusKey := smartStatusSelectionKey(networkKey, siteDisplay, transport)
 	snapshotSelectedAt := s.lastSelectedAt[selectionKey]
 	lastSelected := s.lastSelected[selectionKey]
 	if lastSelected != "" && !snapshotSelectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(snapshotSelectedAt) > s.siteStickiness {
@@ -3150,6 +3340,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	// late healthy result that would otherwise overwrite a newer choice.
 	ranking.snapshotSelected = lastSelected
 	ranking.snapshotSelectedAt = snapshotSelectedAt
+	ranking.statusKey = statusKey
+	ranking.snapshotGeneration = s.selectionGeneration[statusKey]
 	ranking.snapshotValid = true
 	affinity := s.affinity[networkKey+"\x00"+siteKey+"\x00"+transport]
 	s.access.RUnlock()
@@ -3205,13 +3397,14 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			profile = smartProfileBulk
 		}
 		ranking.ranks = append(ranking.ranks, smartRank{
-			outbound:      candidate,
-			identity:      metadata.identity,
-			probeKey:      metadata.probeKey,
-			policyID:      metadata.policyID,
-			weight:        metadata.weight,
-			estimate:      estimate,
-			scoreEstimate: scoreEstimate,
+			outbound:            candidate,
+			identity:            metadata.identity,
+			probeKey:            metadata.probeKey,
+			policyID:            metadata.policyID,
+			selectionGeneration: ranking.snapshotGeneration,
+			weight:              metadata.weight,
+			estimate:            estimate,
+			scoreEstimate:       scoreEstimate,
 			// Hard health gates run before weights and soft score. A circuit-open
 			// endpoint must never become eligible merely because it has a large
 			// configured weight.
@@ -3435,6 +3628,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 					}
 				}
 				if selectedIndex >= 0 {
+					ranking.policySelectedEndpointID = ranks[selectedIndex].status.EndpointID
+					if ranking.policySelectedEndpointID == "" {
+						ranking.policySelectedEndpointID = smartEndpointID(ranks[selectedIndex].identity, ranks[selectedIndex].policyID)
+					}
+					generation := s.recordZigSelectedEndpoint(ranking.statusKey, ranking.policySelectedEndpointID)
+					if generation != 0 {
+						for index := range ranks {
+							ranks[index].selectionGeneration = generation
+						}
+					}
 					reason := "zig policy retained candidate"
 					if decision.Switched {
 						reason = "zig policy confirmed candidate"
@@ -3524,6 +3727,7 @@ func (s *Smart) markSelected(candidate adapter.Outbound, networkKey, siteKey, si
 func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey, siteKey, siteDisplay, transport string, snapshotSelected string, snapshotSelectedAt time.Time, snapshotValid bool, ranks []smartRank, attemptIndex int, hadPriorFailure bool) {
 	now := time.Now()
 	key := smartSelectionKey(networkKey, siteKey, transport)
+	statusKey := smartStatusSelectionKey(networkKey, siteDisplay, transport)
 	usePolicyBackend := s.policyBackendEnabled()
 	// A concurrent Close may retire the Zig engine after rankPooled returned a
 	// candidate but before its dial completed. Do not let this late completion
@@ -3553,13 +3757,27 @@ func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey,
 	previousRank, previousFound := smartRankByTag(ranks, previous)
 	currentRank, currentFound := smartRankByTag(ranks, candidate.Tag())
 	failureSwitch := hadPriorFailure || (previousFound && previousRank.status.State == "open")
+	currentGeneration := s.selectionGeneration[statusKey]
+	if s.selectionGeneration == nil {
+		s.selectionGeneration = make(map[string]uint64)
+		currentGeneration = 0
+	}
+	currentGeneration = s.selectionGeneration[statusKey]
+	if currentGeneration == 0 {
+		currentGeneration = 1
+	}
+	dialGeneration := uint64(0)
+	if currentFound {
+		dialGeneration = currentRank.selectionGeneration
+	}
 	// A ranking is a point-in-time view. If another request committed a newer
 	// incumbent while this dial was in flight, a healthy late result must not
 	// roll the decision back. Failure-driven failover remains allowed because
 	// preserving a broken incumbent would strand the request.
 	staleSnapshot := snapshotValid &&
 		(previous != snapshotSelected || !currentSelectedAt.Equal(snapshotSelectedAt))
-	if staleSnapshot && logicalSwitch && !failureSwitch {
+	staleGeneration := dialGeneration != 0 && dialGeneration != currentGeneration
+	if (staleSnapshot || staleGeneration) && logicalSwitch && !failureSwitch {
 		s.access.Unlock()
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, previous, "stale healthy result retained current candidate")
 		return
@@ -3591,6 +3809,10 @@ func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey,
 		s.lastSelectedAt = make(map[string]time.Time)
 	}
 	s.lastSelectedAt[key] = now
+	if logicalSwitch && s.zigSelectedEndpoint[statusKey] != currentEndpointID {
+		currentGeneration++
+	}
+	s.selectionGeneration[statusKey] = currentGeneration
 	delete(s.switchChallenges, key)
 	if !usePolicyBackend && logicalSwitch && !failureSwitch {
 		if s.performanceCooldown == nil {
@@ -3873,6 +4095,14 @@ func smartSelectionKey(networkKey, siteKey, transport string) string {
 	return networkKey + "\x00" + siteKey + "\x00" + transport
 }
 
+// smartStatusSelectionKey is deliberately separate from the policy key. The
+// health ledger uses a hashed site key, while the dashboard exposes a readable
+// site label. Runtime control/data evidence must use one stable key so a
+// display alias cannot hide a real dial mismatch.
+func smartStatusSelectionKey(networkKey, siteDisplay, transport string) string {
+	return networkKey + "\x00" + siteDisplay + "\x00" + transport
+}
+
 // smartTransportKey preserves the address family when the caller already
 // knows it. sing's NetworkName intentionally normalizes tcp4/tcp6 and udp4/
 // udp6 for protocol dispatch, but Smart must not merge those observations into
@@ -4033,13 +4263,30 @@ func (s *Smart) updateStatus(networkKey, siteDisplay, transport string, ranks []
 func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, ranks []smartRank, selected, reason string) {
 	now := time.Now()
 	phase := s.currentPhase().String()
-	contextKey := smartSelectionKey(networkKey, siteDisplay, transport)
+	contextKey := smartStatusSelectionKey(networkKey, siteDisplay, transport)
 	selectedEndpointID := ""
+	circuitState := ""
 	if selectedRank, found := smartRankByTag(ranks, selected); found {
 		selectedEndpointID = selectedRank.status.EndpointID
 		if selectedEndpointID == "" {
 			selectedEndpointID = smartEndpointID(selectedRank.identity, selectedRank.policyID)
 		}
+		circuitState = selectedRank.status.State
+	}
+	s.access.Lock()
+	if s.circuitState == nil {
+		s.circuitState = make(map[string]string)
+	}
+	if circuitState != "" {
+		s.circuitState[contextKey] = circuitState
+	}
+	zigSelectedEndpointID := s.zigSelectedEndpoint[contextKey]
+	actualDialEndpointID := s.actualDialEndpoint[contextKey]
+	selectionGeneration := s.selectionGeneration[contextKey]
+	s.access.Unlock()
+	lastFailureType := ""
+	if failureType := s.lastFailureType.Load(); failureType != nil {
+		lastFailureType = *failureType
 	}
 	pinned, _, _, _ := s.controlSnapshot(now)
 	statusCount := min(len(ranks), smartStatusCandidateLimit)
@@ -4105,6 +4352,13 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	s.status = adapter.SmartGroupStatus{
 		Selected:                  selected,
 		SelectedEndpointID:        selectedEndpointID,
+		ZigSelectedEndpointID:     zigSelectedEndpointID,
+		ActualDialEndpointID:      actualDialEndpointID,
+		SelectionGeneration:       selectionGeneration,
+		LastFailureType:           lastFailureType,
+		CircuitState:              circuitState,
+		SelectionMismatchTotal:    s.selectionMismatchTotal.Load(),
+		UnobservedConnectionTotal: s.unobservedConnectionTotal.Load(),
 		Pinned:                    pinned,
 		Network:                   networkKey,
 		Site:                      siteDisplay,
@@ -4135,6 +4389,13 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		Phase:                     s.currentPhase().String(),
 		Selected:                  selected,
 		SelectedEndpointID:        selectedEndpointID,
+		ZigSelectedEndpointID:     zigSelectedEndpointID,
+		ActualDialEndpointID:      actualDialEndpointID,
+		SelectionGeneration:       selectionGeneration,
+		LastFailureType:           lastFailureType,
+		CircuitState:              circuitState,
+		SelectionMismatchTotal:    s.selectionMismatchTotal.Load(),
+		UnobservedConnectionTotal: s.unobservedConnectionTotal.Load(),
 		Reason:                    transport + "/" + profile.String() + ": " + reason,
 		UpdatedAt:                 s.status.UpdatedAt,
 		CandidateCount:            len(ranks),
@@ -4342,11 +4603,24 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	}
 	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
 	candidateMetadataByTag := make(map[string]smartCandidateMetadata, len(candidates))
+	keepProfiles := make(map[string]struct{}, len(candidates))
+	keepPolicyIDs := make([]uint64, 0, len(candidates))
+	seenPolicyIDs := make(map[uint64]struct{}, len(candidates))
 	for _, candidate := range candidates {
 		tag := candidate.Tag()
 		identity := s.probeIdentityLocked(candidate)
 		candidateByTag[tag] = candidate
-		candidateMetadataByTag[tag] = s.buildCandidateMetadata(tag, identity)
+		metadata := s.buildCandidateMetadata(tag, identity)
+		candidateMetadataByTag[tag] = metadata
+		if metadata.profileID != "" {
+			keepProfiles[metadata.profileID] = struct{}{}
+		}
+		if metadata.policyID != 0 {
+			if _, exists := seenPolicyIDs[metadata.policyID]; !exists {
+				seenPolicyIDs[metadata.policyID] = struct{}{}
+				keepPolicyIDs = append(keepPolicyIDs, metadata.policyID)
+			}
+		}
 	}
 	// Close can begin after the provider snapshot above. Check before and after
 	// taking the catalog lock so a late callback cannot repopulate a retired
@@ -4371,6 +4645,10 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.candidateByTag = candidateByTag
 	s.candidateMetadataByTag = candidateMetadataByTag
 	s.access.Unlock()
+	if s.store != nil {
+		s.store.pruneCandidates(keepProfiles)
+	}
+	s.prunePolicyBackend(keepPolicyIDs)
 	if s.closing.Load() {
 		return nil
 	}
@@ -4629,6 +4907,7 @@ type smartObservedConn struct {
 	onClose          func(int64, time.Duration)
 	onRetransmit     func(float64)
 	onFailure        func()
+	onFailureReason  func(string)
 	stallOnce        sync.Once
 	failureNotified  atomic.Bool
 	stallTimeout     time.Duration
@@ -4649,19 +4928,24 @@ func newSmartObservedConnWithStall(conn net.Conn, startedAt time.Time, onFirstBy
 }
 
 func newSmartObservedConnWithRetransmit(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onRetransmit func(float64), onFailure func(), stallTimeout time.Duration, requestCtx ...context.Context) net.Conn {
+	return newSmartObservedConnWithRetransmitReason(conn, startedAt, onFirstByte, onClose, onRetransmit, onFailure, nil, stallTimeout, requestCtx...)
+}
+
+func newSmartObservedConnWithRetransmitReason(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onRetransmit func(float64), onFailure func(), onFailureReason func(string), stallTimeout time.Duration, requestCtx ...context.Context) net.Conn {
 	var ctx context.Context
 	if len(requestCtx) > 0 {
 		ctx = requestCtx[0]
 	}
 	return &smartObservedConn{
-		ExtendedConn: bufio.NewExtendedConn(conn),
-		startedAt:    startedAt,
-		onFirstByte:  onFirstByte,
-		onClose:      onClose,
-		onRetransmit: onRetransmit,
-		onFailure:    onFailure,
-		stallTimeout: stallTimeout,
-		requestCtx:   ctx,
+		ExtendedConn:    bufio.NewExtendedConn(conn),
+		startedAt:       startedAt,
+		onFirstByte:     onFirstByte,
+		onClose:         onClose,
+		onRetransmit:    onRetransmit,
+		onFailure:       onFailure,
+		onFailureReason: onFailureReason,
+		stallTimeout:    stallTimeout,
+		requestCtx:      ctx,
 	}
 }
 
@@ -4820,7 +5104,7 @@ func (c *smartObservedConn) observeStall(generation uint64) {
 		return
 	}
 	c.stallOnce.Do(func() {
-		c.notifyFailure()
+		c.notifyFailureType("timeout")
 	})
 }
 
@@ -4843,13 +5127,23 @@ func (c *smartObservedConn) observeFailure(err error) {
 	if !isSmartStreamFailure(err, !c.firstRead.Load()) {
 		return
 	}
-	c.notifyFailure()
+	failureType := "transport"
+	if isSmartProtocolHandshakeFailure(err) {
+		failureType = "protocol"
+	}
+	c.notifyFailureType(failureType)
 }
 
 func (c *smartObservedConn) notifyFailure() {
+	c.notifyFailureType("")
+}
+
+func (c *smartObservedConn) notifyFailureType(failureType string) {
 	c.failureOnce.Do(func() {
 		c.failureNotified.Store(true)
-		if c.onFailure != nil {
+		if c.onFailureReason != nil {
+			c.onFailureReason(failureType)
+		} else if c.onFailure != nil {
 			c.onFailure()
 		}
 	})

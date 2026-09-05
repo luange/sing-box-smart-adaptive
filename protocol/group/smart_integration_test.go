@@ -189,9 +189,10 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		interruptGroup:       interruptGroupForTest(),
 		families:             trafficfamily.NewResolver(),
 	}
-	// Keep integration tests on the same policy owner as production builds.
-	// The smart_zig CI tag links the Zig backend; development builds return nil
-	// here and continue to exercise the host-only reference path.
+	// Keep integration tests on the same policy owner as production builds when
+	// the smart_zig CI tag is present. Untagged tests intentionally exercise the
+	// host-only path without constructing a production Smart outbound; packaged
+	// builds use smart_zig,production_smart.
 	smart.policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
 		Exploration:         smart.exploration,
 		SwitchMargin:        smart.switchMargin,
@@ -1016,6 +1017,43 @@ func TestSmartEndpointIDIsStableAndOpaque(t *testing.T) {
 	}
 }
 
+func TestSmartSelectionGenerationAndDialEvidence(t *testing.T) {
+	first := newSmartFakeOutbound("line-a", nil)
+	second := newSmartFakeOutbound("line-b", nil)
+	smart := newTestSmart(first, second)
+	setSmartCandidateIdentities(smart, map[string]string{
+		first.Tag():  "trojan://edge-a.example:443",
+		second.Tag(): "trojan://edge-b.example:443",
+	})
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("search.example:443")
+	siteDisplay, siteKey := smartSiteIdentity(nil, destination)
+	ranks := []smartRank{
+		{outbound: first, identity: "trojan://edge-a.example:443", policyID: smartPolicyID("trojan://edge-a.example:443"), eligible: true, status: adapter.SmartCandidateStatus{Tag: first.Tag(), EndpointID: smartEndpointID("trojan://edge-a.example:443", smartPolicyID("trojan://edge-a.example:443")), State: "healthy"}},
+		{outbound: second, identity: "trojan://edge-b.example:443", policyID: smartPolicyID("trojan://edge-b.example:443"), eligible: true, status: adapter.SmartCandidateStatus{Tag: second.Tag(), EndpointID: smartEndpointID("trojan://edge-b.example:443", smartPolicyID("trojan://edge-b.example:443")), State: "healthy"}},
+	}
+	smart.markSelected(first, networkKey, siteKey, siteDisplay, N.NetworkTCP, ranks, 0, false)
+	statusKey := smartStatusSelectionKey(networkKey, siteDisplay, N.NetworkTCP)
+	if got := smart.selectionGeneration[statusKey]; got != 1 {
+		t.Fatalf("initial selection generation=%d, want 1", got)
+	}
+	smart.recordZigSelectedEndpoint(statusKey, ranks[0].status.EndpointID)
+	smart.recordActualDial(statusKey, ranks[0].status.EndpointID, 1)
+	smart.recordZigSelectedEndpoint(statusKey, ranks[1].status.EndpointID)
+	smart.markSelected(second, networkKey, siteKey, siteDisplay, N.NetworkTCP, ranks, 1, true)
+	if got := smart.selectionGeneration[statusKey]; got != 2 {
+		t.Fatalf("failover selection generation=%d, want 2", got)
+	}
+	smart.recordActualDial(statusKey, ranks[0].status.EndpointID, 1)
+	if got := smart.selectionMismatchTotal.Load(); got != 1 {
+		t.Fatalf("selection mismatch count=%d, want 1", got)
+	}
+	status := smart.SmartStatus()
+	if status.ActualDialEndpointID != ranks[0].status.EndpointID || status.SelectionGeneration != 2 {
+		t.Fatalf("runtime dial evidence not exposed: %+v", status)
+	}
+}
+
 func TestSmartSwitchAuditIncludesEndpointIDs(t *testing.T) {
 	first := newSmartFakeOutbound("airport/HK #1", nil)
 	second := newSmartFakeOutbound("airport/HK #2", nil)
@@ -1758,6 +1796,20 @@ func TestSmartStatusCoalescesIdenticalDecision(t *testing.T) {
 	}
 }
 
+func TestSmartStatusExposesPolicyBackendContract(t *testing.T) {
+	smart := newTestSmart(newSmartFakeOutbound("first", nil))
+	status := smart.SmartStatus()
+	if status.PolicyBackend != smartPolicyBackendName() {
+		t.Fatalf("status backend=%q, want %q", status.PolicyBackend, smartPolicyBackendName())
+	}
+	if status.PolicyBackendRequired != smartPolicyBackendRequired() {
+		t.Fatalf("status backend required=%t, want %t", status.PolicyBackendRequired, smartPolicyBackendRequired())
+	}
+	if status.PolicyBackendAvailable != (smart.policyBackend != nil) {
+		t.Fatalf("status backend available=%t, actual=%t", status.PolicyBackendAvailable, smart.policyBackend != nil)
+	}
+}
+
 func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
 	local, peer := net.Pipe()
 	var failures atomic.Int32
@@ -1909,6 +1961,17 @@ func TestSmartObservedConnClassifiesErrorsThroughUnwrappedCopy(t *testing.T) {
 	}
 	if failures.Load() != 1 {
 		t.Fatalf("unwrapped copy lost protocol failure, got %d callbacks", failures.Load())
+	}
+}
+
+func TestSmartObservedConnReportsProtocolFailureType(t *testing.T) {
+	var failureType string
+	observed := newSmartObservedConnWithRetransmitReason(&smartProtocolErrorConn{err: errors.New("connection download closed: unknown version: 72")}, time.Now(), nil, nil, nil, nil, func(value string) {
+		failureType = value
+	}, 0)
+	_, _ = observed.Read(make([]byte, 1))
+	if failureType != "protocol" {
+		t.Fatalf("failure type=%q, want protocol", failureType)
 	}
 }
 

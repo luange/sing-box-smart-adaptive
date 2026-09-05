@@ -28,12 +28,13 @@ hosts; unknown profile values fall back to interactive scoring.
   transitions. It has no I/O and is deterministic for `(snapshot, now)`.
 - `lib.zig`: thin lifecycle and C ABI facade.
 
-The Go implementation remains a zero-dependency development/reference path.
-Linux release builds select the in-process Zig adapter with the `smart_zig`
-build tag after the same conformance gate; provider, routing, and API code are
-unchanged. In a `smart_zig` release, Smart construction fails if the Zig ABI
-is missing or incompatible instead of silently falling back to the Go policy.
-This makes Zig the only production decision kernel.
+The Go implementation remains a zero-dependency development/reference path for
+ordinary upstream builds. Linux release builds select the in-process Zig
+adapter with the `smart_zig` build tag after the same conformance gate; provider,
+routing, and API code are unchanged. In a `smart_zig` release, Smart
+construction fails if the Zig ABI is missing or incompatible instead of
+silently falling back to the Go policy. This makes Zig the only production
+decision kernel.
 
 Zig deliberately does not open sockets or duplicate sing-box protocol code.
 The Go host remains the network-I/O adapter that performs the actual TCP/UDP
