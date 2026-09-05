@@ -167,6 +167,36 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 }
 
+func TestLifecyclePublishStaticDirectMirrorsMemorySnapshot(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		FailureMode:   "proxy",
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1}
+	lc.BindSink(sink)
+	prefix := netip.MustParsePrefix("203.0.113.7/32")
+	if err := lc.PublishStaticDirect([]netip.Prefix{prefix, prefix}); err != nil {
+		t.Fatal(err)
+	}
+	if sink.static != 1 {
+		t.Fatalf("kernel snapshot received %d prefixes", sink.static)
+	}
+	if got := lc.Backend().LookupStatic(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
+		t.Fatal("memory snapshot did not receive direct prefix")
+	} else if got.Verdict != uint8(ebpfv3.VerdictDirect) || got.Source != uint8(ebpfv3.SourceStatic) {
+		t.Fatalf("unexpected memory policy: %+v", *got)
+	}
+	if lc.Backend().Control.PolicyGeneration != sink.gen {
+		t.Fatalf("generation diverged: memory=%d kernel=%d", lc.Backend().Control.PolicyGeneration, sink.gen)
+	}
+}
+
 func TestControlFlagsNoDefaultQUICDrop(t *testing.T) {
 	f := false
 	flags := ControlFlags(option.EBPFSharedNetworkOptions{

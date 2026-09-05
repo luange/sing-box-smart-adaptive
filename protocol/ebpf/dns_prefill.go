@@ -45,6 +45,14 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	if i == nil || len(addresses) == 0 {
 		return
 	}
+	// DNSAnswerObserver intentionally carries no client/source identity.  A
+	// source-sensitive PBR policy (MAC/source/VLAN) therefore cannot safely use
+	// a process-wide IP→DIRECT hint: another client may resolve the same CDN IP
+	// to a different policy.  Keep the DNS path fail-open and wait for a
+	// source-aware observer instead of publishing an unsafe global bypass.
+	if !i.dnsPrefillIdentitySafe() {
+		return
+	}
 	// FakeIP answers use the shared-network backend synchronously, but they
 	// still need to participate in the same lifecycle barrier as asynchronous
 	// real-DNS prefill work.  Without admission here, Close could clear
@@ -157,9 +165,17 @@ func (i *Inbound) v3FakeIPEnabled() bool {
 	return po.Enabled && po.FakeIP
 }
 
+// dnsPrefillIdentitySafe reports whether a global DNS/IP hint can be promoted.
+// The observer ABI has no source identity, while mac_source_policy explicitly
+// enables source-sensitive policy matching.  Rejecting promotion is the safe
+// boundary; DNS resolution itself is unaffected.
+func (i *Inbound) dnsPrefillIdentitySafe() bool {
+	return i != nil && !i.sharedOptions.PolicyOffload.MACSourcePolicy
+}
+
 // onFakeIPAnswer publishes authoritative FakeIP → kernel DNS hint (design §8.1).
 func (i *Inbound) onFakeIPAnswer(addresses []netip.Addr) {
-	if !i.v3FakeIPEnabled() || i.sharedNetwork == nil {
+	if !i.v3FakeIPEnabled() || i.sharedNetwork == nil || !i.dnsPrefillIdentitySafe() {
 		return
 	}
 	ttl := i.dnsPrefill.ttl
@@ -231,6 +247,12 @@ func prefixBits(addr netip.Addr) int {
 // Registers for dns_prefill and/or engine=v3 policy_offload DNS/FakeIP hints.
 func (i *Inbound) wireDNSPrefill() {
 	if i == nil {
+		return
+	}
+	if !i.dnsPrefillIdentitySafe() {
+		if i.logger != nil {
+			i.logger.Warn("eBPF DNS/IP hint promotion disabled: source-sensitive policy requires a source-aware observer")
+		}
 		return
 	}
 	needObserver := i.dnsPrefill.enabled || i.v3DNSHintEnabled() || i.v3FakeIPEnabled()

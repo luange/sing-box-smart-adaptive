@@ -579,7 +579,11 @@ func (s *sharedNetwork) revokeExactFlow(protocol uint8, client, dest netip.AddrP
 	if s == nil || !client.IsValid() || !dest.IsValid() {
 		return
 	}
-	if s.v3 != nil {
+	// A v3 lifecycle is created before the kernel backend is prepared.  If
+	// preparation fails Start falls back to v2 but deliberately keeps the
+	// lifecycle for close-time cleanup.  Never use that stale control model for
+	// a v2 revoke: the tuple only exists in the v2 backend in that state.
+	if s.engineV3 && s.v3 != nil {
 		if err := s.v3.RevokeFlow(client, dest, protocol); err != nil {
 			s.parent.logger.Debug("eBPF v3 flow revoke: ", err)
 		}
@@ -597,7 +601,10 @@ func (s *sharedNetwork) learnV3Flow(protocol uint8, client, dest netip.AddrPort)
 	if s == nil || !client.IsValid() || !dest.IsValid() {
 		return
 	}
-	if s.v3 != nil {
+	// See revokeExactFlow: engineV3 is the authoritative dataplane selection.
+	// The lifecycle may outlive a failed v3 prepare, but must not absorb learns
+	// while the live backend is v2.
+	if s.engineV3 && s.v3 != nil {
 		if err := s.v3.LearnFlow(client, dest, protocol, true, time.Now()); err != nil {
 			s.parent.logger.Debug("eBPF v3 flow learn skipped: ", err)
 		}
@@ -665,12 +672,16 @@ func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error
 	outbounds := service.FromContext[adapter.OutboundManager](s.parent.ctx)
 	prefixes := collectV3StaticPrefixes(parent, routeRouter, outbounds)
 	s.staticDirect = prefixes
-	if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
+	if s.engineV3 && s.v3 != nil {
+		// Publish through Lifecycle so the in-process policy banks and the live
+		// kernel inactive bank are committed as one control-plane operation.
+		// Directly calling the backend here used to leave the memory model empty
+		// while only its generation was updated.
+		if err := s.v3.PublishStaticDirect(prefixes); err != nil {
+			return err
+		}
+	} else if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
 		return err
-	}
-	// Keep memory model generation aligned when sink is bound via lifecycle.
-	if s.v3 != nil {
-		s.v3.SyncPolicyGeneration(s.backend.PolicyGeneration())
 	}
 	s.parent.logger.Info("eBPF v3 static policy published: prefixes=", len(prefixes))
 	return nil

@@ -8,16 +8,39 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/netlink"
+	ECommon "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/option"
+	ebpfv3 "github.com/sagernet/sing-box/protocol/ebpf/v3"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"golang.org/x/sys/unix"
 )
+
+// sharedDataplaneStub embeds the full production surface so these tests only
+// need to observe the tuple operations relevant to v2 fallback.  A lifecycle
+// can remain allocated after v3 prepare fails; engineV3 must decide which
+// writer is authoritative.
+type sharedDataplaneStub struct {
+	ECommon.SharedDataplane
+	puts    int
+	deletes int
+}
+
+func (s *sharedDataplaneStub) PutDirectFlow(uint8, netip.AddrPort, netip.AddrPort, time.Duration) error {
+	s.puts++
+	return nil
+}
+
+func (s *sharedDataplaneStub) DeleteDirectFlow(uint8, netip.AddrPort, netip.AddrPort) error {
+	s.deletes++
+	return nil
+}
 
 type transparentPacketConnStub struct {
 	err    atomic.Value
@@ -111,6 +134,22 @@ func TestNormalizeSharedNetworkOptions(t *testing.T) {
 	}
 	if options.DataPlane != sharedNetworkDataPlaneSocketAssign {
 		t.Fatalf("expected socket_assign default, got %q", options.DataPlane)
+	}
+}
+
+func TestV2FallbackIgnoresStaleV3Lifecycle(t *testing.T) {
+	backend := &sharedDataplaneStub{}
+	shared := &sharedNetwork{
+		engineV3: false, // v3 prepare failed; Start selected the v2 backend.
+		v3:       &ebpfv3.Lifecycle{},
+		backend:  backend,
+	}
+	client := netip.MustParseAddrPort("192.0.2.2:53000")
+	dest := netip.MustParseAddrPort("198.51.100.7:443")
+	shared.learnV3Flow(ECommon.ProtocolTCP, client, dest)
+	shared.revokeExactFlow(ECommon.ProtocolTCP, client, dest)
+	if backend.puts != 1 || backend.deletes != 1 {
+		t.Fatalf("v2 fallback did not use backend: puts=%d deletes=%d", backend.puts, backend.deletes)
 	}
 }
 

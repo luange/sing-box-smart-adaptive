@@ -1068,9 +1068,22 @@ func (b *SharedNetworkBackend) V3Stats() ([]uint64, uint32, uint32) {
 	return nil, 0, 0
 }
 func (b *SharedNetworkBackend) DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error {
-	// v2 has no per-tuple delete; generation bump via InvalidateFlowDirect is the revoke path.
-	_ = protocol
-	_ = source
-	_ = destination
+	if b == nil {
+		return osErrClosed
+	}
+	key, err := makeSharedNetworkFlowKey(protocol, source, destination)
+	if err != nil {
+		return err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	if err := deleteMap(int(b.runtime.flow_direct_map_fd), unsafe.Pointer(&key)); err != nil && !errors.Is(err, syscall.ENOENT) {
+		return E.Cause(err, "delete shared-network direct flow")
+	}
 	return nil
 }

@@ -185,6 +185,50 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	return len(direct), len(rej), nil
 }
 
+// PublishStaticDirect replaces the complete DIRECT prefix snapshot in both
+// control-plane representations.  The protocol/ebpf parent already resolved
+// these prefixes from its route and rule-set state, so there is no CompileInput
+// to validate here.  Kernel publication happens first (the fail-closed side),
+// then the memory model is committed with the same bank-flip semantics for
+// tests, diagnostics, and later generation invalidation.
+func (l *Lifecycle) PublishStaticDirect(prefixes []netip.Prefix) error {
+	if l == nil || l.backend == nil {
+		return fmt.Errorf("nil lifecycle")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	normalized := make([]netip.Prefix, 0, len(prefixes))
+	seen := make(map[netip.Prefix]struct{}, len(prefixes))
+	policies := make([]ebpfv3.CompiledPolicy, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		prefix = prefix.Masked()
+		if !prefix.IsValid() {
+			continue
+		}
+		if _, loaded := seen[prefix]; loaded {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		normalized = append(normalized, prefix)
+		policies = append(policies, ebpfv3.CompiledPolicy{
+			Prefix: prefix,
+			Value: ebpfv3.PolicyValue{
+				Verdict:    uint8(ebpfv3.VerdictDirect),
+				Source:     uint8(ebpfv3.SourceStatic),
+				Confidence: ebpfv3.ConfidenceStrong,
+				ReasonCode: uint16(ebpfv3.ReasonStaticDirect),
+			},
+		})
+	}
+	if l.sink != nil {
+		if err := l.sink.PublishStaticDirect(normalized, 0, 0); err != nil {
+			return err
+		}
+	}
+	return l.backend.PublishStatic(policies)
+}
+
 // LearnFlow publishes exact-flow verdict after userspace bare-direct route.
 func (l *Lifecycle) LearnFlow(client, dest netip.AddrPort, protocol uint8, bareDirect bool, now time.Time) error {
 	if l == nil || l.backend == nil {

@@ -2,7 +2,11 @@
 
 package ebpf
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sagernet/sing-box/option"
+)
 
 func TestDNSPrefillAdmissionIsBounded(t *testing.T) {
 	var inbound Inbound
@@ -27,5 +31,20 @@ func TestDNSPrefillAdmissionIsBounded(t *testing.T) {
 	inbound.dnsPrefillClosed.Store(true)
 	if inbound.acquireDNSPrefillSlot() {
 		t.Fatal("closed prefill admission accepted new work")
+	}
+}
+
+func TestDNSPrefillRejectsSourceSensitiveGlobalPromotion(t *testing.T) {
+	inbound := &Inbound{
+		sharedOptions: option.EBPFSharedNetworkOptions{
+			PolicyOffload: option.EBPFPolicyOffloadOptions{MACSourcePolicy: true},
+		},
+	}
+	if inbound.dnsPrefillIdentitySafe() {
+		t.Fatal("source-sensitive policy must not publish global DNS/IP hints")
+	}
+	plain := &Inbound{}
+	if !plain.dnsPrefillIdentitySafe() {
+		t.Fatal("plain policy should allow DNS/IP hints")
 	}
 }
