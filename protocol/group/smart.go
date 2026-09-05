@@ -4841,12 +4841,12 @@ func isSmartStreamFailure(err error, _ ...bool) bool {
 	return isSmartProtocolHandshakeFailure(err)
 }
 
-// isSmartProtocolHandshakeFailure recognizes errors emitted by the protocol
-// readers after DialContext has already returned.  This is deliberately a
-// small, explicit set: application HTTP status codes, normal EOF, generic
-// crypto errors and arbitrary remote text must not evict a node.  The caller
-// additionally requires that no valid downstream byte has been observed, so
-// these markers describe a failed proxy handshake rather than a service error.
+// isSmartProtocolHandshakeFailure recognizes errors emitted by protocol
+// readers after DialContext or ListenPacket has already returned.  The list is
+// intentionally explicit and covers both the normal and slim-build-disabled
+// protocol modules.  Application HTTP status codes, normal EOF, generic TLS
+// errors and arbitrary remote text must not evict a node; only a protocol
+// parser/authenticator sentinel is strong enough to do so.
 func isSmartProtocolHandshakeFailure(err error) bool {
 	if err == nil {
 		return false
@@ -4856,30 +4856,119 @@ func isSmartProtocolHandshakeFailure(err error) bool {
 		return false
 	}
 	markers := []string{
+		// VLESS / VMess.
 		"unknown version:",
 		"unknown version ",
 		"unknown protobuf message header",
 		"unknown command:",
 		"unknown command ",
+		"unknown uuid:",
+		"unknown flow:",
+		"flow mismatch",
 		"bad response header",
 		"bad length chunk",
 		"bad session status",
+		"bad network:",
+		"bad packet connection",
 		"bad header type",
 		"bad client session id",
 		"bad request salt",
 		"bad timestamp",
 		"bad request:",
 		"vmess: invalid chunk checksum",
+		"vmess: unsupported security type",
+		"vision: not a valid supported tls connection",
+
+		// Trojan and Shadowsocks (including Shadowsocks 2022).
+		"bad request size",
 		"snell: bad header",
+		"salt not unique",
+		"server session changed more than once during the last minute",
+		"shadowsocks: unsupported method",
+
+		// TUIC / Hysteria / Hysteria2.  UDP capability errors are transport
+		// scoped by the caller, so they do not evict TCP candidates.
 		"authentication:",
 		"authentication timeout",
+		"unsupported stream command",
+		"invalid dissociate message",
+		"invalid message",
+		"unsupported client version",
+		"authentication failed, auth_str=",
+		"unknown session id:",
+		"udp disabled by server",
+		"udp session id duplicated",
+
+		// SOCKS and HTTP CONNECT upstreams.
+		"unknown socks version:",
+		"socks5: incorrect user name or password",
+		"socks5: unsupported auth method:",
+		"socks4: authentication failed",
+		"socks5: authentication failed",
+		"socks4: udp unsupported",
+		"socks4: unsupported command",
+		"socks5: unsupported command",
+		"http: authentication failed",
+
+		// Snell.
+		"snell: reserved header",
+		"snell: unsupported command",
+		"snell: bad user key",
+		"snell: invalid udp tunnel request",
+		"snell: duplicated salt",
+		"snell: server error ",
+
+		// SSH and VPN protocols that can fail after their underlying socket
+		// has connected.  WireGuard/Tailscale readiness errors are returned
+		// from Dial/ListenPacket and are already counted by the caller.
+		"ssh: handshake failed",
+		"ssh: unable to authenticate",
+		"ssh: host key mismatch",
+		"ssh: no common algorithm",
+		"ssh: no authentication methods",
+		"host key mismatch",
+		"no shared cipher",
+		"cipher negotiation failed with peer",
+		"negotiated cipher not allowed",
+		"unsupported openvpn protocol",
+		"invalid tls control packet",
+		"invalid tls-crypt packet",
+		"invalid tls-auth packet",
+		"invalid tls-crypt-v2 packet",
+		"invalid tls-crypt-v2 wrapped key",
+		"missing tls-crypt-v2 wrapped client key",
+		"peer wants tls-crypt-v2 but no server key is present",
+		"tls-crypt-v2 client key authentication failed",
+		"invalid tls data packet",
+		"invalid tls data packet hmac",
+		"replayed tls data packet",
+		"invalid tls stream data packet hmac",
+		"replayed tls stream data packet",
+		"invalid gcm ciphertext",
+		"invalid gcm payload",
+		"replayed gcm packet",
+		"invalid static key payload",
+		"invalid static key payload hmac",
+		"replayed static key data packet",
+		"invalid static key packet id",
+		"invalid openvpn push reply fields",
+		"invalid openconnect authentication response",
+		"invalid openconnect browser authentication result",
+		"protocol behavior is not supported",
+		"invalid cstp packet header",
+		"invalid cstp http headers",
+		"invalid cstp http status",
+		"received unknown cstp packet type",
+
+		// Naive / AnyTLS / other optional transports.
 		"v2ray-http: unexpected status:",
 		"v2ray-http-upgrade: unexpected status:",
 		"v2ray-grpc: unexpected status:",
 		"anytls: authentication failed",
 		"anytls: remote:",
+		"unknown user password",
+		"authentication failed:",
 		"authentication failed, status code:",
-		"tls-crypt-v2 client key authentication failed",
 		"message authentication failed",
 		"remote error:",
 	}
@@ -4888,10 +4977,15 @@ func isSmartProtocolHandshakeFailure(err error) bool {
 			return true
 		}
 	}
-	// Shadowsocks/2022 and VMess use these exact sentinel messages.  Restrict
-	// them to the pre-first-byte phase above; after a real response they could
-	// just be an application-level message and must remain site-local.
-	return message == "bad header" || message == "invalid request"
+	// Shadowsocks/2022, VMess, OpenConnect and OpenVPN also expose exact
+	// sentinel messages.  Keep these exact (rather than substring) matches so a
+	// target application response cannot accidentally open a node breaker.
+	switch message {
+	case "bad header", "invalid request", "bad request", "bad version", "replayed request", "authentication failed", "authentication required", "authorization failed":
+		return true
+	default:
+		return false
+	}
 }
 
 // smartObservedPacketConn turns real transactional UDP blackholes into Smart
@@ -4972,6 +5066,7 @@ func (c *smartObservedPacketConn) observeWrite(count int) {
 func (c *smartObservedPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 	count, source, err := c.PacketConn.ReadFrom(payload)
 	c.observeRead(count)
+	c.observePacketFailure(err)
 	return count, source, err
 }
 
@@ -4979,9 +5074,8 @@ func (c *smartObservedPacketConn) WriteTo(payload []byte, destination net.Addr) 
 	count, err := c.PacketConn.WriteTo(payload, destination)
 	if err == nil {
 		c.observeWrite(count)
-	} else if c.expectResponse && isSmartPacketFailure(err) {
-		c.stopWatchdog()
-		c.notifyNoResponse(time.Since(c.startedAt))
+	} else {
+		c.observePacketFailure(err)
 	}
 	return count, err
 }
@@ -5045,6 +5139,21 @@ func (c *smartObservedPacketConn) notifyNoResponse(elapsed time.Duration) {
 	})
 }
 
+func (c *smartObservedPacketConn) observePacketFailure(err error) {
+	if err == nil {
+		return
+	}
+	// Network failures only have node-level meaning for a transactional UDP
+	// flow that is waiting for a response.  Protocol sentinels are different:
+	// they prove that the proxy/VPN peer rejected or could not decode the
+	// session, even for one-way UDP, and must be fed into the same breaker.
+	if !isSmartProtocolHandshakeFailure(err) && (!c.expectResponse || !isSmartPacketFailure(err)) {
+		return
+	}
+	c.stopWatchdog()
+	c.notifyNoResponse(time.Since(c.startedAt))
+}
+
 func isSmartPacketFailure(err error) bool {
 	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return false
@@ -5075,6 +5184,7 @@ func (c *smartObservedPacketReaderConn) ReadPacket(buffer *buf.Buffer) (M.Socksa
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
 	c.observeRead(buffer.Len() - before)
+	c.observePacketFailure(err)
 	return destination, err
 }
 
@@ -5088,9 +5198,8 @@ func (c *smartObservedPacketWriterConn) WritePacket(buffer *buf.Buffer, destinat
 	err := c.writer.WritePacket(buffer, destination)
 	if err == nil {
 		c.observeWrite(count)
-	} else if c.expectResponse && isSmartPacketFailure(err) {
-		c.stopWatchdog()
-		c.notifyNoResponse(time.Since(c.startedAt))
+	} else {
+		c.observePacketFailure(err)
 	}
 	return err
 }
@@ -5105,6 +5214,7 @@ func (c *smartObservedExtendedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Sock
 	before := buffer.Len()
 	destination, err := c.reader.ReadPacket(buffer)
 	c.observeRead(buffer.Len() - before)
+	c.observePacketFailure(err)
 	return destination, err
 }
 
@@ -5113,9 +5223,8 @@ func (c *smartObservedExtendedPacketConn) WritePacket(buffer *buf.Buffer, destin
 	err := c.writer.WritePacket(buffer, destination)
 	if err == nil {
 		c.observeWrite(count)
-	} else if c.expectResponse && isSmartPacketFailure(err) {
-		c.stopWatchdog()
-		c.notifyNoResponse(time.Since(c.startedAt))
+	} else {
+		c.observePacketFailure(err)
 	}
 	return err
 }

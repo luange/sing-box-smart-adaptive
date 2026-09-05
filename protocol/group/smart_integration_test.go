@@ -605,9 +605,14 @@ func TestSmartProbeCoversEveryCandidateRegardlessOfGroupSize(t *testing.T) {
 
 type smartObservedTestPacketConn struct {
 	response []byte
+	readErr  error
+	writeErr error
 }
 
 func (c *smartObservedTestPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
+	if c.readErr != nil {
+		return 0, nil, c.readErr
+	}
 	if len(c.response) == 0 {
 		return 0, nil, net.ErrClosed
 	}
@@ -615,7 +620,10 @@ func (c *smartObservedTestPacketConn) ReadFrom(payload []byte) (int, net.Addr, e
 	return count, &net.UDPAddr{}, nil
 }
 
-func (*smartObservedTestPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+func (c *smartObservedTestPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	return len(payload), nil
 }
 
@@ -641,6 +649,42 @@ func TestSmartTransactionalUDPNoResponseReportsOnce(t *testing.T) {
 	}
 	if failures.Load() != 1 {
 		t.Fatalf("transactional UDP failure count=%d, want 1", failures.Load())
+	}
+}
+
+func TestSmartTransactionalUDPClassifiesProtocolErrors(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		expectResponse bool
+		wantFailure    bool
+		readErr        error
+		writeErr       error
+	}{
+		{name: "read", expectResponse: true, wantFailure: true, readErr: errors.New("authentication failed, auth_str=bad")},
+		{name: "write", wantFailure: true, writeErr: errors.New("UDP disabled by server")},
+		{name: "one way", writeErr: errors.New("connection refused")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var failures atomic.Int64
+			conn := newSmartObservedPacketConn(&smartObservedTestPacketConn{
+				readErr:  test.readErr,
+				writeErr: test.writeErr,
+			}, time.Now(), test.expectResponse, func(time.Duration) {
+				failures.Add(1)
+			})
+			if test.readErr != nil {
+				_, _, _ = conn.ReadFrom(make([]byte, 32))
+			} else {
+				_, _ = conn.WriteTo([]byte("payload"), &net.UDPAddr{})
+			}
+			want := int64(0)
+			if test.wantFailure {
+				want = 1
+			}
+			if failures.Load() != want {
+				t.Fatalf("protocol UDP failure count=%d, want %d", failures.Load(), want)
+			}
+		})
 	}
 }
 
@@ -1665,18 +1709,78 @@ func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
 
 func TestSmartObservedConnClassifiesProtocolHandshakeFailures(t *testing.T) {
 	positive := []string{
+		// VLESS / VMess.
 		"connection download closed: unknown version: 72",
 		"bad response header",
 		"vmess: invalid chunk checksum",
 		"bad header type",
 		"unknown protobuf message header: 9",
+		"unknown UUID: deadbeef",
+		"unknown flow: xtls-rprx-vision",
+		"bad version",
+		"replayed request",
+
+		// Trojan / Shadowsocks / Shadowsocks 2022.
+		"bad request size",
+		"salt not unique",
+		"server session changed more than once during the last minute",
+		"shadowsocks: unsupported method chacha20",
+
+		// TUIC / Hysteria / Hysteria2.
 		"v2ray-http: unexpected status: 502 Bad Gateway",
 		"v2ray-grpc: unexpected status: 403 Forbidden",
 		"hysteria2: authentication failed, status code: 401",
 		"authentication: token mismatch",
+		"authentication failed, auth_str=deadbeef",
+		"unsupported stream command 9",
+		"invalid dissociate message",
+		"unknown session ID: 7",
+		"UDP disabled by server",
+
+		// SOCKS / HTTP CONNECT.
+		"unknown socks version: 4",
+		"socks5: incorrect user name or password",
+		"socks5: unsupported auth method: 2",
+		"socks4: authentication failed, username=bad",
+		"socks5: authentication failed, username=bad",
+		"socks4: udp unsupported",
+		"socks5: unsupported command 3",
+		"authentication required",
+		"http: authentication failed, no Proxy-Authorization header",
+
+		// Snell / SSH / OpenVPN / OpenConnect.
+		"snell: bad header version",
+		"snell: unsupported command",
+		"snell: invalid udp tunnel request",
+		"snell: server error 2: bad key",
+		"ssh: handshake failed: ssh: no common algorithm",
+		"ssh: unable to authenticate, attempted methods none",
+		"host key mismatch, server send ssh-ed25519",
+		"no shared cipher",
+		"cipher negotiation failed with peer",
+		"invalid tls-crypt packet",
+		"invalid tls-auth packet",
+		"invalid tls-crypt-v2 packet",
+		"invalid tls data packet hmac",
+		"replayed tls stream data packet",
+		"invalid gcm payload",
+		"invalid static key payload hmac",
+		"invalid OpenVPN push reply fields",
+		"invalid openconnect authentication response",
+		"invalid openconnect browser authentication result",
+		"protocol behavior is not supported",
+		"invalid CSTP packet header",
+		"invalid CSTP HTTP headers",
+		"invalid CSTP HTTP status line",
+		"received unknown CSTP packet type",
+		"authentication failed",
+		"authorization failed",
+
+		// AnyTLS and the QUIC protocol error envelope.
 		"cipher: message authentication failed",
 		"remote error: authentication failed",
 		"anytls: remote: invalid session",
+		"unknown user password",
 		"invalid request",
 	}
 	for _, message := range positive {
@@ -1688,8 +1792,13 @@ func TestSmartObservedConnClassifiesProtocolHandshakeFailures(t *testing.T) {
 	negative := []string{
 		"403 Forbidden",
 		"429 Too Many Requests",
+		"unexpected status: 502 Bad Gateway",
+		"method not allowed",
+		"socks5: request rejected, code=5",
 		"connection closed by peer",
 		"remote EOF",
+		"tls: bad certificate",
+		"x509: certificate signed by unknown authority",
 		"i/o timeout",
 		"context deadline exceeded",
 	}
