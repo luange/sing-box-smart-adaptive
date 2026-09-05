@@ -327,6 +327,7 @@ func (s *sharedNetwork) Start(parentBackend *ECommon.Backend) error {
 		if err = s.publishV3StaticFromParent(parentBackend); err != nil {
 			return E.Errors(E.Cause(err, "publish eBPF v3 static policy"), s.Close())
 		}
+		s.probeXDP(parentBackend)
 	}
 	if s.dataPlane == sharedNetworkDataPlaneSocketAssign {
 		if err = s.registerListenerSockets(); err != nil {
@@ -738,6 +739,31 @@ func (s *sharedNetwork) publishV3MACPolicies(routeRouter adapter.Router) error {
 		entries = append(entries, ebpfv3.MACPolicyEntry{Key: key, Value: value})
 	}
 	return s.v3.PublishMACSourcePolicies(entries)
+}
+
+// probeXDP reports whether the installed kernel/driver supports native or
+// skb XDP on the shared-network interfaces when the user explicitly enabled
+// the experimental xdp block. It never installs a dataplane and never affects
+// forwarding: the AF_XDP host adapter is still pending, so TC stays the live
+// path. The result is logged so deployments on uncertain hardware (virtual
+// NICs, older drivers) get an authoritative answer instead of silent failure.
+func (s *sharedNetwork) probeXDP(parentBackend *ECommon.Backend) {
+	if s == nil || s.parent == nil || !s.parent.sharedOptions.XDP.Enabled {
+		return
+	}
+	for _, iface := range s.interfaces {
+		nativeOK, skbOK, err := ECommon.XDPModeSupport(iface)
+		switch {
+		case err != nil:
+			s.parent.logger.Warn("eBPF XDP capability probe failed on ", iface, ": ", err)
+		case nativeOK:
+			s.parent.logger.Info("eBPF XDP capability on ", iface, ": native supported (skb=", skbOK, "); AF_XDP host adapter pending, TC dataplane unchanged")
+		case skbOK:
+			s.parent.logger.Info("eBPF XDP capability on ", iface, ": skb mode only; AF_XDP host adapter pending, TC dataplane unchanged")
+		default:
+			s.parent.logger.Warn("eBPF XDP not supported by kernel/driver on ", iface, "; continuing with TC dataplane")
+		}
+	}
 }
 
 // RefreshV3Static republishes bypass prefixes after rule-set reload.

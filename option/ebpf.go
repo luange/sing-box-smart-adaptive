@@ -88,8 +88,9 @@ type EBPFSharedNetworkOptions struct {
 	// FailureMode controls map-miss / assign-failure behavior for v3.
 	// Only "proxy" (NEED_USERSPACE) is supported — never silent DIRECT.
 	FailureMode string `json:"failure_mode,omitempty" enum:"proxy"`
-	// XDP is a reserved opt-in DIRECT accelerator layered beside TC v3.  It is
-	// rejected by v3 migration until the Linux AF_XDP host adapter is wired, so
+	// XDP is an experimental opt-in DIRECT accelerator layered beside TC v3.
+	// Enabling it only triggers a capability probe at startup: unsupported
+	// hardware logs a warning and continues on TC, and the AF_XDP host adapter
 	// a configuration cannot claim an accelerator that is not running.
 	XDP EBPFXDPOptions `json:"xdp,omitempty"`
 }

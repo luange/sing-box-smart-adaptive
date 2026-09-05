@@ -37,6 +37,18 @@
 #ifndef XDP_FLAGS_UPDATE_IF_NOEXIST
 #define XDP_FLAGS_UPDATE_IF_NOEXIST (1U << 0)
 #endif
+#ifndef XDP_ATTACHED_NONE
+#define XDP_ATTACHED_NONE 0
+#endif
+#ifndef XDP_ATTACHED_DRV
+#define XDP_ATTACHED_DRV 1
+#endif
+#ifndef XDP_ATTACHED_SKB
+#define XDP_ATTACHED_SKB 2
+#endif
+#ifndef XDP_ATTACHED_HW
+#define XDP_ATTACHED_HW 3
+#endif
 #ifndef XDP_FLAGS_SKB_MODE
 #define XDP_FLAGS_SKB_MODE (1U << 1)
 #endif
@@ -574,4 +586,63 @@ int sb_ebpf_xdp_close(struct sb_ebpf_xdp_runtime *runtime) {
 	runtime->queue_count = 0U;
 	runtime->xsk_bound_mask = 0U;
 	return result;
+}
+
+/* ── Hardware capability probe (no data plane) ──────────────────────────
+ * Loads a two-instruction XDP program (r0 = XDP_PASS; exit) and briefly
+ * attaches it to the target interface in native and then skb mode, reading
+ * back the effective attach mode through netlink. This answers "does this
+ * kernel + driver support XDP at all, and in which mode?" without routing
+ * any traffic through sing-box: the program passes every packet to the
+ * stack exactly as an unattached interface would. */
+int sb_ebpf_xdp_probe_hardware(uint32_t ifindex, int *native_ok, int *skb_ok) {
+	if (ifindex == 0U || native_ok == NULL || skb_ok == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	*native_ok = 0;
+	*skb_ok = 0;
+
+	/* struct bpf_insn r0 = 2 (XDP_PASS); exit; */
+	static const struct {
+		uint8_t code;
+		uint8_t dst_reg : 4;
+		uint8_t src_reg : 4;
+		uint16_t off;
+		int32_t imm;
+	} program[] = {
+		{0xb7, 0, 0, 0, 2}, /* BPF_ALU64 | BPF_MOV | BPF_K */
+		{0x95, 0, 0, 0, 0}, /* BPF_JMP | BPF_EXIT */
+	};
+	union bpf_attr attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.prog_type = BPF_PROG_TYPE_XDP;
+	attr.insns = (uint64_t)(uintptr_t)program;
+	attr.insn_cnt = 2;
+	attr.license = (uint64_t)(uintptr_t)"GPL";
+	int program_fd = (int)xdp_bpf_sys(BPF_PROG_LOAD, &attr);
+	if (program_fd < 0)
+		return -1; /* kernel without usable BPF/XDP syscall support */
+
+	int probe_errno = 0;
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		uint32_t mode_flags = attempt == 0 ? (uint32_t)XDP_FLAGS_DRV_MODE : (uint32_t)XDP_FLAGS_SKB_MODE;
+		if (xdp_set_link_fd(ifindex, program_fd, mode_flags) == 0) {
+			int attached = xdp_get_attached_mode(ifindex);
+			if (attempt == 0)
+				*native_ok = attached > 0;
+			else
+				*skb_ok = attached > 0;
+			(void)xdp_set_link_fd(ifindex, -1, mode_flags);
+		} else if (attempt == 0) {
+			probe_errno = errno;
+		}
+	}
+	if (xdp_close_fd(&program_fd) != 0 && probe_errno == 0)
+		probe_errno = errno;
+	if (probe_errno != 0) {
+		errno = probe_errno;
+		return -1;
+	}
+	return 0;
 }

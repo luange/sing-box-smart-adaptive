@@ -34,9 +34,10 @@ func NormalizeSharedNetwork(options option.EBPFSharedNetworkOptions) (option.EBP
 		return options, nil
 	case EngineV3:
 		options.Engine = EngineV3
-		if options.XDP.Enabled {
-			return options, E.New("shared_network.xdp.enabled is reserved until the Linux AF_XDP host adapter is available; keep xdp.enabled=false")
-		}
+		// xdp.enabled is an explicit experimental opt-in: startup probes the
+		// kernel/driver capability and only reports it. The AF_XDP host
+		// adapter (umem/XSK rings) is not wired yet, so the live packet path
+		// remains TC in this release; probing never affects forwarding.
 	default:
 		return options, E.New("shared_network.engine must be v2 or v3, got ", options.Engine)
 	}

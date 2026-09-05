@@ -87,6 +87,19 @@ typedef struct {
     uint8_t manual_failure;
 } adaptive_engine_config;
 
+/* Adaptive kernel reason codes (adaptive_decision.reason). */
+enum {
+    ADAPTIVE_REASON_RANKED = 0,
+    ADAPTIVE_REASON_RETAINED = 1,
+    ADAPTIVE_REASON_LEASE = 2,
+    ADAPTIVE_REASON_MANUAL = 3,
+    ADAPTIVE_REASON_FALLBACK = 4,
+    ADAPTIVE_REASON_NO_CANDIDATE = 5,
+    ADAPTIVE_REASON_BULK_SPREAD = 6,
+    ADAPTIVE_REASON_BULK_THROUGHPUT = 7,
+    ADAPTIVE_REASON_COOLDOWN = 8,
+};
+
 typedef struct {
     uint64_t selected_id;
     uint8_t switched;

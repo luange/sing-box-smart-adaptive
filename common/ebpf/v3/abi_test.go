@@ -48,3 +48,107 @@ func TestClampCapacity(t *testing.T) {
 		t.Fatal("max")
 	}
 }
+
+// TestABIFieldOffsets pins field offsets, not just sizes: reordering fields
+// of equal total size would pass every size test and silently corrupt
+// verdicts. Values must match abi.h _Static_assert-verified layouts.
+func TestABIFieldOffsets(t *testing.T) {
+	type offsetCheck struct {
+		name string
+		got  uintptr
+		want uintptr
+	}
+	var _ = offsetCheck{}
+	assertOffset(t, "Control.ABIVersion", unsafe.Offsetof(Control{}.ABIVersion), 0)
+	assertOffset(t, "Control.Enabled", unsafe.Offsetof(Control{}.Enabled), 4)
+	assertOffset(t, "Control.Flags", unsafe.Offsetof(Control{}.Flags), 8)
+	assertOffset(t, "Control.ActiveBank", unsafe.Offsetof(Control{}.ActiveBank), 12)
+	assertOffset(t, "Control.PolicyGeneration", unsafe.Offsetof(Control{}.PolicyGeneration), 16)
+	assertOffset(t, "PolicyValue.Verdict", unsafe.Offsetof(PolicyValue{}.Verdict), 0)
+	assertOffset(t, "PolicyValue.ReasonCode", unsafe.Offsetof(PolicyValue{}.ReasonCode), 4)
+	assertOffset(t, "PolicyValue.MatchProtocol", unsafe.Offsetof(PolicyValue{}.MatchProtocol), 6)
+	assertOffset(t, "PolicyValue.MatchDPortMin", unsafe.Offsetof(PolicyValue{}.MatchDPortMin), 8)
+	assertOffset(t, "PolicyValue.MatchDPortMax", unsafe.Offsetof(PolicyValue{}.MatchDPortMax), 10)
+	assertOffset(t, "PolicyValue.PolicyID", unsafe.Offsetof(PolicyValue{}.PolicyID), 12)
+	assertOffset(t, "PolicyValue.Generation", unsafe.Offsetof(PolicyValue{}.Generation), 16)
+	assertOffset(t, "FlowKey.Family", unsafe.Offsetof(FlowKey{}.Family), 0)
+	assertOffset(t, "FlowKey.Direction", unsafe.Offsetof(FlowKey{}.Direction), 2)
+	assertOffset(t, "FlowKey.SPort", unsafe.Offsetof(FlowKey{}.SPort), 4)
+	assertOffset(t, "FlowKey.DPort", unsafe.Offsetof(FlowKey{}.DPort), 6)
+	assertOffset(t, "FlowKey.SAddr", unsafe.Offsetof(FlowKey{}.SAddr), 8)
+	assertOffset(t, "FlowKey.DAddr", unsafe.Offsetof(FlowKey{}.DAddr), 24)
+	assertOffset(t, "DNSIPValue.DirectRefs", unsafe.Offsetof(DNSIPValue{}.DirectRefs), 0)
+	assertOffset(t, "DNSIPValue.ProxyRefs", unsafe.Offsetof(DNSIPValue{}.ProxyRefs), 4)
+	assertOffset(t, "MACKey.Ifindex", unsafe.Offsetof(MACKey{}.Ifindex), 8)
+	assertOffset(t, "MACPolicyValue.PolicyID", unsafe.Offsetof(MACPolicyValue{}.PolicyID), 8)
+	assertOffset(t, "MACPolicyValue.Generation", unsafe.Offsetof(MACPolicyValue{}.Generation), 12)
+}
+
+func assertOffset(t *testing.T, name string, got, want uintptr) {
+	t.Helper()
+	if got != want {
+		t.Fatalf("%s offset=%d want %d", name, got, want)
+	}
+}
+
+// TestABIEnumValues pins the cross-language enum contract: the kernel switch
+// statements and the Go publishers must agree on every value, not just the
+// width of the enum.
+func TestABIEnumValues(t *testing.T) {
+	pairs := map[string][2]uint8{
+		"VerdictUnseen":      {uint8(VerdictUnseen), 0},
+		"VerdictDirect":      {uint8(VerdictDirect), 1},
+		"VerdictProxy":       {uint8(VerdictProxy), 2},
+		"VerdictBlock":       {uint8(VerdictBlock), 3},
+		"VerdictMustControl": {uint8(VerdictMustControl), 4},
+		"SourceStatic":       {uint8(SourceStatic), 1},
+		"SourceExactFlow":    {uint8(SourceExactFlow), 2},
+		"SourceDNSWeak":      {uint8(SourceDNSWeak), 3},
+		"SourceFakeIP":       {uint8(SourceFakeIP), 4},
+		"DNSEvidenceNone":    {DNSEvidenceNone, 0},
+		"DNSEvidenceFakeIP":  {DNSEvidenceFakeIP, 1},
+		"DNSEvidenceStrong":  {DNSEvidenceStrong, 2},
+		"DNSEvidenceWeak":    {DNSEvidenceWeak, 3},
+	}
+	for name, pair := range pairs {
+		if pair[0] != pair[1] {
+			t.Fatalf("%s = %d, kernel expects %d", name, pair[0], pair[1])
+		}
+	}
+	flagPairs := map[string][2]uint32{
+		"FlagIPv4":         {FlagIPv4, 1 << 0},
+		"FlagIPv6":         {FlagIPv6, 1 << 1},
+		"FlagTCP":          {FlagTCP, 1 << 2},
+		"FlagUDP":          {FlagUDP, 1 << 3},
+		"FlagDNSHijack":    {FlagDNSHijack, 1 << 4},
+		"FlagDropUDP443":   {FlagDropUDP443, 1 << 5},
+		"FlagSocketAssign": {FlagSocketAssign, 1 << 6},
+		"FlagStaticPolicy": {FlagStaticPolicy, 1 << 7},
+		"FlagExactFlow":    {FlagExactFlow, 1 << 8},
+		"FlagDNSHint":      {FlagDNSHint, 1 << 9},
+		"FlagFakeIP":       {FlagFakeIP, 1 << 10},
+		"FlagMACSource":    {FlagMACSource, 1 << 11},
+		"FlagFailureProxy": {FlagFailureProxy, 1 << 12},
+	}
+	for name, pair := range flagPairs {
+		if pair[0] != pair[1] {
+			t.Fatalf("%s = %d, kernel expects %d", name, pair[0], pair[1])
+		}
+	}
+	reasons := map[string][2]uint16{
+		"ReasonNone":           {uint16(ReasonNone), 0},
+		"ReasonStaticDirect":   {uint16(ReasonStaticDirect), 1},
+		"ReasonFlowDirect":     {uint16(ReasonFlowDirect), 2},
+		"ReasonFakeIPDirect":   {uint16(ReasonFakeIPDirect), 3},
+		"ReasonDNSHintDirect":  {uint16(ReasonDNSHintDirect), 4},
+		"ReasonMustControl":    {uint16(ReasonMustControl), 18},
+		"ReasonDNSHijackProxy": {uint16(ReasonDNSHijackProxy), 19},
+		"ReasonFlowProxy":      {uint16(ReasonFlowProxy), 20},
+		"ReasonFlowBlock":      {uint16(ReasonFlowBlock), 21},
+	}
+	for name, pair := range reasons {
+		if pair[0] != pair[1] {
+			t.Fatalf("%s = %d, kernel expects %d", name, pair[0], pair[1])
+		}
+	}
+}

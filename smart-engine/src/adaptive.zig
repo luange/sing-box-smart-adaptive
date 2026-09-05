@@ -41,7 +41,8 @@ pub const State = extern struct {
 pub const Decision = extern struct {
     selected_id: u64,
     switched: u8,
-    reason: u8, // 0 ranked, 1 retained, 2 lease, 3 manual, 4 fallback, 5 no candidate
+    reason: u8, // ADAPTIVE_REASON_*: 0 ranked, 1 retained, 2 lease, 3 manual,
+    // 4 fallback, 5 no candidate, 6 bulk spread, 7 bulk throughput, 8 cooldown
     score: f64,
 };
 

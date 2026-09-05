@@ -255,6 +255,10 @@ int sb_ebpf_xdp_attach_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifinde
  * enables the data plane and returns failure for an occupied or unsupported
  * mode so the caller can keep TC active. */
 int sb_ebpf_xdp_probe_mode(struct sb_ebpf_xdp_runtime *runtime, uint32_t ifindex, uint32_t mode);
+/* Hardware capability probe: loads a pass-everything XDP program and briefly
+ * attaches it in native/skb mode. Never routes sing-box traffic. Returns 0 on
+ * successful probe; native_ok/skb_ok report per-mode support. */
+int sb_ebpf_xdp_probe_hardware(uint32_t ifindex, int *native_ok, int *skb_ok);
 int sb_ebpf_xdp_detach(struct sb_ebpf_xdp_runtime *runtime);
 int sb_ebpf_xdp_set_control(
 	struct sb_ebpf_xdp_runtime *runtime,
