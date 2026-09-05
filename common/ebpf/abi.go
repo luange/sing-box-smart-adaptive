@@ -1,3 +1,10 @@
+// Package ebpf ABI contract notes:
+//
+//   - Endianness: the kernel objects are built with `clang -target bpfel`
+//     (little-endian only, see common/ebpf/Makefile BPF_CFLAGS) and the Go
+//     mirrors write native byte order. Big-endian hosts are not supported;
+//     ports are the one deliberate exception and are stored host-order on
+//     both sides ("ABI iron law", native/singbox_ebpf_out.h).
 package ebpf
 
 import (

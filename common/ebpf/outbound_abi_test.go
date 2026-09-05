@@ -31,3 +31,35 @@ func TestOutVerdictABI(t *testing.T) {
 		t.Fatalf("outVerdictControl size=%d want %d", unsafe.Sizeof(outVerdictControl{}), outVerdictControlSize)
 	}
 }
+
+// TestSpliceStatIndexValues pins the Go splice stat indices to the enum
+// order in native/splice.bpf.c and native/singbox_ebpf_out.h. The indices
+// are duplicated in three places; reordering one without the others would
+// keep every size test green while pointing userspace counters at the wrong
+// kernel slots.
+func TestSpliceStatIndexValues(t *testing.T) {
+	expected := map[string]int{
+		"PairsCreated":     0,
+		"PairsReleased":    1,
+		"Redirects":        2,
+		"RedirectFailures": 3,
+		"PeerMisses":       4,
+		"Passthrough":      5,
+	}
+	actual := map[string]int{
+		"PairsCreated":     spliceStatPairsCreated,
+		"PairsReleased":    spliceStatPairsReleased,
+		"Redirects":        spliceStatRedirects,
+		"RedirectFailures": spliceStatRedirectFailures,
+		"PeerMisses":       spliceStatPeerMisses,
+		"Passthrough":      spliceStatPassthrough,
+	}
+	for name, want := range expected {
+		if actual[name] != want {
+			t.Fatalf("spliceStat%s = %d, kernel enum expects %d (sync native/splice.bpf.c, singbox_ebpf_out.h, outbound_abi.go)", name, actual[name], want)
+		}
+	}
+	if spliceStatCount != 6 {
+		t.Fatalf("spliceStatCount = %d, kernel expects 6", spliceStatCount)
+	}
+}
