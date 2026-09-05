@@ -9,6 +9,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Shared-network ABI types (sb_shared_original_key et al.) live here; the
+ * runtime struct below embeds them, so the full definitions must be visible
+ * to every cgo translation unit that includes this header. */
+#include "shared_network.h" 
+
 #define SB_EBPF_DEFAULT_CGROUP_PATH "/sys/fs/cgroup"
 #define SB_EBPF_MAX_TCP_REDIRECT_MAP_ENTRIES 16384U
 #define SB_EBPF_MAX_UDP_REDIRECT_MAP_ENTRIES 16384U
