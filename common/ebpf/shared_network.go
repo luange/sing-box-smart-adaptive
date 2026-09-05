@@ -63,6 +63,7 @@ import (
 
 	E "github.com/sagernet/sing/common/exceptions"
 
+	ebpfabi "github.com/sagernet/sing-box/common/ebpf/v3"
 	"golang.org/x/sys/unix"
 )
 
