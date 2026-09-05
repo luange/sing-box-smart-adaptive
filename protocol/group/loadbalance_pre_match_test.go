@@ -10,6 +10,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestLoadBalanceRandomPrefersAvailableMembers(t *testing.T) {
+	firstOutbound := &preMatchTestOutbound{tag: "first"}
+	secondOutbound := &preMatchTestOutbound{tag: "second"}
+	history := U.NewHistoryStorage()
+	history.StoreURLTestHistory(secondOutbound.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
+	loadBalanceGroup := &LoadBalanceGroup{
+		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
+		history:   history,
+	}
+	loadBalanceGroup.strategyFn = strategyRandom(loadBalanceGroup, "")
+	for range 16 {
+		if selected := loadBalanceGroup.Unwrap(new(adapter.InboundContext), true); selected != secondOutbound {
+			t.Fatalf("random balance selected unavailable member %v", selected)
+		}
+	}
+}
+
+func TestLoadBalancePersistentHashKeepsHostAffinity(t *testing.T) {
+	firstOutbound := &preMatchTestOutbound{tag: "first"}
+	secondOutbound := &preMatchTestOutbound{tag: "second"}
+	history := U.NewHistoryStorage()
+	now := time.Now()
+	history.StoreURLTestHistory(firstOutbound.Tag(), &adapter.URLTestHistory{Time: now, Delay: 20})
+	history.StoreURLTestHistory(secondOutbound.Tag(), &adapter.URLTestHistory{Time: now, Delay: 30})
+	loadBalanceGroup := &LoadBalanceGroup{
+		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
+		history:   history,
+	}
+	loadBalanceGroup.strategyFn = strategyConsistentHashing(loadBalanceGroup, "")
+	metadata := &adapter.InboundContext{Domain: "example.com"}
+	selected := loadBalanceGroup.Unwrap(metadata, true)
+	for range 16 {
+		if got := loadBalanceGroup.Unwrap(metadata, true); got != selected {
+			t.Fatalf("persistent balance changed host affinity from %v to %v", selected, got)
+		}
+	}
+}
+
 func TestLoadBalanceSelectPreMatchOutboundWithMetadata(t *testing.T) {
 	selectedOutbound := new(preMatchTestOutbound)
 	metadata := &adapter.InboundContext{Network: N.NetworkUDP}

@@ -11,7 +11,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
@@ -90,13 +89,6 @@ func URLTestWithNetwork(ctx context.Context, link string, detour N.Dialer, netwo
 	if N.NetworkName(network) != N.NetworkTCP {
 		network = N.NetworkTCP
 	}
-	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
-	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
-		_, err := urlTest(ctx, link, detour, network)
-		if err != nil {
-			return 0, err
-		}
-	}
 	return urlTest(ctx, link, detour, network)
 }
 
@@ -157,19 +149,42 @@ func urlTest(ctx context.Context, link string, detour N.Dialer, network string) 
 		Timeout: clientTimeout,
 	}
 	defer client.CloseIdleConnections()
-	request := req.WithContext(ctx)
-	if serverName := probeTLSServerName(hostname); serverName != hostname {
-		// Keep the probe endpoint literal so bootstrap never performs a DNS
-		// lookup through the Smart group, while still routing Cloudflare's
-		// virtual host to a valid certificate and response handler.
-		request.Host = serverName
+	newRequest := func() *http.Request {
+		request := req.WithContext(ctx)
+		if serverName := probeTLSServerName(hostname); serverName != hostname {
+			// Keep the probe endpoint literal so bootstrap never performs a DNS
+			// lookup through the Smart group, while still routing Cloudflare's
+			// virtual host to a valid certificate and response handler.
+			request.Host = serverName
+		}
+		return request
 	}
-	resp, err := client.Do(request)
+	resp, err := client.Do(newRequest())
 	if err != nil {
 		return
 	}
 	resp.Body.Close()
-	t = uint16(time.Since(start) / time.Millisecond)
+	firstDelay := uint16(time.Since(start) / time.Millisecond)
+	if resp.Close {
+		// The endpoint explicitly disabled keep-alive, so the first request is
+		// the only meaningful measurement (the same fallback used by Surge).
+		t = firstDelay
+		return
+	}
+
+	// A second request on the same HTTP connection removes most handshake
+	// cost from the score and makes URLTest compare the path rather than the
+	// proxy's cold-start behavior.  If a peer closes the connection between
+	// requests, retain the successful first result instead of turning a
+	// keep-alive quirk into a false outage.
+	secondStart := time.Now()
+	secondResp, secondErr := client.Do(newRequest())
+	if secondErr != nil {
+		t = firstDelay
+		return
+	}
+	secondResp.Body.Close()
+	t = uint16(time.Since(secondStart) / time.Millisecond)
 	return
 }
 

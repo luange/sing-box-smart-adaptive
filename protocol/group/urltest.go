@@ -204,7 +204,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
 	return nil, err
 }
 
@@ -223,7 +223,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
 	return nil, err
 }
 
@@ -250,6 +250,7 @@ type URLTestGroup struct {
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
 	checking                     atomic.Bool
+	lastCheck                    atomic.Int64
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -298,26 +299,33 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 
 func (g *URLTestGroup) PostStart() {
 	g.access.Lock()
-	defer g.access.Unlock()
 	g.started = true
 	g.lastActive.Store(time.Now())
-	go g.CheckOutbounds(g.ctx, false)
+	g.access.Unlock()
 }
 
 func (g *URLTestGroup) Touch() {
 	if !g.started {
 		return
 	}
+	lastCheck := g.lastCheck.Load()
+	needsProbe := lastCheck == 0 || time.Since(time.Unix(0, lastCheck)) >= g.interval
 	g.access.Lock()
-	defer g.access.Unlock()
+	g.lastActive.Store(time.Now())
 	if g.ticker != nil {
-		g.lastActive.Store(time.Now())
+		g.access.Unlock()
 		return
 	}
 	ticker := time.NewTicker(g.interval)
 	g.ticker = ticker
 	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
 	go g.loopCheck(ticker, g.close)
+	g.access.Unlock()
+	if needsProbe {
+		// Match Surge's cold start: the first configured member is usable
+		// immediately; the complete test round runs in the background.
+		go g.CheckOutbounds(g.ctx, false)
+	}
 }
 
 func (g *URLTestGroup) Close() error {
@@ -361,7 +369,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if history == nil {
 			continue
 		}
-		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
+		if minDelay == 0 || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
 			minDelay = history.Delay
 			minOutbound = detour
 		}
@@ -418,6 +426,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	defer g.checking.Store(false)
 	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+	g.lastCheck.Store(time.Now().UnixNano())
 	g.performUpdateCheck()
 	return result, nil
 }

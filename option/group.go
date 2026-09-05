@@ -10,11 +10,11 @@ type SelectorOutboundOptions struct {
 
 type URLTestOutboundOptions struct {
 	GroupCommonOption
-	URL                       string                 `json:"url,omitempty"`
-	Interval                  badoption.Duration     `json:"interval,omitempty"`
-	Tolerance                 uint16                 `json:"tolerance,omitempty"`
-	IdleTimeout               badoption.Duration     `json:"idle_timeout,omitempty"`
-	InterruptExistConnections bool                   `json:"interrupt_exist_connections,omitempty"`
+	URL                       string             `json:"url,omitempty"`
+	Interval                  badoption.Duration `json:"interval,omitempty"`
+	Tolerance                 uint16             `json:"tolerance,omitempty"`
+	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
+	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 }
 
 type GroupCommonOption struct {
@@ -34,12 +34,17 @@ type NodeWeightOptions struct {
 
 type LoadBalanceOutboundOptions struct {
 	GroupCommonOption
-	URL                       string             `json:"url,omitempty"`
-	Interval                  badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL                       badoption.Duration `json:"ttl,omitempty"`
-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
-	Strategy                  string             `json:"strategy,omitempty"`
+	URL         string             `json:"url,omitempty"`
+	Interval    badoption.Duration `json:"interval,omitempty"`
+	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	TTL         badoption.Duration `json:"ttl,omitempty"`
+	// Persistent keeps the same target host on the same available member when
+	// possible, matching Surge's persistent load-balance mode.  It is
+	// deliberately separate from Strategy so legacy strategy names remain
+	// accepted without changing their compatibility semantics.
+	Persistent                bool   `json:"persistent,omitempty"`
+	InterruptExistConnections bool   `json:"interrupt_exist_connections,omitempty"`
+	Strategy                  string `json:"strategy,omitempty"`
 }
 
 type SmartOutboundOptions struct {
