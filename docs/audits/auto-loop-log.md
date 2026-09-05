@@ -29,3 +29,32 @@
 ### 遗留观察(非缺陷)
 - adapter/adaptive_pool.go、common/listener/listener.go 为历史遗留未 gofmt 文件,不属于本轮改动范围
 - .bpf.o 内核对象需 Linux CI 重建(本机无法编译 tc.bpf.c/xdp.bpf.c);C 改动经 Linux CI `make -C common/ebpf generate check` 验证
+
+## 2026-09-06 运行 #2(定时任务)
+
+### 一、codex 任务检测
+- 仓库 HEAD=d0dada78,工作区干净;~/.codex/sessions 无 24h 内活跃会话 → 无需续跑。
+
+### 二、审查 → 修复循环
+
+**第 5 轮**(commit ed144ac4)— 评分公式第 4 份副本对齐
+- 发现 4 处 host 端 smartScoreForProfile 与 scoring.zig 的边界分歧:
+  1. normalizedLogCost 对 ≤0/NaN/−Inf 返回 0(内核用 0.5 未知先验)——未测量节点看起来"免费";
+  2. throughput/samples/reliability 非有限值未守卫;
+  3. connect 为 0/亚微秒截断时 jitter 仍被信任(内核视为未知);
+  4. 冷启动候选按 sqrt 衰减探索项(内核用全额预算)。
+  全部对齐到内核语义。
+- conformance reference.go 增加 profile 支持(bulk/udp 权重),新增
+  TestSmartScoreForProfileMatchesReference:7 种估计形态 × 3 profile
+  逐位钉死 host 分数,任何一侧漂移立即测试失败。
+
+**第 6 轮**(commit 0baafef7)
+- splice 统计下标在 splice.bpf.c / singbox_ebpf_out.h / outbound_abi.go
+  三处重复 → TestSpliceStatIndexValues 值级钉死(Go 侧,防单侧重排)。
+- abi.go 补小端序(bpfel-only)与 host-order 端口例外契约说明。
+
+**第 7/8 轮**:BuildFlowPair/BankPublisher/generation 内部不变量审查——提交顺序注释、CAS SyncGeneration 回退保护均正确,无新发现。满足停止条件。
+
+### 验证
+go test ./... 全绿、-race 绿、smart_zig cgo conformance 绿、Zig 25/25、
+GOOS=linux with_ebpf 全仓构建 OK。共 3 个提交(ed144ac4、0baafef7 及本轮内)。
