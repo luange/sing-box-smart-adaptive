@@ -58,3 +58,20 @@
 ### 验证
 go test ./... 全绿、-race 绿、smart_zig cgo conformance 绿、Zig 25/25、
 GOOS=linux with_ebpf 全仓构建 OK。共 3 个提交(ed144ac4、0baafef7 及本轮内)。
+
+## 2026-09-06 运行 #3(定时任务)
+
+### 一、codex 任务检测
+- 仓库 HEAD=60d0a02b,干净且已全部推送(origin 同步);无 24h 内活跃 codex 会话 → 无需续跑。
+
+### 二、审查 → 修复循环
+
+**第 9 轮**:dns_hint.go 全量审查——冲突隔离(proxy_refs+direct_refs→WEAK)、世代重置、TTL 过期清理、8192 上限 + LastSeen LRU 逐出、evidence 只升不降(无冲突时)——逻辑自洽,无缺陷。
+
+**第 10 轮**:dns_prefill(OnDNSAnswer/dnsPrefillApply)——admission 槽位防 goroutine 风暴、Close 与异步发布的生命周期屏障、冲突时记录 proxy evidence、非直连地址也进冲突隔离、MACSourcePolicy 下禁用全局 promote(v3-control-plane-integrity 审计的闭环)——正确。
+
+**第 11 轮**:verdict_learn(fail-closed 门:53 端口、MatchInputs 非 IP 类、process/user、非 bare-direct 全部 skip)+ 失效链路(重载 → RefreshV3Static/InvalidateFlowDirect;InvalidateAll 失败 → SetEnabled(false) 兜底;close → best-effort)+ smartStore(边界/锁/晚到观察的兼容写法)——无新发现。
+
+**验证中发现并解决**(非代码缺陷):smart-engine/zig-out/lib/libsmart_engine.a 曾被 `-Dtarget=x86_64-linux-musl` 覆盖(部署准备),导致本机 `smart_zig cgo` 链接失败;按 host 目标重建后恢复。注意:在同一 worktree 切 zig 交叉目标会破坏本机 smart_zig 测试链路,交叉产物应使用独立 build root(zig build --prefix)。
+
+**结论**:本轮审查(dns_hint / dns_prefill / verdict_learn / store / adaptive 解码)无新发现,全部测试绿:go test ./... 、race 4 包、smart_zig cgo conformance、GOOS=linux with_ebpf 构建。满足停止条件,无新提交。
