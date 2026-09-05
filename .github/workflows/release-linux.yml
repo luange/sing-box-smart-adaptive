@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer without v (for example 1.14.0 or 1.14.1)"
+        description: "SemVer without v (for example 1.15.0-alpha.1+smart.0.1)"
         required: true
         type: string
       publish_release:
@@ -212,6 +212,11 @@ jobs:
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           tag="v${ver}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$ver" =~ -(alpha|beta|rc)\. ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create or update release
         env:
@@ -244,10 +249,11 @@ jobs:
           )"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release-assets/* --clobber
-            gh release edit "$tag" --notes "$notes" || true
+            gh release edit "$tag" --notes "$notes" --prerelease="${{ steps.assets.outputs.prerelease }}" || true
           else
             gh release create "$tag" release-assets/* \
               --title "sing-box ${ver}" \
               --target "$GITHUB_SHA" \
+              $([[ "${{ steps.assets.outputs.prerelease }}" == "true" ]] && echo --prerelease) \
               --notes "$notes"
           fi
