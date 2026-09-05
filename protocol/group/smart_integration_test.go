@@ -1662,6 +1662,48 @@ func TestSmartObservedConnIgnoresNormalEOF(t *testing.T) {
 	}
 }
 
+func TestSmartObservedConnClassifiesProtocolHandshakeFailures(t *testing.T) {
+	positive := []string{
+		"connection download closed: unknown version: 72",
+		"bad response header",
+		"vmess: invalid chunk checksum",
+		"bad header type",
+		"unknown protobuf message header: 9",
+		"v2ray-http: unexpected status: 502 Bad Gateway",
+		"v2ray-grpc: unexpected status: 403 Forbidden",
+		"hysteria2: authentication failed, status code: 401",
+		"authentication: token mismatch",
+		"cipher: message authentication failed",
+		"remote error: authentication failed",
+		"anytls: remote: invalid session",
+		"invalid request",
+	}
+	for _, message := range positive {
+		if !isSmartStreamFailure(errors.New(message), true) {
+			t.Errorf("protocol handshake failure was not classified: %q", message)
+		}
+	}
+
+	negative := []string{
+		"403 Forbidden",
+		"429 Too Many Requests",
+		"connection closed by peer",
+		"remote EOF",
+		"i/o timeout",
+		"context deadline exceeded",
+	}
+	for _, message := range negative {
+		if isSmartStreamFailure(errors.New(message), true) {
+			t.Errorf("non-handshake error was classified: %q", message)
+		}
+	}
+	for _, message := range positive {
+		if isSmartStreamFailure(errors.New(message), false) {
+			t.Errorf("post-response protocol text escaped the handshake gate: %q", message)
+		}
+	}
+}
+
 func TestSmartRanksLargeCandidatePool(t *testing.T) {
 	const candidateCount = 1000
 	candidates := make([]adapter.Outbound, 0, candidateCount)

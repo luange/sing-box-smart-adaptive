@@ -4765,7 +4765,12 @@ func (c *smartObservedConn) observeFailure(err error) {
 		// stall after the transport has already told us what happened.
 		c.stopStallTimer()
 	}
-	if !isSmartStreamFailure(err) {
+	// Protocol framing/authentication errors are only hard evidence while the
+	// proxy handshake is still waiting for its first valid downstream byte.
+	// Once application data has arrived, the same transport may legitimately
+	// report a remote/service error; keeping that site-local observation
+	// separate avoids turning an HTTP/API failure into a node breaker.
+	if !isSmartStreamFailure(err, !c.firstRead.Load()) {
 		return
 	}
 	c.notifyFailure()
@@ -4780,7 +4785,7 @@ func (c *smartObservedConn) notifyFailure() {
 	})
 }
 
-func isSmartStreamFailure(err error) bool {
+func isSmartStreamFailure(err error, handshakePending ...bool) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return false
 	}
@@ -4788,12 +4793,68 @@ func isSmartStreamFailure(err error) bool {
 	if errors.As(err, &networkError) && networkError.Timeout() {
 		return true
 	}
-	return errors.Is(err, syscall.ECONNRESET) ||
+	if errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
 		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, syscall.ETIMEDOUT) ||
 		errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.EHOSTUNREACH)
+		errors.Is(err, syscall.EHOSTUNREACH) {
+		return true
+	}
+	return len(handshakePending) > 0 && handshakePending[0] && isSmartProtocolHandshakeFailure(err)
+}
+
+// isSmartProtocolHandshakeFailure recognizes errors emitted by the protocol
+// readers after DialContext has already returned.  This is deliberately a
+// small, explicit set: application HTTP status codes, normal EOF, generic
+// crypto errors and arbitrary remote text must not evict a node.  The caller
+// additionally requires that no valid downstream byte has been observed, so
+// these markers describe a failed proxy handshake rather than a service error.
+func isSmartProtocolHandshakeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "i/o timeout") || strings.Contains(message, "deadline exceeded") {
+		return false
+	}
+	markers := []string{
+		"unknown version:",
+		"unknown version ",
+		"unknown protobuf message header",
+		"unknown command:",
+		"unknown command ",
+		"bad response header",
+		"bad length chunk",
+		"bad session status",
+		"bad header type",
+		"bad client session id",
+		"bad request salt",
+		"bad timestamp",
+		"bad request:",
+		"vmess: invalid chunk checksum",
+		"snell: bad header",
+		"authentication:",
+		"authentication timeout",
+		"v2ray-http: unexpected status:",
+		"v2ray-http-upgrade: unexpected status:",
+		"v2ray-grpc: unexpected status:",
+		"anytls: authentication failed",
+		"anytls: remote:",
+		"authentication failed, status code:",
+		"tls-crypt-v2 client key authentication failed",
+		"message authentication failed",
+		"remote error:",
+	}
+	for _, marker := range markers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	// Shadowsocks/2022 and VMess use these exact sentinel messages.  Restrict
+	// them to the pre-first-byte phase above; after a real response they could
+	// just be an application-level message and must remain site-local.
+	return message == "bad header" || message == "invalid request"
 }
 
 // smartObservedPacketConn turns real transactional UDP blackholes into Smart
