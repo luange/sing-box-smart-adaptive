@@ -36,13 +36,18 @@ func TestNormalizeXDPRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-func TestNormalizeXDPRejectsEnabledUntilHostAdapter(t *testing.T) {
-	_, err := NormalizeSharedNetwork(option.EBPFSharedNetworkOptions{
+func TestNormalizeXDPAcceptsEnabledAsExperimental(t *testing.T) {
+	o, err := NormalizeSharedNetwork(option.EBPFSharedNetworkOptions{
 		Engine: EngineV3,
 		XDP:    option.EBPFXDPOptions{Enabled: true},
 	})
-	if err == nil {
-		t.Fatal("xdp.enabled must not be accepted before the AF_XDP host adapter is wired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// xdp.enabled is now an experimental opt-in: startup probes hardware
+	// capability and reports it while the TC dataplane stays live.
+	if !o.XDP.Enabled {
+		t.Fatal("xdp.enabled must survive normalization")
 	}
 }
 
