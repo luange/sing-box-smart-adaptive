@@ -1,9 +1,10 @@
 package constant
 
 const (
-	ProviderTypeInline = "inline"
-	ProviderTypeLocal  = "local"
-	ProviderTypeRemote = "remote"
+	ProviderTypeInline    = "inline"
+	ProviderTypeLocal     = "local"
+	ProviderTypeRemote    = "remote"
+	ProviderTypeAggregate = "aggregate"
 )
 
 func ProviderDisplayName(providerType string) string {
@@ -14,6 +15,8 @@ func ProviderDisplayName(providerType string) string {
 		return "Local"
 	case ProviderTypeRemote:
 		return "Remote"
+	case ProviderTypeAggregate:
+		return "Aggregate"
 	default:
 		return "Unknown"
 	}

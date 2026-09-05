@@ -10,6 +10,16 @@
 - Preserve existing history queue-drop counters; no sensitive payload or URL is
   recorded.
 
+## Unreleased — aggregate outbound providers
+
+- Add an `aggregate` Provider that exposes several existing subscription
+  Providers as one reusable read-only view.
+- Reuse child outbounds and update callbacks instead of downloading, parsing,
+  or creating duplicate nodes; each child Provider remains independently
+  referenceable.
+- Add include/exclude filtering, deterministic child order, duplicate-tag
+  protection, and startup cycle detection.
+
 ## Unreleased — unified Smart selection policy
 
 - Merge the former `primary_backup` and `balanced` branches into one stable

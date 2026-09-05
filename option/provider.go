@@ -142,6 +142,16 @@ type ProviderInlineOptions struct {
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
 }
 
+// ProviderAggregateOptions exposes several providers as one read-only view.
+// The child providers keep ownership of their outbounds; the aggregate only
+// indexes and forwards their updates. This lets a subscription remain usable
+// both directly and through one combined provider without duplicate outbounds.
+type ProviderAggregateOptions struct {
+	Providers []string          `json:"providers" reference:"provider"`
+	Exclude   *badoption.Regexp `json:"exclude,omitempty"`
+	Include   *badoption.Regexp `json:"include,omitempty"`
+}
+
 type ProviderHealthCheckOptions struct {
 	Enabled  bool               `json:"enabled,omitempty"`
 	URL      string             `json:"url,omitempty"`
