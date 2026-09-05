@@ -645,7 +645,7 @@ func makeSharedNetworkRedirectKey(
 // PublishMACPolicies is v2-specific: the source-MAC identity policy is a v3
 // feature and the token data plane never consumes it, so this surface only
 // rejects explicitly instead of silently ignoring a misconfigured engine.
-func (b *SharedNetworkBackend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
+func (b *SharedNetworkBackend) PublishMACPolicies(entries []ebpfabi.MACPolicyEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -699,8 +699,12 @@ func (b *SharedNetworkBackend) DeleteRedirect(
 		match.client_port = C.uint16_t(key.ClientPort)
 		match.original_port = C.uint16_t(key.RedirectPort)
 		match.reserved = 0
-		copy(match.client_addr[:], key.ClientAddr[:])
-		copy(match.original_addr[:], key.RedirectAddr[:])
+		for i := range key.ClientAddr {
+			match.client_addr[i] = C.__u8(key.ClientAddr[i])
+		}
+		for i := range key.RedirectAddr {
+			match.original_addr[i] = C.__u8(key.RedirectAddr[i])
+		}
 		var savedErrno C.int
 		if purgeErr := C.singbox_ebpf_shared_network_purge_token_flow(b.runtime, &match, &savedErrno); purgeErr != 0 {
 			return E.Cause(syscall.Errno(savedErrno), "purge token flow rows")
