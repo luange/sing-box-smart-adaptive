@@ -115,6 +115,12 @@ func (s *URLTest) Now() string {
 	} else if s.group.selectedOutboundUDP != nil {
 		return s.group.selectedOutboundUDP.Tag()
 	}
+	// Surge's default cold start uses the first configured policy while the
+	// initial test runs in the background. Keep the dashboard/current-policy
+	// view consistent with the actual first-use fallback.
+	if len(s.tags) > 0 {
+		return s.tags[0]
+	}
 	return ""
 }
 
@@ -128,6 +134,7 @@ func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selec
 		network = metadata.Network
 	}
 	var outbound adapter.Outbound
+	selectionNetwork := network
 	switch network {
 	case N.NetworkTCP:
 		outbound = s.group.selectedOutboundTCP
@@ -138,6 +145,10 @@ func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selec
 		if outbound == nil {
 			outbound = s.group.selectedOutboundUDP
 		}
+		selectionNetwork = N.NetworkTCP
+	}
+	if outbound == nil {
+		outbound, _ = s.group.Select(selectionNetwork)
 	}
 	if outbound == nil {
 		return nil, adapter.PreMatchContinue

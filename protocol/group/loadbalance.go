@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -408,7 +409,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	if persistent {
 		// Surge's persistent mode is host-affinity over the currently available
 		// set.  It takes precedence over the legacy per-connection strategy.
-		loadBalanceGroup.strategyFn = strategyConsistentHashing(loadBalanceGroup, link)
+		loadBalanceGroup.strategyFn = strategyPersistentHashing(loadBalanceGroup, link)
 	} else {
 		switch strategy {
 		case StrategyRandom:
@@ -672,6 +673,24 @@ func getKey(metadata *adapter.InboundContext) string {
 	return destinationAddr.String()
 }
 
+func getTargetHostKey(metadata *adapter.InboundContext) string {
+	if metadata == nil {
+		return ""
+	}
+	var host string
+	if metadata.Destination.IsDomain() {
+		host = metadata.Destination.Fqdn
+	} else if metadata.SniffHost != "" {
+		host = metadata.SniffHost
+	} else {
+		host = metadata.Domain
+	}
+	if host != "" {
+		return strings.ToLower(strings.TrimSuffix(host, "."))
+	}
+	return getKey(metadata)
+}
+
 func getKeyWithSrcAndDst(metadata *adapter.InboundContext) string {
 	dst := getKey(metadata)
 	src := ""
@@ -728,6 +747,14 @@ func strategyRoundRobin(g *LoadBalanceGroup, url string) strategyFn {
 }
 
 func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
+	return strategyHashing(g, url, false)
+}
+
+func strategyPersistentHashing(g *LoadBalanceGroup, url string) strategyFn {
+	return strategyHashing(g, url, true)
+}
+
+func strategyHashing(g *LoadBalanceGroup, url string, fullHost bool) strategyFn {
 	maxRetry := 5
 	hash := maphash.NewHasher[string]()
 	return func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound {
@@ -737,7 +764,11 @@ func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
 		if len(outbounds) == 0 {
 			return nil
 		}
-		key := hash.Hash(getKey(metadata))
+		keyString := getKey(metadata)
+		if fullHost {
+			keyString = getTargetHostKey(metadata)
+		}
+		key := hash.Hash(keyString)
 		buckets := int32(len(outbounds))
 		for i := 0; i < maxRetry; i++ {
 			idx := jumpHash(key, buckets)
