@@ -19,10 +19,13 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dnsmux"
 	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	ebpfabi "github.com/sagernet/sing-box/common/ebpf/v3"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/redir"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	R "github.com/sagernet/sing-box/route/rule"
+
 	"github.com/sagernet/sing-box/option"
 	ebpfv3 "github.com/sagernet/sing-box/protocol/ebpf/v3"
 	"github.com/sagernet/sing/common"
@@ -527,7 +530,7 @@ func (s v3KernelSink) PublishStaticDirect(prefixes []netip.Prefix, generation ui
 	}
 	return s.dp.PublishStaticDirect(prefixes, generation, bank)
 }
-func (s v3KernelSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
+func (s v3KernelSink) PublishMACPolicies(entries []ebpfabi.MACPolicyEntry) error {
 	if s.dp == nil {
 		return nil
 	}
@@ -723,20 +726,20 @@ func (s *sharedNetwork) publishV3MACPolicies(routeRouter adapter.Router) error {
 		rules = routeRouter.Rules()
 	}
 	collected := R.CollectSourceMACPolicies(rules)
-	entries := make([]ebpfv3.MACPolicyEntry, 0, len(collected))
+	entries := make([]ebpfabi.MACPolicyEntry, 0, len(collected))
 	for _, policy := range collected {
-		var key ebpfv3.MACKey
+		var key ebpfabi.MACKey
 		copy(key.Addr[:], policy.MAC)
-		value := ebpfv3.MACPolicyValue{
+		value := ebpfabi.MACPolicyValue{
 			Verdict:    uint8(policy.Verdict),
-			Confidence: ebpfv3.ConfidenceAuthoritative,
+			Confidence: ebpfabi.ConfidenceAuthoritative,
 		}
 		if policy.Verdict == R.SourceMACOffloadBlock {
-			value.ReasonCode = uint16(ebpfv3.ReasonStaticBlock)
+			value.ReasonCode = uint16(ebpfabi.ReasonStaticBlock)
 		} else {
-			value.ReasonCode = uint16(ebpfv3.ReasonStaticDirect)
+			value.ReasonCode = uint16(ebpfabi.ReasonStaticDirect)
 		}
-		entries = append(entries, ebpfv3.MACPolicyEntry{Key: key, Value: value})
+		entries = append(entries, ebpfabi.MACPolicyEntry{Key: key, Value: value})
 	}
 	return s.v3.PublishMACSourcePolicies(entries)
 }
