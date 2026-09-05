@@ -665,28 +665,43 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 	default:
 		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight, confidenceWeight = 0.30, 0.25, 0.30, 0, 0.10, 0.05
 	}
+	connectValue := firstNonZero(estimate.ConnectP95MS, estimate.ConnectMS)
 	connectCost := 0.50
 	if estimate.HasConnect {
-		connectCost = normalizedLogCost(firstNonZero(estimate.ConnectP95MS, estimate.ConnectMS), 5000)
+		connectCost = normalizedLogCost(connectValue, 5000)
 	}
 	firstByteCost := 0.50
 	if estimate.HasFirstByte {
 		firstByteCost = normalizedLogCost(firstNonZero(estimate.FirstByteP95MS, estimate.FirstByteMS), 10000)
 	}
+	// Mirrors scoring.zig: only a finite positive throughput earns a cost
+	// reduction; anything else is the neutral 0.60.
 	throughputCost := 0.60
-	if estimate.HasThroughput {
+	if estimate.HasThroughput && estimate.ThroughputBPS > 0 &&
+		!math.IsInf(estimate.ThroughputBPS, 1) && !math.IsNaN(estimate.ThroughputBPS) {
 		speedUtility := math.Min(1, math.Log1p(estimate.ThroughputBPS)/math.Log1p(64*1024*1024))
 		throughputCost = 1 - speedUtility
 	}
+	// Mirrors scoring.zig: jitter evidence is only valid when the same flow
+	// produced a positive connect latency; a zero/sub-µs connect (possible
+	// via µs truncation) leaves both costs at the unknown prior.
 	jitterCost := 0.50
-	if estimate.HasConnect {
+	if estimate.HasConnect && connectValue > 0 {
 		jitterCost = math.Min(1, estimate.JitterMS/1000)
 	}
-	confidenceCost := 0.0
-	if estimate.Samples < 3 {
-		confidenceCost = math.Max(0, 1-estimate.Samples/3)
+	samples := estimate.Samples
+	if math.IsNaN(samples) || math.IsInf(samples, 0) {
+		samples = 0
 	}
-	score := reliabilityWeight*(1-estimate.Reliability) +
+	confidenceCost := 0.0
+	if samples < 3 {
+		confidenceCost = math.Max(0, 1-samples/3)
+	}
+	reliability := estimate.Reliability
+	if math.IsNaN(reliability) {
+		reliability = 0.5
+	}
+	score := reliabilityWeight*(1-reliability) +
 		connectWeight*connectCost +
 		firstByteWeight*firstByteCost +
 		throughputWeight*throughputCost +
@@ -695,8 +710,14 @@ func smartScoreForProfile(estimate smartEstimate, profile smartTrafficProfile, e
 	if estimate.State == "half_open" {
 		score += 0.20
 	}
+	// Mirrors scoring.zig: a candidate without samples pays the full
+	// exploration budget; the sqrt decay only applies once it has evidence.
 	if exploration > 0 {
-		score -= exploration * math.Sqrt(math.Log(totalSamples+2)/(estimate.Samples+1))
+		if samples > 0 && totalSamples > 0 {
+			score -= exploration * math.Sqrt(math.Log(totalSamples+2)/(samples+1))
+		} else {
+			score -= exploration
+		}
 	}
 	return math.Max(0, score)
 }
@@ -763,9 +784,19 @@ func passiveThroughputBelowFloor(estimate smartEstimate, floorBPS uint64, minSam
 	return estimate.ThroughputSamples >= float64(minSamples) && throughput < float64(floorBPS)
 }
 
+// normalizedLogCost mirrors scoring.zig normalizedCost: a missing, negative
+// or non-finite value is an unknown cost (0.5), infinity saturates at 1, and
+// positive values are log1p-normalized. Returning 0 for unknowns (the old
+// behavior) made an unmeasured endpoint look free next to a measured one.
 func normalizedLogCost(value, ceiling float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, -1) {
+		return 0.5
+	}
+	if math.IsInf(value, 1) {
+		return 1
+	}
 	if value <= 0 {
-		return 0
+		return 0.5
 	}
 	return math.Min(1, math.Log1p(value)/math.Log1p(ceiling))
 }

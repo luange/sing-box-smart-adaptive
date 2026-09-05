@@ -65,7 +65,24 @@ func weightOf(weight float64) float64 {
 	return weight
 }
 
+// Traffic profiles mirror scoring.zig TrafficProfile.
+const (
+	ProfileInteractive = 0
+	ProfileBulk        = 1
+	ProfileUDP         = 2
+)
+
 func score(c Config, candidate Candidate, total float64) float64 {
+	return scoreProfile(c, candidate, total, ProfileInteractive)
+}
+
+// ScoreProfile is the exported view of the profile-aware reference score
+// used by host-side drift pins.
+func ScoreProfile(c Config, candidate Candidate, total float64, profile int) float64 {
+	return scoreProfile(c, candidate, total, profile)
+}
+
+func scoreProfile(c Config, candidate Candidate, total float64, profile int) float64 {
 	samples := 0.0
 	if candidate.Samples > 0 && isFinite(candidate.Samples) {
 		samples = candidate.Samples
@@ -82,13 +99,24 @@ func score(c Config, candidate Candidate, total float64) float64 {
 		candidate.JitterMS >= 0 && isFinite(candidate.JitterMS) {
 		jitter = math.Min(1, candidate.JitterMS/1000)
 	}
-	// The interactive profile keeps throughput_weight at 0 (scoring.zig);
-	// ThroughputBPS is accepted for ABI compatibility but not ranked here.
+	var reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = .30, .25, .30, 0.0, .10
+	const confidenceWeight = .05
+	switch profile {
+	case ProfileBulk:
+		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = .30, .15, .20, .30, 0
+	case ProfileUDP:
+		reliabilityWeight, connectWeight, firstByteWeight, throughputWeight, jitterWeight = .50, .25, 0, 0, .20
+	}
+	throughputCost := .60
+	if candidate.ThroughputBPS > 0 && isFinite(candidate.ThroughputBPS) {
+		throughputCost = 1 - math.Min(1, math.Log1p(candidate.ThroughputBPS)/math.Log1p(64*1024*1024))
+	}
 	confidence := 0.0
 	if samples < 3 {
 		confidence = 1 - samples/3
 	}
-	base := .30*(1-reliability) + .25*connect + .30*first + .10*jitter + .05*confidence
+	base := reliabilityWeight*(1-reliability) + connectWeight*connect + firstByteWeight*first +
+		throughputWeight*throughputCost + jitterWeight*jitter + confidenceWeight*confidence
 	if candidate.State == 5 {
 		base += 0.20
 	}
