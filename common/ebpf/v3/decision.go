@@ -21,6 +21,12 @@ type StaticPolicy struct {
 	Verdict Verdict
 }
 
+// MACSourceHit is one source-MAC identity policy hit (generation-checked by
+// caller). Verdict follows the kernel sb_v3_source_policy_value semantics.
+type MACSourceHit struct {
+	Verdict Verdict
+}
+
 // FlowHit is one exact-flow hit (already generation/TTL-checked by caller).
 type FlowHit struct {
 	Verdict Verdict
@@ -32,12 +38,18 @@ type Input struct {
 	Packet         Packet
 	Static         *StaticPolicy
 	Flow           *FlowHit
+	MACSource      *MACSourceHit
 	DNS            *DNSIPValue
 	DNSNowNs       uint64
 	EstablishedTCP bool
+	// HostAddress mirrors the kernel v3_host4/6 membership consulted by
+	// security_bypass; it must be precomputed by the caller.
+	HostAddress bool
 }
 
-// Decide implements design §5 order. Any failure → Proxy, never silent Direct.
+// Decide implements the literal tc.bpf.c ingress order (design §5). The model
+// and the kernel must agree step for step; when the kernel order changes, this
+// function and its tests change with it.
 func Decide(in Input) Decision {
 	c := in.Control
 	p := in.Packet
@@ -46,22 +58,32 @@ func Decide(in Input) Decision {
 		return Decision{Action: ActionContinue, Reason: ReasonNone, Mark: 0}
 	}
 
-	// §5.1 parse failure. A malformed/non-IP frame has no trustworthy tuple
-	// with which to assign a listener, so fail open to the kernel without mark.
+	// tc step 1: parse failure. A malformed/non-IP frame has no trustworthy
+	// tuple with which to assign a listener, so fail open without mark.
 	if p.ParseRC < 0 {
 		return Decision{Action: ActionContinue, Reason: ReasonParseFailProxy, Mark: 0}
 	}
 
-	// §5.2 security bypass
-	if p.ParseRC == 1 || securityBypass(p) {
+	// tc step 2: DNS interception precedes host-address bypass. PBR deployments
+	// send DNS to an address owned by this host; if security_bypass ran first,
+	// those packets would reach the local stack with no :53 listener.
+	if p.ParseRC == 0 && c.Flags&FlagDNSHijack != 0 &&
+		(p.Protocol == ProtocolTCP || p.Protocol == ProtocolUDP) && p.DPort == 53 {
+		return proxyDecision(c, ReasonDNSHijackProxy)
+	}
+
+	// tc step 3: security bypass (parse_rc==1, ICMP, DHCP, multicast,
+	// broadcast, host-owned addresses).
+	if p.ParseRC == 1 || securityBypass(p) || in.HostAddress {
 		return Decision{Action: ActionContinue, Reason: ReasonSecurityBypass, Mark: 0}
 	}
 
-	// Incomplete L4 (IP fragments): never static/flow DIRECT — NEED_USERSPACE.
+	// tc step 4: IP fragments — never static/flow/MAC DIRECT; NEED_USERSPACE.
 	if p.Fragmented {
 		return proxyDecision(c, ReasonParseFailProxy)
 	}
 
+	// tc step 5: family/protocol feature gates.
 	if p.Family == AFInet && c.Flags&FlagIPv4 == 0 {
 		return Decision{Action: ActionContinue, Reason: ReasonNone, Mark: 0}
 	}
@@ -78,12 +100,24 @@ func Decide(in Input) Decision {
 		return Decision{Action: ActionContinue, Reason: ReasonNone, Mark: 0}
 	}
 
-	// §5.3 explicit block only
+	// tc step 6: explicit block only.
 	if c.Flags&FlagDropUDP443 != 0 && p.Protocol == ProtocolUDP && p.DPort == 443 {
 		return Decision{Action: ActionBlock, Reason: ReasonBlocked, Mark: 0}
 	}
 
-	// §5.4 static
+	// tc step 7: source-MAC identity policy overrides destination defaults.
+	if in.MACSource != nil {
+		switch in.MACSource.Verdict {
+		case VerdictDirect:
+			return Decision{Action: ActionContinue, Reason: ReasonStaticDirect, Mark: 0}
+		case VerdictBlock:
+			return Decision{Action: ActionBlock, Reason: ReasonStaticBlock, Mark: 0}
+		case VerdictProxy, VerdictMustControl:
+			return proxyDecision(c, ReasonMustControl)
+		}
+	}
+
+	// tc step 8: static policy.
 	if in.Static != nil {
 		switch in.Static.Verdict {
 		case VerdictDirect:
@@ -97,7 +131,7 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// §5.5 exact-flow
+	// tc step 9: exact-flow.
 	if in.Flow != nil {
 		switch in.Flow.Verdict {
 		case VerdictDirect:
@@ -111,28 +145,21 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// §5.6–5.7 DNS/FakeIP
+	// tc step 10: DNS/FakeIP allows direct. A conflict does NOT proxy in the
+	// kernel — it only counts DNS_HINT_CONFLICT and falls through, so the
+	// model falls through too.
 	if in.DNS != nil {
-		ok, reason := DNSHintAllowsDirect(*in.DNS, c.PolicyGeneration, in.DNSNowNs)
-		if ok {
+		if ok, reason := DNSHintAllowsDirect(*in.DNS, c.PolicyGeneration, in.DNSNowNs); ok {
 			return Decision{Action: ActionContinue, Reason: reason, Mark: 0}
-		}
-		if reason == ReasonDNSHintConflict {
-			return proxyDecision(c, ReasonMustControl)
 		}
 	}
 
-	// §5.8 established
+	// tc step 11: established-TCP socket assignment bypass.
 	if in.EstablishedTCP {
 		return Decision{Action: ActionContinue, Reason: ReasonEstablishedBypass, Mark: 0}
 	}
 
-	// DNS hijack
-	if c.Flags&FlagDNSHijack != 0 && p.DPort == 53 {
-		return proxyDecision(c, ReasonDNSHijackProxy)
-	}
-
-	// §5.9 default NEED_USERSPACE
+	// tc step 12: default NEED_USERSPACE.
 	return proxyDecision(c, ReasonMapMissProxy)
 }
 

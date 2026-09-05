@@ -166,3 +166,54 @@ func TestDecisionStaticBeforeFlow(t *testing.T) {
 		t.Fatalf("static must precede flow: %+v", d)
 	}
 }
+
+func TestDecideMatchesKernelOrderDNSHijackBeforeSecurity(t *testing.T) {
+	// The kernel hijacks dport 53 before host-address/multicast bypass: a
+	// query aimed at the router's own DNS must reach the hijack path.
+	c := baseControl()
+	c.Flags |= FlagDNSHijack
+	p := tcpPacket(53)
+	p.Protocol = ProtocolUDP
+	d := Decide(Input{Control: c, Packet: p, HostAddress: true})
+	if d.Action != ActionProxy || d.Reason != ReasonDNSHijackProxy {
+		t.Fatalf("got action=%d reason=%d", d.Action, d.Reason)
+	}
+}
+
+func TestDecideMACSourceOverridesDestinationPolicy(t *testing.T) {
+	c := baseControl()
+	p := tcpPacket(443)
+	d := Decide(Input{
+		Control:   c,
+		Packet:    p,
+		MACSource: &MACSourceHit{Verdict: VerdictDirect},
+		Static:    &StaticPolicy{Verdict: VerdictProxy},
+	})
+	if d.Action != ActionContinue || d.Reason != ReasonStaticDirect {
+		t.Fatalf("mac direct: action=%d reason=%d", d.Action, d.Reason)
+	}
+	d = Decide(Input{
+		Control:   c,
+		Packet:    p,
+		MACSource: &MACSourceHit{Verdict: VerdictBlock},
+		Static:    &StaticPolicy{Verdict: VerdictDirect},
+	})
+	if d.Action != ActionBlock {
+		t.Fatalf("mac block: action=%d", d.Action)
+	}
+}
+
+func TestDecideDNSConflictFallsThroughLikeKernel(t *testing.T) {
+	c := baseControl()
+	p := tcpPacket(443)
+	d := Decide(Input{
+		Control: c,
+		Packet:  p,
+		DNS:     &DNSIPValue{DirectRefs: 1, ProxyRefs: 1, Evidence: DNSEvidenceStrong},
+	})
+	// Kernel counts DNS_HINT_CONFLICT and keeps walking: no static/flow/MAC
+	// hit and no established socket means the packet proxies as map miss.
+	if d.Action != ActionProxy || d.Reason != ReasonMapMissProxy {
+		t.Fatalf("action=%d reason=%d", d.Action, d.Reason)
+	}
+}
