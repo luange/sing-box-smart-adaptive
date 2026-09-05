@@ -3738,6 +3738,7 @@ func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey,
 	}
 	s.access.Lock()
 	s.pruneAffinityLocked(now)
+	s.pruneContextStateLocked(now)
 	previous := s.lastSelected[key]
 	currentSelectedAt := s.lastSelectedAt[key]
 	if previous != "" && !currentSelectedAt.IsZero() && s.siteStickiness > 0 && now.Sub(currentSelectedAt) > s.siteStickiness {
@@ -4470,6 +4471,49 @@ func (s *Smart) pruneAffinityLocked(now time.Time) {
 			break
 		}
 		delete(s.affinity, key)
+	}
+}
+
+// pruneContextStateLocked bounds the per-context maps that otherwise grow one
+// entry per (network, site, transport) key for the lifetime of the process.
+// It runs on the same cadence as pruneAffinityLocked, inside s.access.
+func (s *Smart) pruneContextStateLocked(now time.Time) {
+	limit := min(10000, max(1024, s.maxHistoryEntries/4))
+	// Cooldown rows are useless once expired.
+	for key, until := range s.performanceCooldown {
+		if !until.After(now) {
+			delete(s.performanceCooldown, key)
+		}
+	}
+	// Challenges older than the confirmation window can never confirm again.
+	challengeMaxAge := s.switchConfirm * 8
+	if challengeMaxAge <= 0 || challengeMaxAge > time.Hour {
+		challengeMaxAge = time.Hour
+	}
+	for key, challenge := range s.switchChallenges {
+		if now.Sub(challenge.Since) > challengeMaxAge {
+			delete(s.switchChallenges, key)
+		}
+	}
+	// zigSelectedEndpoint and selectionGeneration share one key set; cap both
+	// together by dropping arbitrary rows past the limit (same policy as the
+	// affinity overflow pass).
+	if len(s.zigSelectedEndpoint) >= limit {
+		for key := range s.zigSelectedEndpoint {
+			if len(s.zigSelectedEndpoint) < limit && len(s.selectionGeneration) < limit {
+				break
+			}
+			delete(s.zigSelectedEndpoint, key)
+			delete(s.selectionGeneration, key)
+		}
+	}
+	if len(s.selectionGeneration) >= limit {
+		for key := range s.selectionGeneration {
+			if len(s.selectionGeneration) < limit {
+				break
+			}
+			delete(s.selectionGeneration, key)
+		}
 	}
 }
 

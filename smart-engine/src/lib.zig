@@ -598,3 +598,22 @@ test "profile scoring changes only the intended objective" {
     try std.testing.expect(scoring.score(config, fast, 20, .bulk) < scoring.score(config, slow, 20, .bulk));
     try std.testing.expectEqual(scoring.score(config, fast, 20, .interactive), scoring.score(config, slow, 20, .interactive));
 }
+
+test "prune keeps only listed ids and resets state exactly once" {
+    var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 });
+    var id: u64 = 1;
+    while (id <= 100) : (id += 1) engine.observe(id, true, 1, id);
+    var keep: [10]u64 = undefined;
+    for (&keep, 0..) |*slot, index| slot.* = @intCast((index + 1) * 10);
+    engine.observations.prune(&keep);
+    try std.testing.expectEqual(@as(usize, 10), engine.observations.count);
+    for (keep) |kept_id| try std.testing.expect(engine.observations.get(kept_id) != null);
+    try std.testing.expect(engine.observations.get(1) == null);
+    try std.testing.expect(engine.observations.get(99) == null);
+
+    // The full prune path (empty keep list) must wipe everything, matching
+    // smart_engine_prune(engine, null, 0).
+    engine.observations.prune(&[_]u64{});
+    try std.testing.expectEqual(@as(usize, 0), engine.observations.count);
+    try std.testing.expect(engine.observations.get(10) == null);
+}

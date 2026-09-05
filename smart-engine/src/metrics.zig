@@ -23,6 +23,9 @@ fn initialFreeSlots() [max_entries]u16 {
 pub const Metrics = struct {
     id: u64 = 0,
     used: bool = false,
+    // Transient prune marker: set for rows whose id appears in the keep list,
+    // cleared again in the same prune pass. Never meaningful between calls.
+    kept: bool = false,
     successes: u64 = 0,
     failures: u64 = 0,
     connect_ms: f64 = 0,
@@ -98,33 +101,22 @@ pub const Store = struct {
         // Provider reloads can remove an endpoint while its policy context is
         // still retained. Drop those rows before the next Choose so stale
         // aliases cannot inherit health or selection state.
-        var index: usize = 0;
-        while (index < self.entries.len) : (index += 1) {
-            if (!self.entries[index].used) continue;
-            var retained = false;
-            for (keep) |id| {
-                if (id == self.entries[index].id) {
-                    retained = true;
-                    break;
-                }
-            }
-            if (!retained) self.removeIndex(self.entries[index].id);
+        // Mark retained rows through the O(1) lookup index instead of scanning
+        // the keep list once per entry; the keep list can hold thousands of
+        // endpoints and prune runs once per provider refresh per context.
+        for (keep) |id| {
+            if (self.findConst(id)) |entry_index| self.entries[entry_index].kept = true;
         }
-        for (self.entries, 0..) |*entry, entry_index| {
+        for (&self.entries, 0..) |*entry, entry_index| {
             if (!entry.used) continue;
-            var retained = false;
-            for (keep) |id| {
-                if (id == entry.id) {
-                    retained = true;
-                    break;
-                }
+            if (entry.kept) {
+                entry.kept = false;
+                continue;
             }
-            if (!retained) {
-                entry.* = .{};
-                self.free_slots[self.free_count] = @intCast(entry_index);
-                self.free_count += 1;
-                self.count -= 1;
-            }
+            entry.* = .{};
+            self.free_slots[self.free_count] = @intCast(entry_index);
+            self.free_count += 1;
+            self.count -= 1;
         }
         self.rebuildIndex();
     }

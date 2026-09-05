@@ -1,3 +1,4 @@
+const std = @import("std");
 const model = @import("model.zig");
 const scoring = @import("scoring.zig");
 const metrics = @import("metrics.zig");
@@ -28,7 +29,7 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
     const switch_margin = if (config.switch_margin >= 0 and scoring.isFinite(config.switch_margin)) @min(config.switch_margin, 0.95) else 0.0;
     var decision = model.Decision{ .selected_id = 0, .score = 100.0, .switched = 0, .reason = @intFromEnum(model.DecisionReason.no_candidate) };
     var best: ?model.Candidate = null;
-    var best_score: f64 = 100.0;
+    var best_score: f64 = std.math.inf(f64);
     var best_tier: u8 = 255;
     var total_samples: f64 = 0;
     for (candidates) |raw_candidate| {

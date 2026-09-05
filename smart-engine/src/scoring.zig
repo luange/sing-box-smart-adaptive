@@ -49,7 +49,13 @@ pub fn score(config: model.Config, candidate: model.Candidate, total_samples: f6
         exploration_budget * @sqrt(@log(total_samples + 2.0) / (sample_count + 1.0))
     else
         exploration_budget;
-    const weight = if (candidate.weight > 0 and isFinite(candidate.weight)) candidate.weight else 1.0;
+    // Divide by weight for ranking, but keep a floor: a near-zero weight must
+    // rank that candidate last, not push every score past the sentinel range
+    // and make the kernel report "no candidate" for a healthy pool.
+    const weight = if (candidate.weight > 0 and isFinite(candidate.weight))
+        @max(candidate.weight, 0.01)
+    else
+        1.0;
     var reliability_weight: f64 = 0.30;
     var connect_weight: f64 = 0.25;
     var first_byte_weight: f64 = 0.30;
@@ -98,4 +104,14 @@ test "non-finite sample counts use the unknown confidence prior" {
     try std.testing.expectEqual(unknown, score(config, candidate, 0, .interactive));
     candidate.samples = -4;
     try std.testing.expectEqual(unknown, score(config, candidate, 0, .interactive));
+}
+
+test "near-zero weight ranks last instead of overflowing the score sentinel" {
+    const config = model.Config{ .exploration = 0, .switch_margin = 0, .switch_confirm_samples = 1, .switch_confirm_ms = 0, .switch_cooldown_ms = 0 };
+    var candidate = model.Candidate{ .id = 1, .reliability = 0.5, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 4, .weight = 1e-9, .state = 1, .eligible = 1 };
+    const tiny = score(config, candidate, 4, .interactive);
+    try std.testing.expect(tiny < 100.0);
+    candidate.weight = 1.0;
+    const normal = score(config, candidate, 4, .interactive);
+    try std.testing.expect(tiny > normal);
 }
