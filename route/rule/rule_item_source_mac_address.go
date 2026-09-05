@@ -12,6 +12,7 @@ var _ RuleItem = (*SourceMACAddressItem)(nil)
 type SourceMACAddressItem struct {
 	addresses  []string
 	addressMap map[string]bool
+	parsed     []net.HardwareAddr
 }
 
 func NewSourceMACAddressItem(addressList []string) *SourceMACAddressItem {
@@ -23,11 +24,18 @@ func NewSourceMACAddressItem(addressList []string) *SourceMACAddressItem {
 		parsed, err := net.ParseMAC(address)
 		if err == nil {
 			rule.addressMap[parsed.String()] = true
+			rule.parsed = append(rule.parsed, parsed)
 		} else {
 			rule.addressMap[address] = true
 		}
 	}
 	return rule
+}
+
+// MACAddresses returns the successfully parsed hardware addresses for
+// dataplane offload (v3 source-MAC policy). Unparseable entries are skipped.
+func (r *SourceMACAddressItem) MACAddresses() []net.HardwareAddr {
+	return r.parsed
 }
 
 func (r *SourceMACAddressItem) Match(metadata *adapter.InboundContext) bool {

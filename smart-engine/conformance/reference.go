@@ -2,6 +2,11 @@ package conformance
 
 import "math"
 
+// This file is the Go reference mirror of smart-engine/src/scoring.zig and
+// the cold-start ranking/confirmation flow of policy.zig (interactive
+// profile). Any change to the Zig kernel formula MUST be mirrored here; the
+// conformance tests pin the two implementations to identical scores.
+
 type Candidate struct {
 	ID, State, Eligible                                                           uint64
 	Reliability, ConnectMS, FirstByteMS, JitterMS, ThroughputBPS, Samples, Weight float64
@@ -26,43 +31,83 @@ type state struct {
 	count                                uint32
 }
 
-func normalized(value, ceiling float64) float64 {
-	if value <= 0 || math.IsNaN(value) {
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func normalizedCost(value, ceiling float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, -1) {
+		return .5
+	}
+	if math.IsInf(value, 1) {
+		return 1
+	}
+	if !(value > 0) {
 		return .5
 	}
 	return math.Max(0, math.Min(1, math.Log1p(value)/math.Log1p(ceiling)))
 }
 
+func normalizedReliability(value float64) float64 {
+	if !isFinite(value) {
+		return .5
+	}
+	return math.Max(0, math.Min(1, value))
+}
+
+func weightOf(weight float64) float64 {
+	if !(weight > 0) || !isFinite(weight) {
+		return 1
+	}
+	if weight < 0.01 {
+		return 0.01
+	}
+	return weight
+}
+
 func score(c Config, candidate Candidate, total float64) float64 {
-	connect := normalized(candidate.ConnectMS, 5000)
-	first := normalized(candidate.FirstByteMS, 10000)
+	samples := 0.0
+	if candidate.Samples > 0 && isFinite(candidate.Samples) {
+		samples = candidate.Samples
+	}
+	exploration := 0.0
+	if c.Exploration > 0 && isFinite(c.Exploration) {
+		exploration = c.Exploration
+	}
+	reliability := normalizedReliability(candidate.Reliability)
+	connect := normalizedCost(candidate.ConnectMS, 5000)
+	first := normalizedCost(candidate.FirstByteMS, 10000)
 	jitter := .5
-	if candidate.JitterMS > 0 {
+	if candidate.ConnectMS > 0 && isFinite(candidate.ConnectMS) &&
+		candidate.JitterMS >= 0 && isFinite(candidate.JitterMS) {
 		jitter = math.Min(1, candidate.JitterMS/1000)
 	}
-	exploration := math.Max(c.Exploration, 0)
-	if candidate.Samples > 0 && total > 0 {
-		exploration *= math.Sqrt(math.Log(total+1) / candidate.Samples)
-	}
+	// The interactive profile keeps throughput_weight at 0 (scoring.zig);
+	// ThroughputBPS is accepted for ABI compatibility but not ranked here.
 	confidence := 0.0
-	minSamples := float64(c.MinSamples)
-	if minSamples <= 0 {
-		minSamples = 3
+	if samples < 3 {
+		confidence = 1 - samples/3
 	}
-	if candidate.Samples < minSamples {
-		confidence = math.Max(0, 1-candidate.Samples/minSamples)
+	base := .30*(1-reliability) + .25*connect + .30*first + .10*jitter + .05*confidence
+	if candidate.State == 5 {
+		base += 0.20
 	}
-	return math.Max(0, .30*(1-candidate.Reliability)+.25*connect+.30*first+.10*jitter+.05*confidence-exploration) / math.Max(candidate.Weight, 1)
+	if samples > 0 && total > 0 {
+		exploration *= math.Sqrt(math.Log(total+2) / (samples + 1))
+	}
+	return math.Max(0, base-exploration) / weightOf(candidate.Weight)
 }
 
 func choose(s *state, c Config, candidates []Candidate, now uint64) Decision {
 	d := Decision{Score: 100, Reason: 3}
 	var best *Candidate
-	bestScore, total := 100.0, 0.0
+	bestScore, total := math.Inf(1), 0.0
 	for i := range candidates {
 		candidate := &candidates[i]
 		if candidate.ID != 0 && candidate.Eligible != 0 && candidate.State != 4 {
-			total += math.Max(candidate.Samples, 0)
+			if candidate.Samples > 0 && isFinite(candidate.Samples) {
+				total += candidate.Samples
+			}
 		}
 	}
 	for i := range candidates {
@@ -71,7 +116,7 @@ func choose(s *state, c Config, candidates []Candidate, now uint64) Decision {
 			continue
 		}
 		value := score(c, *candidate, total)
-		if best == nil || value < bestScore {
+		if isFinite(value) && (best == nil || value < bestScore) {
 			best, bestScore = candidate, value
 		}
 	}

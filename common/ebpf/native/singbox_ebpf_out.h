@@ -13,7 +13,6 @@
 
 /* ── Module A: flow verdict offload (OUT-A) ─────────────────────────── */
 #define SB_OUT_VERDICT_DIRECT 1U
-#define SB_OUT_VERDICT_PROXY  2U
 #define SB_OUT_VERDICT_MAX_ENTRIES 8192U
 
 struct sb_out_verdict_key {
@@ -68,7 +67,6 @@ enum sb_splice_stat_index {
 };
 
 #define SB_SPLICE_CTRL_FLAG_ACCOUNTING (1U << 0)
-#define SB_SPLICE_CTRL_FLAG_VERDICT_ONLY (1U << 1)
 
 /* Ports stored host-order on both sides (ABI iron law). */
 struct sb_splice_key {

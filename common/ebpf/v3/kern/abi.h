@@ -20,7 +20,6 @@
 #define SB_V3_MAX_SOURCE_POLICY 8192U
 #define SB_V3_MAX_FLOW_ENTRIES 65536U
 #define SB_V3_MAX_DNS_HINTS 32768U
-#define SB_V3_MAX_SOCKET_IDENTITY 16384U
 #define SB_V3_LISTENER_COUNT 4U
 #define SB_V3_STATS_COUNT 32U
 #define SB_V3_EVENT_RING_ENTRIES 4096U
@@ -43,8 +42,6 @@ enum sb_v3_source {
 	SB_V3_SRC_EXACT_FLOW = 2,
 	SB_V3_SRC_DNS_WEAK = 3,
 	SB_V3_SRC_FAKEIP = 4,
-	SB_V3_SRC_CONTROL = 5,
-	SB_V3_SRC_SECURITY = 6,
 };
 
 enum sb_v3_reason {
@@ -99,6 +96,9 @@ enum sb_v3_stat_index {
 	SB_V3_STAT_PACKETS_DIRECT,
 	SB_V3_STAT_PACKETS_PROXY,
 	SB_V3_STAT_RELOAD_GENERATION,
+	SB_V3_STAT_MAC_SOURCE_DIRECT,
+	SB_V3_STAT_MAC_SOURCE_BLOCK,
+	SB_V3_STAT_MAC_SOURCE_PROXY,
 	SB_V3_STAT_COUNT = SB_V3_STATS_COUNT,
 };
 
@@ -272,6 +272,14 @@ struct sb_v3_source_policy_value {
 
 _Static_assert(sizeof(struct sb_v3_source_policy_value) == 16U, "sb_v3_source_policy_value size");
 
+/* Host-to-kernel snapshot row for v3_source_mac (design §7.3). */
+struct sb_v3_mac_policy_entry {
+	struct sb_v3_mac_key key;
+	struct sb_v3_source_policy_value value;
+};
+
+_Static_assert(sizeof(struct sb_v3_mac_policy_entry) == 28U, "sb_v3_mac_policy_entry size");
+
 /* Original destination retained for socket_assign handoff (userspace lookup). */
 struct sb_v3_redirect_key {
 	__u8 family;
@@ -296,19 +304,6 @@ struct sb_v3_redirect_value {
 };
 
 _Static_assert(sizeof(struct sb_v3_redirect_value) == 32U, "sb_v3_redirect_value size");
-
-struct sb_v3_socket_identity_key {
-	__u64 cookie;
-};
-
-struct sb_v3_socket_identity_value {
-	__u32 uid;
-	__u32 cgroup_class;
-	__u32 generation;
-	__u32 reserved0;
-};
-
-_Static_assert(sizeof(struct sb_v3_socket_identity_value) == 16U, "sb_v3_socket_identity_value size");
 
 /* Parsed packet view used by TC (also mirrored in Go model tests). */
 struct sb_v3_packet {

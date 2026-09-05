@@ -49,9 +49,6 @@ SB_V3_MAP(v3_redirect, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_redirect_key, struct 
 
 SB_V3_MAP(v3_listener_sockets, BPF_MAP_TYPE_SOCKMAP, __u32, __u64, SB_V3_LISTENER_COUNT, 0U);
 
-SB_V3_MAP(v3_socket_identity, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_socket_identity_key,
-	  struct sb_v3_socket_identity_value, SB_V3_MAX_SOCKET_IDENTITY, 0U);
-
 /* Counters are write-hot on every packet. Keep policy truth in shared maps,
  * but put one complete telemetry vector in a PERCPU array. This avoids both
  * cross-CPU cache contention and a second map lookup for byte accounting. */

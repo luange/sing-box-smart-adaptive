@@ -524,6 +524,12 @@ func (s v3KernelSink) PublishStaticDirect(prefixes []netip.Prefix, generation ui
 	}
 	return s.dp.PublishStaticDirect(prefixes, generation, bank)
 }
+func (s v3KernelSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.PublishMACPolicies(entries)
+}
 func (s v3KernelSink) MergeStaticDirect(prefix netip.Prefix) error {
 	if s.dp == nil {
 		return nil
@@ -686,11 +692,44 @@ func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error
 		if err := s.v3.PublishStaticDirect(prefixes); err != nil {
 			return err
 		}
+		// MAC identity policies ride the same refresh cadence so provider
+		// reloads cannot leave a stale device verdict in v3_source_mac.
+		if err := s.publishV3MACPolicies(routeRouter); err != nil {
+			return err
+		}
 	} else if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
 		return err
 	}
 	s.parent.logger.Info("eBPF v3 static policy published: prefixes=", len(prefixes))
 	return nil
+}
+
+// publishV3MACPolicies sinks MAC-only route rules into the kernel source
+// identity map. Silent no-op unless policy_offload.mac_source_policy is on;
+// only DIRECT and reject-method=drop rules are sinkable (see
+// rule.CollectSourceMACPolicies) — everything else stays in userspace.
+func (s *sharedNetwork) publishV3MACPolicies(routeRouter adapter.Router) error {
+	var rules []adapter.Rule
+	if routeRouter != nil {
+		rules = routeRouter.Rules()
+	}
+	collected := R.CollectSourceMACPolicies(rules)
+	entries := make([]ebpfv3.MACPolicyEntry, 0, len(collected))
+	for _, policy := range collected {
+		var key ebpfv3.MACKey
+		copy(key.Addr[:], policy.MAC)
+		value := ebpfv3.MACPolicyValue{
+			Verdict:    uint8(policy.Verdict),
+			Confidence: ebpfv3.ConfidenceAuthoritative,
+		}
+		if policy.Verdict == R.SourceMACOffloadBlock {
+			value.ReasonCode = uint16(ebpfv3.ReasonStaticBlock)
+		} else {
+			value.ReasonCode = uint16(ebpfv3.ReasonStaticDirect)
+		}
+		entries = append(entries, ebpfv3.MACPolicyEntry{Key: key, Value: value})
+	}
+	return s.v3.PublishMACSourcePolicies(entries)
 }
 
 // RefreshV3Static republishes bypass prefixes after rule-set reload.

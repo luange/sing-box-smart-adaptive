@@ -209,7 +209,6 @@ struct sb_ebpf_v3_runtime {
 	int source_mac_map_fd;
 	int redirect_map_fd;
 	int listener_map_fd;
-	int socket_identity_map_fd;
 	int stats_map_fd;
 	int ingress_prog_fd;
 	int egress_prog_fd;

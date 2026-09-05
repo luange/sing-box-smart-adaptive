@@ -3,6 +3,8 @@ package v3
 import (
 	"net/netip"
 	"time"
+
+	ebpfv3 "github.com/sagernet/sing-box/common/ebpf/v3"
 )
 
 // DataplaneSink is the single kernel-facing publish surface for engine=v3.
@@ -14,6 +16,7 @@ type DataplaneSink interface {
 	PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error
 	DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
+	PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error
 	InvalidateFlowDirect() error
 	PolicyGeneration() uint32
 }

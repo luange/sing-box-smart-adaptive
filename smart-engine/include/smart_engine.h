@@ -102,7 +102,6 @@ adaptive_decision adaptive_engine_choose(adaptive_engine *engine, const adaptive
 void adaptive_engine_set_bulk_sequence(adaptive_engine *engine, uint64_t sequence);
 void adaptive_engine_remember(adaptive_engine *engine, uint64_t id, uint64_t now_ms, uint64_t cooldown_ms);
 void adaptive_engine_forget(adaptive_engine *engine);
-void adaptive_engine_reset(adaptive_engine *engine);
 
 #ifdef __cplusplus
 }

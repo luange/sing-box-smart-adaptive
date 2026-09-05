@@ -4,7 +4,6 @@ package ebpf
 // Mirror native/singbox_ebpf_out.h SB_OUT_VERDICT_*.
 const (
 	OutVerdictDIRECT = 1
-	OutVerdictPROXY  = 2
 
 	// BPF stats ARRAY indices (A2).
 	outVerdictStatHits        = 0

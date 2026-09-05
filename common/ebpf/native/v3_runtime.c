@@ -52,7 +52,7 @@ static int v3_load_programs(
 	const uint8_t *object,
 	size_t object_size,
 	struct sb_ebpf_v3_runtime *runtime) {
-	struct sb_ebpf_object_map_entry entries[20];
+	struct sb_ebpf_object_map_entry entries[19];
 	struct sb_ebpf_object_map_table maps;
 	size_t n = 0;
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_control", runtime->control_map_fd};
@@ -67,7 +67,6 @@ static int v3_load_programs(
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_source_mac", runtime->source_mac_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_redirect", runtime->redirect_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_listener_sockets", runtime->listener_map_fd};
-	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_socket_identity", runtime->socket_identity_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_stats", runtime->stats_map_fd};
 	maps.entries = entries;
 	maps.count = n;
@@ -167,13 +166,6 @@ int sb_ebpf_v3_prepare(
 		sizeof(uint64_t),
 		SB_V3_LISTENER_COUNT,
 		0U);
-	stage = "create socket identity map";
-	runtime->socket_identity_map_fd = sb_ebpf_create_map(
-		BPF_MAP_TYPE_LRU_HASH,
-		sizeof(struct sb_v3_socket_identity_key),
-		sizeof(struct sb_v3_socket_identity_value),
-		SB_V3_MAX_SOCKET_IDENTITY > 16384U ? 16384U : SB_V3_MAX_SOCKET_IDENTITY,
-		0U);
 	stage = "create stats map";
 	runtime->stats_map_fd = sb_ebpf_create_map(
 		BPF_MAP_TYPE_PERCPU_ARRAY,
@@ -188,7 +180,7 @@ int sb_ebpf_v3_prepare(
 	    runtime->host6_map_fd < 0 || runtime->flow_map_fd < 0 ||
 	    runtime->dns_hint_map_fd < 0 || runtime->source_mac_map_fd < 0 ||
 	    runtime->redirect_map_fd < 0 || runtime->listener_map_fd < 0 ||
-	    runtime->socket_identity_map_fd < 0 || runtime->stats_map_fd < 0) {
+	    runtime->stats_map_fd < 0) {
 		goto fail;
 	}
 
@@ -218,7 +210,6 @@ int sb_ebpf_v3_close(struct sb_ebpf_v3_runtime *runtime) {
 	CLOSE_V3(runtime->egress_prog_fd);
 	CLOSE_V3(runtime->ingress_prog_fd);
 	CLOSE_V3(runtime->stats_map_fd);
-	CLOSE_V3(runtime->socket_identity_map_fd);
 	CLOSE_V3(runtime->listener_map_fd);
 	CLOSE_V3(runtime->redirect_map_fd);
 	CLOSE_V3(runtime->source_mac_map_fd);

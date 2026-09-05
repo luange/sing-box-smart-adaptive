@@ -1,7 +1,9 @@
 // Copyright 2026 sing-box smart-adaptive contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Single v3 TC object: ingress decision engine + minimal egress.
+// Single v3 TC object: ingress decision engine. Egress is not used: the
+// socket_assign handoff covers the proxy return path and reverse traffic is
+// left to the kernel stack (design §10).
 // Maps are process-owned; do not pin across ABI versions.
 
 #define SEC(name) __attribute__((section(name), used))
@@ -68,6 +70,29 @@ static __attribute__((always_inline)) bool policy_port_match(const struct sb_v3_
 	if (policy->match_dport_min == 0 && policy->match_dport_max == 0)
 		return true;
 	return packet->dport >= policy->match_dport_min && packet->dport <= policy->match_dport_max;
+}
+
+/* Source-MAC identity policy (design §7.3). The host publishes MAC-keyed
+ * verdicts for LAN devices whose route rules are pure source-MAC matches.
+ * An exact ifindex entry wins over the wildcard (ifindex 0 = any interface).
+ * The map is small (SB_V3_MAX_SOURCE_POLICY) and only consulted when the
+ * SB_V3_FLAG_MAC_SOURCE control flag is set, so the common path pays one
+ * flag test. */
+static __attribute__((always_inline)) const struct sb_v3_source_policy_value *
+lookup_source_policy(const struct sb_v3_control *control, const struct sb_v3_packet *packet) {
+	if (!(control->flags & SB_V3_FLAG_MAC_SOURCE))
+		return 0;
+	struct sb_v3_mac_key key = {};
+	__builtin_memcpy(key.addr, packet->smac, 6);
+	key.ifindex = packet->ifindex;
+	const struct sb_v3_source_policy_value *policy = map_lookup(&v3_source_mac, &key);
+	if (policy && policy->generation == control->policy_generation)
+		return policy;
+	key.ifindex = 0;
+	policy = map_lookup(&v3_source_mac, &key);
+	if (policy && policy->generation == control->policy_generation)
+		return policy;
+	return 0;
 }
 
 static __attribute__((always_inline)) const struct sb_v3_policy_value *lookup_static_policy(
@@ -395,6 +420,19 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 	    packet.dport == 443)
 		return action_block(skb);
 
+	/* Source identity overrides destination defaults: a MAC-keyed rule is
+	 * strictly more specific about the client than any destination CIDR.
+	 * Proxy/MustControl verdicts hand off exactly like the static path. */
+	const struct sb_v3_source_policy_value *source_policy = lookup_source_policy(control, &packet);
+	if (source_policy) {
+		if (source_policy->verdict == SB_V3_DIRECT)
+			return action_direct(skb, SB_V3_STAT_MAC_SOURCE_DIRECT);
+		if (source_policy->verdict == SB_V3_BLOCK)
+			return action_block(skb);
+		if (source_policy->verdict == SB_V3_PROXY || source_policy->verdict == SB_V3_MUST_CONTROL)
+			return handoff_proxy(skb, control, &packet, SB_V3_STAT_MAC_SOURCE_PROXY, ifindex, pkt_len);
+	}
+
 	const struct sb_v3_policy_value *static_policy = lookup_static_policy(control, &packet);
 	if (static_policy) {
 		if (static_policy->verdict == SB_V3_DIRECT)
@@ -432,16 +470,6 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 	}
 
 	return handoff_proxy(skb, control, &packet, SB_V3_STAT_MAP_MISS_PROXY, ifindex, pkt_len);
-}
-
-SEC("classifier/egress")
-int sb_v3_egress(struct __sk_buff *skb) {
-	__u32 zero = 0;
-	struct sb_v3_control *control = map_lookup(&v3_control, &zero);
-	if (!control || !control->enabled)
-		return TC_ACT_OK;
-	(void)skb;
-	return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";

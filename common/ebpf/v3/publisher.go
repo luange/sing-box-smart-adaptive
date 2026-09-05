@@ -140,6 +140,7 @@ type MemoryBackend struct {
 	Policy6         [2]map[LPM6Key]PolicyValue
 	Flows           map[FlowKey]FlowValue
 	DNS             *DNSHintTable
+	MACPolicies     map[MACKey]MACPolicyValue
 	Publisher       *BankPublisher
 	Stats           [StatsCount]uint64
 	flowLimit       int
@@ -151,6 +152,7 @@ func NewMemoryBackend() *MemoryBackend {
 		Publisher: NewBankPublisher(),
 		Flows:     make(map[FlowKey]FlowValue),
 		DNS:       NewDNSHintTable(),
+		MACPolicies: make(map[MACKey]MACPolicyValue),
 		flowLimit: maxMemoryFlowEntries,
 	}
 	b.Policy4[0] = make(map[LPM4Key]PolicyValue)
@@ -427,4 +429,33 @@ func (b *MemoryBackend) LookupFlow(key FlowKey) *FlowValue {
 		return nil
 	}
 	return &v
+}
+
+// PublishMACPolicies replaces the complete MAC-source snapshot in the memory
+// model. Rows are tagged with the current policy generation so a generation
+// bump (PublishStatic / InvalidateFlowDirect) retires stale identities.
+func (b *MemoryBackend) PublishMACPolicies(entries []MACPolicyEntry) error {
+	if b == nil {
+		return fmt.Errorf("nil memory backend")
+	}
+	if len(entries) > MaxSourcePolicies {
+		return fmt.Errorf("mac source policy exceeds map capacity")
+	}
+	snapshot := make(map[MACKey]MACPolicyValue, len(entries))
+	for _, entry := range entries {
+		var zero MACKey
+		if entry.Key == zero {
+			continue
+		}
+		entry.Value.Generation = b.Control.PolicyGeneration
+		if entry.Value.Generation == 0 {
+			entry.Value.Generation = 1
+		}
+		if entry.Value.Source == 0 {
+			entry.Value.Source = uint8(SourceStatic)
+		}
+		snapshot[entry.Key] = entry.Value
+	}
+	b.MACPolicies = snapshot
+	return nil
 }

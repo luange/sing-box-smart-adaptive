@@ -90,6 +90,7 @@ type memSink struct {
 	merged  int
 	invalid int
 	deleted int
+	mac     int
 	gen     uint32
 }
 
@@ -114,6 +115,10 @@ func (m *memSink) PutDirectFlow(protocol uint8, source, destination netip.AddrPo
 }
 func (m *memSink) DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error {
 	m.deleted++
+	return nil
+}
+func (m *memSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
+	m.mac += len(entries)
 	return nil
 }
 func (m *memSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
@@ -287,5 +292,73 @@ func TestControlFlagsNoDefaultQUICDrop(t *testing.T) {
 	}
 	if flags&ebpfv3.FlagStaticPolicy == 0 || flags&ebpfv3.FlagSocketAssign == 0 {
 		t.Fatalf("flags=%x", flags)
+	}
+}
+
+func TestLifecyclePublishMACSourcePolicies(t *testing.T) {
+	drop := false
+	newLifecycle := func(macSource bool) *Lifecycle {
+		t.Helper()
+		lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+			Enabled:    true,
+			Engine:     EngineV3,
+			DataPlane:  "socket_assign",
+			DropUDP443: &drop,
+			PolicyOffload: option.EBPFPolicyOffloadOptions{
+				Enabled:         true,
+				MACSourcePolicy: macSource,
+			},
+		}, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lc
+	}
+	entries := []ebpfv3.MACPolicyEntry{{
+		Key:   ebpfv3.MACKey{Addr: [6]byte{0xaa, 0xbb, 0xcc, 0x01, 0x02, 0x03}},
+		Value: ebpfv3.MACPolicyValue{Verdict: uint8(ebpfv3.VerdictDirect), Confidence: ebpfv3.ConfidenceAuthoritative},
+	}}
+
+	// Disabled policy is a no-op in both representations.
+	lc := newLifecycle(false)
+	defer lc.Close()
+	sink := &memSink{}
+	lc.BindSink(sink)
+	if err := lc.PublishMACSourcePolicies(entries); err != nil {
+		t.Fatal(err)
+	}
+	if sink.mac != 0 || len(lc.backend.MACPolicies) != 0 {
+		t.Fatalf("disabled mac policy published: sink=%d model=%d", sink.mac, len(lc.backend.MACPolicies))
+	}
+
+	// Enabled policy mirrors to sink and model with generation tagging.
+	lc2 := newLifecycle(true)
+	defer lc2.Close()
+	sink2 := &memSink{}
+	lc2.BindSink(sink2)
+	if err := lc2.PublishMACSourcePolicies(entries); err != nil {
+		t.Fatal(err)
+	}
+	if sink2.mac != 1 {
+		t.Fatalf("sink entries=%d", sink2.mac)
+	}
+	if len(lc2.backend.MACPolicies) != 1 {
+		t.Fatalf("model entries=%d", len(lc2.backend.MACPolicies))
+	}
+	for _, value := range lc2.backend.MACPolicies {
+		if value.Generation == 0 {
+			t.Fatal("mac row not generation-tagged")
+		}
+		if value.Source != uint8(ebpfv3.SourceStatic) {
+			t.Fatalf("unexpected source %d", value.Source)
+		}
+	}
+
+	// An empty snapshot retires all rows (authoritative replace).
+	if err := lc2.PublishMACSourcePolicies(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(lc2.backend.MACPolicies) != 0 {
+		t.Fatalf("stale mac rows survived snapshot replace: %d", len(lc2.backend.MACPolicies))
 	}
 }

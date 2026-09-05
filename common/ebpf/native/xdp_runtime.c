@@ -368,7 +368,6 @@ int sb_ebpf_xdp_prepare(
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_source_mac", v3->source_mac_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_redirect", v3->redirect_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_listener_sockets", v3->listener_map_fd};
-	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_socket_identity", v3->socket_identity_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_stats", v3->stats_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_xdp_control", runtime->control_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_xsk_map", runtime->xsk_map_fd};

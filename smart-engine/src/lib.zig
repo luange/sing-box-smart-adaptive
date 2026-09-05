@@ -209,10 +209,6 @@ export fn adaptive_engine_forget(engine: ?*AdaptiveEngine) void {
     }
 }
 
-export fn adaptive_engine_reset(engine: ?*AdaptiveEngine) void {
-    if (engine) |value| value.state.reset();
-}
-
 test "retains incumbent until confirmation" {
     var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0.05, .switch_confirm_samples = 2, .switch_confirm_ms = 1000, .switch_cooldown_ms = 2000 });
     const candidates = [_]Candidate{

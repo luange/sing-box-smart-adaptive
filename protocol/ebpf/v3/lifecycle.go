@@ -195,6 +195,28 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	return len(direct), len(rej), nil
 }
 
+// PublishMACSourcePolicies replaces the complete MAC-source identity
+// snapshot in both control-plane representations. It is a no-op unless
+// policy_offload.mac_source_policy is enabled, so the kernel flag and the
+// publication surface stay consistent. Kernel publication happens first
+// (the fail-closed side), then the memory model is committed.
+func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) error {
+	if l == nil || l.backend == nil {
+		return fmt.Errorf("nil lifecycle")
+	}
+	if !l.options.PolicyOffload.Enabled || !l.options.PolicyOffload.MACSourcePolicy {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.sink != nil {
+		if err := l.sink.PublishMACPolicies(entries); err != nil {
+			return err
+		}
+	}
+	return l.backend.PublishMACPolicies(entries)
+}
+
 // PublishStaticDirect replaces the complete DIRECT prefix snapshot in both
 // control-plane representations.  The protocol/ebpf parent already resolved
 // these prefixes from its route and rule-set state, so there is no CompileInput

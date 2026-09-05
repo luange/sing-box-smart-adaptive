@@ -43,6 +43,8 @@ import (
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"golang.org/x/sys/unix"
+
+	ebpfv3 "github.com/sagernet/sing-box/common/ebpf/v3"
 )
 
 //go:embed v3/kern/tc.bpf.o
@@ -178,6 +180,23 @@ type v3LPM4 struct {
 type v3LPM6 struct {
 	PrefixLen uint32
 	Addr      [16]byte
+}
+
+type v3MACKey struct {
+	Addr     [6]byte
+	Reserved [2]byte
+	Ifindex  uint32
+}
+
+type v3MACPolicyValue struct {
+	Verdict    uint8
+	Source     uint8
+	Confidence uint8
+	Reserved0  uint8
+	ReasonCode uint16
+	Reserved1  uint16
+	PolicyID   uint32
+	Generation uint32
 }
 
 const (
@@ -1027,6 +1046,88 @@ func deleteV3PolicyPrefix(fd4, fd6 int, prefix netip.Prefix) error {
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+// PublishMACPolicies replaces the complete source-MAC identity snapshot in
+// the kernel v3_source_mac map (design §7.3). The snapshot is authoritative:
+// keys absent from entries are deleted so a provider reload cannot leave a
+// stale device verdict behind. Rows are tagged with the live policy
+// generation so the kernel ignores them after a generation bump until the
+// host republishes.
+func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
+	if b == nil {
+		return osErrClosed
+	}
+	if len(entries) > ebpfv3.MaxSourcePolicies {
+		return E.New("mac source policy exceeds map capacity")
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	mapFD := int(b.runtime.source_mac_map_fd)
+	generation := b.control.PolicyGeneration
+	if generation == 0 {
+		generation = 1
+	}
+	// Enumerate live keys first: deleting while iterating with get_next_key
+	// can skip entries, so removals happen after the walk completes.
+	var live []v3MACKey
+	var next v3MACKey
+	for {
+		var start unsafe.Pointer
+		if len(live) > 0 {
+			prev := live[len(live)-1]
+			start = unsafe.Pointer(&prev)
+		}
+		if err := getNextKeyMap(mapFD, start, unsafe.Pointer(&next)); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				break
+			}
+			return E.Cause(err, "iterate v3 source mac")
+		}
+		live = append(live, next)
+	}
+	desired := make(map[v3MACKey]v3MACPolicyValue, len(entries))
+	for _, entry := range entries {
+		var zero ebpfv3.MACKey
+		if entry.Key == zero {
+			continue
+		}
+		value := v3MACPolicyValue{
+			Verdict:    entry.Value.Verdict,
+			Source:     entry.Value.Source,
+			Confidence: entry.Value.Confidence,
+			ReasonCode: entry.Value.ReasonCode,
+			PolicyID:   entry.Value.PolicyID,
+			Generation: generation,
+		}
+		if value.Source == 0 {
+			value.Source = v3SourceStatic
+		}
+		desired[v3MACKey{
+			Addr:     entry.Key.Addr,
+			Reserved: entry.Key.Reserved,
+			Ifindex:  entry.Key.Ifindex,
+		}] = value
+	}
+	for _, old := range live {
+		if _, ok := desired[old]; ok {
+			continue
+		}
+		stale := old
+		if err := deleteMap(mapFD, unsafe.Pointer(&stale)); err != nil && !errors.Is(err, unix.ENOENT) {
+			return E.Cause(err, "delete stale v3 source mac")
+		}
+	}
+	for key, value := range desired {
+		entry := key
+		if err := updateMap(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&value)); err != nil {
+			return E.Cause(err, "publish v3 source mac")
+		}
 	}
 	return nil
 }

@@ -37,8 +37,6 @@ const (
 	SourceExactFlow Source = 2
 	SourceDNSWeak   Source = 3
 	SourceFakeIP    Source = 4
-	SourceControl   Source = 5
-	SourceSecurity  Source = 6
 )
 
 // Reason codes mirror SB_V3_REASON_* / stats for observability.
@@ -266,3 +264,34 @@ func DNSHintAllowsDirect(v DNSIPValue, generation uint32, nowNs uint64) (ok bool
 		return false, ReasonMapMissProxy
 	}
 }
+
+// MACKey mirrors struct sb_v3_mac_key (12 bytes): one LAN client identity.
+type MACKey struct {
+	Addr     [6]byte
+	Reserved [2]byte
+	// Ifindex 0 matches any ingress interface; a nonzero value wins over
+	// the wildcard when both exist.
+	Ifindex uint32
+}
+
+// MACPolicyValue mirrors struct sb_v3_source_policy_value (16 bytes).
+type MACPolicyValue struct {
+	Verdict    uint8 // VerdictUnseen means "no override"
+	Source     uint8
+	Confidence uint8
+	Reserved0  uint8
+	ReasonCode uint16
+	Reserved1  uint16
+	PolicyID   uint32
+	Generation uint32
+}
+
+// MACPolicyEntry is one snapshot row published into the v3_source_mac map.
+// The C mirror is struct sb_v3_mac_policy_entry (28 bytes, no padding:
+// both halves are 4-byte aligned).
+type MACPolicyEntry struct {
+	Key   MACKey
+	Value MACPolicyValue
+}
+
+const MaxSourcePolicies = 8192

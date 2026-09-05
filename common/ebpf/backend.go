@@ -90,6 +90,7 @@ const (
 	bpfMapLookupElem = 1
 	bpfMapUpdateElem = 2
 	bpfMapDeleteElem = 3
+	bpfMapGetNextKey = 4
 	bpfMapTypeArray  = 2
 	bpfNoExist       = 1
 )
@@ -1039,6 +1040,12 @@ func updateMapWithFlags(mapFD int, key unsafe.Pointer, value unsafe.Pointer, fla
 
 func deleteMap(mapFD int, key unsafe.Pointer) error {
 	return mapOperation(bpfMapDeleteElem, mapFD, key, nil, 0)
+}
+
+// getNextKeyMap returns the next key after key in mapFD. Pass key == nil to
+// start iteration from the first key. Returns ENOENT when key is the last.
+func getNextKeyMap(mapFD int, key, nextKey unsafe.Pointer) error {
+	return mapOperation(bpfMapGetNextKey, mapFD, key, nextKey, 0)
 }
 
 func mapOperation(command uintptr, mapFD int, key unsafe.Pointer, value unsafe.Pointer, flags uint64) error {
