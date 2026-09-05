@@ -547,6 +547,9 @@ func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapt
 	recent := append([]candidate(nil), items...)
 	oldest := append([]candidate(nil), items...)
 	sort.SliceStable(recent, func(i, j int) bool {
+		if recent[i].history == nil && recent[j].history == nil {
+			return false
+		}
 		if recent[i].history == nil {
 			return false
 		}
@@ -556,6 +559,9 @@ func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapt
 		return recent[i].history.Time.After(recent[j].history.Time)
 	})
 	sort.SliceStable(oldest, func(i, j int) bool {
+		if oldest[i].history == nil && oldest[j].history == nil {
+			return false
+		}
 		if oldest[i].history == nil {
 			return true
 		}
