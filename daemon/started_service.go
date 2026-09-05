@@ -728,11 +728,29 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	if isURLTest {
 		go urlTest.CheckOutbounds()
 	} else if isOutboundGroup {
-		outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
-			itOutbound, _ := boxService.outboundManager.Outbound(it)
-			return itOutbound
-		}))
-		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+		if dashboardGroup, ok := outbound.(adapter.DashboardURLTestGroup); ok {
+			// A control-plane refresh must not fan out one dial per provider
+			// alias. Smart/Adaptive own a bounded, shared scheduler for this
+			// path; keep the API handler asynchronous and give the probe a hard
+			// deadline so a slow endpoint cannot pin service shutdown.
+			go func() {
+				probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
+				defer cancel()
+				_, _ = dashboardGroup.DashboardURLTest(probeCtx)
+			}()
+		} else if urlTestGroup, ok := outbound.(adapter.URLTestGroup); ok {
+			go func() {
+				probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
+				defer cancel()
+				_, _ = urlTestGroup.URLTest(probeCtx)
+			}()
+		} else {
+			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
+				itOutbound, _ := boxService.outboundManager.Outbound(it)
+				return itOutbound
+			}))
+			go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+		}
 	} else {
 		go func() {
 			t, err := urltest.URLTest(boxService.ctx, "", outbound)

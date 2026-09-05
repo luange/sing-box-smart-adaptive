@@ -63,6 +63,7 @@ const (
 
 var (
 	_ adapter.AdaptivePoolGroup        = (*AdaptivePool)(nil)
+	_ adapter.DashboardURLTestGroup    = (*AdaptivePool)(nil)
 	_ adapter.PreMatchDisabledOutbound = (*AdaptivePool)(nil)
 	_ adapter.RuntimeEpochLifecycle    = (*AdaptivePool)(nil)
 )
@@ -145,6 +146,8 @@ type AdaptivePool struct {
 	retired                 bool
 	scheduler               *ProbeScheduler
 	manualProbePending      atomic.Bool
+	dashboardProbeRunning   atomic.Bool
+	dashboardProbeCursor    atomic.Uint64
 	schedulerOwner          *SchedulerCoordinator
 	schedulerGen            uint64
 	capabilityProvider      RefreshableProbeTargetProvider
@@ -1276,6 +1279,67 @@ func (p *AdaptivePool) URLTest(ctx context.Context) (map[string]uint16, error) {
 			return result, submission.Err
 		}
 		pending = append(pending, pendingProbe{tag: candidate.PrimaryTag, future: submission.Future})
+	}
+	for index, probe := range pending {
+		probeResult, err := probe.future.Await(ctx)
+		if err != nil {
+			for _, remaining := range pending[index+1:] {
+				remaining.future.Cancel()
+			}
+			return result, err
+		}
+		if probeResult.Outcome == OutcomeSuccess {
+			result[probe.tag] = uint16(max(0, probeResult.Delay.Milliseconds()))
+		}
+	}
+	return result, nil
+}
+
+// DashboardURLTest is a bounded control-plane probe.  AdaptivePool.URLTest is
+// intentionally a complete scheduler check for explicit callers; using it for
+// a dashboard refresh would enqueue every provider node at once.  Keep the
+// dashboard request on the pool scheduler, endpoint admission and observation
+// path, but inspect only a small rotating slice of candidates.
+func (p *AdaptivePool) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
+	if p.closing.Load() || !p.dashboardProbeRunning.CompareAndSwap(false, true) {
+		return map[string]uint16{}, nil
+	}
+	defer p.dashboardProbeRunning.Store(false)
+
+	p.lifecycleAccess.Lock()
+	scheduler := p.scheduler
+	p.lifecycleAccess.Unlock()
+	if scheduler == nil {
+		return nil, errors.New("adaptive probe scheduler is not running")
+	}
+	snapshot := p.catalog.load()
+	if snapshot == nil || len(snapshot.Candidates) == 0 {
+		return map[string]uint16{}, nil
+	}
+	const dashboardProbeLimit = 2
+	limit := min(dashboardProbeLimit, len(snapshot.Candidates))
+	start := int(p.dashboardProbeCursor.Add(uint64(limit))-uint64(limit)) % len(snapshot.Candidates)
+	candidates := make([]Candidate, 0, limit)
+	for index := range limit {
+		candidates = append(candidates, snapshot.Candidates[(start+index)%len(snapshot.Candidates)])
+	}
+	result := make(map[string]uint16, len(candidates))
+	pending := make([]struct {
+		tag    string
+		future *ProbeFuture
+	}, 0, len(candidates))
+	for _, candidate := range candidates {
+		submission := scheduler.Submit(p.probeTask(snapshot, candidate, time.Now(), 0))
+		if submission.Err != nil {
+			for _, probe := range pending {
+				probe.future.Cancel()
+			}
+			return result, submission.Err
+		}
+		pending = append(pending, struct {
+			tag    string
+			future *ProbeFuture
+		}{tag: candidate.PrimaryTag, future: submission.Future})
 	}
 	for index, probe := range pending {
 		probeResult, err := probe.future.Await(ctx)

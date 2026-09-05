@@ -78,13 +78,12 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		defer cancel()
 
 		var result map[string]uint16
-		_, isSmartGroup := proxy.(adapter.SmartGroup)
-		_, isAdaptivePool := proxy.(adapter.AdaptivePoolGroup)
-		// Smart and AdaptivePool implement URLTestGroup for their scheduler,
-		// but the dashboard action is deliberately a separate, one-shot probe.
-		// Calling URLTestGroup here would run the scheduler's full-cycle
-		// deadline and turn a large group into an all-or-nothing 504.
-		if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup && !isSmartGroup && !isAdaptivePool {
+		// Smart and AdaptivePool expose a bounded dashboard surface.  It shares
+		// their endpoint admission and scheduler instead of recursively walking
+		// every leaf with the generic URLTestOutbounds fan-out.
+		if dashboardGroup, isDashboardGroup := outboundGroup.(adapter.DashboardURLTestGroup); isDashboardGroup {
+			result, err = dashboardGroup.DashboardURLTest(ctx)
+		} else if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
 			result, err = urlTestGroup.URLTest(ctx)
 		} else {
 			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {

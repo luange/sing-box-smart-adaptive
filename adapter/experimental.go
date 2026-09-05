@@ -176,3 +176,14 @@ type URLTestGroup interface {
 	URLTest(ctx context.Context) (map[string]uint16, error)
 	PerformUpdateCheck()
 }
+
+// DashboardURLTestGroup is the bounded, non-fan-out probe surface used by
+// control-plane clients such as Zashboard.  It is intentionally separate from
+// URLTest: the latter is the full group check used by the configured scheduler,
+// while a dashboard request must never turn into one dial per provider alias.
+// Implementations must share their normal endpoint registry/scheduler and may
+// return a partial result when the caller's deadline expires.
+type DashboardURLTestGroup interface {
+	URLTestGroup
+	DashboardURLTest(ctx context.Context) (map[string]uint16, error)
+}

@@ -49,10 +49,13 @@ const (
 	// The probe must not depend on a hostname whose DNS is routed through the
 	// very Smart group being measured.  A literal Cloudflare address keeps the
 	// first probe bootstrap-safe; urltest supplies the matching TLS SNI.
-	defaultSmartProbeURL              = "https://1.1.1.1/cdn-cgi/trace"
-	defaultSmartProbeCycleTimeout     = 30 * time.Second
-	defaultSmartProbeTimeout          = 5 * time.Second
-	defaultSmartProbeConcurrency      = 2
+	defaultSmartProbeURL          = "https://1.1.1.1/cdn-cgi/trace"
+	defaultSmartProbeCycleTimeout = 30 * time.Second
+	defaultSmartProbeTimeout      = 5 * time.Second
+	defaultSmartProbeConcurrency  = 2
+	// A control-plane refresh is advisory. Keep it below the cold-start
+	// baseline so opening a dashboard cannot compete with a live stream.
+	defaultSmartDashboardProbeBudget  = 2
 	defaultSmartUDPProbeTimeout       = 2 * time.Second
 	defaultSmartUDPProbeTargetCount   = 2
 	defaultSmartRecoveryProbeTimeout  = 2 * time.Second
@@ -223,6 +226,7 @@ func RegisterSmart(registry *outbound.Registry) {
 
 var (
 	_ adapter.SmartGroup            = (*Smart)(nil)
+	_ adapter.DashboardURLTestGroup = (*Smart)(nil)
 	_ adapter.PreMatchOutboundGroup = (*Smart)(nil)
 )
 
@@ -2367,6 +2371,16 @@ func hasEligibleSmartRank(ranks []smartRank) bool {
 
 func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.probe(ctx)
+}
+
+// DashboardURLTest is deliberately bounded.  The native URLTest contract is
+// a full group probe; using it for a panel refresh would scan every provider
+// alias and compete with real traffic.  The dashboard path uses the same
+// endpoint-deduplicating registry, health portraits and UDP/TCP split as the
+// normal Smart worker, but only a small advisory budget per request.  A later
+// scheduled cycle fills the remaining catalog without a control-plane burst.
+func (s *Smart) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
+	return s.probeWithBudget(ctx, defaultSmartDashboardProbeBudget)
 }
 
 // PerformUpdateCheck is the non-blocking hook used by the Clash API after a
