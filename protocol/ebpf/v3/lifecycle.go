@@ -199,6 +199,11 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 		}
 	}
 	if err := l.backend.PublishStatic(direct); err != nil {
+		// The kernel bank already committed a new generation; realign the
+		// memory model to it so the next publish cannot diverge permanently.
+		if l.sink != nil {
+			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+		}
 		return 0, 0, err
 	}
 	return len(direct), len(rej), nil
@@ -267,7 +272,15 @@ func (l *Lifecycle) PublishStaticDirect(prefixes []netip.Prefix) error {
 			return err
 		}
 	}
-	return l.backend.PublishStatic(policies)
+	if err := l.backend.PublishStatic(policies); err != nil {
+		// Kernel generation moved ahead of the model; resync or the gap is
+		// permanent (each side increments from its own counter).
+		if l.sink != nil {
+			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+		}
+		return err
+	}
+	return nil
 }
 
 // MergeStaticDirect publishes one learned DIRECT prefix to the active bank
@@ -288,7 +301,13 @@ func (l *Lifecycle) MergeStaticDirect(prefix netip.Prefix) error {
 			return err
 		}
 	}
-	return l.backend.MergeStaticDirect(prefix)
+	if err := l.backend.MergeStaticDirect(prefix); err != nil {
+		if l.sink != nil {
+			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+		}
+		return err
+	}
+	return nil
 }
 
 // LearnFlow publishes exact-flow verdict after userspace bare-direct route.
