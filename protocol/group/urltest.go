@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,8 +34,16 @@ func RegisterURLTest(registry *outbound.Registry) {
 
 var (
 	_ adapter.OutboundGroup           = (*URLTest)(nil)
+	_ adapter.DashboardURLTestGroup   = (*URLTest)(nil)
 	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
 )
+
+const (
+	dashboardURLTestLimit       = 12
+	dashboardURLTestConcurrency = 4
+)
+
+var dashboardURLTestSlots = make(chan struct{}, dashboardURLTestConcurrency)
 
 type URLTest struct {
 	outbound.Adapter
@@ -138,6 +147,16 @@ func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selec
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
+}
+
+// DashboardURLTest is the control-plane variant of URLTest. The configured
+// URL-test scheduler may cover the complete catalog, but a panel refresh must
+// use the shared sampled path instead of creating a full fan-out.
+func (s *URLTest) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
+	if s.group == nil {
+		return map[string]uint16{}, nil
+	}
+	return DashboardURLTestOutbounds(ctx, s.outbound, s.group.history, s.logger, s.group.outbounds, s.group.link), nil
 }
 
 func (s *URLTest) CheckOutbounds() {
@@ -409,27 +428,63 @@ type urlTestResult struct {
 }
 
 type urlTestBatch struct {
-	ctx      context.Context
-	outbound adapter.OutboundManager
-	history  *urltest.HistoryStorage
-	logger   log.Logger
-	batch    *batch.Batch[any]
-	checked  map[string]bool
-	groups   []adapter.OutboundGroup
-	access   sync.Mutex
-	result   map[string]uint16
+	ctx       context.Context
+	outbound  adapter.OutboundManager
+	history   *urltest.HistoryStorage
+	logger    log.Logger
+	batch     *batch.Batch[any]
+	checked   map[string]bool
+	groups    []adapter.OutboundGroup
+	access    sync.Mutex
+	result    map[string]uint16
+	dashboard bool
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, false, 10)
+}
+
+// DashboardURLTestOutbounds follows Surge's control-plane rule: sample the
+// most recently observed and stalest leaves, while nested Smart/Adaptive/URLTest
+// groups keep ownership of their own bounded scheduler. It is intentionally
+// separate from URLTestOutbounds so periodic full checks retain their contract.
+func DashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string) map[string]uint16 {
+	leaves, dashboardGroups := collectDashboardOutbounds(outboundManager, outbounds)
+	selectedLeaves := selectDashboardOutbounds(history, leaves, dashboardURLTestLimit)
+	result := make(map[string]uint16)
+	var resultAccess sync.Mutex
+	if len(selectedLeaves) > 0 {
+		maps.Copy(result, urlTestOutbounds(ctx, outboundManager, history, logger, selectedLeaves, link, 0, true, true, dashboardURLTestConcurrency))
+	}
+	groupBatch, _ := batch.New(ctx, batch.WithConcurrencyNum[any](dashboardURLTestConcurrency))
+	for _, dashboardGroup := range dashboardGroups {
+		group := dashboardGroup
+		groupBatch.Go(group.Tag(), func() (any, error) {
+			groupResult, err := group.DashboardURLTest(ctx)
+			resultAccess.Lock()
+			maps.Copy(result, groupResult)
+			resultAccess.Unlock()
+			return nil, err
+		})
+	}
+	groupBatch.Wait()
+	return result
+}
+
+func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force, dashboard bool, concurrency int) map[string]uint16 {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
 	testBatch := &urlTestBatch{
-		ctx:      ctx,
-		outbound: outboundManager,
-		history:  history,
-		logger:   logger,
-		batch:    b,
-		checked:  make(map[string]bool),
-		result:   make(map[string]uint16),
+		ctx:       ctx,
+		outbound:  outboundManager,
+		history:   history,
+		logger:    logger,
+		batch:     b,
+		checked:   make(map[string]bool),
+		result:    make(map[string]uint16),
+		dashboard: dashboard,
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
@@ -440,6 +495,107 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		}
 	}
 	return testBatch.result
+}
+
+func collectDashboardOutbounds(outboundManager adapter.OutboundManager, outbounds []adapter.Outbound) ([]adapter.Outbound, []adapter.DashboardURLTestGroup) {
+	visited := make(map[string]bool)
+	leaves := make([]adapter.Outbound, 0, len(outbounds))
+	groups := make([]adapter.DashboardURLTestGroup, 0)
+	var walk func(adapter.Outbound)
+	walk = func(detour adapter.Outbound) {
+		if detour == nil || visited[detour.Tag()] {
+			return
+		}
+		visited[detour.Tag()] = true
+		if dashboardGroup, ok := detour.(adapter.DashboardURLTestGroup); ok {
+			groups = append(groups, dashboardGroup)
+			return
+		}
+		if outboundGroup, ok := detour.(adapter.OutboundGroup); ok {
+			for _, childTag := range outboundGroup.All() {
+				child, loaded := outboundManager.Outbound(childTag)
+				if loaded {
+					walk(child)
+				}
+			}
+			return
+		}
+		leaves = append(leaves, detour)
+	}
+	for _, detour := range outbounds {
+		walk(detour)
+	}
+	return leaves, groups
+}
+
+func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapter.Outbound, limit int) []adapter.Outbound {
+	if limit <= 0 || len(outbounds) <= limit {
+		return outbounds
+	}
+	type candidate struct {
+		outbound adapter.Outbound
+		history  *adapter.URLTestHistory
+	}
+	items := make([]candidate, 0, len(outbounds))
+	for _, outbound := range outbounds {
+		var itemHistory *adapter.URLTestHistory
+		if history != nil {
+			itemHistory = history.LoadURLTestHistory(outbound.Tag())
+		}
+		items = append(items, candidate{outbound: outbound, history: itemHistory})
+	}
+	recent := append([]candidate(nil), items...)
+	oldest := append([]candidate(nil), items...)
+	sort.SliceStable(recent, func(i, j int) bool {
+		if recent[i].history == nil {
+			return false
+		}
+		if recent[j].history == nil {
+			return true
+		}
+		return recent[i].history.Time.After(recent[j].history.Time)
+	})
+	sort.SliceStable(oldest, func(i, j int) bool {
+		if oldest[i].history == nil {
+			return true
+		}
+		if oldest[j].history == nil {
+			return false
+		}
+		return oldest[i].history.Time.Before(oldest[j].history.Time)
+	})
+	selected := make([]adapter.Outbound, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	appendCandidate := func(item candidate) {
+		if len(selected) >= limit {
+			return
+		}
+		if _, exists := seen[item.outbound.Tag()]; exists {
+			return
+		}
+		seen[item.outbound.Tag()] = struct{}{}
+		selected = append(selected, item.outbound)
+	}
+	for _, item := range recent[:min(len(recent), limit/2)] {
+		appendCandidate(item)
+	}
+	for _, item := range oldest {
+		appendCandidate(item)
+	}
+	for _, item := range items {
+		appendCandidate(item)
+	}
+	return selected
+}
+
+func runDashboardLeafProbe(ctx context.Context, probe func(context.Context) (uint16, error)) (uint16, error) {
+	select {
+	case dashboardURLTestSlots <- struct{}{}:
+		defer func() { <-dashboardURLTestSlots }()
+		return probe(ctx)
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
 func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
@@ -459,6 +615,18 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				b.access.Unlock()
 				return nil, nil
 			})
+		case adapter.DashboardURLTestGroup:
+			// Do not recursively expand Smart/Adaptive candidates when they are
+			// nested below another group. Their dashboard method owns endpoint
+			// deduplication and the bounded sample budget.
+			b.checked[tag] = true
+			b.batch.Go(tag, func() (any, error) {
+				nestedResult, nestedErr := nested.DashboardURLTest(b.ctx)
+				b.access.Lock()
+				maps.Copy(b.result, nestedResult)
+				b.access.Unlock()
+				return nil, nestedErr
+			})
 		case adapter.OutboundGroup:
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
@@ -475,16 +643,22 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.batch.Go(tag, func() (any, error) {
 				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
 				defer cancel()
-				testChan := make(chan urlTestResult, 1)
-				go func() {
-					delay, testErr := urltest.URLTest(testCtx, link, detour)
-					testChan <- urlTestResult{delay, testErr}
-				}()
 				var testResult urlTestResult
-				select {
-				case testResult = <-testChan:
-				case <-testCtx.Done():
-					testResult.err = testCtx.Err()
+				if b.dashboard {
+					testResult.delay, testResult.err = runDashboardLeafProbe(testCtx, func(probeCtx context.Context) (uint16, error) {
+						return urltest.URLTest(probeCtx, link, detour)
+					})
+				} else {
+					testChan := make(chan urlTestResult, 1)
+					go func() {
+						delay, testErr := urltest.URLTest(testCtx, link, detour)
+						testChan <- urlTestResult{delay, testErr}
+					}()
+					select {
+					case testResult = <-testChan:
+					case <-testCtx.Done():
+						testResult.err = testCtx.Err()
+					}
 				}
 				if testResult.err != nil {
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)

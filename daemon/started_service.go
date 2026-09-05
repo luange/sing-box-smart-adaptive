@@ -723,22 +723,15 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
 	}
 	historyStorage := boxService.urlTestHistoryStorage
-	urlTest, isURLTest := outbound.(*group.URLTest)
 	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
-	if isURLTest {
-		go urlTest.CheckOutbounds()
+	if dashboardGroup, ok := outbound.(adapter.DashboardURLTestGroup); ok {
+		go func() {
+			probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
+			defer cancel()
+			_, _ = dashboardGroup.DashboardURLTest(probeCtx)
+		}()
 	} else if isOutboundGroup {
-		if dashboardGroup, ok := outbound.(adapter.DashboardURLTestGroup); ok {
-			// A control-plane refresh must not fan out one dial per provider
-			// alias. Smart/Adaptive own a bounded, shared scheduler for this
-			// path; keep the API handler asynchronous and give the probe a hard
-			// deadline so a slow endpoint cannot pin service shutdown.
-			go func() {
-				probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
-				defer cancel()
-				_, _ = dashboardGroup.DashboardURLTest(probeCtx)
-			}()
-		} else if urlTestGroup, ok := outbound.(adapter.URLTestGroup); ok {
+		if urlTestGroup, ok := outbound.(adapter.URLTestGroup); ok {
 			go func() {
 				probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
 				defer cancel()
@@ -749,7 +742,11 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 				itOutbound, _ := boxService.outboundManager.Outbound(it)
 				return itOutbound
 			}))
-			go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+			go func() {
+				probeCtx, cancel := context.WithTimeout(boxService.ctx, 15*time.Second)
+				defer cancel()
+				_ = group.DashboardURLTestOutbounds(probeCtx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "")
+			}()
 		}
 	} else {
 		go func() {

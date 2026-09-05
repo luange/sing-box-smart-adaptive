@@ -125,6 +125,24 @@ func TestSmartProbeScheduleFollowsTrafficActivity(t *testing.T) {
 	}
 }
 
+func TestSmartManualProbeUsesDashboardBudget(t *testing.T) {
+	smart := &Smart{probeNow: make(chan struct{}, 1)}
+	smart.PerformUpdateCheck()
+	if budget := smart.manualProbeBudget.Load(); budget != int32(defaultSmartDashboardProbeBudget) {
+		t.Fatalf("manual probe budget = %d, want %d", budget, defaultSmartDashboardProbeBudget)
+	}
+	select {
+	case <-smart.probeNow:
+	default:
+		t.Fatal("manual delay test did not wake Smart probe worker")
+	}
+	// A normal traffic wakeup must not replace the smaller control-plane cap.
+	smart.requestProbeWithBudget(defaultSmartActiveProbeBudget)
+	if budget := smart.manualProbeBudget.Load(); budget != int32(defaultSmartDashboardProbeBudget) {
+		t.Fatalf("traffic wakeup widened manual budget to %d", budget)
+	}
+}
+
 func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
 	registry := &smartProbeRegistry{
 		ctx:     context.Background(),

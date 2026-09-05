@@ -523,6 +523,7 @@ type Smart struct {
 	releaseProbeRegistry       func()
 	probeStartupDelay          time.Duration
 	probeNow                   chan struct{}
+	manualProbeBudget          atomic.Int32
 	families                   *trafficfamily.Resolver
 }
 
@@ -1529,7 +1530,11 @@ func (s *Smart) run(ctx context.Context) {
 				return
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
-			_, _ = s.probeWithBudget(probeCtx, s.requestedProbeBudget(time.Now()))
+			budget := s.requestedProbeBudget(time.Now())
+			if manualBudget := int(s.manualProbeBudget.Swap(0)); manualBudget > 0 && manualBudget < budget {
+				budget = manualBudget
+			}
+			_, _ = s.probeWithBudget(probeCtx, budget)
 			cancel()
 			if !probeTimer.Stop() {
 				select {
@@ -1586,8 +1591,23 @@ func (s *Smart) noteTrafficActivity() {
 }
 
 func (s *Smart) requestProbe() {
+	s.requestProbeWithBudget(0)
+}
+
+func (s *Smart) requestProbeWithBudget(budget int) {
 	if s == nil || s.closing.Load() {
 		return
+	}
+	if budget > 0 {
+		for {
+			current := s.manualProbeBudget.Load()
+			if current != 0 && current <= int32(budget) {
+				break
+			}
+			if s.manualProbeBudget.CompareAndSwap(current, int32(budget)) {
+				break
+			}
+		}
 	}
 	select {
 	case s.probeNow <- struct{}{}:
@@ -2391,7 +2411,10 @@ func (s *Smart) PerformUpdateCheck() {
 	if s.closing.Load() {
 		return
 	}
-	s.requestProbe()
+	// A leaf delay request is a control-plane hint, not a traffic-activity
+	// wakeup. Keep it on the small dashboard budget; otherwise an active Smart
+	// group would expand one manual test into its 16-candidate profiling cycle.
+	s.requestProbeWithBudget(defaultSmartDashboardProbeBudget)
 }
 
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {

@@ -184,6 +184,6 @@ type URLTestGroup interface {
 // Implementations must share their normal endpoint registry/scheduler and may
 // return a partial result when the caller's deadline expires.
 type DashboardURLTestGroup interface {
-	URLTestGroup
+	OutboundGroup
 	DashboardURLTest(ctx context.Context) (map[string]uint16, error)
 }
