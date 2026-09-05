@@ -31,3 +31,8 @@ v3 静态镜像一致性。
 在 Linux 上完成 Zig/CO-RE/BTF/eBPF verifier 与交叉构建验证。TC 解析失败仍按
 兼容性策略“无标记放行”，不擅自改为 DROP；AF_XDP 仍是实验性 DIRECT 快路径，
 代理、未知、畸形、分片流量回落 TC，未挂载到生产 VM。
+
+本轮 Linux 门禁已通过：全局审查 `33964265688`、Smart Zig
+`33964157515`、XDP `33964171036`。期间发现并修正一个仅在 Linux
+`with_ebpf` tagged test 才会编译到的地址 fixture 错误，修正后的全局 run
+包含完整 tagged 单测、竞态、vet、BTF/对象和 Zig 交叉构建结果。
