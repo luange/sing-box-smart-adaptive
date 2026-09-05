@@ -149,11 +149,11 @@ type MemoryBackend struct {
 
 func NewMemoryBackend() *MemoryBackend {
 	b := &MemoryBackend{
-		Publisher: NewBankPublisher(),
-		Flows:     make(map[FlowKey]FlowValue),
-		DNS:       NewDNSHintTable(),
+		Publisher:   NewBankPublisher(),
+		Flows:       make(map[FlowKey]FlowValue),
+		DNS:         NewDNSHintTable(),
 		MACPolicies: make(map[MACKey]MACPolicyValue),
-		flowLimit: maxMemoryFlowEntries,
+		flowLimit:   maxMemoryFlowEntries,
 	}
 	b.Policy4[0] = make(map[LPM4Key]PolicyValue)
 	b.Policy4[1] = make(map[LPM4Key]PolicyValue)
