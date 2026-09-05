@@ -131,7 +131,10 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
             break;
         }
     }
-    if (config.selection_mode <= 1 and affinity_ready) {
+    // Engine.init clamps selection_mode to 0/1, and both legacy values share
+    // this unified primary/backup + stable-affinity path (see model.zig), so
+    // no mode predicate remains here.
+    if (affinity_ready) {
         const threshold = if (best_score > 0) best_score * (1.0 + switch_margin) else 0.05;
         var retained_incumbent = false;
         if (incumbent) |current| {

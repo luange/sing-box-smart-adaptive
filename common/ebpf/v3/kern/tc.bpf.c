@@ -399,9 +399,10 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 		return TC_ACT_OK;
 	}
 
-	/* IP fragments lack a reliable L4 5-tuple; never static/flow DIRECT them. */
+	/* IP fragments lack a reliable L4 5-tuple; never static/flow DIRECT them.
+	 * handoff_proxy() records the reason itself — an explicit count_stat here
+	 * would double-count PARSE_FAIL_PROXY for every fragmented packet. */
 	if (packet.fragmented) {
-		count_stat(SB_V3_STAT_PARSE_FAIL_PROXY);
 		return handoff_proxy(skb, control, &packet, SB_V3_STAT_PARSE_FAIL_PROXY, ifindex, pkt_len);
 	}
 

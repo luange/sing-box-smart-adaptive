@@ -6,6 +6,7 @@
 #include <linux/unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -90,7 +91,13 @@ int sb_ebpf_load_prog(
     enum bpf_prog_type prog_type,
     enum bpf_attach_type expected_attach_type,
     bool log_error) {
+    /* v3 prepare, splice prepare and inbound prepare can run concurrently at
+     * startup; the verifier log buffer is function-scoped static, so all
+     * concurrent loads must serialize on one mutex or they interleave log
+     * text and retry decisions. */
+    static pthread_mutex_t log_buf_mutex = PTHREAD_MUTEX_INITIALIZER;
     static char log_buf[SB_EBPF_LOG_BUF_SIZE];
+    pthread_mutex_lock(&log_buf_mutex);
     memset(log_buf, 0, sizeof(log_buf));
     uint32_t log_level = log_error ? 1U : 0U;
     int fd = load_prog_once(
@@ -110,7 +117,10 @@ int sb_ebpf_load_prog(
             name,
             prog_type,
             expected_attach_type);
-        if (fd >= 0) return fd;
+        if (fd >= 0) {
+            pthread_mutex_unlock(&log_buf_mutex);
+            return fd;
+        }
         if (errno == EAGAIN || errno == ENOSPC) {
             errno = log_errno;
         }
@@ -124,6 +134,7 @@ int sb_ebpf_load_prog(
             strerror(errno),
             log_buf);
     }
+    pthread_mutex_unlock(&log_buf_mutex);
     return fd;
 }
 
