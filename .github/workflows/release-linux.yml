@@ -246,8 +246,12 @@ jobs:
             gh release upload "$tag" release-assets/* --clobber
             gh release edit "$tag" --notes "$notes" || true
           else
+            # For workflow_dispatch, GITHUB_SHA is the default branch tip,
+            # not necessarily the selected ref. Pin the tag to the checked
+            # out source that produced these assets.
+            target="$(git rev-parse HEAD)"
             gh release create "$tag" release-assets/* \
               --title "sing-box ${ver}" \
-              --target "$GITHUB_SHA" \
+              --target "$target" \
               --notes "$notes"
           fi
