@@ -155,3 +155,76 @@ func TestIPv4IPv6FlowSymmetric(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupStaticIPv6HonorsProtocolAndPort(t *testing.T) {
+	b := NewMemoryBackend()
+	prefix := netip.MustParsePrefix("2001:db8::1/128")
+	compiled, rejected, err := CompileStatic([]CompileInput{{
+		Destination: prefix,
+		Protocol:    ProtocolTCP,
+		DPortMin:    443,
+		DPortMax:    443,
+		Verdict:     VerdictDirect,
+		Kind:        RuleKindStatic,
+	}}, 1)
+	if err != nil || len(rejected) != 0 || len(compiled) != 1 {
+		t.Fatalf("compile err=%v rejected=%d compiled=%d", err, len(rejected), len(compiled))
+	}
+	if err := b.PublishStatic(compiled); err != nil {
+		t.Fatal(err)
+	}
+	if b.LookupStatic(prefix.Addr(), ProtocolUDP, 443) != nil {
+		t.Fatal("IPv6 static rule matched the wrong protocol")
+	}
+	if b.LookupStatic(prefix.Addr(), ProtocolTCP, 80) != nil {
+		t.Fatal("IPv6 static rule matched the wrong destination port")
+	}
+	if b.LookupStatic(prefix.Addr(), ProtocolTCP, 443) == nil {
+		t.Fatal("IPv6 static rule did not match its protocol and port")
+	}
+}
+
+func TestMergeStaticDirectMirrorsActiveBank(t *testing.T) {
+	b := NewMemoryBackend()
+	prefix := netip.MustParsePrefix("203.0.113.9/32")
+	if err := b.MergeStaticDirect(prefix); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.LookupStatic(prefix.Addr(), ProtocolTCP, 443); got == nil || got.Generation != b.Control.PolicyGeneration {
+		t.Fatalf("merged policy=%+v control=%+v", got, b.Control)
+	}
+	if err := b.MergeStaticDirect(prefix); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(b.Policy4[b.Control.ActiveBank]); got != 1 {
+		t.Fatalf("duplicate merge grew active bank: %d", got)
+	}
+}
+
+func TestPublishStaticRejectsPolicyCapacityWithoutCommit(t *testing.T) {
+	b := NewMemoryBackend()
+	policies := make([]CompiledPolicy, DefaultPolicyLPM+1)
+	for i := range policies {
+		n := uint32(i)
+		addr := netip.AddrFrom4([4]byte{198, 18, byte(n >> 8), byte(n)})
+		policies[i] = CompiledPolicy{
+			Prefix: addrPrefix(addr),
+			Value: PolicyValue{
+				Verdict: uint8(VerdictDirect),
+			},
+		}
+	}
+	if err := b.PublishStatic(policies); err == nil {
+		t.Fatal("oversized static policy unexpectedly committed")
+	}
+	if b.Publisher.Generation() != 1 || b.Control.PolicyGeneration != 1 || b.Control.ActiveBank != 0 {
+		t.Fatalf("failed publish changed control state: control=%+v publisher=%d", b.Control, b.Publisher.Generation())
+	}
+	if len(b.Policy4[1]) != 0 || len(b.Policy6[1]) != 0 {
+		t.Fatalf("failed publish left inactive entries: v4=%d v6=%d", len(b.Policy4[1]), len(b.Policy6[1]))
+	}
+}
+
+func addrPrefix(addr netip.Addr) netip.Prefix {
+	return netip.PrefixFrom(addr, 32).Masked()
+}

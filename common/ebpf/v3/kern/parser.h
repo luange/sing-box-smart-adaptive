@@ -27,7 +27,11 @@ static __attribute__((always_inline)) void sb_v3_copy4(__u8 out[16], __be32 valu
 	__builtin_memcpy(out, &value, 4);
 }
 
-/* Bounded L2/L3/L4 parse. Returns 0 on success, -1 on failure (must NEED_USERSPACE). */
+/* Bounded L2/L3/L4 parse. Returns 0 on success, 1 for ARP, and -1 for an
+ * unclassifiable/truncated frame. The classifier passes -1 unchanged with no
+ * mark: there is no trustworthy five-tuple with which to perform socket
+ * assignment, and malformed/non-IP frames must not be routed using zeroed
+ * fields. */
 static __attribute__((always_inline)) int sb_v3_parse(void *data, void *data_end, struct sb_v3_packet *packet) {
 	__builtin_memset(packet, 0, sizeof(*packet));
 	struct ethhdr *ethernet = data;

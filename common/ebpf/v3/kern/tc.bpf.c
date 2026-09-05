@@ -352,7 +352,9 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 
 	if (parse_rc < 0) {
 		count_stat(SB_V3_STAT_PARSE_FAIL_PROXY);
-		/* Incomplete headers → NEED_USERSPACE (fail toward control plane). */
+		/* No reliable five-tuple exists, so leave the frame to the kernel with
+		 * no mark. Calling handoff_proxy here would manufacture a redirect key
+		 * from zeroed fields and cannot select a listener safely. */
 		return TC_ACT_OK;
 	}
 

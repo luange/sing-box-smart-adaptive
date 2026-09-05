@@ -692,6 +692,11 @@ func (i *Inbound) startUDPNATCleanup() {
 				if i.sharedNetwork != nil {
 					i.sharedNetwork.udpNat.PurgeExpired()
 				}
+				// Promoted DIRECT prefixes have their own TTL and must be
+				// collected even when outbound verdict learning is disabled.
+				// Previously GC was only reached from verdict metrics, so a
+				// dns_prefill-only deployment retained expired LPM entries.
+				i.gcPromotedBypass()
 			}
 		}
 	}()
@@ -1124,10 +1129,11 @@ func (i *Inbound) refreshBypassRuleSetsLocked(warnEmpty bool) (bool, error) {
 	}
 	// Merge non-expired learn→TC promotions (dae-style gateway high trigger).
 	now := time.Now()
+	var expiredPromotions []netip.Addr
 	if i.promotedBypass != nil {
 		for addr, exp := range i.promotedBypass {
 			if now.After(exp) {
-				delete(i.promotedBypass, addr)
+				expiredPromotions = append(expiredPromotions, addr)
 				continue
 			}
 			bits := 32
@@ -1144,6 +1150,12 @@ func (i *Inbound) refreshBypassRuleSetsLocked(warnEmpty bool) (bool, error) {
 	updated, err := backend.UpdateBypassCIDR(prefixes)
 	if err != nil {
 		return false, err
+	}
+	// Do not drop expired entries from the authoritative Go table until the
+	// backend accepted the rebuilt snapshot.  Keeping them on a failed refresh
+	// allows the next retry to remove both the Go and kernel mirrors together.
+	for _, addr := range expiredPromotions {
+		delete(i.promotedBypass, addr)
 	}
 	// v3 static banks must track bypass_rule_set reloads (double-buffer commit).
 	if updated && i.sharedNetwork != nil {
@@ -1185,6 +1197,34 @@ func localInterfacePrefixes(interfaces []control.Interface) []netip.Prefix {
 
 const promotedBypassMaxEntries = 8192
 
+func clonePromotedBypass(entries map[netip.Addr]time.Time) map[netip.Addr]time.Time {
+	if len(entries) == 0 {
+		return nil
+	}
+	clone := make(map[netip.Addr]time.Time, len(entries))
+	for addr, expiresAt := range entries {
+		clone[addr] = expiresAt
+	}
+	return clone
+}
+
+// promotedBypassEviction returns expired entries and, separately, the live
+// entry that should be evicted when the bounded table is full.  It is kept
+// pure so the selection policy can be tested without a live eBPF backend.
+func promotedBypassEviction(entries map[netip.Addr]time.Time, now time.Time) (evict netip.Addr, expired []netip.Addr) {
+	var evictAt time.Time
+	for addr, exp := range entries {
+		if now.After(exp) {
+			expired = append(expired, addr)
+			continue
+		}
+		if !evict.IsValid() || exp.Before(evictAt) {
+			evict, evictAt = addr, exp
+		}
+	}
+	return evict, expired
+}
+
 // promoteLearnedBypass installs addr/32|/128 into TC bypass LPM.
 // Returns true when a new map entry is created (false on refresh/skip/error).
 func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool {
@@ -1207,26 +1247,32 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool 
 	if i.promotedBypass == nil {
 		i.promotedBypass = make(map[netip.Addr]time.Time)
 	}
-	_, existed := i.promotedBypass[addr]
+	previousExpiry, existed := i.promotedBypass[addr]
+	// A snapshot is only needed on the bounded-table path, where eviction may
+	// be followed by a full backend rebuild. The common hot path avoids copying
+	// the table and remains a single map update.
+	var previousPromoted map[netip.Addr]time.Time
 	if len(i.promotedBypass) >= promotedBypassMaxEntries {
+		previousPromoted = clonePromotedBypass(i.promotedBypass)
+	}
+	var removed []netip.Addr
+	if len(i.promotedBypass) >= promotedBypassMaxEntries {
+		// Expired entries must be removed from the kernel mirror as well as the
+		// bounded Go table.  Otherwise a full table can keep stale LPM entries
+		// alive until the map itself fills.  Batch the removals so one refresh
+		// also updates the v3 static bank when it is active.
+		evict, expired := promotedBypassEviction(i.promotedBypass, time.Now())
+		for _, a := range expired {
+			delete(i.promotedBypass, a)
+			removed = append(removed, a)
+		}
 		if !existed {
-			now := time.Now()
 			// Evict the entry closest to expiry first.  Map iteration order is
 			// random; arbitrary eviction made hot destinations disappear while
 			// long-lived entries occupied the bounded table.
-			var evict netip.Addr
-			var evictAt time.Time
-			for a, exp := range i.promotedBypass {
-				if now.After(exp) {
-					delete(i.promotedBypass, a)
-					continue
-				}
-				if evict == (netip.Addr{}) || exp.Before(evictAt) {
-					evict, evictAt = a, exp
-				}
-			}
 			if evict.IsValid() {
 				delete(i.promotedBypass, evict)
+				removed = append(removed, evict)
 			}
 		}
 	}
@@ -1236,35 +1282,74 @@ func (i *Inbound) promoteLearnedBypass(addr netip.Addr, ttl time.Duration) bool 
 		bits = 128
 	}
 	prefix := netip.PrefixFrom(addr, bits)
-	// engine=v3: feed the unified kernel policy surface (DNS hint + static merge).
-	// Parent bypass map remains for cgroup capture_local path when enabled.
-	if i.sharedNetwork != nil && i.sharedNetwork.engineV3 {
-		i.sharedNetwork.promoteV3Direct(addr, ttl)
-	}
 	backend := i.backendInstance()
 	if backend != nil {
-		if err := backend.AddBypassPrefix(prefix); err != nil {
-			i.logger.Debug("promote AddBypassPrefix: ", err, " fallback full refresh")
+		if len(removed) > 0 {
+			// Rebuild from rule-set state when an entry is removed.  An expired
+			// promotion may overlap a permanent bypass rule; deleting it directly
+			// would accidentally remove that rule from the kernel mirror.  The
+			// authoritative rebuild preserves such overlaps and refreshes v3's
+			// separate static bank in the same operation.
 			if _, err2 := i.refreshBypassRuleSetsLocked(false); err2 != nil {
+				i.promotedBypass = previousPromoted
+				i.logger.Debug("promote learned bypass refresh: ", err2)
+				return false
+			}
+		} else if err := backend.AddBypassPrefix(prefix); err != nil {
+			i.logger.Debug("promote AddBypassPrefix: ", err, " fallback full refresh")
+			if previousPromoted == nil {
+				// Reconstruct the pre-update table before taking the
+				// snapshot; copying after insertion would make a failed
+				// fallback appear committed on the next request.
+				newExpiry := i.promotedBypass[addr]
+				if existed {
+					i.promotedBypass[addr] = previousExpiry
+				} else {
+					delete(i.promotedBypass, addr)
+				}
+				previousPromoted = clonePromotedBypass(i.promotedBypass)
+				i.promotedBypass[addr] = newExpiry
+			}
+			if _, err2 := i.refreshBypassRuleSetsLocked(false); err2 != nil {
+				i.promotedBypass = previousPromoted
 				i.logger.Debug("promote learned bypass refresh: ", err2)
 				return false
 			}
 		}
-		if !existed {
-			i.logger.Debug("eBPF promote TC bypass /32: ", addr.String(), " ttl=", ttl, " promoted=", len(i.promotedBypass))
-		} else {
-			i.logger.Debug("eBPF promote TC bypass refresh: ", addr.String(), " ttl=", ttl)
+	} else {
+		if previousPromoted == nil {
+			newExpiry := i.promotedBypass[addr]
+			if existed {
+				i.promotedBypass[addr] = previousExpiry
+			} else {
+				delete(i.promotedBypass, addr)
+			}
+			previousPromoted = clonePromotedBypass(i.promotedBypass)
+			i.promotedBypass[addr] = newExpiry
 		}
-		return !existed
+		if _, err := i.refreshBypassRuleSetsLocked(false); err != nil {
+			i.promotedBypass = previousPromoted
+			i.logger.Debug("promote learned bypass refresh: ", err)
+			return false
+		}
 	}
-	if _, err := i.refreshBypassRuleSetsLocked(false); err != nil {
-		i.logger.Debug("promote learned bypass refresh: ", err)
-		return false
+	// engine=v3: feed the unified kernel policy surface only after the parent
+	// bypass update succeeded. This prevents a failed parent rebuild from
+	// leaving a v3 static entry with no authoritative Go/TC counterpart.
+	if i.sharedNetwork != nil && i.sharedNetwork.engineV3 {
+		i.sharedNetwork.promoteV3Direct(addr, ttl)
+	}
+	if !existed {
+		i.logger.Debug("eBPF promote TC bypass /32: ", addr.String(), " ttl=", ttl, " promoted=", len(i.promotedBypass))
+	} else {
+		i.logger.Debug("eBPF promote TC bypass refresh: ", addr.String(), " ttl=", ttl)
 	}
 	return !existed
 }
 
-// gcPromotedBypass drops TTL-expired learn→TC entries from the LPM (no full rebuild).
+// gcPromotedBypass drops TTL-expired learn→TC entries from the LPM.  Expiry is
+// uncommon, so a single authoritative rebuild per batch is preferable to
+// risking removal of an overlapping permanent bypass rule.
 func (i *Inbound) gcPromotedBypass() {
 	if i == nil {
 		return
@@ -1279,24 +1364,27 @@ func (i *Inbound) gcPromotedBypass() {
 	for addr, exp := range i.promotedBypass {
 		if now.After(exp) {
 			expired = append(expired, addr)
-			delete(i.promotedBypass, addr)
 		}
 	}
 	if len(expired) == 0 {
 		return
 	}
+	previousPromoted := clonePromotedBypass(i.promotedBypass)
+	for _, addr := range expired {
+		delete(i.promotedBypass, addr)
+	}
 	backend := i.backendInstance()
 	if backend == nil {
+		i.promotedBypass = previousPromoted
 		return
 	}
-	for _, addr := range expired {
-		bits := 32
-		if !addr.Is4() {
-			bits = 128
-		}
-		if err := backend.DeleteBypassPrefix(netip.PrefixFrom(addr, bits)); err != nil {
-			i.logger.Debug("gc promoted bypass delete: ", addr, " ", err)
-		}
+	// Rebuild from the authoritative rule-set state rather than deleting each
+	// address incrementally.  This preserves a permanent bypass rule if it
+	// happens to share an address with an expired learned promotion and updates
+	// the v3 static bank without a second, divergent path.
+	if _, err := i.refreshBypassRuleSetsLocked(false); err != nil {
+		i.promotedBypass = previousPromoted
+		i.logger.Debug("gc promoted bypass full refresh: ", err)
 	}
 	i.logger.Info("eBPF gc promoted TC bypass expired=", len(expired), " remain=", len(i.promotedBypass))
 }

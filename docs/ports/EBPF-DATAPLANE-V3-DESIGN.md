@@ -121,9 +121,9 @@ enum sb_v3_verdict {
 6. **FakeIP 映射**：只做 map lookup；真正域名规则仍由控制面编译后的 policy id 决定。
 7. **DNS 弱关联**：只有满足第 8 节资格时才可 DIRECT。
 8. **既有 socket/established 路径**：合法 socket assign 或已确认直连。
-9. **默认 NEED_USERSPACE**：送入 sing-box，而不是猜测 DIRECT。
+9. **默认 NEED_USERSPACE**：可解析的 IP/TCP/UDP miss 送入 sing-box，而不是猜测 DIRECT。无法得到可靠五元组的截断或非 IP 帧不做 socket assign，保持无 mark 交给内核处理。
 
-任何 verifier 边界、header 解析失败、map 错误、过期条目均走第 9 步。
+任何 verifier 边界、可解析包的 header 解析失败、map 错误、过期条目均走第 9 步；不可解析帧不伪造五元组，直接无 mark 交给内核。
 
 ## 6. Map 与 ABI
 

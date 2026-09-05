@@ -202,6 +202,10 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 		}
 		policy6[key] = p.Value
 	}
+	if len(policy4) > DefaultPolicyLPM || len(policy6) > DefaultPolicyLPM {
+		b.Publisher.AbortCompile()
+		return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+	}
 	b.Policy4[inactive] = policy4
 	b.Policy6[inactive] = policy6
 	gen, bank := b.Publisher.Commit()
@@ -210,6 +214,57 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
 	return nil
+}
+
+// MergeStaticDirect adds one learned DIRECT prefix to the active bank without
+// changing policy_generation. It mirrors the kernel-side DNS/prefill merge so
+// the in-process audit model never silently falls behind the live map.
+func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
+	if b == nil || b.Publisher == nil {
+		return fmt.Errorf("nil memory backend")
+	}
+	prefix = prefix.Masked()
+	if !prefix.IsValid() {
+		return fmt.Errorf("invalid static prefix")
+	}
+	active := b.Control.ActiveBank & 1
+	value := PolicyValue{
+		Verdict:    uint8(VerdictDirect),
+		Source:     uint8(SourceStatic),
+		Confidence: ConfidenceStrong,
+		ReasonCode: uint16(ReasonStaticDirect),
+		Generation: b.Control.PolicyGeneration,
+	}
+	addr := prefix.Addr().Unmap()
+	if addr.Is4() {
+		key, err := PrefixToLPM4(prefix)
+		if err != nil {
+			return err
+		}
+		if _, ok := b.Policy4[active][key]; ok {
+			return nil
+		}
+		if len(b.Policy4[active]) >= DefaultPolicyLPM {
+			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+		}
+		b.Policy4[active][key] = value
+		return nil
+	}
+	if addr.Is6() {
+		key, err := PrefixToLPM6(prefix)
+		if err != nil {
+			return err
+		}
+		if _, ok := b.Policy6[active][key]; ok {
+			return nil
+		}
+		if len(b.Policy6[active]) >= DefaultPolicyLPM {
+			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+		}
+		b.Policy6[active][key] = value
+		return nil
+	}
+	return fmt.Errorf("invalid static prefix family")
 }
 
 // PublishFlow writes bidirectional flow verdicts.
@@ -352,6 +407,14 @@ func (b *MemoryBackend) LookupStatic(dest netip.Addr, protocol uint8, dport uint
 	}
 	key := LPM6Key{PrefixLen: 128, Addr: addr.As16()}
 	if v, ok := b.Policy6[bank][key]; ok && v.Generation == b.Control.PolicyGeneration {
+		if v.MatchProtocol != 0 && uint8(v.MatchProtocol) != protocol {
+			return nil
+		}
+		if v.MatchDPortMin != 0 || v.MatchDPortMax != 0 {
+			if dport < v.MatchDPortMin || dport > v.MatchDPortMax {
+				return nil
+			}
+		}
 		return &v
 	}
 	return nil

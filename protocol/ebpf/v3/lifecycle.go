@@ -71,7 +71,11 @@ func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.backend != nil {
+		if current := l.backend.Control.PolicyGeneration; current != 0 && generation < current {
+			return
+		}
 		l.backend.Control.PolicyGeneration = generation
+		l.backend.Publisher.SyncGeneration(generation)
 		l.backend.InvalidateGeneration(generation)
 	}
 }
@@ -164,7 +168,13 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	}
 	direct := make([]ebpfv3.CompiledPolicy, 0, len(compiled))
 	for _, policy := range compiled {
-		if policy.Value.Verdict == uint8(ebpfv3.VerdictDirect) {
+		// DataplaneSink.PublishStaticDirect intentionally accepts only a
+		// destination prefix.  Publishing a protocol/port-scoped rule through
+		// that surface would silently broaden it to all traffic for the prefix;
+		// keep such rules in userspace instead of changing their semantics.
+		if policy.Value.Verdict == uint8(ebpfv3.VerdictDirect) &&
+			policy.Value.MatchProtocol == 0 &&
+			policy.Value.MatchDPortMin == 0 && policy.Value.MatchDPortMax == 0 {
 			direct = append(direct, policy)
 		} else {
 			rej = append(rej, ebpfv3.CompileInput{Destination: policy.Prefix, Verdict: ebpfv3.Verdict(policy.Value.Verdict), Kind: ebpfv3.RuleKindNeedsControl, PolicyID: policy.Value.PolicyID})
@@ -227,6 +237,27 @@ func (l *Lifecycle) PublishStaticDirect(prefixes []netip.Prefix) error {
 		}
 	}
 	return l.backend.PublishStatic(policies)
+}
+
+// MergeStaticDirect publishes one learned DIRECT prefix to the active bank
+// while keeping the kernel sink and in-process model in lockstep. It is a
+// no-op when static policy offload is disabled because the TC program would
+// not consult the policy bank in that mode.
+func (l *Lifecycle) MergeStaticDirect(prefix netip.Prefix) error {
+	if l == nil || l.backend == nil {
+		return fmt.Errorf("nil lifecycle")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.options.PolicyOffload.Enabled || !l.options.PolicyOffload.StaticRules {
+		return nil
+	}
+	if l.sink != nil {
+		if err := l.sink.MergeStaticDirect(prefix); err != nil {
+			return err
+		}
+	}
+	return l.backend.MergeStaticDirect(prefix)
 }
 
 // LearnFlow publishes exact-flow verdict after userspace bare-direct route.
@@ -330,6 +361,7 @@ func (l *Lifecycle) InvalidateGeneration() error {
 		if l.backend.Control.PolicyGeneration == 0 {
 			l.backend.Control.PolicyGeneration = 1
 		}
+		l.backend.Publisher.SyncGeneration(l.backend.Control.PolicyGeneration)
 		l.backend.InvalidateGeneration(l.backend.Control.PolicyGeneration)
 	}
 	if l.sink != nil {

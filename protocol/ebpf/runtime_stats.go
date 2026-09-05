@@ -249,7 +249,6 @@ func (i *Inbound) logVerdictRuntimeStats(reason string, warning bool) {
 }
 
 func (i *Inbound) logVerdictRuntimeStatsValue(reason string, stats ECommon.VerdictStats, warning bool) {
-	i.gcPromotedBypass()
 	logArgs := []any{
 		"eBPF outbound verdict metrics: reason=", reason,
 		", writes=", stats.Writes,

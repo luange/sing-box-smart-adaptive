@@ -127,29 +127,6 @@ func smartProbeKey(identity, probeURL string, timeout time.Duration) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
-// failed reports a recent shared probe failure for a candidate. Probe
-// outcomes are process-wide, so every Smart group avoids the same failed node
-// until the shared TTL expires instead of rediscovering the failure itself.
-func (r *smartProbeRegistry) failed(key string, ttl time.Duration) bool {
-	if r == nil || key == "" {
-		return false
-	}
-	if ttl <= 0 {
-		ttl = time.Minute
-	}
-	r.access.Lock()
-	defer r.access.Unlock()
-	entry := r.entries[key]
-	if entry == nil || entry.inflight || entry.result.success || entry.result.nextProbeAt.IsZero() {
-		return false
-	}
-	now := time.Now()
-	if ttl > 0 && now.Sub(entry.result.completedAt) > ttl {
-		return false
-	}
-	return now.Before(entry.result.nextProbeAt)
-}
-
 func (r *smartProbeRegistry) dead(key string) bool {
 	if r == nil || key == "" {
 		return false
@@ -375,6 +352,29 @@ func (r *smartProbeRegistry) runProbeMode(ctx context.Context, endpointKey, key 
 	completedAt := time.Now()
 	r.access.Lock()
 	previous := entry.result
+	// A caller/registry cancellation is not evidence that the endpoint is
+	// unhealthy.  This can race the probe callback's return (for example when
+	// a group closes while an HTTP probe is unwinding); caching it as a normal
+	// failure would make every other Smart group inherit a false breaker. Keep
+	// the previous evidence, mark this run deferred, and make the next caller
+	// eligible to retry immediately.
+	if ctx.Err() != nil || r.ctx.Err() != nil {
+		result := previous
+		result.completedAt = completedAt
+		result.nextProbeAt = completedAt
+		result.deferred = true
+		entry.result = result
+		entry.inflight = false
+		close(entry.done)
+		entry.done = nil
+		if endpointKey != "" {
+			done := r.active[endpointKey]
+			delete(r.active, endpointKey)
+			close(done)
+		}
+		r.access.Unlock()
+		return 0, errSharedSmartProbeDeferred, false
+	}
 	var successes, failures uint8
 	if err == nil {
 		successes = min(previous.successes+1, uint8(3))

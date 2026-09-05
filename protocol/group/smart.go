@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1846,6 +1847,9 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 }
 
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.noteTrafficActivity()
 	transport := smartTransportKey(network, destination)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
@@ -1909,7 +1913,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			s.observeDataPlaneFailureForTransport(time.Now(), networkKey, siteKey, candidate.Tag(), transport, observedTransport, time.Since(observedStartedAt))
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
-		}, s.establishedStallTimeout), nil
+		}, s.establishedStallTimeout, ctx), nil
 	} else {
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
 		if len(attemptErrors) == 0 {
@@ -2217,6 +2221,15 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			resetHedge()
 		case result := <-results:
 			active--
+			// A caller cancellation can race the worker result.  Treat that
+			// cancellation as request-local state, not node health evidence, and
+			// never return a late socket to a request that has already gone away.
+			if parentErr := ctx.Err(); parentErr != nil {
+				if result.conn != nil {
+					_ = result.conn.Close()
+				}
+				return nil, smartDialResult{}, append(attemptErrors, parentErr), false
+			}
 			candidate := result.attempt.candidate
 			if result.err != nil {
 				s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed)
@@ -2322,6 +2335,19 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			s.releaseHalfOpen(candidate.Tag(), networkKey, siteKey, transport)
 		}
 		elapsed := time.Since(startedAt)
+		// A caller cancellation/deadline is not evidence that the candidate is
+		// unhealthy.  In particular, an outbound may return ctx.Err() after the
+		// parent has already been canceled, or may win a cancellation race and
+		// return a usable socket just after the caller went away.  Do not feed
+		// either case into the breaker, and never leak the late socket to the
+		// canceled request.  The independent attempt timeout still reaches the
+		// failure path below because ctx itself remains live.
+		if parentErr := ctx.Err(); parentErr != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return nil, parentErr
+		}
 		if err != nil {
 			s.observeDataPlaneFailure(time.Now(), networkKey, siteKey, candidate.Tag(), transport, elapsed)
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
@@ -4611,6 +4637,7 @@ type smartObservedConn struct {
 	stallGeneration  uint64
 	stallPending     bool
 	closed           atomic.Bool
+	requestCtx       context.Context
 }
 
 func newSmartObservedConn(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onFailure func()) net.Conn {
@@ -4621,7 +4648,11 @@ func newSmartObservedConnWithStall(conn net.Conn, startedAt time.Time, onFirstBy
 	return newSmartObservedConnWithRetransmit(conn, startedAt, onFirstByte, onClose, nil, onFailure, stallTimeout)
 }
 
-func newSmartObservedConnWithRetransmit(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onRetransmit func(float64), onFailure func(), stallTimeout time.Duration) net.Conn {
+func newSmartObservedConnWithRetransmit(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onRetransmit func(float64), onFailure func(), stallTimeout time.Duration, requestCtx ...context.Context) net.Conn {
+	var ctx context.Context
+	if len(requestCtx) > 0 {
+		ctx = requestCtx[0]
+	}
 	return &smartObservedConn{
 		ExtendedConn: bufio.NewExtendedConn(conn),
 		startedAt:    startedAt,
@@ -4630,6 +4661,7 @@ func newSmartObservedConnWithRetransmit(conn net.Conn, startedAt time.Time, onFi
 		onRetransmit: onRetransmit,
 		onFailure:    onFailure,
 		stallTimeout: stallTimeout,
+		requestCtx:   ctx,
 	}
 }
 
@@ -4784,6 +4816,9 @@ func (c *smartObservedConn) observeStall(generation uint64) {
 	c.stallTimer = nil
 	c.stallPending = false
 	c.stallTimerAccess.Unlock()
+	if c.requestCtx != nil && c.requestCtx.Err() != nil {
+		return
+	}
 	c.stallOnce.Do(func() {
 		c.notifyFailure()
 	})
@@ -4795,6 +4830,9 @@ func (c *smartObservedConn) observeFailure(err error) {
 		// phase.  Do not leave its timer behind to report a second, synthetic
 		// stall after the transport has already told us what happened.
 		c.stopStallTimer()
+	}
+	if isSmartRequestContextError(c.requestCtx, err) {
+		return
 	}
 	// The explicit protocol markers below are authoritative even when the
 	// protocol reader consumed invalid bytes before returning the error.  The
@@ -4839,6 +4877,23 @@ func isSmartStreamFailure(err error, _ ...bool) bool {
 	// already yielded bytes.  HTTP status codes and normal EOF are intentionally
 	// excluded by isSmartProtocolHandshakeFailure.
 	return isSmartProtocolHandshakeFailure(err)
+}
+
+// isSmartRequestContextError separates a caller-owned request deadline from a
+// transport timeout. The former only says that this flow was abandoned and
+// must never lower the endpoint score; the latter remains valid node evidence.
+func isSmartRequestContextError(requestCtx context.Context, err error) bool {
+	if requestCtx == nil || requestCtx.Err() == nil || err == nil {
+		return false
+	}
+	requestErr := requestCtx.Err()
+	if errors.Is(requestErr, context.Canceled) {
+		return errors.Is(err, context.Canceled)
+	}
+	if errors.Is(requestErr, context.DeadlineExceeded) {
+		return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+	}
+	return false
 }
 
 // isSmartProtocolHandshakeFailure recognizes errors emitted by protocol
@@ -5011,6 +5066,7 @@ type smartObservedPacketConn struct {
 	watchdogTimer      *time.Timer
 	watchdogGeneration uint64
 	watchdogPending    bool
+	requestCtx         context.Context
 }
 
 func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expectResponse bool, onNoResponse func(time.Duration)) net.PacketConn {
@@ -5021,7 +5077,7 @@ func newSmartObservedPacketConnWithWatchdog(conn net.PacketConn, startedAt time.
 	return newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, expectResponse, 1, watchdogTimeout, onNoResponse)
 }
 
-func newSmartObservedPacketConnWithWatchdogThreshold(conn net.PacketConn, startedAt time.Time, expectResponse bool, requiredPackets uint64, watchdogTimeout time.Duration, onNoResponse func(time.Duration)) net.PacketConn {
+func newSmartObservedPacketConnWithWatchdogThreshold(conn net.PacketConn, startedAt time.Time, expectResponse bool, requiredPackets uint64, watchdogTimeout time.Duration, onNoResponse func(time.Duration), requestCtx ...context.Context) net.PacketConn {
 	if requiredPackets == 0 {
 		requiredPackets = 1
 	}
@@ -5032,6 +5088,9 @@ func newSmartObservedPacketConnWithWatchdogThreshold(conn net.PacketConn, starte
 		requiredPackets: requiredPackets,
 		watchdogTimeout: watchdogTimeout,
 		onNoResponse:    onNoResponse,
+	}
+	if len(requestCtx) > 0 {
+		base.requestCtx = requestCtx[0]
 	}
 	reader, hasReader := conn.(N.PacketReader)
 	writer, hasWriter := conn.(N.PacketWriter)
@@ -5085,7 +5144,7 @@ func (c *smartObservedPacketConn) Close() error {
 		c.closed.Store(true)
 		c.stopWatchdog()
 		elapsed := time.Since(c.startedAt)
-		if c.expectResponse && c.writePackets.Load() >= c.requiredPackets && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
+		if (c.requestCtx == nil || c.requestCtx.Err() == nil) && c.expectResponse && c.writePackets.Load() >= c.requiredPackets && c.readPackets.Load() == 0 && elapsed >= time.Second && c.onNoResponse != nil {
 			c.notifyNoResponse(elapsed)
 		}
 	})
@@ -5128,6 +5187,9 @@ func (c *smartObservedPacketConn) observeWatchdog(generation uint64) {
 	c.watchdogTimer = nil
 	c.watchdogPending = false
 	c.watchdogAccess.Unlock()
+	if c.requestCtx != nil && c.requestCtx.Err() != nil {
+		return
+	}
 	c.notifyNoResponse(time.Since(c.startedAt))
 }
 
@@ -5141,6 +5203,9 @@ func (c *smartObservedPacketConn) notifyNoResponse(elapsed time.Duration) {
 
 func (c *smartObservedPacketConn) observePacketFailure(err error) {
 	if err == nil {
+		return
+	}
+	if isSmartRequestContextError(c.requestCtx, err) {
 		return
 	}
 	// Network failures only have node-level meaning for a transactional UDP

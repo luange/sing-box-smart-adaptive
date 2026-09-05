@@ -751,6 +751,9 @@ func (b *V3Backend) UpdateHostAddresses(addresses []netip.Addr) error {
 		return osErrClosed
 	}
 	ipv4, ipv6 := compileSharedHostPrefixes(addresses)
+	if err := validateV3HostPrefixes(ipv4, ipv6); err != nil {
+		return err
+	}
 	b.access.Lock()
 	defer b.access.Unlock()
 	if b.runtime == nil {
@@ -760,10 +763,42 @@ func (b *V3Backend) UpdateHostAddresses(addresses []netip.Addr) error {
 		return E.Cause(err, "update v3 host6")
 	}
 	if err := replaceBypassCIDRPolicyMap(int(b.runtime.host4_map_fd), b.hostIPv4, ipv4); err != nil {
-		_ = replaceBypassCIDRPolicyMap(int(b.runtime.host6_map_fd), ipv6, b.hostIPv6)
+		rollbackErr := replaceBypassCIDRPolicyMap(int(b.runtime.host6_map_fd), ipv6, b.hostIPv6)
+		if rollbackErr != nil {
+			return errors.Join(E.Cause(err, "update v3 host4"), E.Cause(rollbackErr, "rollback v3 host6"))
+		}
 		return E.Cause(err, "update v3 host4")
 	}
 	b.hostIPv4, b.hostIPv6 = ipv4, ipv6
+	return nil
+}
+
+const v3HostMapCapacity = 1024
+
+// v3PolicyMapCapacity mirrors SB_V3_DEFAULT_POLICY_LPM in the native
+// constructor. Each address family has its own LPM map with this limit.
+const v3PolicyMapCapacity = 16384
+
+func validateV3HostPrefixes(ipv4, ipv6 []netip.Prefix) error {
+	if len(ipv4) > v3HostMapCapacity || len(ipv6) > v3HostMapCapacity {
+		return E.New("v3 host address policy exceeds eBPF map capacity")
+	}
+	return nil
+}
+
+func validateV3PolicyPrefixes(prefixes []netip.Prefix) error {
+	var ipv4, ipv6 int
+	for _, prefix := range prefixes {
+		addr := prefix.Addr().Unmap()
+		if addr.Is4() {
+			ipv4++
+		} else if addr.Is6() {
+			ipv6++
+		}
+	}
+	if ipv4 > v3PolicyMapCapacity || ipv6 > v3PolicyMapCapacity {
+		return E.New("v3 static policy exceeds eBPF LPM map capacity")
+	}
 	return nil
 }
 
@@ -803,9 +838,13 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 	for _, p := range next {
 		nextSet[p] = struct{}{}
 	}
-	// Keep a copy so a control-map commit failure can restore the in-process
-	// transaction state. The inactive bank may contain the new entries, but it
-	// is still unreachable until writeControl succeeds and can safely be retried.
+	if err := validateV3PolicyPrefixes(next); err != nil {
+		return err
+	}
+	// Keep a copy so every failure path can restore both the in-process
+	// transaction state and the inactive BPF bank. The inactive bank is
+	// unreachable until writeControl succeeds, but leaving partially written
+	// generations there would consume LPM capacity and make later retries fail.
 	previousControl := b.control
 	previousStatic := append([]netip.Prefix(nil), b.lastStatic[inactive]...)
 	// Drop keys present in this bank's previous snapshot but not in the new one.
@@ -814,21 +853,17 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 			continue
 		}
 		if err := deleteV3PolicyPrefix(fd4, fd6, old); err != nil {
+			rollbackErr := rollbackV3StaticBank(fd4, fd6, previousStatic, nil, previousControl.PolicyGeneration)
+			if rollbackErr != nil {
+				return errors.Join(E.Cause(err, "remove stale v3 static prefix"), E.Cause(rollbackErr, "rollback v3 static prefix"))
+			}
 			return E.Cause(err, "remove stale v3 static prefix")
 		}
 	}
 	written := make([]netip.Prefix, 0, len(next))
 	for _, prefix := range next {
 		if err := writeV3PolicyPrefix(fd4, fd6, prefix, generation); err != nil {
-			// A failed update may have written an earlier prefix.  Remove only
-			// entries from this attempt so the inactive bank remains the previous
-			// committed snapshot and can be retried safely.
-			var cleanupErr error
-			for _, partial := range written {
-				if removeErr := deleteV3PolicyPrefix(fd4, fd6, partial); removeErr != nil {
-					cleanupErr = errors.Join(cleanupErr, removeErr)
-				}
-			}
+			cleanupErr := rollbackV3StaticBank(fd4, fd6, previousStatic, written, previousControl.PolicyGeneration)
 			b.lastStatic[inactive] = previousStatic
 			if cleanupErr != nil {
 				return errors.Join(err, E.Cause(cleanupErr, "rollback v3 static prefix"))
@@ -837,15 +872,58 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 		}
 		written = append(written, prefix)
 	}
-	b.lastStatic[inactive] = next
 	b.control.ActiveBank = inactive
 	b.control.PolicyGeneration = generation
 	if err := b.writeControl(b.control.Enabled != 0); err != nil {
 		b.control = previousControl
 		b.lastStatic[inactive] = previousStatic
+		rollbackErr := rollbackV3StaticBank(fd4, fd6, previousStatic, written, previousControl.PolicyGeneration)
+		restoreControlErr := b.writeControl(previousControl.Enabled != 0)
+		if rollbackErr != nil || restoreControlErr != nil {
+			return errors.Join(E.Cause(err, "commit v3 static policy"),
+				wrapOptionalEBPFError(rollbackErr, "rollback v3 static prefix"),
+				wrapOptionalEBPFError(restoreControlErr, "restore v3 control"))
+		}
 		return E.Cause(err, "commit v3 static policy")
 	}
+	b.lastStatic[inactive] = next
 	return nil
+}
+
+// rollbackV3StaticBank restores the last committed snapshot after an
+// inactive-bank write or control-map commit fails.  Rewriting the full prior
+// snapshot is intentional: stale-key deletion may have succeeded before the
+// failure, and a partial write may have replaced a prefix with a new
+// generation.  The helper only removes entries introduced by this attempt;
+// entries from an older failed attempt are not enumerable without an extra
+// syscall and remain unreachable by generation checks.
+func rollbackV3StaticBank(fd4, fd6 int, previous, written []netip.Prefix, generation uint32) error {
+	previousSet := make(map[netip.Prefix]struct{}, len(previous))
+	for _, prefix := range previous {
+		previousSet[prefix] = struct{}{}
+	}
+	var rollbackErr error
+	for _, prefix := range written {
+		if _, keep := previousSet[prefix]; keep {
+			continue
+		}
+		if err := deleteV3PolicyPrefix(fd4, fd6, prefix); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	for _, prefix := range previous {
+		if err := writeV3PolicyPrefix(fd4, fd6, prefix, generation); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	return rollbackErr
+}
+
+func wrapOptionalEBPFError(err error, context string) error {
+	if err == nil {
+		return nil
+	}
+	return E.Cause(err, context)
 }
 
 // MergeStaticDirect installs one DIRECT prefix into the *active* bank using the
@@ -871,21 +949,20 @@ func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
 		fd4 = int(b.runtime.policy4_bank1_fd)
 		fd6 = int(b.runtime.policy6_bank1_fd)
 	}
+	last := b.lastStatic[active]
+	for _, p := range last {
+		if p == prefix {
+			return nil
+		}
+	}
+	if err := validateV3PolicyPrefixes(append(append([]netip.Prefix(nil), last...), prefix)); err != nil {
+		return err
+	}
 	if err := writeV3PolicyPrefix(fd4, fd6, prefix, b.control.PolicyGeneration); err != nil {
 		return err
 	}
 	// Keep the active bank snapshot coherent for the next full publish delete pass.
-	last := b.lastStatic[active]
-	found := false
-	for _, p := range last {
-		if p == prefix {
-			found = true
-			break
-		}
-	}
-	if !found {
-		b.lastStatic[active] = append(last, prefix)
-	}
+	b.lastStatic[active] = append(last, prefix)
 	return nil
 }
 

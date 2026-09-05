@@ -653,7 +653,13 @@ func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
 	prefix := netip.PrefixFrom(addr, bits).Masked()
 	// Evidence strong: dns_prefill / route already proved stable DIRECT.
 	s.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
-	if err := s.backend.MergeStaticDirect(prefix); err != nil {
+	var err error
+	if s.v3 != nil {
+		err = s.v3.MergeStaticDirect(prefix)
+	} else if s.backend != nil {
+		err = s.backend.MergeStaticDirect(prefix)
+	}
+	if err != nil {
 		s.parent.logger.Debug("eBPF v3 merge static direct: ", err)
 	}
 }

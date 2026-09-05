@@ -57,6 +57,27 @@ func (p *BankPublisher) AbortCompile() {
 	p.compiling.Store(0)
 }
 
+// SyncGeneration advances the in-process publisher to a generation committed
+// by another publisher (for example the live kernel sink).  Stale snapshots
+// are ignored: moving backwards could make an old flow/DNS generation valid
+// again after a reload. The Lifecycle serializes this operation with all
+// MemoryBackend publishes, so the compare-and-swap cannot invalidate an
+// in-flight bank transaction.
+func (p *BankPublisher) SyncGeneration(generation uint32) {
+	if p == nil || generation == 0 {
+		return
+	}
+	for {
+		current := p.generation.Load()
+		if current != 0 && generation < current {
+			return
+		}
+		if p.generation.CompareAndSwap(current, generation) {
+			return
+		}
+	}
+}
+
 // Commit flips active_bank and bumps generation atomically from the caller's
 // perspective: generation is incremented first is wrong — we set generation then
 // bank so old flow entries (keyed by old gen) miss immediately after bank flip.

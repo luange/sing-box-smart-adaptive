@@ -45,3 +45,19 @@ func TestNormalizeXDPRejectsEnabledUntilHostAdapter(t *testing.T) {
 		t.Fatal("xdp.enabled must not be accepted before the AF_XDP host adapter is wired")
 	}
 }
+
+func TestNormalizePolicyOffloadSafeDefaults(t *testing.T) {
+	got, err := NormalizeSharedNetwork(option.EBPFSharedNetworkOptions{
+		Enabled: true,
+		Engine:  EngineV3,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{
+			Enabled: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PolicyOffload.StaticRules || !got.PolicyOffload.ExactFlowLearning {
+		t.Fatalf("enabled policy_offload did not apply safe defaults: %+v", got.PolicyOffload)
+	}
+}

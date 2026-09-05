@@ -46,7 +46,8 @@ func Decide(in Input) Decision {
 		return Decision{Action: ActionContinue, Reason: ReasonNone, Mark: 0}
 	}
 
-	// §5.1 parse failure
+	// §5.1 parse failure. A malformed/non-IP frame has no trustworthy tuple
+	// with which to assign a listener, so fail open to the kernel without mark.
 	if p.ParseRC < 0 {
 		return Decision{Action: ActionContinue, Reason: ReasonParseFailProxy, Mark: 0}
 	}

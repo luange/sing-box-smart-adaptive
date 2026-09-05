@@ -39,3 +39,22 @@ func TestBankPublisherAbort(t *testing.T) {
 		t.Fatal("should allow compile after abort")
 	}
 }
+
+func TestBankPublisherSyncGeneration(t *testing.T) {
+	p := NewBankPublisher()
+	p.SyncGeneration(17)
+	if got := p.Generation(); got != 17 {
+		t.Fatalf("generation=%d want 17", got)
+	}
+	p.SyncGeneration(9)
+	if got := p.Generation(); got != 17 {
+		t.Fatalf("stale generation regressed publisher to %d", got)
+	}
+	if _, ok := p.BeginCompile(); !ok {
+		t.Fatal("begin")
+	}
+	gen, bank := p.Commit()
+	if gen != 18 || bank != 1 {
+		t.Fatalf("after sync commit gen=%d bank=%d", gen, bank)
+	}
+}

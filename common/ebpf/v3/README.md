@@ -63,7 +63,7 @@ Kernel sink: `common/ebpf.V3Backend` (sole writer of TC maps).
 
 - Empty `engine` → **v2** (unchanged).
 - `engine: v3` is required for this path.
-- Map miss / parse fail / IP fragment / DNS conflict → **proxy (NEED_USERSPACE)**, never silent DIRECT.
+- Map miss / IP fragment / DNS conflict → **proxy (NEED_USERSPACE)**, never silent DIRECT. A truncated or non-IP frame with no trustworthy tuple is passed to the kernel without a mark because socket assignment cannot be performed safely.
 - UDP/443 is **not** dropped unless `drop_udp_443: true`.
 - With `shared_network.enabled`, **`capture_local` defaults to false** (PA/PBR gateway). Explicit `true` still allowed for host capture.
 

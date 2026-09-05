@@ -118,3 +118,14 @@ func TestCompileSharedHostPrefixes(t *testing.T) {
 		t.Fatalf("unexpected IPv6 host prefixes: %v", ipv6)
 	}
 }
+
+func TestV3HostPrefixCapacity(t *testing.T) {
+	addresses := make([]netip.Addr, v3HostMapCapacity+1)
+	for index := range addresses {
+		addresses[index] = netip.AddrFrom4(198, 18, byte(index>>8), byte(index))
+	}
+	ipv4, ipv6 := compileSharedHostPrefixes(addresses)
+	if err := validateV3HostPrefixes(ipv4, ipv6); err == nil {
+		t.Fatalf("accepted %d IPv4 host prefixes beyond map capacity", len(ipv4))
+	}
+}

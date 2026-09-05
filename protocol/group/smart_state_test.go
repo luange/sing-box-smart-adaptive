@@ -260,6 +260,44 @@ func TestSmartProbeRegistryDistinguishesFreshAndCachedResults(t *testing.T) {
 	}
 }
 
+func TestSmartProbeRegistryCancellationDoesNotCacheFailure(t *testing.T) {
+	registry := newSmartProbeRegistry(context.Background())
+	defer registry.close()
+	started := make(chan struct{})
+	var calls atomic.Int32
+	registry.probe = func(ctx context.Context, _ string, _ adapter.Outbound) (uint16, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-ctx.Done()
+			return 0, ctx.Err()
+		}
+		return 9, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err, fresh := registry.runWithMeta(ctx, "cancelled", "https://probe", time.Second, time.Minute, nil)
+		if fresh {
+			firstDone <- errors.New("cancelled probe reported fresh evidence")
+			return
+		}
+		firstDone <- err
+	}()
+	<-started
+	cancel()
+	if err := <-firstDone; !errors.Is(err, errSharedSmartProbeDeferred) {
+		t.Fatalf("cancelled probe error = %v, want deferred", err)
+	}
+
+	if _, err, fresh := registry.runWithMeta(context.Background(), "cancelled", "https://probe", time.Second, time.Minute, nil); err != nil || !fresh {
+		t.Fatalf("retry after cancellation = err %v, fresh %v; want fresh success", err, fresh)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe executed %d times, want cancellation not cached", got)
+	}
+}
+
 func TestSmartProbeRegistrySerializesTracksPerEndpoint(t *testing.T) {
 	registry := newSmartProbeRegistry(context.Background())
 	defer registry.close()

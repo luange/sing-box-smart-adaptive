@@ -406,6 +406,73 @@ func TestSmartUDPAttemptUsesAttemptTimeout(t *testing.T) {
 	}
 }
 
+func TestSmartUDPParentCancellationDoesNotPenalizeCandidate(t *testing.T) {
+	candidate := newSmartBlockingPacketOutbound("cancelled-udp")
+	smart := newTestSmart(candidate)
+	smart.maxAttempts = 1
+	smart.attemptTimeout = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := smart.ListenPacket(ctx, M.ParseSocksaddr("1.1.1.1:53"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected parent cancellation, got %v", err)
+	}
+	smart.store.access.RLock()
+	defer smart.store.access.RUnlock()
+	for key := range smart.store.metrics {
+		if key.Candidate == candidate.Tag() {
+			t.Fatalf("parent cancellation recorded a node failure: %+v", key)
+		}
+	}
+}
+
+func TestSmartDialParentCancellationDoesNotPenalizeCandidate(t *testing.T) {
+	// Both the parent context and the worker result are ready at the same time
+	// here. The adaptive dialer must prefer the request cancellation regardless
+	// of which ready case the scheduler selects; otherwise a canceled request
+	// is recorded as node health evidence roughly half the time.
+	for attempt := 0; attempt < 64; attempt++ {
+		candidate := newSmartParentCanceledDialOutbound("cancelled-tcp-" + strconv.Itoa(attempt))
+		smart := newTestSmart(candidate)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		dialAttempt := smartDialAttempt{candidate: candidate}
+		_, _, _, _ = smart.dialContextAdaptive(
+			ctx,
+			N.NetworkTCP,
+			M.ParseSocksaddr("example.com:443"),
+			[]smartDialAttempt{dialAttempt},
+			"network",
+			"site",
+			N.NetworkTCP,
+		)
+		smart.store.access.RLock()
+		for key := range smart.store.metrics {
+			if key.Candidate == candidate.Tag() {
+				smart.store.access.RUnlock()
+				t.Fatalf("parent cancellation recorded a node failure: %+v", key)
+			}
+		}
+		smart.store.access.RUnlock()
+	}
+}
+
+type smartParentCanceledDialOutbound struct {
+	outbound.Adapter
+}
+
+func newSmartParentCanceledDialOutbound(tag string) *smartParentCanceledDialOutbound {
+	return &smartParentCanceledDialOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, tag, []string{N.NetworkTCP}, nil)}
+}
+
+func (o *smartParentCanceledDialOutbound) DialContext(ctx context.Context, _ string, _ M.Socksaddr) (net.Conn, error) {
+	return nil, ctx.Err()
+}
+
+func (*smartParentCanceledDialOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("not implemented")
+}
+
 type smartCanceledProbeOutbound struct {
 	outbound.Adapter
 }
@@ -1842,6 +1909,41 @@ func TestSmartObservedConnClassifiesErrorsThroughUnwrappedCopy(t *testing.T) {
 	}
 	if failures.Load() != 1 {
 		t.Fatalf("unwrapped copy lost protocol failure, got %d callbacks", failures.Load())
+	}
+}
+
+func TestSmartObservedConnIgnoresExpiredRequestDeadline(t *testing.T) {
+	requestCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	var failures atomic.Int32
+	observed := newSmartObservedConnWithRetransmit(&smartProtocolErrorConn{err: context.DeadlineExceeded}, time.Now(), nil, nil, nil, func() {
+		failures.Add(1)
+	}, 0, requestCtx)
+	_, err := observed.Read(make([]byte, 1))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("read error=%v, want request deadline", err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("expired request deadline was recorded as node failure: %d", failures.Load())
+	}
+}
+
+func TestSmartObservedPacketConnIgnoresExpiredRequestDeadline(t *testing.T) {
+	requestCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	var failures atomic.Int32
+	conn := newSmartObservedPacketConnWithWatchdogThreshold(&smartObservedTestPacketConn{}, time.Now(), true, 1, 20*time.Millisecond, func(time.Duration) {
+		failures.Add(1)
+	}, requestCtx)
+	if _, err := conn.WriteTo([]byte("dns"), &net.UDPAddr{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("expired request deadline was recorded as UDP node failure: %d", failures.Load())
 	}
 }
 

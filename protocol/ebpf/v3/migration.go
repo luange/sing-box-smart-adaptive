@@ -71,6 +71,15 @@ func NormalizeSharedNetwork(options option.EBPFSharedNetworkOptions) (option.EBP
 	default:
 		return options, E.New("policy_offload.dns_ip_hint must be off|safe|strong")
 	}
+	// Keep the effective policy identical across the kernel constructor,
+	// Lifecycle, and the in-process audit model.  An enabled block with no
+	// sub-flags means "safe defaults" (static rules + exact-flow learning), as
+	// documented by shared_network.Start.  Normalizing it here prevents the
+	// kernel from learning flows that Lifecycle later refuses to mirror.
+	if po.Enabled && !po.StaticRules && !po.ExactFlowLearning && !po.FakeIP && !po.MACSourcePolicy {
+		po.StaticRules = true
+		po.ExactFlowLearning = true
+	}
 	// When policy_offload block is present but enabled omitted, treat zero-value
 	// as disabled unless any sub-feature is set by caller later. Explicit enabled
 	// is required for production sinks.

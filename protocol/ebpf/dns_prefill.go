@@ -225,11 +225,15 @@ func (i *Inbound) dnsPrefillApply(
 		} else if i.v3DNSHintEnabled() && i.sharedNetwork != nil {
 			// policy_offload DNS path without legacy dns_prefill module.
 			i.sharedNetwork.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
-			if i.sharedNetwork.backend != nil {
-				p := netip.PrefixFrom(addr.Unmap(), prefixBits(addr)).Masked()
-				if err := i.sharedNetwork.backend.MergeStaticDirect(p); err != nil && i.logger != nil {
-					i.logger.Debug("eBPF v3 dns hint merge: ", err)
-				}
+			p := netip.PrefixFrom(addr.Unmap(), prefixBits(addr)).Masked()
+			var mergeErr error
+			if i.sharedNetwork.v3 != nil {
+				mergeErr = i.sharedNetwork.v3.MergeStaticDirect(p)
+			} else if i.sharedNetwork.backend != nil {
+				mergeErr = i.sharedNetwork.backend.MergeStaticDirect(p)
+			}
+			if mergeErr != nil && i.logger != nil {
+				i.logger.Debug("eBPF v3 dns hint merge: ", mergeErr)
 			}
 		}
 	}

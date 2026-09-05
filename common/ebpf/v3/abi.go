@@ -212,7 +212,9 @@ type Packet struct {
 	DMAC       [6]byte
 	IfIndex    uint32
 	Mark       uint32
-	// ParseRC: 0 ok, 1 ARP-like L2, -1 fail
+	// ParseRC: 0 ok, 1 ARP-like L2, -1 unclassifiable/truncated frame. Parse
+	// failures are passed to the kernel without a mark because no safe tuple
+	// exists for socket assignment.
 	ParseRC int
 }
 

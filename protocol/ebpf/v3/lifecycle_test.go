@@ -167,6 +167,37 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 }
 
+func TestLifecyclePublishStaticRulesKeepsScopedDirectInUserspace(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1}
+	lc.BindSink(sink)
+	accepted, rejected, err := lc.PublishStaticRules([]ebpfv3.CompileInput{{
+		Destination: netip.MustParsePrefix("203.0.113.0/24"),
+		Protocol:    ebpfv3.ProtocolTCP,
+		DPortMin:    443,
+		DPortMax:    443,
+		Verdict:     ebpfv3.VerdictDirect,
+		Kind:        ebpfv3.RuleKindStatic,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted != 0 || rejected != 1 {
+		t.Fatalf("accepted=%d rejected=%d want 0/1", accepted, rejected)
+	}
+	if sink.static != 0 {
+		t.Fatalf("scoped direct rule reached broad static sink: %d prefixes", sink.static)
+	}
+}
+
 func TestLifecyclePublishStaticDirectMirrorsMemorySnapshot(t *testing.T) {
 	drop := false
 	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
@@ -194,6 +225,53 @@ func TestLifecyclePublishStaticDirectMirrorsMemorySnapshot(t *testing.T) {
 	}
 	if lc.Backend().Control.PolicyGeneration != sink.gen {
 		t.Fatalf("generation diverged: memory=%d kernel=%d", lc.Backend().Control.PolicyGeneration, sink.gen)
+	}
+}
+
+func TestLifecycleGenerationSyncKeepsPublisherMonotonic(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	lc.SyncPolicyGeneration(10)
+	lc.SyncPolicyGeneration(12)
+	if got := lc.Backend().Publisher.Generation(); got != 12 {
+		t.Fatalf("publisher generation=%d want 12", got)
+	}
+	if err := lc.Backend().PublishStatic(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := lc.Backend().Control.PolicyGeneration; got != 13 {
+		t.Fatalf("control generation=%d want 13", got)
+	}
+}
+
+func TestLifecycleMergeStaticDirectMirrorsSinkAndModel(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1}
+	lc.BindSink(sink)
+	prefix := netip.MustParsePrefix("203.0.113.10/32")
+	if err := lc.MergeStaticDirect(prefix); err != nil {
+		t.Fatal(err)
+	}
+	if sink.merged != 1 {
+		t.Fatalf("sink merges=%d", sink.merged)
+	}
+	if got := lc.Backend().LookupStatic(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
+		t.Fatal("memory model did not receive merged policy")
 	}
 }
 
