@@ -4683,11 +4683,42 @@ func (c *smartObservedConn) Close() error {
 }
 
 func (c *smartObservedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
-	return c.ExtendedConn, []N.CountFunc{c.observeRead}
+	// Keep the byte-counter contract used by sing/common/bufio, but do not
+	// return the raw upstream reader.  CopyWithIncreateBuffer unwraps a
+	// ReadCounter before copying; returning ExtendedConn directly would bypass
+	// Read/ReadBuffer and lose the terminal proxy-protocol error (for example
+	// VLESS "unknown version: 72").  The small reader shim preserves the
+	// zero-allocation counter path while routing the read error through the
+	// Smart classifier.
+	return smartObservedReader{owner: c}, []N.CountFunc{c.observeRead}
 }
 
 func (c *smartObservedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
-	return c.ExtendedConn, []N.CountFunc{c.observeWrite}
+	return smartObservedWriter{owner: c}, []N.CountFunc{c.observeWrite}
+}
+
+type smartObservedReader struct {
+	owner *smartObservedConn
+}
+
+func (r smartObservedReader) Read(buffer []byte) (int, error) {
+	return r.owner.Read(buffer)
+}
+
+func (r smartObservedReader) ReadBuffer(buffer *buf.Buffer) error {
+	return r.owner.ReadBuffer(buffer)
+}
+
+type smartObservedWriter struct {
+	owner *smartObservedConn
+}
+
+func (w smartObservedWriter) Write(buffer []byte) (int, error) {
+	return w.owner.Write(buffer)
+}
+
+func (w smartObservedWriter) WriteBuffer(buffer *buf.Buffer) error {
+	return w.owner.WriteBuffer(buffer)
 }
 
 func (c *smartObservedConn) Upstream() any {
@@ -4765,11 +4796,12 @@ func (c *smartObservedConn) observeFailure(err error) {
 		// stall after the transport has already told us what happened.
 		c.stopStallTimer()
 	}
-	// Protocol framing/authentication errors are only hard evidence while the
-	// proxy handshake is still waiting for its first valid downstream byte.
-	// Once application data has arrived, the same transport may legitimately
-	// report a remote/service error; keeping that site-local observation
-	// separate avoids turning an HTTP/API failure into a node breaker.
+	// The explicit protocol markers below are authoritative even when the
+	// protocol reader consumed invalid bytes before returning the error.  The
+	// old gate treated any byte as a valid first response, which allowed a
+	// malformed VLESS/VMess/Trojan handshake to escape the breaker.  Ordinary
+	// application responses (403/429/EOF) are not in that marker set and remain
+	// site-local observations.
 	if !isSmartStreamFailure(err, !c.firstRead.Load()) {
 		return
 	}
@@ -4785,7 +4817,7 @@ func (c *smartObservedConn) notifyFailure() {
 	})
 }
 
-func isSmartStreamFailure(err error, handshakePending ...bool) bool {
+func isSmartStreamFailure(err error, _ ...bool) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return false
 	}
@@ -4801,7 +4833,12 @@ func isSmartStreamFailure(err error, handshakePending ...bool) bool {
 		errors.Is(err, syscall.EHOSTUNREACH) {
 		return true
 	}
-	return len(handshakePending) > 0 && handshakePending[0] && isSmartProtocolHandshakeFailure(err)
+	// A protocol reader may consume the invalid response bytes before it can
+	// report the framing/authentication error.  Therefore an explicit proxy
+	// protocol marker is hard evidence regardless of whether the raw stream has
+	// already yielded bytes.  HTTP status codes and normal EOF are intentionally
+	// excluded by isSmartProtocolHandshakeFailure.
+	return isSmartProtocolHandshakeFailure(err)
 }
 
 // isSmartProtocolHandshakeFailure recognizes errors emitted by the protocol

@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/common/nodefilter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -1698,9 +1699,40 @@ func TestSmartObservedConnClassifiesProtocolHandshakeFailures(t *testing.T) {
 		}
 	}
 	for _, message := range positive {
-		if isSmartStreamFailure(errors.New(message), false) {
-			t.Errorf("post-response protocol text escaped the handshake gate: %q", message)
+		if !isSmartStreamFailure(errors.New(message), false) {
+			t.Errorf("protocol failure was lost after invalid response bytes: %q", message)
 		}
+	}
+}
+
+type smartProtocolErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c *smartProtocolErrorConn) Read([]byte) (int, error) {
+	// Return one byte together with the protocol error.  This models a proxy
+	// reader consuming an invalid version byte before it can report the error.
+	return 1, c.err
+}
+
+func TestSmartObservedConnClassifiesErrorsThroughUnwrappedCopy(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var failures atomic.Int32
+	observed := newSmartObservedConn(&smartProtocolErrorConn{
+		Conn: local,
+		err:  errors.New("connection download closed: unknown version: 72"),
+	}, time.Now(), nil, nil, func() {
+		failures.Add(1)
+	})
+
+	_, err := bufio.CopyWithIncreateBuffer(io.Discard, observed, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	if err == nil || !strings.Contains(err.Error(), "unknown version: 72") {
+		t.Fatalf("copy returned %v, want protocol error", err)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("unwrapped copy lost protocol failure, got %d callbacks", failures.Load())
 	}
 }
 
