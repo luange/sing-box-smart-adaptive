@@ -194,6 +194,11 @@ int sb_ebpf_shared_network_prepare(
     bool data_plane_v2,
     struct sb_ebpf_shared_network_runtime *runtime);
 int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime);
+/* Delete the token-mode forward/reverse rows for one flow tuple (any ingress
+ * ifindex). No-op on the socket_assign data plane. */
+int sb_ebpf_shared_network_purge_token_flow(
+    struct sb_ebpf_shared_network_runtime *runtime,
+    const struct sb_shared_original_key *match);
 
 /* eBPF shared-network engine=v3 runtime (independent maps/programs). */
 struct sb_ebpf_v3_runtime {

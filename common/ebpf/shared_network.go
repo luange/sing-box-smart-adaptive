@@ -38,6 +38,15 @@ static int singbox_ebpf_shared_network_close(
 	if (result != 0) *saved_errno = errno;
 	return result;
 }
+
+static int singbox_ebpf_shared_network_purge_token_flow(
+	struct sb_ebpf_shared_network_runtime *runtime,
+	const struct sb_shared_original_key *match,
+	int *saved_errno) {
+	int result = sb_ebpf_shared_network_purge_token_flow(runtime, match);
+	if (result != 0) *saved_errno = errno;
+	return result;
+}
 */
 import "C"
 
@@ -664,10 +673,30 @@ func (b *SharedNetworkBackend) DeleteRedirect(
 		return osErrClosed
 	}
 	err = deleteMap(int(b.runtime.redirect_map_fd), unsafe.Pointer(&key))
-	if errors.Is(err, unix.ENOENT) {
-		return nil
+	if err != nil && !errors.Is(err, unix.ENOENT) {
+		return err
 	}
-	return err
+	// Token mode also published original_to_token / token_to_original rows.
+	// Leaving them behind let a reply to a stale token address rewrite to a
+	// dead original until LRU pressure evicted the row, so purge the token
+	// state for this flow tuple as part of the delete. socket_assign builds
+	// never publish token rows and the helper is a no-op there.
+	if !b.dataPlaneV2 {
+		var match C.struct_sb_shared_original_key
+		match.ifindex = 0
+		match.family = C.uint8_t(key.Family)
+		match.protocol = C.uint8_t(key.Protocol)
+		match.client_port = C.uint16_t(key.ClientPort)
+		match.original_port = C.uint16_t(key.RedirectPort)
+		match.reserved = 0
+		match.client_addr = key.ClientAddr
+		match.original_addr = key.RedirectAddr
+		var savedErrno C.int
+		if purgeErr := C.singbox_ebpf_shared_network_purge_token_flow(b.runtime, &match, &savedErrno); purgeErr != 0 {
+			return E.Cause(syscall.Errno(savedErrno), "purge token flow rows")
+		}
+	}
+	return nil
 }
 
 func (b *SharedNetworkBackend) UpdateHostAddresses(addresses []netip.Addr) error {

@@ -10,6 +10,12 @@ func TestRedirectABI(t *testing.T) {
 	if size := unsafe.Sizeof(redirectKey{}); size != 20 {
 		t.Fatalf("unexpected redirect key size: %d", size)
 	}
+	// originalDestination doubles as the read buffer for the 32-byte
+	// sb_shared_original_dst shared-network map value: its first 32 bytes
+	// must stay layout-identical (family/protocol/port/addr/flags/reserved/
+	// socket_cookie) so the trailing module-A UID fields are simply never
+	// written by the shorter lookup. The SocketCookie offset assertion below
+	// pins that prefix contract.
 	if size := unsafe.Sizeof(originalDestination{}); size != 40 {
 		t.Fatalf("unexpected original destination size: %d", size)
 	}

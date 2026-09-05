@@ -214,3 +214,107 @@ int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime)
 #undef CLOSE_SHARED_FD
     return result;
 }
+
+/* ── Token-mode flow purge (v1 data_plane="token") ────────────────────────
+ * Userspace closes a UDP flow and deletes the shared_redirect row, but the
+ * token-mode ingress also wrote shared_original_to_token and
+ * shared_token_to_original rows. Leaving them behind let a reply to a stale
+ * token address rewrite to a dead original until LRU pressure, and let a
+ * reused client tuple inherit stale token state. This helper walks the
+ * original_to_token map, deletes every row matching the flow tuple on the
+ * identity fields (any ingress ifindex), and removes the paired reverse row
+ * (reverse rows are always published with ifindex 0). */
+#ifndef __NR_bpf
+#if defined(__aarch64__)
+#define __NR_bpf 280
+#elif defined(__arm__)
+#define __NR_bpf 386
+#elif defined(__i386__)
+#define __NR_bpf 357
+#elif defined(__x86_64__)
+#define __NR_bpf 321
+#endif
+#endif
+
+static int shared_network_map_next_key(int map_fd, const void *key, void *next_key) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.next_key = (uint64_t)(uintptr_t)next_key;
+    return (int)syscall(__NR_bpf, BPF_MAP_GET_NEXT_KEY, &attr, sizeof(attr));
+}
+
+static int shared_network_map_delete_entry(int map_fd, const void *key) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    return (int)syscall(__NR_bpf, BPF_MAP_DELETE_ELEM, &attr, sizeof(attr));
+}
+
+static int shared_network_map_lookup_entry(int map_fd, const void *key, void *value) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.value = (uint64_t)(uintptr_t)value;
+    return (int)syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr));
+}
+
+int sb_ebpf_shared_network_purge_token_flow(
+    struct sb_ebpf_shared_network_runtime *runtime,
+    const struct sb_shared_original_key *match) {
+    if (runtime == NULL || match == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (runtime->original_to_token_map_fd < 0 || runtime->token_to_original_map_fd < 0) {
+        /* socket_assign data plane never publishes token rows. */
+        return 0;
+    }
+    struct sb_shared_control control;
+    memset(&control, 0, sizeof(control));
+    __u32 control_key = 0;
+    if (runtime->control_map_fd >= 0) {
+        (void)shared_network_map_lookup_entry(runtime->control_map_fd, &control_key, &control);
+    }
+
+    struct sb_shared_original_key key;
+    struct sb_shared_original_key next;
+    int result = 0;
+    memset(&key, 0, sizeof(key));
+    for (;;) {
+        if (shared_network_map_next_key(runtime->original_to_token_map_fd,
+                                        key.ifindex == 0 && key.family == 0 ? NULL : (const void *)&key,
+                                        &next) != 0)
+            break;
+        key = next;
+        if (key.family != match->family || key.protocol != match->protocol ||
+            key.client_port != match->client_port || key.original_port != match->original_port ||
+            memcmp(key.client_addr, match->client_addr, sizeof(key.client_addr)) != 0 ||
+            memcmp(key.original_addr, match->original_addr, sizeof(key.original_addr)) != 0)
+            continue;
+        struct sb_shared_token_value token;
+        memset(&token, 0, sizeof(token));
+        if (shared_network_map_lookup_entry(runtime->original_to_token_map_fd, &key, &token) != 0)
+            continue;
+        struct sb_shared_reverse_key reverse;
+        memset(&reverse, 0, sizeof(reverse));
+        reverse.ifindex = 0U;
+        reverse.family = key.family;
+        reverse.protocol = key.protocol;
+        reverse.client_port = key.client_port;
+        reverse.token_port = control.bridge_port;
+        reverse.reserved = 0;
+        memcpy(reverse.client_addr, key.client_addr, sizeof(reverse.client_addr));
+        memcpy(reverse.token_addr, token.token_addr, sizeof(reverse.token_addr));
+        if (shared_network_map_delete_entry(runtime->token_to_original_map_fd, &reverse) != 0 &&
+            errno != ENOENT && result == 0)
+            result = -1;
+        if (shared_network_map_delete_entry(runtime->original_to_token_map_fd, &key) != 0 &&
+            errno != ENOENT && result == 0)
+            result = -1;
+    }
+    return result;
+}
