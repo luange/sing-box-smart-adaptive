@@ -10,7 +10,7 @@ type NaiveInboundOptions struct {
 	ListenOptions
 	Users                 []auth.User `json:"users,omitempty"`
 	Network               NetworkList `json:"network,omitempty"`
-	QUICCongestionControl string      `json:"quic_congestion_control,omitempty" enum:"bbr,cubic,reno"`
+	QUICCongestionControl string      `json:"quic_congestion_control,omitempty" enum:"bbr,bbr_standard,bbr2,bbr2_variant,cubic,reno"`
 	InboundTLSOptionsContainer
 }
 

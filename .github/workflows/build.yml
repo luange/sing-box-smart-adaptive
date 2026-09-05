@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version name"
+        description: "SemVer without v (for example 1.14.0 or 1.14.1)"
         required: true
         type: string
       build:
@@ -70,9 +70,12 @@ jobs:
           restore-keys: go-build-tools-linux-
       - name: Check input version
         if: github.event_name == 'workflow_dispatch'
-        run: |-
-          echo "version=${{ inputs.version }}"
-          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          .github/validate-version.sh "$REQUESTED_VERSION"
+          echo "version=$REQUESTED_VERSION" >> "$GITHUB_ENV"
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
@@ -1016,7 +1019,7 @@ jobs:
           }
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Update version
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/testing' || github.ref == 'refs/heads/oldstable')
         run: |-
           go run -v ./cmd/internal/update_desktop_version --ci
       - name: Update nightly version
@@ -1112,7 +1115,7 @@ jobs:
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Update version
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/testing' || github.ref == 'refs/heads/oldstable')
         run: |-
           go run -v ./cmd/internal/update_desktop_version --ci
       - name: Update nightly version
@@ -1304,8 +1307,6 @@ jobs:
             destination: ''
             archive: ''
             upload: ''
-            upload_extension: ''
-            altool_platform: ''
           - name: iOS-jailbreak
             if: ${{ github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'iOS-jailbreak' }}
             type: jailbreak
@@ -1316,8 +1317,6 @@ jobs:
             destination: ''
             archive: ''
             upload: ''
-            upload_extension: ''
-            altool_platform: ''
     steps: &build_apple_steps
       - name: Checkout
         if: matrix.if

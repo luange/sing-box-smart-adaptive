@@ -62,7 +62,6 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			render.JSON(w, r, ErrNotFound)
 			return
 		}
-
 		query := r.URL.Query()
 		url := query.Get("url")
 		if strings.HasPrefix(url, "http://") {
@@ -79,7 +78,13 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		defer cancel()
 
 		var result map[string]uint16
-		if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
+		_, isSmartGroup := proxy.(adapter.SmartGroup)
+		_, isAdaptivePool := proxy.(adapter.AdaptivePoolGroup)
+		// Smart and AdaptivePool implement URLTestGroup for their scheduler,
+		// but the dashboard action is deliberately a separate, one-shot probe.
+		// Calling URLTestGroup here would run the scheduler's full-cycle
+		// deadline and turn a large group into an all-or-nothing 504.
+		if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup && !isSmartGroup && !isAdaptivePool {
 			result, err = urlTestGroup.URLTest(ctx)
 		} else {
 			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {

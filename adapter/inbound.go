@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
@@ -45,14 +46,15 @@ type InboundManager interface {
 }
 
 type InboundContext struct {
-	Inbound     string
-	InboundType string
-	IPVersion   uint8
-	Network     string
-	Source      M.Socksaddr
-	Destination M.Socksaddr
-	User        string
-	Outbound    string
+	Inbound          string
+	InboundInterface string
+	InboundType      string
+	IPVersion        uint8
+	Network          string
+	Source           M.Socksaddr
+	Destination      M.Socksaddr
+	User             string
+	Outbound         string
 
 	// power report
 
@@ -63,6 +65,7 @@ type InboundContext struct {
 
 	Protocol     string
 	Domain       string
+	SniffHost    string
 	Client       string
 	SniffContext any
 	SnifferNames []string
@@ -103,6 +106,9 @@ type InboundContext struct {
 	QueryDNSSEC                         bool
 	FakeIP                              bool
 	PreMatch                            bool
+	// MatchInputs accumulates condition classes evaluated during routing.
+	MatchInputs RouteMatchInputs
+	Extended    *InboundContextExtended
 
 	// rule cache
 
@@ -117,9 +123,36 @@ type InboundContext struct {
 	IgnoreDestinationIPCIDRMatch bool
 }
 
+// InboundContextExtended holds optional chain diagnostics (loadbalance/smart).
+type InboundContextExtended struct {
+	RealOutboundChain []string
+	closeReason       atomic.Pointer[closeReasonState]
+}
+
+func (c *InboundContext) InitExtended() {
+	if c.Extended == nil {
+		c.Extended = new(InboundContextExtended)
+	}
+}
+
+func (c *InboundContext) AppendRealOutbound(tag string) {
+	c.InitExtended()
+	c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
+}
+
+func (c *InboundContext) GetRealOutboundChain() []string {
+	if c.Extended == nil {
+		return nil
+	}
+	return c.Extended.RealOutboundChain
+}
+
 func (c *InboundContext) ResetRuleCache() {
 	c.IPCIDRMatchSource = false
 	c.IPCIDRAcceptEmpty = false
+	// MatchInputs is scoped per rule evaluation; only the final matched rule's
+	// classes must survive for eBPF verdict learn (not prior failed rules).
+	c.MatchInputs = 0
 	c.ResetRuleMatchCache()
 }
 
@@ -226,3 +259,28 @@ func OverrideContext(ctx context.Context) context.Context {
 	}
 	return ctx
 }
+
+// RouteMatchInputs is a bitset of rule condition classes evaluated for a flow.
+type RouteMatchInputs uint32
+
+// RouteMatchUnknown must be a real bit.  Zero means that no rule-input class
+// was recorded (legacy callers); using zero for Unknown made OR accumulation a
+// no-op and accidentally allowed unknown rules into the DIRECT offload path.
+const RouteMatchUnknown RouteMatchInputs = 1 << 31
+
+const (
+	RouteMatchIP RouteMatchInputs = 1 << iota // ip_cidr / geoip / ip_is_private / ip_version
+	RouteMatchPort
+	RouteMatchNetwork
+	RouteMatchDomain
+	RouteMatchProcess
+	RouteMatchUser
+	RouteMatchSSID
+	RouteMatchClashMode
+	RouteMatchProtocol
+	RouteMatchPackageName
+	RouteMatchOther
+)
+
+// RouteMatchIPOnly is the whitelist for destination-level DIRECT learn.
+const RouteMatchIPOnly = RouteMatchIP | RouteMatchPort | RouteMatchNetwork

@@ -32,6 +32,7 @@ func RegisterURLTest(registry *outbound.Registry) {
 var (
 	_ adapter.OutboundGroup           = (*URLTest)(nil)
 	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
+	_ adapter.PreMatchOutboundGroup   = (*URLTest)(nil)
 	_ adapter.Referrer                = (*URLTest)(nil)
 )
 
@@ -127,16 +128,35 @@ func (s *URLTest) References() []string {
 	return references
 }
 
+func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	network := ""
+	if metadata != nil {
+		network = metadata.Network
+	}
+	var outbound adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		outbound = s.group.selectedOutboundTCP
+	case N.NetworkUDP:
+		outbound = s.group.selectedOutboundUDP
+	default:
+		outbound = s.group.selectedOutboundTCP
+		if outbound == nil {
+			outbound = s.group.selectedOutboundUDP
+		}
+	}
+	if outbound == nil {
+		return nil, adapter.PreMatchContinue
+	}
+	return selectOutbound(outbound)
+}
+
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
 }
 
 func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(s.ctx, true)
-}
-
-func (s *URLTest) PerformUpdateCheck() {
-	s.group.performUpdateCheck()
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
@@ -174,6 +194,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
@@ -192,6 +213,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil

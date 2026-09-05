@@ -26,6 +26,8 @@ func RegisterSelector(registry *outbound.Registry) {
 var (
 	_ adapter.OutboundGroup           = (*Selector)(nil)
 	_ adapter.Referrer                = (*Selector)(nil)
+	_ adapter.SelectorGroup           = (*Selector)(nil)
+	_ adapter.PreMatchOutboundGroup   = (*Selector)(nil)
 	_ adapter.ConnectionHandler       = (*Selector)(nil)
 	_ adapter.PacketConnectionHandler = (*Selector)(nil)
 )
@@ -125,6 +127,15 @@ func (s *Selector) References() []string {
 	return []string{s.Now()}
 }
 
+func (s *Selector) Selected() adapter.Outbound {
+	return s.selected.Load()
+}
+
+func (s *Selector) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	_ = metadata
+	return selectOutbound(s.selected.Load())
+}
+
 func (s *Selector) SelectOutbound(tag string) bool {
 	detour, loaded := s.outbounds[tag]
 	if !loaded {
@@ -150,7 +161,9 @@ func (s *Selector) SelectOutbound(tag string) bool {
 }
 
 func (s *Selector) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	conn, err := s.selected.Load().DialContext(ctx, network, destination)
+	selected := s.selected.Load()
+	adapter.NoteRealOutbound(ctx, selected)
+	conn, err := selected.DialContext(ctx, network, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +171,9 @@ func (s *Selector) DialContext(ctx context.Context, network string, destination 
 }
 
 func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	conn, err := s.selected.Load().ListenPacket(ctx, destination)
+	selected := s.selected.Load()
+	adapter.NoteRealOutbound(ctx, selected)
+	conn, err := selected.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, err
 	}

@@ -11,7 +11,12 @@ INSTALL_CONFIG_PATH="/usr/local/etc/sing-box"
 INSTALL_DATA_PATH="/var/lib/sing-box"
 SYSTEMD_SERVICE_PATH="/etc/systemd/system"
 
-DEFAULT_BUILD_TAGS="$(cat "$PROJECT_DIR/release/DEFAULT_BUILD_TAGS_OTHERS")"
+DEFAULT_BUILD_TAGS_FILE="${SING_BOX_BUILD_TAGS_FILE:-$PROJECT_DIR/release/DEFAULT_BUILD_TAGS_OTHERS}"
+if [ ! -f "$DEFAULT_BUILD_TAGS_FILE" ]; then
+    echo "Error: build tags file not found: $DEFAULT_BUILD_TAGS_FILE" >&2
+    exit 1
+fi
+DEFAULT_BUILD_TAGS="$(cat "$DEFAULT_BUILD_TAGS_FILE")"
 
 setup_environment() {
     if [ -d /usr/local/go ]; then

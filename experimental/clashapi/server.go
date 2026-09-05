@@ -19,6 +19,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/clashmode"
+	"github.com/sagernet/sing-box/experimental/connectionhistory"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -45,18 +46,23 @@ type Server struct {
 	router         adapter.Router
 	dnsRouter      adapter.DNSRouter
 	outbound       adapter.OutboundManager
+	provider       adapter.ProviderManager
 	endpoint       adapter.EndpointManager
 	logger         log.Logger
 	httpServer     *http.Server
 	trafficManager *trafficcontrol.Manager
 	urlTestHistory *urltest.HistoryStorage
 	clashMode      *clashmode.Manager
+	history        connectionhistory.Service
 	logDebug       bool
 
 	externalController       bool
 	externalUI               string
 	externalUIDownloadURL    string
 	externalUIDownloadDetour string
+
+	memoryReclaim       *memoryReclaimState
+	memoryReclaimConfig memoryReclaimConfig
 }
 
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.LifecycleService, error) {
@@ -79,6 +85,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		router:    service.FromContext[adapter.Router](ctx),
 		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
 		outbound:  service.FromContext[adapter.OutboundManager](ctx),
+		provider:  service.FromContext[adapter.ProviderManager](ctx),
 		endpoint:  service.FromContext[adapter.EndpointManager](ctx),
 		logger:    logFactory.NewLogger("clash-api"),
 		httpServer: &http.Server{
@@ -88,10 +95,15 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		trafficManager:           trafficManager,
 		urlTestHistory:           urlTestHistory,
 		clashMode:                clashMode,
+		history:                  service.FromContext[connectionhistory.Service](ctx),
 		logDebug:                 logFactory.Level() >= log.LevelDebug,
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
+	}
+	if reclaimConfig, enabled := newMemoryReclaimConfig(options.MemoryReclaim); enabled {
+		s.memoryReclaim = &memoryReclaimState{startedAt: time.Now()}
+		s.memoryReclaimConfig = reclaimConfig
 	}
 	//goland:noinspection GoDeprecation
 	//nolint:staticcheck
@@ -116,12 +128,16 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Get("/logs", getLogs(s.ctx, logFactory))
 		r.Get("/traffic", traffic(s.ctx, trafficManager))
 		r.Get("/version", version)
+		r.Get("/capabilities", capabilities)
 		r.Mount("/configs", configRouter(s, logFactory))
 		r.Mount("/proxies", proxyRouter(s, s.router))
 		r.Mount("/rules", ruleRouter(s.router))
 		r.Mount("/connections", connectionRouter(s.ctx, s.network, trafficManager))
-		r.Mount("/providers/proxies", proxyProviderRouter())
+		r.Mount("/providers/proxies", proxyProviderRouter(s))
 		r.Mount("/providers/rules", ruleProviderRouter())
+		if s.history != nil {
+			r.Mount("/history", connectionHistoryRouter(s.history))
+		}
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
@@ -143,6 +159,29 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 	return s, nil
 }
 
+func capabilities(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, r, render.M{
+		"apiVersion": 1,
+		"core":       "sing-box",
+		"features": render.M{
+			"maintenance": render.M{
+				"dnsFlush":    true,
+				"fakeIPFlush": true,
+			},
+			"providers": render.M{
+				"list":            true,
+				"update":          true,
+				"healthcheck":     true,
+				"pauseRestore":    true,
+				"permanentDelete": true,
+			},
+			"smart": render.M{
+				"nativeGroup": true,
+			},
+		},
+	})
+}
+
 func (s *Server) Name() string {
 	return "clash server"
 }
@@ -150,6 +189,12 @@ func (s *Server) Name() string {
 func (s *Server) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStarted {
 		return nil
+	}
+	if s.memoryReclaim != nil {
+		go s.memoryReclaim.run(s.ctx, s.memoryReclaimConfig)
+		s.logger.Info("memory reclaim enabled: interval=", s.memoryReclaimConfig.interval,
+			" cooldown=", s.memoryReclaimConfig.cooldown,
+			" min_idle=", s.memoryReclaimConfig.minimumIdle)
 	}
 	if s.externalController {
 		s.checkAndDownloadExternalUI()

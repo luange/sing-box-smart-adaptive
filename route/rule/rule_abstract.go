@@ -55,13 +55,30 @@ func (r *abstractDefaultRule) Match(metadata *adapter.InboundContext) bool {
 	if len(r.allItems) == 0 {
 		return true
 	}
+	// Accumulate classes into a scratch copy so failed rules never pollute
+	// the caller's MatchInputs (even without ResetRuleCache).
+	before := metadata.MatchInputs
+	beforeDeferred := metadata.DeferredIPCIDRMatchGroups
+	metadata.MatchInputs = 0
+	metadata.DeferredIPCIDRMatchGroups = 0
 	matched := r.matchInner(metadata)
+	ruleInputs := metadata.MatchInputs
+	deferredGroups := metadata.DeferredIPCIDRMatchGroups
 	if r.invert {
 		if !matched {
-			metadata.DeferredIPCIDRMatchGroups = 0
-			return true
+			deferredGroups = 0
+			matched = true
+		} else {
+			matched = deferredGroups != 0
 		}
-		return metadata.DeferredIPCIDRMatchGroups != 0
+	}
+	if matched {
+		// Commit only the winning rule's evaluated classes onto the prior base.
+		metadata.MatchInputs = before | ruleInputs
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred | deferredGroups
+	} else {
+		metadata.MatchInputs = before
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred
 	}
 	return matched
 }
@@ -69,16 +86,20 @@ func (r *abstractDefaultRule) Match(metadata *adapter.InboundContext) bool {
 func (r *abstractDefaultRule) matchInner(metadata *adapter.InboundContext) bool {
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
+		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return false
 		}
 	}
-	var matched bool
 	if r.ruleSetItem != nil {
-		matched = r.ruleSetItem.matchWithOuterGroups(metadata, groups)
-	} else {
-		matched = groups.done()
+		metadata.MatchInputs |= itemMatchClass(r.ruleSetItem)
+		matched := r.ruleSetItem.matchWithOuterGroups(metadata, groups)
+		if matched {
+			metadata.DeferredIPCIDRMatchGroups &^= uint8(groups.satisfied)
+		}
+		return matched
 	}
+	matched := groups.done()
 	if matched {
 		metadata.DeferredIPCIDRMatchGroups &^= uint8(groups.satisfied)
 	}
@@ -88,6 +109,7 @@ func (r *abstractDefaultRule) matchInner(metadata *adapter.InboundContext) bool 
 func (r *abstractDefaultRule) evaluateForMerge(metadata *adapter.InboundContext) (ruleGroupMatch, bool) {
 	groups := r.evaluateGroups(metadata)
 	for _, item := range r.items {
+		metadata.MatchInputs |= itemMatchClass(item)
 		if !item.Match(metadata) {
 			return ruleGroupMatch{}, false
 		}
@@ -106,36 +128,42 @@ func (r *abstractDefaultRule) destinationIPCIDRMatchesDestination(metadata *adap
 func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) ruleGroupMatch {
 	var groups ruleGroupMatch
 	if len(r.sourceAddressItems) > 0 {
+		accumulateItemClasses(metadata, r.sourceAddressItems)
 		groups.required |= ruleMatchSourceAddress
 		if matchAnyItem(r.sourceAddressItems, metadata) {
 			groups.satisfied |= ruleMatchSourceAddress
 		}
 	}
 	if r.destinationIPCIDRMatchesSource(metadata) {
+		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchSourceAddress
 		if !groups.satisfied.has(ruleMatchSourceAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
 			groups.satisfied |= ruleMatchSourceAddress
 		}
 	}
 	if len(r.sourcePortItems) > 0 {
+		accumulateItemClasses(metadata, r.sourcePortItems)
 		groups.required |= ruleMatchSourcePort
 		if matchAnyItem(r.sourcePortItems, metadata) {
 			groups.satisfied |= ruleMatchSourcePort
 		}
 	}
 	if len(r.destinationAddressItems) > 0 {
+		accumulateItemClasses(metadata, r.destinationAddressItems)
 		groups.required |= ruleMatchDestinationAddress
 		if matchAnyItem(r.destinationAddressItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationAddress
 		}
 	}
 	if r.destinationIPCIDRMatchesDestination(metadata) {
+		accumulateItemClasses(metadata, r.destinationIPCIDRItems)
 		groups.required |= ruleMatchDestinationAddress
 		if !groups.satisfied.has(ruleMatchDestinationAddress) && matchAnyItem(r.destinationIPCIDRItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationAddress
 		}
 	}
 	if len(r.destinationPortItems) > 0 {
+		accumulateItemClasses(metadata, r.destinationPortItems)
 		groups.required |= ruleMatchDestinationPort
 		if matchAnyItem(r.destinationPortItems, metadata) {
 			groups.satisfied |= ruleMatchDestinationPort
@@ -145,6 +173,12 @@ func (r *abstractDefaultRule) evaluateGroups(metadata *adapter.InboundContext) r
 		metadata.DeferredIPCIDRMatchGroups |= uint8(ruleMatchDestinationAddress)
 	}
 	return groups
+}
+
+func accumulateItemClasses(metadata *adapter.InboundContext, items []RuleItem) {
+	for _, item := range items {
+		metadata.MatchInputs |= itemMatchClass(item)
+	}
 }
 
 func (r *abstractDefaultRule) Action() adapter.RuleAction {
@@ -164,6 +198,23 @@ type abstractLogicalRule struct {
 	mode   string
 	invert bool
 	action adapter.RuleAction
+}
+
+// legacyPreMatcher preserves deferred destination-IP semantics when a logical
+// DNS rule is nested inside another logical rule. Calling Match directly on a
+// LogicalDNSRule intentionally evaluates it as a final boolean and drops the
+// deferred group marker; pre-match must use its LegacyPreMatch path instead.
+type legacyPreMatcher interface {
+	LegacyPreMatch(*adapter.InboundContext) bool
+}
+
+func matchLogicalChild(rule adapter.HeadlessRule, metadata *adapter.InboundContext) bool {
+	if metadata.IgnoreDestinationIPCIDRMatch {
+		if preMatcher, ok := rule.(legacyPreMatcher); ok {
+			return preMatcher.LegacyPreMatch(metadata)
+		}
+	}
+	return rule.Match(metadata)
 }
 
 func (r *abstractLogicalRule) Type() string {
@@ -204,42 +255,67 @@ func (r *abstractLogicalRule) Close() error {
 func (r *abstractLogicalRule) Match(metadata *adapter.InboundContext) bool {
 	var (
 		matched        bool
+		collected      adapter.RouteMatchInputs
 		deferredGroups uint8
 	)
 	snapshot := snapshotRuleMatch(metadata)
+	before := metadata.MatchInputs
+	beforeDeferred := snapshot.deferredIPCIDRMatchGroups
 	if r.mode == C.LogicalTypeAnd {
 		matched = true
 		for _, rule := range r.rules {
-			metadata.ResetRuleCache()
-			if !rule.Match(metadata) {
+			nestedMetadata := *metadata
+			nestedMetadata.ResetRuleCache()
+			subMatched := matchLogicalChild(rule, &nestedMetadata)
+			// A nested branch may be unable to decide while destination IP
+			// matching is deliberately deferred. Preserve that evidence even when
+			// the branch currently returns false; an outer OR/invert must re-enter
+			// address-limit evaluation instead of treating the provisional result
+			// as a final boolean.
+			collected |= nestedMetadata.MatchInputs
+			deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
+			if !subMatched {
 				matched = false
-				deferredGroups = 0
-				break
+				if deferredGroups == 0 {
+					break
+				}
 			}
-			deferredGroups |= metadata.DeferredIPCIDRMatchGroups
 		}
 	} else {
 		for _, rule := range r.rules {
-			metadata.ResetRuleCache()
-			if rule.Match(metadata) {
+			nestedMetadata := *metadata
+			nestedMetadata.ResetRuleCache()
+			subMatched := matchLogicalChild(rule, &nestedMetadata)
+			deferredGroups |= nestedMetadata.DeferredIPCIDRMatchGroups
+			if subMatched {
 				matched = true
-				if metadata.DeferredIPCIDRMatchGroups == 0 {
-					deferredGroups = 0
+				// OR: prefer the first fully-resolved match. If the match is
+				// deferred, retain its classes while allowing a later rule to
+				// resolve the same destination group.
+				collected = nestedMetadata.MatchInputs
+				if nestedMetadata.DeferredIPCIDRMatchGroups == 0 {
 					break
 				}
-				deferredGroups |= metadata.DeferredIPCIDRMatchGroups
 			}
 		}
 	}
 	snapshot.restore(metadata)
-	if matched {
-		metadata.DeferredIPCIDRMatchGroups |= deferredGroups
-	}
 	if r.invert {
-		if !matched {
-			return true
+		// A deferred address group is an unknown, not a false, result. Keep the
+		// rule eligible for the post-DNS address check; otherwise nested logical
+		// invert rules incorrectly skip routing during pre-match.
+		if deferredGroups != 0 {
+			matched = true
+		} else {
+			matched = !matched
 		}
-		return deferredGroups != 0
+	}
+	if matched {
+		metadata.MatchInputs = before | collected
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred | deferredGroups
+	} else {
+		metadata.MatchInputs = before
+		metadata.DeferredIPCIDRMatchGroups = beforeDeferred
 	}
 	return matched
 }

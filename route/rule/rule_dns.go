@@ -462,7 +462,6 @@ func (r *DefaultDNSRule) matchForMatch(metadata *adapter.InboundContext) bool {
 
 func (r *DefaultDNSRule) MatchAddressLimit(metadata *adapter.InboundContext, response *dns.Msg) bool {
 	matchMetadata := *metadata
-	matchMetadata.ResetRuleCache()
 	matchMetadata.DNSResponse = response
 	matchMetadata.DestinationAddressMatchFromResponse = true
 	return r.abstractDefaultRule.Match(&matchMetadata)
@@ -491,6 +490,34 @@ func (r *LogicalDNSRule) MatchResponseAnonymous() bool {
 
 func (r *LogicalDNSRule) Race() bool {
 	return r.race
+}
+
+func (r *LogicalDNSRule) matchForMatch(metadata *adapter.InboundContext) bool {
+	var matched bool
+	if r.mode == C.LogicalTypeAnd {
+		matched = true
+		for _, rule := range r.rules {
+			nestedMetadata := *metadata
+			nestedMetadata.ResetRuleCache()
+			if !rule.Match(&nestedMetadata) {
+				matched = false
+				break
+			}
+		}
+	} else {
+		for _, rule := range r.rules {
+			nestedMetadata := *metadata
+			nestedMetadata.ResetRuleCache()
+			if rule.Match(&nestedMetadata) {
+				matched = true
+				break
+			}
+		}
+	}
+	if r.invert {
+		return !matched
+	}
+	return matched
 }
 
 func NewLogicalDNSRule(ctx context.Context, logger log.ContextLogger, options option.LogicalDNSRule, legacyDNSMode bool) (*LogicalDNSRule, error) {
@@ -547,6 +574,10 @@ func (r *LogicalDNSRule) WithAddressLimit() bool {
 	return false
 }
 
+func (r *LogicalDNSRule) Match(metadata *adapter.InboundContext) bool {
+	return r.matchForMatch(metadata)
+}
+
 func (r *LogicalDNSRule) LegacyPreMatch(metadata *adapter.InboundContext) bool {
 	metadata.IgnoreDestinationIPCIDRMatch = true
 	defer func() { metadata.IgnoreDestinationIPCIDRMatch = false }()
@@ -555,7 +586,6 @@ func (r *LogicalDNSRule) LegacyPreMatch(metadata *adapter.InboundContext) bool {
 
 func (r *LogicalDNSRule) MatchAddressLimit(metadata *adapter.InboundContext, response *dns.Msg) bool {
 	matchMetadata := *metadata
-	matchMetadata.ResetRuleCache()
 	matchMetadata.DNSResponse = response
 	matchMetadata.DestinationAddressMatchFromResponse = true
 	return r.abstractLogicalRule.Match(&matchMetadata)

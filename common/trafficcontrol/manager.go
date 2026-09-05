@@ -2,6 +2,7 @@ package trafficcontrol
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -27,6 +28,12 @@ type ConnectionEvent struct {
 	ClosedAt time.Time
 }
 
+// ConnectionHistorySink receives open/close events for durable connection history.
+type ConnectionHistorySink interface {
+	ConnectionOpened(metadata TrackerMetadata)
+	ConnectionClosed(metadata TrackerMetadata)
+}
+
 const closedConnectionsLimit = 1000
 
 var (
@@ -35,17 +42,19 @@ var (
 )
 
 type Manager struct {
-	outbound adapter.OutboundManager
+	outbound      adapter.OutboundManager
+	uploadTotal   atomic.Int64
+	downloadTotal atomic.Int64
 
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]
-	closedUploadTotal       int64
-	closedDownloadTotal     int64
 
-	eventSubscriber *observable.Subscriber[ConnectionEvent]
-	eventObserver   *observable.Observer[ConnectionEvent]
-	cleaner         *cleanup.Cleaner
+	eventSubscriber   *observable.Subscriber[ConnectionEvent]
+	eventObserver     *observable.Observer[ConnectionEvent]
+	historySinkAccess sync.RWMutex
+	historySink       ConnectionHistorySink
+	cleaner           *cleanup.Cleaner
 }
 
 func NewManager(outbound adapter.OutboundManager) *Manager {
@@ -85,9 +94,20 @@ func (m *Manager) UnSubscribeEvents(subscription observable.Subscription[Connect
 	m.eventObserver.UnSubscribe(subscription)
 }
 
+func (m *Manager) SetConnectionHistorySink(sink ConnectionHistorySink) {
+	m.historySinkAccess.Lock()
+	m.historySink = sink
+	m.historySinkAccess.Unlock()
+}
+
 func (m *Manager) join(tracker Tracker) {
 	metadata := tracker.Metadata()
 	m.connections.Store(metadata.ID, tracker)
+	m.historySinkAccess.RLock()
+	if m.historySink != nil {
+		m.historySink.ConnectionOpened(*metadata)
+	}
+	m.historySinkAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventNew,
 		ID:       metadata.ID,
@@ -97,46 +117,42 @@ func (m *Manager) join(tracker Tracker) {
 
 func (m *Manager) leave(tracker Tracker) {
 	metadata := tracker.Metadata()
-	closedAt := time.Now()
-	m.closedConnectionsAccess.Lock()
 	_, loaded := m.connections.LoadAndDelete(metadata.ID)
 	if !loaded {
-		m.closedConnectionsAccess.Unlock()
 		return
 	}
-	metadata.ClosedAt = closedAt
-	metadataCopy := *metadata
+	// Rebuild leaf chain after dial so smart/selector/etc. real outbounds win.
+	// Work on an immutable copy. Connections() may have handed the live
+	// metadata pointer to the Clash API or another subscriber; mutating Chain,
+	// Outbound, or OutboundType here races with JSON serialization and can tear
+	// a slice header. The copy keeps the finalized leaf for history without
+	// changing the object visible to active-connection readers.
+	metadataCopy := cloneTrackerMetadata(metadata)
+	metadataCopy.CloseReason = metadataCopy.LoadCloseReason()
+	metadataCopy.FinalizeChain()
+	closedAt := time.Now()
+	metadataCopy.ClosedAt = closedAt
+	m.closedConnectionsAccess.Lock()
 	if m.closedConnections.Len() >= closedConnectionsLimit {
-		evicted := m.closedConnections.PopFront()
-		m.closedUploadTotal += evicted.Upload.Load()
-		m.closedDownloadTotal += evicted.Download.Load()
+		m.closedConnections.PopFront()
 	}
-	m.closedConnections.PushBack(metadataCopy)
+	m.closedConnections.PushBack(*metadataCopy)
 	m.closedConnectionsAccess.Unlock()
+	m.historySinkAccess.RLock()
+	if m.historySink != nil {
+		m.historySink.ConnectionClosed(*metadataCopy)
+	}
+	m.historySinkAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventClosed,
 		ID:       metadata.ID,
-		Metadata: &metadataCopy,
+		Metadata: metadataCopy,
 		ClosedAt: closedAt,
 	})
 }
 
 func (m *Manager) Total() (uplinkTotal int64, downlinkTotal int64) {
-	m.closedConnectionsAccess.Lock()
-	defer m.closedConnectionsAccess.Unlock()
-	uplinkTotal = m.closedUploadTotal
-	downlinkTotal = m.closedDownloadTotal
-	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
-		uplinkTotal += element.Value.Upload.Load()
-		downlinkTotal += element.Value.Download.Load()
-	}
-	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
-		metadata := tracker.Metadata()
-		uplinkTotal += metadata.Upload.Load()
-		downlinkTotal += metadata.Download.Load()
-		return true
-	})
-	return
+	return m.uploadTotal.Load(), m.downloadTotal.Load()
 }
 
 func (m *Manager) ConnectionsLen() int {
@@ -146,7 +162,10 @@ func (m *Manager) ConnectionsLen() int {
 func (m *Manager) Connections() []*TrackerMetadata {
 	var connections []*TrackerMetadata
 	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
-		connections = append(connections, tracker.Metadata())
+		// Never expose the live tracker metadata. In particular, Chain and the
+		// route fields are immutable to readers even while a connection is
+		// being closed and its history entry is finalized.
+		connections = append(connections, cloneTrackerMetadata(tracker.Metadata()))
 		return true
 	})
 	return connections
@@ -184,9 +203,5 @@ func (m *Manager) CloseAllConnections() {
 func (m *Manager) Clear() {
 	m.closedConnectionsAccess.Lock()
 	defer m.closedConnectionsAccess.Unlock()
-	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
-		m.closedUploadTotal += element.Value.Upload.Load()
-		m.closedDownloadTotal += element.Value.Download.Load()
-	}
 	m.closedConnections.Init()
 }

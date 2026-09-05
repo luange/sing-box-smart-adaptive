@@ -101,8 +101,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
 	if s.cacheFile != nil {
-		savedSet := s.cacheFile.LoadRuleSet(s.tag)
-		if savedSet != nil {
+		if savedSet := s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
 			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
 				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
 			} else {

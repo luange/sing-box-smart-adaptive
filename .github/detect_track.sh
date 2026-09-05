@@ -2,13 +2,26 @@
 set -euo pipefail
 
 branches=$(git branch -r --contains HEAD)
+track=""
 if echo "$branches" | grep -q 'origin/stable'; then
   track=stable
 elif echo "$branches" | grep -q 'origin/testing'; then
   track=testing
 elif echo "$branches" | grep -q 'origin/oldstable'; then
   track=oldstable
-else
+fi
+
+# The adaptive fork may run package jobs from its development branch or a
+# SemVer prerelease tag. They are beta-track artifacts, not upstream stable
+# packages. Capabilities belong to build tags, never to the version string.
+if [[ -z "$track" ]]; then
+  ref="${GITHUB_REF_NAME:-}"
+  if [[ "$ref" == adaptive/* || "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+    track=beta
+  fi
+fi
+
+if [[ -z "$track" ]]; then
   echo "ERROR: HEAD is not on any known release branch (stable/testing/oldstable)" >&2
   exit 1
 fi

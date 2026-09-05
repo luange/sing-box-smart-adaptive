@@ -5,9 +5,8 @@ on:
   #  branches:
   #    - stable
   #    - testing
-  release:
-    types:
-      - published
+  # Custom gateway releases do not publish the upstream full Docker matrix.
+  # Use workflow_dispatch explicitly when a full upstream image is required.
   workflow_dispatch:
     inputs:
       tag:

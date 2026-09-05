@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/sagernet/sing-box/common/hash"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/varbin"
 )
@@ -47,13 +48,20 @@ type CacheFile interface {
 	StoreGroupExpand(group string, expand bool) error
 	LoadRuleSet(tag string) *SavedBinary
 	SaveRuleSet(tag string, set *SavedBinary) error
+
+	LoadSubscription(tag string) *SavedBinary
+	SaveSubscription(tag string, sub *SavedBinary) error
 }
 
 type SavedBinary struct {
 	Content     []byte
 	LastUpdated time.Time
 	LastEtag    string
-	URLHash     []byte
+	// URLHash belongs to the official rule-set cache format. Hash is kept
+	// separately for provider subscription identity and is serialized by the
+	// provider cache codec, not by MarshalBinary.
+	URLHash []byte
+	Hash    hash.HashType
 }
 
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {

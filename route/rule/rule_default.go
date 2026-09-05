@@ -12,6 +12,18 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+// RuleItemClass reports which condition class this item evaluates (eBPF learn gate).
+type RuleItemClass interface {
+	MatchClass() adapter.RouteMatchInputs
+}
+
+func itemMatchClass(item RuleItem) adapter.RouteMatchInputs {
+	if c, ok := item.(RuleItemClass); ok {
+		return c.MatchClass()
+	}
+	return adapter.RouteMatchUnknown
+}
+
 func NewRule(ctx context.Context, logger log.ContextLogger, options option.Rule, checkOutbound bool) (adapter.Rule, error) {
 	switch options.Type {
 	case "", C.RuleTypeDefault:
@@ -67,6 +79,11 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	if len(options.Inbound) > 0 {
 		item := NewInboundRule(options.Inbound)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
+	if len(options.InboundInterface) > 0 {
+		item := NewInboundInterfaceItem(options.InboundInterface)
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}

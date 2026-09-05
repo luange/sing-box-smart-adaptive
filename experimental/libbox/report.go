@@ -34,13 +34,11 @@ func baseReportMetadata() reportMetadata {
 		processName = ""
 	}
 	return reportMetadata{
-		Source:              sCrashReportSource,
-		ProcessName:         processName,
-		ProcessPath:         processPath,
-		AppVersion:          sAppVersion,
-		AppMarketingVersion: sAppMarketingVersion,
-		CoreVersion:         C.Version,
-		GoVersion:           GoVersion(),
+		Source:      sCrashReportSource,
+		ProcessName: processName,
+		ProcessPath: processPath,
+		CoreVersion: C.Version,
+		GoVersion:   GoVersion(),
 	}
 }
 

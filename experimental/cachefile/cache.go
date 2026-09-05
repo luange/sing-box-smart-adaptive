@@ -20,16 +20,18 @@ import (
 )
 
 var (
-	bucketSelected = []byte("selected")
-	bucketExpand   = []byte("group_expand")
-	bucketMode     = []byte("clash_mode")
-	bucketRuleSet  = []byte("rule_set")
+	bucketSelected         = []byte("selected")
+	bucketExpand           = []byte("group_expand")
+	bucketMode             = []byte("clash_mode")
+	bucketRuleSet          = []byte("rule_set")
+	bucketOutboundProvider = []byte("outbound_provider")
 
 	bucketNameList = []string{
 		string(bucketSelected),
 		string(bucketExpand),
 		string(bucketMode),
 		string(bucketRuleSet),
+		string(bucketOutboundProvider),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}
@@ -210,6 +212,13 @@ func (c *CacheFile) start() error {
 		if rmErr != nil {
 			return err
 		}
+		if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
+			rmErr := filemanager.Remove(c.ctx, c.path)
+			if rmErr != nil {
+				return err
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	if err != nil {
 		return err
@@ -479,6 +488,39 @@ func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
 			return err
 		}
 		setBinary, err := set.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(tag), setBinary)
+	})
+}
+
+func (c *CacheFile) LoadSubscription(tag string) *adapter.SavedBinary {
+	var savedSet adapter.SavedBinary
+	err := c.DB.View(func(t *bbolt.Tx) error {
+		bucket := c.bucket(t, bucketOutboundProvider)
+		if bucket == nil {
+			return os.ErrNotExist
+		}
+		setBinary := bucket.Get([]byte(tag))
+		if len(setBinary) == 0 {
+			return os.ErrInvalid
+		}
+		return unmarshalSubscriptionBinary(&savedSet, setBinary)
+	})
+	if err != nil {
+		return nil
+	}
+	return &savedSet
+}
+
+func (c *CacheFile) SaveSubscription(tag string, sub *adapter.SavedBinary) error {
+	return c.batch(func(t *bbolt.Tx) error {
+		bucket, err := c.createBucket(t, bucketOutboundProvider)
+		if err != nil {
+			return err
+		}
+		setBinary, err := marshalSubscriptionBinary(sub)
 		if err != nil {
 			return err
 		}

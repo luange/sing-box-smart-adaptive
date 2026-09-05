@@ -25,6 +25,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/exp/slices"
 )
@@ -163,10 +164,13 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
-	if selectedRule != nil {
-		metadata.RouteRule = selectedRule.String()
+	// Share Extended with trackers + dial path before any routing side-effects.
+	metadata.InitExtended()
+	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
+		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
+			offload.NoteRoutedDirect(metadata, selectedOutbound)
+		}
 	}
-	metadata.RouteOutbound = selectedOutbound.Tag()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -295,10 +299,12 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
-	if selectedRule != nil {
-		metadata.RouteRule = selectedRule.String()
+	metadata.InitExtended()
+	if selectedOutbound != nil && (metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed) {
+		if offload := service.FromContext[adapter.DirectOffload](ctx); offload != nil {
+			offload.NoteRoutedDirect(metadata, selectedOutbound)
+		}
 	}
-	metadata.RouteOutbound = selectedOutbound.Tag()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -437,6 +443,39 @@ func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R
 	}
 }
 
+func (r *Router) selectPreMatchOutbound(metadata *adapter.InboundContext, outbound adapter.Outbound, depth int) (adapter.Outbound, adapter.PreMatchAction) {
+	if outbound == nil || depth > 8 {
+		return nil, adapter.PreMatchContinue
+	}
+	if _, disabled := outbound.(adapter.PreMatchDisabledOutbound); disabled {
+		return nil, adapter.PreMatchContinue
+	}
+	if preMatchGroup, isPreMatchGroup := outbound.(adapter.PreMatchOutboundGroup); isPreMatchGroup {
+		return preMatchGroup.SelectPreMatchOutbound(metadata, func(selectedOutbound adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction) {
+			return r.selectPreMatchOutbound(metadata, selectedOutbound, depth+1)
+		})
+	}
+	if group, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
+		if !selectedLoaded {
+			return nil, adapter.PreMatchContinue
+		}
+		return r.selectPreMatchOutbound(metadata, selectedOutbound, depth+1)
+	}
+	if !common.Contains(outbound.Network(), metadata.Network) {
+		return nil, adapter.PreMatchContinue
+	}
+	flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound)
+	if !isFlowOutbound {
+		return nil, adapter.PreMatchContinue
+	}
+	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
+	if flowAction == adapter.PreMatchContinue {
+		return nil, adapter.PreMatchContinue
+	}
+	return outbound, flowAction
+}
+
 func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundContext, packetDestination M.Socksaddr, matchedRule adapter.Rule, outboundTag string) adapter.PreMatchResult {
 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
 	var outbound adapter.Outbound
@@ -449,25 +488,10 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
-	for range 8 {
-		group, isGroup := outbound.(adapter.OutboundGroup)
-		if !isGroup {
-			break
-		}
-		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
-		if !selectedLoaded {
-			return continueResult
-		}
-		outbound = selectedOutbound
-	}
-	if !common.Contains(outbound.Network(), metadata.Network) {
+	outbound, flowAction := r.selectPreMatchOutbound(metadata, outbound, 0)
+	if outbound == nil {
 		return continueResult
 	}
-	flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound)
-	if !isFlowOutbound {
-		return continueResult
-	}
-	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
 	if flowAction != adapter.PreMatchFlow {
 		return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
 	}
@@ -504,9 +528,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			}
 			return adapter.PreMatchResult{Action: adapter.PreMatchReject}
 		}
-		flowAction = flowOutbound.PreMatchFlow(metadata.Network, newDestination)
-		if flowAction != adapter.PreMatchFlow {
-			return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
+		if flowOutbound, ok := outbound.(adapter.FlowOutbound); ok {
+			flowAction = flowOutbound.PreMatchFlow(metadata.Network, newDestination)
+			if flowAction != adapter.PreMatchFlow {
+				return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
+			}
 		}
 		result.Destination = netip.AddrPortFrom(newDestination, metadata.Destination.Port)
 	} else if metadata.Destination != packetDestination {
@@ -568,6 +594,9 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
 		if loaded {
 			metadata.Domain = domain
+			if metadata.SniffHost == "" {
+				metadata.SniffHost = domain
+			}
 			r.logger.DebugContext(ctx, "found reserve mapped domain: ", metadata.Domain)
 		}
 	}

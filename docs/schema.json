@@ -6657,6 +6657,9 @@
               "type": "string",
               "enum": [
                 "bbr",
+                "bbr_standard",
+                "bbr2",
+                "bbr2_variant",
                 "cubic",
                 "reno"
               ]

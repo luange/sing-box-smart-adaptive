@@ -79,17 +79,28 @@ func (s *HistoryStorage) Close() error {
 }
 
 func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	return URLTestWithNetwork(ctx, link, detour, N.NetworkTCP)
+}
+
+// URLTestWithNetwork is the family-aware variant used by Smart's bounded
+// profile worker. The default URLTest contract remains unchanged; tcp4/tcp6
+// are passed through to the dialer so the probe measures the selected address
+// family instead of copying a dual-stack result into both ledgers.
+func URLTestWithNetwork(ctx context.Context, link string, detour N.Dialer, network string) (uint16, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		network = N.NetworkTCP
+	}
 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
-		_, err := urlTest(ctx, link, detour)
+		_, err := urlTest(ctx, link, detour, network)
 		if err != nil {
 			return 0, err
 		}
 	}
-	return urlTest(ctx, link, detour)
+	return urlTest(ctx, link, detour, network)
 }
 
-func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+func urlTest(ctx context.Context, link string, detour N.Dialer, network string) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -109,7 +120,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	instance, err := detour.DialContext(ctx, network, M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
 		return
 	}
@@ -121,27 +132,53 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	if err != nil {
 		return
 	}
+	// Prefer the caller's deadline (smart probe is typically 5s). Falling back
+	// to TCPTimeout (15s) made serial smart-group Close exceed FatalStopTimeout.
+	clientTimeout := C.TCPTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < clientTimeout {
+			clientTimeout = remaining
+		}
+	}
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return instance, nil
 			},
 			TLSClientConfig: &tls.Config{
-				Time:    ntp.TimeFuncFromContext(ctx),
-				RootCAs: adapter.RootPoolFromContext(ctx),
+				Time:       ntp.TimeFuncFromContext(ctx),
+				RootCAs:    adapter.RootPoolFromContext(ctx),
+				ServerName: probeTLSServerName(hostname),
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: C.TCPTimeout,
+		Timeout: clientTimeout,
 	}
 	defer client.CloseIdleConnections()
-	resp, err := client.Do(req.WithContext(ctx))
+	request := req.WithContext(ctx)
+	if serverName := probeTLSServerName(hostname); serverName != hostname {
+		// Keep the probe endpoint literal so bootstrap never performs a DNS
+		// lookup through the Smart group, while still routing Cloudflare's
+		// virtual host to a valid certificate and response handler.
+		request.Host = serverName
+	}
+	resp, err := client.Do(request)
 	if err != nil {
 		return
 	}
 	resp.Body.Close()
 	t = uint16(time.Since(start) / time.Millisecond)
 	return
+}
+
+func probeTLSServerName(hostname string) string {
+	if ip := net.ParseIP(hostname); ip != nil {
+		switch ip.String() {
+		case "1.1.1.1", "1.0.0.1":
+			return "cloudflare-dns.com"
+		}
+	}
+	return hostname
 }

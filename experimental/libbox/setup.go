@@ -95,7 +95,7 @@ func ReloadSetupOptions(options *SetupOptions) {
 			debug.SetGCPercent(oomkiller.DefaultAppleNetworkExtensionGCPercent)
 		}
 		if sOOMMemoryLimit > 0 {
-			debug.SetMemoryLimit(sOOMMemoryLimit * 4 / 5)
+			debug.SetMemoryLimit(sOOMMemoryLimit * 3 / 4)
 		} else {
 			debug.SetMemoryLimit(math.MaxInt64)
 		}

@@ -26,6 +26,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
+	"github.com/sagernet/sing/service"
 )
 
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
@@ -92,7 +93,42 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 	}
 }
 
+// TrackCloser registers an arbitrary closer (e.g. eBPF splice pair) so CloseAll
+// releases it. Returns a wrapper that unregisters on Close.
+func (m *ConnectionManager) TrackCloser(closer io.Closer) io.Closer {
+	if closer == nil {
+		return nil
+	}
+	m.access.Lock()
+	element := m.connections.PushBack(closer)
+	m.access.Unlock()
+	return &trackedCloser{
+		Closer:  closer,
+		manager: m,
+		element: element,
+	}
+}
+
+type trackedCloser struct {
+	io.Closer
+	manager *ConnectionManager
+	element *list.Element[io.Closer]
+}
+
+func (c *trackedCloser) Close() error {
+	c.manager.access.Lock()
+	if c.element != nil {
+		c.manager.connections.Remove(c.element)
+		c.element = nil
+	}
+	c.manager.access.Unlock()
+	return c.Closer.Close()
+}
+
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// Share Extended with traffic trackers so group leaf tags recorded during
+	// DialContext are visible to connection_history on close.
+	metadata.InitExtended()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remoteConn net.Conn
@@ -104,6 +140,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
 	}
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyDialError(err))
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {
 			remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
@@ -113,6 +150,9 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		var dialerString string
 		if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 			dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+			if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+				dialerString += "[" + strings.Join(chain, " -> ") + "]"
+			}
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -121,11 +161,20 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	}
 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 		err = E.Cause(err, "report handshake success")
 		remoteConn.Close()
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
+	}
+	// Module A: learn path after dial success (first connection still userspace). Fail-open.
+	// Shared-network transparent flows may surface as mixed; hub learners gate eligibility.
+	if metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := M.AddrPortFromNet(remoteConn.RemoteAddr())
+			learner.MaybeLearnTCP(ctx, this, metadata, remoteAP)
+		}
 	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
@@ -133,6 +182,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if metadata.TLSSpoof != "" {
 		spoofConn, spoofErr := tlsspoof.NewConn(remoteConn, metadata.TLSSpoofMethod, metadata.TLSSpoof)
 		if spoofErr != nil {
+			noteCloseReason(ctx, adapter.ClassifyHandshakeError(spoofErr))
 			spoofErr = E.Cause(spoofErr, "tls_spoof setup")
 			remoteConn.Close()
 			N.CloseOnHandshakeFailure(conn, onClose, spoofErr)
@@ -149,11 +199,19 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
+	// Module B: eBPF sockmap splice (opt-in, fail-open). Master §6.1.
+	if splicer := service.FromContext[adapter.ConnectionSplicer](ctx); splicer != nil {
+		if splicer.TrySpliceTCP(ctx, metadata.InboundType, this, conn, remoteConn, metadata, onClose) {
+			m.logger.DebugContext(ctx, "connection handed to eBPF splice")
+			return
+		}
+	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.InitExtended()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
@@ -179,6 +237,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			remoteConn, err = this.DialContext(ctx, N.NetworkUDP, metadata.Destination)
 		}
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyDialError(err))
 			var remoteString string
 			if len(metadata.DestinationAddresses) > 0 {
 				remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
@@ -188,6 +247,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			var dialerString string
 			if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+				if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+					dialerString += "[" + strings.Join(chain, " -> ") + "]"
+				}
 			}
 			err = E.Cause(err, "open packet connection to ", remoteString, dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -208,9 +270,13 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			remotePacketConn, err = this.ListenPacket(ctx, metadata.Destination)
 		}
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyDialError(err))
 			var dialerString string
 			if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+				if chain := metadata.GetRealOutboundChain(); len(chain) > 0 {
+					dialerString += "[" + strings.Join(chain, " -> ") + "]"
+				}
 			}
 			err = E.Cause(err, "listen packet connection using ", dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -220,10 +286,27 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
 	if err != nil {
+		noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 		conn.Close()
 		remotePacketConn.Close()
 		m.logger.ErrorContext(ctx, "report handshake success: ", err)
 		return
+	}
+	// UDP DIRECT learn after proven bind/connect (fail-open).
+	if metadata.InboundType == C.TypeEBPF || metadata.InboundType == C.TypeMixed {
+		if learner := service.FromContext[adapter.VerdictLearner](ctx); learner != nil {
+			remoteAP := metadata.Destination.AddrPort()
+			if destinationAddress.IsValid() {
+				remoteAP = netip.AddrPortFrom(destinationAddress, metadata.Destination.Port)
+			} else if remoteConn != nil {
+				if ap := M.AddrPortFromNet(remoteConn.RemoteAddr()); ap.IsValid() {
+					remoteAP = ap
+				}
+			}
+			if remoteAP.IsValid() {
+				learner.MaybeLearnUDP(ctx, this, metadata, remoteAP)
+			}
+		}
 	}
 	if destinationAddress.IsValid() {
 		var originDestination M.Socksaddr
@@ -272,11 +355,13 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 
 func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
 	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	noteCloseReason(ctx, adapter.ClassifyStreamError(err, !direction))
 	if err != nil {
 		common.Close(source, destination)
 	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
 		err = duplexDst.CloseWrite()
 		if err != nil {
+			noteCloseReason(ctx, adapter.ClassifyStreamError(err, !direction))
 			common.Close(source, destination)
 		}
 	} else {
@@ -349,8 +434,13 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		return false
 	}
 	if !wrotePayload && (E.IsMulti(err, os.ErrInvalid, context.DeadlineExceeded, io.EOF) || E.IsTimeout(err)) {
+		// A probe-style write can time out before any payload is available. The
+		// caller deliberately continues with the normal copy path, so this is
+		// not a closed connection and must not be recorded as a handshake
+		// failure in history.
 		return false
 	}
+	noteCloseReason(ctx, adapter.ClassifyHandshakeError(err))
 	if !done.Swap(true) {
 		if onClose != nil {
 			onClose(err)
@@ -367,6 +457,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
 	_, err := bufio.CopyPacket(destination, source)
+	noteCloseReason(ctx, classifyPacketCloseError(err, !direction))
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")
@@ -390,6 +481,25 @@ func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.P
 		}
 	}
 	common.Close(source, destination)
+}
+
+func noteCloseReason(ctx context.Context, reason adapter.ConnectionCloseReason) {
+	if reason == "" {
+		return
+	}
+	if metadata := adapter.ContextFrom(ctx); metadata != nil && metadata.Extended != nil {
+		metadata.Extended.SetCloseReason(reason)
+	}
+}
+
+func classifyPacketCloseError(err error, clientDirection bool) adapter.ConnectionCloseReason {
+	if err == nil {
+		if clientDirection {
+			return adapter.CloseReasonClientEOF
+		}
+		return adapter.CloseReasonRemoteEOF
+	}
+	return adapter.ClassifyStreamError(err, clientDirection)
 }
 
 type trackedConn struct {

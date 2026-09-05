@@ -221,13 +221,13 @@ func (m *Manager) Remove(tag string) error {
 	if !found {
 		return os.ErrInvalid
 	}
-	delete(m.outboundByTag, tag)
 	index := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 		return it == outbound
 	})
 	if index == -1 {
-		panic("invalid inbound index")
+		return E.New("outbound index missing: ", tag)
 	}
+	delete(m.outboundByTag, tag)
 	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
 	started := m.started
 	if m.defaultOutbound == outbound {
@@ -290,7 +290,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			return it == existsOutbound
 		})
 		if existsIndex == -1 {
-			panic("invalid inbound index")
+			return E.New("existing outbound index missing: ", tag)
 		}
 		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
 	}

@@ -82,6 +82,10 @@ require (
 	howett.net/plist v1.0.1
 )
 
+// Keep the project-maintained sing-tun fork that carries the eBPF v3 ABI.
+// The upstream RC baseline is otherwise used unchanged.
+replace github.com/sagernet/sing-tun => github.com/luange/sing-tun v0.8.12-0.20260805152848-9833946bd00a
+
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	filippo.io/hpke v0.4.0 // indirect
