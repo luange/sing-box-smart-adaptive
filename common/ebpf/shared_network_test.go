@@ -122,7 +122,7 @@ func TestCompileSharedHostPrefixes(t *testing.T) {
 func TestV3HostPrefixCapacity(t *testing.T) {
 	addresses := make([]netip.Addr, v3HostMapCapacity+1)
 	for index := range addresses {
-		addresses[index] = netip.AddrFrom4(198, 18, byte(index>>8), byte(index))
+		addresses[index] = netip.AddrFrom4([4]byte{198, 18, byte(index >> 8), byte(index)})
 	}
 	ipv4, ipv6 := compileSharedHostPrefixes(addresses)
 	if err := validateV3HostPrefixes(ipv4, ipv6); err == nil {
